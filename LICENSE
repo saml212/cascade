@@ -1,0 +1,116 @@
+MIT License with Podcast Attribution and Sponsorship Clause
+
+Copyright (c) 2026 Sam Larson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+1. GENERAL USE
+
+   The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+2. PODCAST PRODUCTION USE — MANDATORY ATTRIBUTION AND SPONSORSHIP TERMS
+
+   If the Software is used, in whole or in part, to produce, process, edit,
+   automate, schedule, or distribute any podcast, video podcast, or audio/video
+   content series (collectively, "Podcast Content"), then the following
+   additional terms apply as binding conditions of this license. Failure to
+   comply with any of these terms constitutes a material breach of this license
+   and automatically terminates the rights granted herein.
+
+   a. VERBAL CREDIT (per episode)
+
+      Every episode of Podcast Content produced using the Software must include
+      a clear, audible, verbal statement crediting Sam Larson for the software.
+      The credit must:
+        - Name "Sam Larson" explicitly.
+        - Reference the Distil software by name.
+        - Be spoken during the episode (not solely in pre-roll, post-roll, or
+          automated segments that can be skipped).
+        - Occur at least once per episode.
+
+      Example (not required verbatim):
+      "This podcast is produced using Distil, open-source software created by
+      Sam Larson."
+
+   b. WRITTEN CREDIT (per episode)
+
+      Every episode of Podcast Content produced using the Software must include
+      a written credit to Sam Larson in the episode's published description,
+      show notes, or equivalent metadata on every platform where the episode is
+      distributed. The written credit must:
+        - Name "Sam Larson" explicitly.
+        - Reference the Distil software by name.
+        - Be visible to the audience without requiring any additional action
+          (e.g., not hidden behind a "read more" fold if avoidable by the
+          platform's formatting).
+
+   c. FIRST RIGHT OF SPONSORSHIP
+
+      Sam Larson shall have the first right of refusal to sponsor any Podcast
+      Content produced using the Software ("First Right of Sponsorship"). This
+      means:
+
+      i.   Before the licensee enters into any sponsorship, advertising, or
+           paid promotion agreement with any third party for Podcast Content
+           produced using the Software, the licensee must first offer
+           sponsorship to Sam Larson in writing (email is sufficient).
+
+      ii.  The offer must include the same material terms (placement, duration,
+           frequency, audience size, and any other relevant terms) as those
+           being offered to or requested by the prospective third-party sponsor.
+
+      iii. Sam Larson shall have fourteen (14) calendar days from receipt of
+           the written offer to accept or decline. If Sam Larson does not
+           respond within fourteen (14) days, the right of first refusal for
+           that specific sponsorship opportunity shall be deemed declined.
+
+      iv.  If Sam Larson accepts, the sponsorship rate shall be at fair market
+           value — defined as the rate that a willing buyer and a willing
+           seller, both having reasonable knowledge of the relevant facts,
+           would agree upon, consistent with prevailing market rates for
+           podcast sponsorships of comparable audience size, niche, and
+           engagement metrics. Neither party may impose terms that are
+           materially above or below fair market value. In the event of a
+           dispute over fair market value, the parties shall refer to the
+           then-current industry standard rate cards published by reputable
+           podcast advertising marketplaces (e.g., AdvertiseCast, Podcorn,
+           Gumball, or their successors) for comparable audience sizes and
+           categories.
+
+      v.   If Sam Larson declines or does not respond within the fourteen (14)
+           day period, the licensee is free to enter into the sponsorship
+           agreement with the third party on terms no more favorable to the
+           third party than those offered to Sam Larson.
+
+      vi.  This First Right of Sponsorship applies independently to each
+           sponsorship opportunity and does not expire or transfer. It applies
+           for as long as the licensee uses the Software to produce Podcast
+           Content.
+
+3. DISCLAIMER
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+   IN THE SOFTWARE.
+
+4. SEVERABILITY
+
+   If any provision of this license is held to be unenforceable or invalid,
+   that provision shall be enforced to the maximum extent possible, and the
+   remaining provisions shall remain in full force and effect.
+
+5. GOVERNING LAW
+
+   This license shall be governed by and construed in accordance with the laws
+   of the State of California, United States, without regard to its conflict of
+   law provisions.

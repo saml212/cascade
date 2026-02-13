@@ -1,0 +1,80 @@
+[project]
+name = "distil"
+version = "0.1.0"
+
+[paths]
+ingest_dir = "~/podcast_ingest"          # Watch folder / SD card mount point
+output_dir = "./output"                   # Processed output (SSD)
+work_dir = "./work"                       # Temporary processing files
+backup_dir = "/Volumes/Backup/podcast"    # External HDD backup location
+public_media_dir = ""                     # Public URL base for Instagram uploads
+
+[processing]
+frame_seconds = 0.1                       # Audio analysis frame size
+speech_db_margin = 12                     # dB above noise floor for speech
+min_segment_seconds = 2.0                 # Minimum speaker segment duration
+max_channel_correlation = 0.95            # Above this = channels identical
+max_channel_rms_ratio_delta = 3.0         # dB; below this = channels identical
+clip_min_seconds = 30                     # Minimum clip duration
+clip_max_seconds = 90                     # Maximum clip duration
+clip_count = 10                           # Number of clips to generate
+output_resolution = "1920x1080"           # Longform output resolution
+shorts_resolution = "1080x1920"           # Shorts output resolution
+video_crf = 18                            # CRF for longform
+shorts_crf = 20                           # CRF for shorts
+audio_bitrate = "192k"                    # Audio bitrate for longform
+shorts_audio_bitrate = "128k"             # Audio bitrate for shorts
+use_hardware_accel = false                # Use VideoToolbox
+
+[transcription]
+provider = "deepgram"                     # Transcription provider
+model = "nova-3"                          # Deepgram model
+language = "en"                           # Language code
+diarize = true                            # Enable speaker diarization
+smart_format = true                       # Deepgram smart formatting
+utterances = true                         # Group into utterances
+
+[clip_mining]
+method = "llm"                            # "baseline", "transcript", or "llm"
+llm_model = "claude-opus-4-6"            # Model for clip ranking + metadata
+llm_temperature = 0.3                     # LLM temperature
+boundary_snap_tolerance_seconds = 3.0     # Max distance to snap to silence
+
+[schedule]
+shorts_per_day_weekday = 1                # Mon-Thu
+shorts_per_day_weekend = 2                # Fri-Sun
+peak_days = ["friday", "saturday", "sunday"]
+longform_delay_days = 0                   # Days after approval to publish longform
+timezone = "America/Los_Angeles"
+
+[automation]
+cron_enabled = false                      # Enable cron-based auto-ingest
+sd_card_mount = "/Volumes/Untitled"       # SD card mount point
+auto_backup = true                        # Auto backup to external HDD
+cleanup_after_publish = true              # Remove source files after all clips published
+cleanup_grace_days = 7                    # Keep files for N days after last publish
+
+[platforms.youtube]
+enabled = true
+require_approval = true
+include_shorts_hashtag = true
+link_to_longform = true                   # Include longform link in Shorts description
+
+[platforms.tiktok]
+enabled = true
+require_approval = true
+max_caption_chars = 2200
+link_to_longform = true                   # "Full episode" link in bio/comment
+
+[platforms.instagram]
+enabled = true
+require_approval = true
+requires_public_url = true
+link_to_longform = true                   # "Link in bio" CTA
+
+[platforms.podcast_rss]
+enabled = true
+feed_url = ""
+audio_format = "mp3"
+audio_bitrate = "128k"
+artwork_path = ""

@@ -1,0 +1,25 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Output artifacts
+output/
+work/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Models
+models/
+
+# Logs
+logs/
+*.log

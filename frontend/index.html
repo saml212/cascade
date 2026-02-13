@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distil</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9' }
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="/frontend/styles.css">
+</head>
+<body class="h-full bg-zinc-950 text-zinc-100 antialiased">
+  <!-- Nav -->
+  <nav class="fixed top-0 left-0 right-0 z-50 bg-zinc-900/80 backdrop-blur border-b border-zinc-800">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex items-center justify-between h-14">
+        <a href="#/" class="text-lg font-bold tracking-tight text-white">
+          <span class="text-brand-500">distil</span>
+        </a>
+        <div class="flex items-center gap-1">
+          <a href="#/" class="nav-link px-3 py-1.5 rounded-md text-sm text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors" data-nav="dashboard">Dashboard</a>
+          <a href="#/schedule" class="nav-link px-3 py-1.5 rounded-md text-sm text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors" data-nav="schedule">Schedule</a>
+          <a href="#/analytics" class="nav-link px-3 py-1.5 rounded-md text-sm text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors" data-nav="analytics">Analytics</a>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <!-- App container -->
+  <main id="app" class="pt-14 min-h-full">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      <div class="text-zinc-500 text-center py-20">Loading...</div>
+    </div>
+  </main>
+
+  <script src="/frontend/app.js"></script>
+</body>
+</html>

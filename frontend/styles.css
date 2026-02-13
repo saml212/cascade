@@ -1,0 +1,120 @@
+/* Distil — Custom Styles */
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Active nav link */
+.nav-link.active {
+  color: #fff;
+  background: #27272a;
+}
+
+/* View transitions */
+#app > div {
+  animation: fadeIn 0.15s ease-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Video player */
+.video-container {
+  position: relative;
+  background: #000;
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.video-container video {
+  width: 100%;
+  display: block;
+}
+
+/* Virality score badge */
+.score-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.375rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.score-low { background: #991b1b; color: #fca5a5; }
+.score-mid { background: #92400e; color: #fcd34d; }
+.score-high { background: #166534; color: #86efac; }
+
+/* Status badges */
+.status-pending { background: #3f3f46; color: #a1a1aa; }
+.status-approved { background: #166534; color: #86efac; }
+.status-rejected { background: #991b1b; color: #fca5a5; }
+.status-processing { background: #1e3a5f; color: #93c5fd; }
+.status-published { background: #4c1d95; color: #c4b5fd; }
+.status-ready_for_review { background: #92400e; color: #fcd34d; }
+
+/* Platform colors */
+.platform-youtube { color: #ef4444; }
+.platform-tiktok { color: #e4e4e7; }
+.platform-instagram { color: #a855f7; }
+
+/* Transcript highlight */
+.transcript-line.active {
+  background: rgba(139, 92, 246, 0.15);
+  border-left: 2px solid #8b5cf6;
+  padding-left: 0.5rem;
+}
+
+/* Timeline bar */
+.timeline-bar {
+  position: relative;
+  height: 4px;
+  background: #27272a;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.timeline-bar .clip-region {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: #8b5cf6;
+  border-radius: 2px;
+  opacity: 0.6;
+}
+.timeline-bar .clip-region:hover {
+  opacity: 1;
+}
+
+/* Card hover */
+.clip-card {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.clip-card:hover {
+  border-color: #52525b;
+  box-shadow: 0 0 0 1px rgba(82, 82, 91, 0.3);
+}
+
+/* Metadata tabs */
+.tab-btn {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.8125rem;
+  border-radius: 0.375rem;
+  transition: all 0.15s ease;
+}
+.tab-btn.active {
+  background: #27272a;
+  color: #fff;
+}
