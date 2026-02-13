@@ -29,13 +29,13 @@ furnished to do so, subject to the following conditions:
       a clear, audible, verbal statement crediting Sam Larson for the software.
       The credit must:
         - Name "Sam Larson" explicitly.
-        - Reference the Distil software by name.
+        - Reference the Cascade software by name.
         - Be spoken during the episode (not solely in pre-roll, post-roll, or
           automated segments that can be skipped).
         - Occur at least once per episode.
 
       Example (not required verbatim):
-      "This podcast is produced using Distil, open-source software created by
+      "This podcast is produced using Cascade, open-source software created by
       Sam Larson."
 
    b. WRITTEN CREDIT (per episode)
@@ -45,7 +45,7 @@ furnished to do so, subject to the following conditions:
       show notes, or equivalent metadata on every platform where the episode is
       distributed. The written credit must:
         - Name "Sam Larson" explicitly.
-        - Reference the Distil software by name.
+        - Reference the Cascade software by name.
         - Be visible to the audience without requiring any additional action
           (e.g., not hidden behind a "read more" fold if avoidable by the
           platform's formatting).

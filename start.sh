@@ -8,11 +8,11 @@ cd "$SCRIPT_DIR"
 # ── ASCII banner ────────────────────────────────────────────────────────────
 cat << 'BANNER'
 
-    ____  _      __  _ __
-   / __ \(_)____/ /_(_) /
-  / / / / / ___/ __/ / /
- / /_/ / (__  ) /_/ / /
-/_____/_/____/\__/_/_/
+   ______                          __
+  / ____/___ _______________ _____/ /__
+ / /   / __ `/ ___/ ___/ __ `/ __  / _ \
+/ /___/ /_/ (__  ) /__/ /_/ / /_/ /  __/
+\____/\__,_/____/\___/\__,_/\__,_/\___/
 
   Podcast Automation Engine
   ─────────────────────────
@@ -22,7 +22,7 @@ BANNER
 # ── Trap SIGINT for clean shutdown ──────────────────────────────────────────
 cleanup() {
     echo ""
-    echo "Distil stopped."
+    echo "Cascade stopped."
     exit 0
 }
 trap cleanup SIGINT
@@ -87,7 +87,7 @@ echo "Directories verified."
 
 # ── Start FastAPI server ────────────────────────────────────────────────────
 echo ""
-echo "Starting Distil on http://localhost:8420"
+echo "Starting Cascade on http://localhost:8420"
 echo "Press Ctrl+C to stop."
 echo ""
 

@@ -1,4 +1,4 @@
-"""Distil API — FastAPI entry point."""
+"""Cascade API — FastAPI entry point."""
 
 import os
 from pathlib import Path
@@ -12,10 +12,10 @@ from server.routes import episodes, clips, publish, analytics
 
 # Project root is the parent of server/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = Path(os.getenv("DISTIL_OUTPUT_DIR", PROJECT_ROOT / "output"))
+OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
-app = FastAPI(title="Distil API", version="0.1.0")
+app = FastAPI(title="Cascade API", version="0.1.0")
 
 # CORS — allow all for local dev
 app.add_middleware(

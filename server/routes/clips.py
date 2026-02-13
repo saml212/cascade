@@ -11,7 +11,7 @@ from pydantic import BaseModel
 router = APIRouter(prefix="/api/episodes/{episode_id}/clips", tags=["clips"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = Path(os.getenv("DISTIL_OUTPUT_DIR", PROJECT_ROOT / "output"))
+OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
 EPISODES_DIR = OUTPUT_DIR / "episodes"
 
 

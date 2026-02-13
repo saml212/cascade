@@ -1,4 +1,4 @@
-// Distil — Client-side application
+// Cascade — Client-side application
 // Single-page app with hash-based routing, vanilla JS
 
 const API = '/api';

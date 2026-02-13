@@ -1,10 +1,10 @@
-# Distil — Podcast Automation Pipeline Specification
+# Cascade — Podcast Automation Pipeline Specification
 
 **Version:** 2.0
 **Status:** Draft
 **Last Updated:** 2026-02-13
 
-Distil is a self-hosted, AI-assisted podcast automation pipeline. It extracts the essence from raw podcast content into concentrated, shareable clips. This spec is written so an engineer can implement independently — no prior context required.
+Cascade is a self-hosted, AI-assisted podcast automation pipeline. It automates the distribution of raw podcast content into concentrated, shareable clips across platforms. This spec is written so an engineer can implement independently — no prior context required.
 
 ---
 
@@ -782,7 +782,7 @@ Each (platform, day_of_week, hour) tuple is a bandit arm with `Beta(successes + 
 ```
 /Users/samuellarson/local/podcast/          # Project umbrella
   GitHub/
-    distil/                                 # Git repo — all code
+    cascade/                                # Git repo — all code
       frontend/                             # Single-page web app
       server/                               # FastAPI backend
       config/                               # Default configuration
@@ -793,7 +793,7 @@ Each (platform, day_of_week, hour) tuple is a bandit arm with `Beta(successes + 
   # Future: media/, backup links, etc.
 
 # Runtime directories (created by start.sh, gitignored):
-distil/
+cascade/
   output/
     episodes/<episode_id>/
       source_merged.mp4
@@ -840,7 +840,7 @@ distil/
 
 ```toml
 [project]
-name = "distil"
+name = "cascade"
 version = "0.1.0"
 
 [paths]
@@ -1063,19 +1063,19 @@ The Mac Mini handles the full lifecycle autonomously via cron:
 
 ```bash
 # Check for new media every 15 minutes
-*/15 * * * * /Users/samuellarson/local/podcast/GitHub/distil/scripts/check_ingest.sh
+*/15 * * * * /Users/samuellarson/local/podcast/GitHub/cascade/scripts/check_ingest.sh
 
 # Run publisher queue every hour
-0 * * * * /Users/samuellarson/local/podcast/GitHub/distil/scripts/publish_queue.sh
+0 * * * * /Users/samuellarson/local/podcast/GitHub/cascade/scripts/publish_queue.sh
 
 # Weekly analytics collection (Sunday midnight)
-0 0 * * 0 /Users/samuellarson/local/podcast/GitHub/distil/scripts/collect_analytics.sh
+0 0 * * 0 /Users/samuellarson/local/podcast/GitHub/cascade/scripts/collect_analytics.sh
 
 # Daily backup to external HDD
-0 2 * * * /Users/samuellarson/local/podcast/GitHub/distil/scripts/backup.sh
+0 2 * * * /Users/samuellarson/local/podcast/GitHub/cascade/scripts/backup.sh
 
 # Daily cleanup of old episodes
-0 3 * * * /Users/samuellarson/local/podcast/GitHub/distil/scripts/cleanup.sh
+0 3 * * * /Users/samuellarson/local/podcast/GitHub/cascade/scripts/cleanup.sh
 ```
 
 ### SD Card Detection
