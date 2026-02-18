@@ -23,3 +23,9 @@ models/
 # Logs
 logs/
 *.log
+
+# Wrangler
+.wrangler/
+
+# Node
+node_modules/

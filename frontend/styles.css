@@ -65,6 +65,9 @@
 .status-processing { background: #1e3a5f; color: #93c5fd; }
 .status-published { background: #4c1d95; color: #c4b5fd; }
 .status-ready_for_review { background: #92400e; color: #fcd34d; }
+.status-awaiting_crop_setup { background: #78350f; color: #fbbf24; }
+.status-cancelled { background: #7f1d1d; color: #fca5a5; }
+.status-error { background: #7f1d1d; color: #fca5a5; }
 
 /* Platform colors */
 .platform-youtube { color: #ef4444; }
@@ -117,4 +120,116 @@
 .tab-btn.active {
   background: #27272a;
   color: #fff;
+}
+
+/* Episode detail tabs */
+.episode-tab {
+  color: #71717a;
+  border-bottom: 2px solid transparent;
+  border-radius: 0.5rem 0.5rem 0 0;
+  margin-bottom: -1px;
+  cursor: pointer;
+}
+.episode-tab:hover {
+  color: #a1a1aa;
+  background: rgba(39, 39, 42, 0.5);
+}
+.episode-tab.active {
+  color: #fff;
+  border-bottom-color: #8b5cf6;
+  background: rgba(39, 39, 42, 0.8);
+}
+
+/* Chat bubbles */
+.chat-bubble.chat-user {
+  background: #7c3aed;
+  color: #f4f4f5;
+}
+.chat-bubble.chat-ai {
+  background: #27272a;
+  color: #d4d4d8;
+}
+
+/* Chat container scrollbar */
+.chat-container #chat-messages::-webkit-scrollbar {
+  width: 4px;
+}
+
+/* Short card */
+.short-card {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.short-card:hover {
+  border-color: #3f3f46;
+}
+
+/* Short video hover play indicator */
+.short-video-wrapper {
+  position: relative;
+}
+.short-video-wrapper video {
+  cursor: pointer;
+}
+
+/* Clip detail video */
+.clip-detail-video {
+  background: #000;
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.clip-detail-video video {
+  display: block;
+}
+
+/* Toast notifications */
+.toast-enter {
+  animation: toastIn 0.3s ease-out;
+}
+.toast-exit {
+  animation: toastOut 0.3s ease-in forwards;
+}
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes toastOut {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(8px); }
+}
+
+/* Rotate utility for expand/collapse */
+.rotate-180 {
+  transform: rotate(180deg);
+}
+
+/* Line clamp utility */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Disabled button state */
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Animate pulse for pipeline indicators */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Metadata clip row */
+.metadata-clip-row:last-child {
+  border-bottom: none;
 }

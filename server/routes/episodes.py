@@ -2,18 +2,24 @@
 
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/episodes", tags=["episodes"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
-EPISODES_DIR = OUTPUT_DIR / "episodes"
+_output_env = os.getenv("CASCADE_OUTPUT_DIR", "")
+if _output_env:
+    # Env var points directly to episodes dir
+    EPISODES_DIR = Path(_output_env)
+else:
+    EPISODES_DIR = PROJECT_ROOT / "output" / "episodes"
 
 
 class NewEpisodeRequest(BaseModel):
@@ -61,6 +67,10 @@ async def list_episodes() -> list[dict]:
                 "duration_seconds": ep.get("duration_seconds"),
                 "created_at": ep.get("created_at"),
                 "clips": ep.get("clips", []),
+                "guest_name": ep.get("guest_name", ""),
+                "guest_title": ep.get("guest_title", ""),
+                "episode_name": ep.get("episode_name", ""),
+                "episode_description": ep.get("episode_description", ""),
             })
         except (json.JSONDecodeError, OSError):
             continue
@@ -99,6 +109,15 @@ async def create_episode(req: NewEpisodeRequest) -> dict:
     return {"episode_id": episode_id, "status": "processing"}
 
 
+def _normalize_clip(clip: dict) -> dict:
+    """Ensure clips have both start/end and start_seconds/end_seconds."""
+    if "start_seconds" in clip and "start" not in clip:
+        clip["start"] = clip["start_seconds"]
+    if "end_seconds" in clip and "end" not in clip:
+        clip["end"] = clip["end_seconds"]
+    return clip
+
+
 @router.get("/{episode_id}")
 async def get_episode(episode_id: str) -> dict:
     """Get full episode detail."""
@@ -110,11 +129,76 @@ async def get_episode(episode_id: str) -> dict:
         try:
             with open(clips_file) as f:
                 clips_data = json.load(f)
-            ep["clips"] = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+            clips = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+            ep["clips"] = [_normalize_clip(c) for c in clips]
         except (json.JSONDecodeError, OSError):
             pass
 
+    # Normalize any clips already in episode data
+    if ep.get("clips"):
+        ep["clips"] = [_normalize_clip(c) for c in ep["clips"]]
+
     return ep
+
+
+class EpisodeUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[list] = None
+    guest_name: Optional[str] = None
+    guest_title: Optional[str] = None
+    episode_name: Optional[str] = None
+    episode_description: Optional[str] = None
+
+
+@router.patch("/{episode_id}")
+async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
+    """Update episode metadata."""
+    ep = read_episode(episode_id)
+    if req.title is not None:
+        ep["title"] = req.title
+    if req.description is not None:
+        ep["description"] = req.description
+    if req.tags is not None:
+        ep["tags"] = req.tags
+    if req.guest_name is not None:
+        ep["guest_name"] = req.guest_name
+    if req.guest_title is not None:
+        ep["guest_title"] = req.guest_title
+    if req.episode_name is not None:
+        ep["episode_name"] = req.episode_name
+    if req.episode_description is not None:
+        ep["episode_description"] = req.episode_description
+    write_episode(episode_id, ep)
+    return {"status": "updated", "episode_id": episode_id}
+
+
+@router.delete("/{episode_id}")
+async def delete_episode(episode_id: str) -> dict:
+    """Delete an episode and all its files."""
+    ep_dir = EPISODES_DIR / episode_id
+    if not ep_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
+
+    # Check if pipeline is actively running (allow delete if cancelled)
+    from server.routes.pipeline import _running, _cancel_requested
+    if episode_id in _running and _running[episode_id].is_alive():
+        # If already cancelled, force-allow deletion
+        ep_file = ep_dir / "episode.json"
+        if ep_file.exists():
+            with open(ep_file) as f:
+                ep_data = json.load(f)
+            if ep_data.get("status") != "cancelled":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot delete episode while pipeline is running. Cancel the pipeline first."
+                )
+        # Signal cancellation and clean up tracking
+        _cancel_requested.add(episode_id)
+        del _running[episode_id]
+
+    shutil.rmtree(ep_dir)
+    return {"status": "deleted", "episode_id": episode_id}
 
 
 @router.post("/{episode_id}/approve")
@@ -146,3 +230,68 @@ async def approve_episode(episode_id: str) -> dict:
 
     write_episode(episode_id, ep)
     return {"status": "approved", "episode_id": episode_id}
+
+
+@router.get("/{episode_id}/crop-frame")
+async def get_crop_frame(episode_id: str):
+    """Serve the crop_frame.jpg extracted by the stitch agent."""
+    frame_path = EPISODES_DIR / episode_id / "crop_frame.jpg"
+    if not frame_path.exists():
+        raise HTTPException(status_code=404, detail="Crop frame not found. Run stitch first.")
+    return FileResponse(frame_path, media_type="image/jpeg")
+
+
+class CropConfigRequest(BaseModel):
+    speaker_l_center_x: int
+    speaker_l_center_y: int
+    speaker_r_center_x: int
+    speaker_r_center_y: int
+
+
+@router.post("/{episode_id}/crop-config")
+async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
+    """Save crop config to episode.json and update status."""
+    ep = read_episode(episode_id)
+
+    # Get source dimensions from stitch.json
+    stitch_file = EPISODES_DIR / episode_id / "stitch.json"
+    source_width = 1920
+    source_height = 1080
+    if stitch_file.exists():
+        with open(stitch_file) as f:
+            stitch_data = json.load(f)
+        output_path = stitch_data.get("output_path", "")
+        if output_path:
+            import subprocess
+            try:
+                probe_cmd = [
+                    "ffprobe", "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams",
+                    output_path,
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                probe = json.loads(result.stdout)
+                for s in probe.get("streams", []):
+                    if s.get("codec_type") == "video":
+                        source_width = int(s["width"])
+                        source_height = int(s["height"])
+                        break
+            except (subprocess.CalledProcessError, KeyError, ValueError):
+                pass
+
+    ep["crop_config"] = {
+        "source_width": source_width,
+        "source_height": source_height,
+        "speaker_l_center_x": req.speaker_l_center_x,
+        "speaker_l_center_y": req.speaker_l_center_y,
+        "speaker_r_center_x": req.speaker_r_center_x,
+        "speaker_r_center_y": req.speaker_r_center_y,
+    }
+
+    # Transition from awaiting_crop_setup to processing
+    if ep.get("status") == "awaiting_crop_setup":
+        ep["status"] = "processing"
+
+    write_episode(episode_id, ep)
+    return {"status": "saved", "crop_config": ep["crop_config"]}

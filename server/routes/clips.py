@@ -11,8 +11,11 @@ from pydantic import BaseModel
 router = APIRouter(prefix="/api/episodes/{episode_id}/clips", tags=["clips"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
-EPISODES_DIR = OUTPUT_DIR / "episodes"
+_output_env = os.getenv("CASCADE_OUTPUT_DIR", "")
+if _output_env:
+    EPISODES_DIR = Path(_output_env)
+else:
+    EPISODES_DIR = PROJECT_ROOT / "output" / "episodes"
 
 
 class ManualClipRequest(BaseModel):
@@ -29,25 +32,37 @@ class MetadataUpdate(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _normalize_clip(clip: dict) -> dict:
+    """Ensure clips have both start/end and start_seconds/end_seconds fields."""
+    if "start_seconds" in clip and "start" not in clip:
+        clip["start"] = clip["start_seconds"]
+    if "end_seconds" in clip and "end" not in clip:
+        clip["end"] = clip["end_seconds"]
+    if "start" in clip and "start_seconds" not in clip:
+        clip["start_seconds"] = clip["start"]
+    if "end" in clip and "end_seconds" not in clip:
+        clip["end_seconds"] = clip["end"]
+    return clip
+
+
 def load_clips(episode_id: str) -> tuple[list, Path]:
     """Load clips from clips.json, falling back to episode.json."""
     ep_dir = EPISODES_DIR / episode_id
-    if not ep_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-
     clips_file = ep_dir / "clips.json"
+    if not ep_dir.exists():
+        return [], clips_file
     if clips_file.exists():
         with open(clips_file) as f:
             data = json.load(f)
         clips = data.get("clips", data) if isinstance(data, dict) else data
-        return clips, clips_file
+        return [_normalize_clip(c) for c in clips], clips_file
 
     # Fallback to episode.json
     ep_file = ep_dir / "episode.json"
     if ep_file.exists():
         with open(ep_file) as f:
             ep = json.load(f)
-        return ep.get("clips", []), clips_file
+        return [_normalize_clip(c) for c in ep.get("clips", [])], clips_file
 
     return [], clips_file
 
@@ -67,6 +82,7 @@ def find_clip(clips: list, clip_id: str) -> tuple[dict, int]:
     raise HTTPException(status_code=404, detail=f"Clip {clip_id} not found")
 
 
+@router.get("")
 @router.get("/")
 async def list_clips(episode_id: str) -> list[dict]:
     """List all clip candidates."""

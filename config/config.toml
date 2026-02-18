@@ -4,15 +4,16 @@ version = "0.1.0"
 
 [paths]
 ingest_dir = "~/podcast_ingest"          # Watch folder / SD card mount point
-output_dir = "./output"                   # Processed output (SSD)
-work_dir = "./work"                       # Temporary processing files
-backup_dir = "/Volumes/Backup/podcast"    # External HDD backup location
+output_dir = "/Volumes/1TB_SSD/cascade/episodes"  # Episode output (SSD — primary working storage)
+work_dir = "/Volumes/1TB_SSD/cascade/work"        # Temporary processing files (SSD)
+backup_dir = "/Volumes/Seagate Portable Drive/podcast"  # External HDD backup
 public_media_dir = ""                     # Public URL base for Instagram uploads
 
 [processing]
 frame_seconds = 0.1                       # Audio analysis frame size
-speech_db_margin = 12                     # dB above noise floor for speech
-min_segment_seconds = 2.0                 # Minimum speaker segment duration
+speech_db_margin = 6                      # dB above noise floor for speech
+min_segment_seconds = 0.8                 # Minimum speaker segment duration
+both_db_range = 6.0                       # If both channels active and within this dB range, classify as BOTH
 max_channel_correlation = 0.95            # Above this = channels identical
 max_channel_rms_ratio_delta = 3.0         # dB; below this = channels identical
 clip_min_seconds = 30                     # Minimum clip duration
@@ -49,7 +50,7 @@ timezone = "America/Los_Angeles"
 
 [automation]
 cron_enabled = false                      # Enable cron-based auto-ingest
-sd_card_mount = "/Volumes/Untitled"       # SD card mount point
+sd_card_mount = "/Volumes/7"              # SD card mount point (Canon SD)
 auto_backup = true                        # Auto backup to external HDD
 cleanup_after_publish = true              # Remove source files after all clips published
 cleanup_grace_days = 7                    # Keep files for N days after last publish
@@ -78,3 +79,19 @@ feed_url = ""
 audio_format = "mp3"
 audio_bitrate = "128k"
 artwork_path = ""
+
+[podcast]
+title = "The Local Podcast"
+description = "A local Bay Area podcast"
+author = "The Local Podcast"
+channel_handle = "@local"
+artwork_url = "https://pub-eb7a2f9e3c574c519db9e95d779b30c4.r2.dev/artwork.jpg"
+language = "en"
+category = "Society & Culture"
+explicit = "false"
+link = "https://www.youtube.com/channel/UC3PAf5CnfDAvzIjs6nSlTlA"
+owner_email = "samlarson16@gmail.com"
+
+[podcast.r2]
+bucket = "the-local-podcast"
+public_url = "https://pub-eb7a2f9e3c574c519db9e95d779b30c4.r2.dev"
