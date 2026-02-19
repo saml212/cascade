@@ -1,11 +1,26 @@
-"""Longform render agent — render full episode with speaker-appropriate crops."""
+"""Longform render agent — render full episode with speaker-appropriate crops.
+
+Inputs:
+    - segments.json, diarized_transcript.json, episode.json (crop_config)
+    - source_merged.mp4
+Outputs:
+    - longform.mp4 (final 16:9 render with speaker crops + subtitles)
+Dependencies:
+    - ffmpeg (render + concat), ffprobe (dimensions + validation)
+Config:
+    - processing.video_crf, processing.audio_bitrate
+"""
 
 import json
+import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent
+from lib.encoding import get_video_encoder_args
+from lib.ffprobe import probe as ffprobe
+from lib.srt import fmt_timecode, escape_srt_path
 
 
 class LongformRenderAgent(BaseAgent):
@@ -31,15 +46,15 @@ class LongformRenderAgent(BaseAgent):
             )
 
         # Get source video dimensions
-        probe = self._ffprobe(merged_path)
+        probe = ffprobe(merged_path)
         video_stream = next(
             s for s in probe["streams"] if s["codec_type"] == "video"
         )
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
 
-        crf = self.config.get("processing", {}).get("video_crf", 18)
         audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
+        encoder_args = get_video_encoder_args(self.config)
 
         # Pre-generate per-segment SRT files
         self.logger.info("Generating per-segment subtitles...")
@@ -51,15 +66,15 @@ class LongformRenderAgent(BaseAgent):
         segment_files = []
         self.logger.info(f"Rendering {len(segments)} segments with speaker crops...")
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() // 2, 6)) as executor:
             futures = {}
             for i, seg in enumerate(segments):
                 seg_path = work_dir / f"longform_seg_{i:04d}.mp4"
                 srt_path = srt_dir / f"seg_{i:04d}.srt"
                 future = executor.submit(
                     self._render_segment,
-                    merged_path, seg_path, seg, src_w, src_h, crf, audio_bitrate,
-                    crop_config, srt_path,
+                    merged_path, seg_path, seg, src_w, src_h, audio_bitrate,
+                    crop_config, srt_path, encoder_args,
                 )
                 futures[future] = (i, seg_path)
 
@@ -82,19 +97,50 @@ class LongformRenderAgent(BaseAgent):
                 f.write(f"file '{safe_path}'\n")
 
         output_path = self.episode_dir / "longform.mp4"
+        raw_concat = work_dir / "longform_raw.mp4"
         self.logger.info("Concatenating segments into longform.mp4...")
-        cmd = [
+
+        # Step 1: Concat all segments (stream-copy, fast)
+        concat_cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
+            str(raw_concat),
+        ]
+        subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
+
+        # Step 2: Get exact video track duration
+        raw_probe = ffprobe(raw_concat)
+        video_dur = None
+        for s in raw_probe["streams"]:
+            if s["codec_type"] == "video" and "duration" in s:
+                video_dur = float(s["duration"])
+                break
+
+        # Step 3: Re-mux with -t to hard-stop both tracks at the video
+        # duration. This prevents audio from being longer than video
+        # (segment concat can introduce timing gaps that inflate audio).
+        # Re-encode audio to flush any accumulated timestamp drift;
+        # video is stream-copied (already encoded with correct settings).
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(raw_concat),
+        ]
+        if video_dur:
+            mux_cmd += ["-t", str(video_dur)]
+        mux_cmd += [
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", audio_bitrate,
+            "-use_editlist", "0",
             "-movflags", "+faststart",
             str(output_path),
         ]
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(mux_cmd, capture_output=True, text=True, check=True)
+        raw_concat.unlink(missing_ok=True)
 
         # Validate
-        probe = self._ffprobe(output_path)
+        probe = ffprobe(output_path)
         output_duration = float(probe["format"]["duration"])
 
         return {
@@ -111,10 +157,10 @@ class LongformRenderAgent(BaseAgent):
         segment: dict,
         src_w: int,
         src_h: int,
-        crf: int,
         audio_bitrate: str,
         crop_config: dict,
         srt_path: Path = None,
+        encoder_args: list = None,
     ):
         """Render a single segment with speaker-appropriate crop and subtitles."""
         start = segment["start"]
@@ -126,7 +172,7 @@ class LongformRenderAgent(BaseAgent):
 
         # Append subtitle burn-in if SRT has content
         if srt_path and srt_path.exists() and srt_path.stat().st_size > 0:
-            srt_escaped = str(srt_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+            srt_escaped = escape_srt_path(srt_path)
             vf += (
                 f",subtitles='{srt_escaped}':force_style="
                 f"'FontSize=14,FontName=Arial,Bold=1,"
@@ -142,10 +188,14 @@ class LongformRenderAgent(BaseAgent):
             "-i", str(source),
             "-t", str(duration),
             "-vf", vf,
-            "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+            "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+            *encoder_args,
             "-r", "30", "-g", "30", "-bf", "0",
+            "-vsync", "cfr",
             "-pix_fmt", "yuv420p",
+            "-video_track_timescale", "30000",
             "-c:a", "aac", "-b:a", audio_bitrate,
+            "-use_editlist", "0",
             "-movflags", "+faststart",
             str(output),
         ]
@@ -199,7 +249,7 @@ class LongformRenderAgent(BaseAgent):
 
             srt_lines.append(
                 f"{idx}\n"
-                f"{self._fmt(t_start)} --> {self._fmt(t_end)}\n"
+                f"{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n"
                 f"{text}\n"
             )
             idx += 1
@@ -208,21 +258,3 @@ class LongformRenderAgent(BaseAgent):
         with open(srt_path, "w") as f:
             f.write("\n".join(srt_lines))
 
-    @staticmethod
-    def _fmt(seconds):
-        seconds = max(0, seconds)
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds % 1) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    def _ffprobe(self, path: Path) -> dict:
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)

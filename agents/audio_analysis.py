@@ -1,4 +1,15 @@
-"""Audio analysis agent — determine if L/R channels are distinct (true stereo) or identical."""
+"""Audio analysis agent — determine if L/R channels are distinct (true stereo) or identical.
+
+Inputs:
+    - source_merged.mp4
+Outputs:
+    - audio_analysis.json (classification, correlation, RMS delta)
+    - work/left.wav, work/right.wav (extracted channels)
+Dependencies:
+    - ffmpeg (channel extraction), ffprobe (stream info), numpy
+Config:
+    - processing.max_channel_correlation, processing.max_channel_rms_ratio_delta
+"""
 
 import json
 import subprocess
@@ -8,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from agents.base import BaseAgent
+from lib.ffprobe import probe as ffprobe
 
 
 class AudioAnalysisAgent(BaseAgent):
@@ -19,7 +31,7 @@ class AudioAnalysisAgent(BaseAgent):
         work_dir.mkdir(exist_ok=True)
 
         # Get channel info via ffprobe
-        probe = self._ffprobe(merged_path)
+        probe = ffprobe(merged_path)
         audio_stream = next(
             (s for s in probe["streams"] if s["codec_type"] == "audio"), None
         )
@@ -46,8 +58,7 @@ class AudioAnalysisAgent(BaseAgent):
         left_wav = work_dir / "left.wav"
         right_wav = work_dir / "right.wav"
 
-        self._extract_channel(merged_path, left_wav, "FL")
-        self._extract_channel(merged_path, right_wav, "FR")
+        self._extract_channels(merged_path, left_wav, right_wav)
 
         # Load WAV data
         left_data = self._load_wav(left_wav)
@@ -58,8 +69,8 @@ class AudioAnalysisAgent(BaseAgent):
         left_data = left_data[:min_len]
         right_data = right_data[:min_len]
 
-        # Compute Pearson correlation
-        correlation = float(np.corrcoef(left_data, right_data)[0, 1])
+        # Compute Pearson correlation (subsample for speed — still millions of samples)
+        correlation = float(np.corrcoef(left_data[::10], right_data[::10])[0, 1])
 
         # Compute RMS delta
         left_rms = float(np.sqrt(np.mean(left_data.astype(np.float64) ** 2)))
@@ -84,22 +95,28 @@ class AudioAnalysisAgent(BaseAgent):
             f"(corr={correlation:.4f}, rms_delta={rms_delta_db:.2f}dB)"
         )
 
+        # Save as .npy for speaker_cut (much faster than re-reading WAV)
+        np.save(str(work_dir / "left_channel.npy"), left_data)
+        np.save(str(work_dir / "right_channel.npy"), right_data)
+
         return {
             "channels": channels,
             "sample_rate": sample_rate,
+            "extracted_sample_rate": 16000,
             "classification": classification,
             "audio_channels_identical": channels_identical,
             "correlation": round(correlation, 6),
             "rms_delta_db": round(float(rms_delta_db), 2),
         }
 
-    def _extract_channel(self, input_path: Path, output_path: Path, channel: str):
+    def _extract_channels(self, input_path: Path, left_out: Path, right_out: Path):
+        """Extract L and R channels in a single ffmpeg call, downsampled to 16kHz."""
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
-            "-af", f"pan=mono|c0={channel}",
-            "-ar", "48000",
-            str(output_path),
+            "-filter_complex", "channelsplit=channel_layout=stereo[L][R]",
+            "-map", "[L]", "-ar", "16000", str(left_out),
+            "-map", "[R]", "-ar", "16000", str(right_out),
         ]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
 
@@ -110,12 +127,3 @@ class AudioAnalysisAgent(BaseAgent):
             data = np.frombuffer(raw, dtype=np.int16)
         return data.astype(np.float32)
 
-    def _ffprobe(self, path: Path) -> dict:
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)

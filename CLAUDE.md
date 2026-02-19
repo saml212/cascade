@@ -1,11 +1,12 @@
 # Cascade — Podcast Automation Pipeline
 
 ## Overview
-Cascade is a 10-agent pipeline that processes podcast recordings from SD card to publish-ready shorts + longform video. It ingests Canon MP4 clips, stitches them, analyzes audio channels, segments speakers, transcribes via Deepgram, mines clips via Claude, renders longform (16:9) and shorts (9:16 with subtitles), generates platform metadata, and runs QA validation.
+Cascade is a 13-agent pipeline that processes podcast recordings from SD card to publish-ready shorts + longform video. It ingests Canon MP4 clips, stitches them, analyzes audio channels, segments speakers, transcribes via Deepgram, mines clips via Claude, renders longform (16:9) and shorts (9:16 with subtitles), generates platform metadata, runs QA validation, generates a podcast RSS feed, publishes to platforms, and backs up to external storage.
 
 ## Architecture
 - **Config:** `config/config.toml` — all paths, thresholds, API settings
-- **Agents:** `agents/` — 10 sequential agents, each producing JSON + media artifacts
+- **Agents:** `agents/` — 13 sequential agents, each producing JSON + media artifacts
+- **Lib:** `lib/` — shared utilities (paths, ffprobe, clips, SRT formatting)
 - **Server:** `server/` — FastAPI app on port 8420 with episode/clip/pipeline routes
 - **Frontend:** `frontend/` — SPA for clip review and approval
 - **Working storage:** `/Volumes/1TB_SSD/cascade/` — all episode data lives on external SSD
@@ -21,6 +22,9 @@ Cascade is a 10-agent pipeline that processes podcast recordings from SD card to
 8. `shorts_render` — Render 9:16 shorts with burned subtitles
 9. `metadata_gen` — Claude generates per-platform metadata + schedule
 10. `qa` — Validate all outputs
+11. `podcast_feed` — Extract audio, generate RSS feed, upload to Cloudflare R2
+12. `publish` — Distribute to YouTube, TikTok, Instagram via Upload-Post
+13. `backup` — rsync episode to external HDD
 
 ## How to Run
 
@@ -113,3 +117,8 @@ episodes/<episode_id>/
 - Deepgram transcription: ~$0.50
 - Claude clip mining: ~$0.10-0.30
 - Claude metadata: ~$0.10-0.20
+
+## Roadmap
+- **Publishing system**: Full Upload-Post integration with schedule management and retry logic
+- **Analytics dashboard**: Track clip performance across platforms, adjust scoring weights
+- **Shared utilities**: `lib/` package provides common ffprobe, path resolution, clip normalization, and SRT formatting

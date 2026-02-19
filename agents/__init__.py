@@ -1,4 +1,4 @@
-"""Cascade agents package — 12-agent podcast automation pipeline."""
+"""Cascade agents package — 13-agent podcast automation pipeline."""
 
 from agents.ingest import IngestAgent
 from agents.stitch import StitchAgent
@@ -12,6 +12,7 @@ from agents.metadata_gen import MetadataGenAgent
 from agents.qa import QAAgent
 from agents.podcast_feed import PodcastFeedAgent
 from agents.publish import PublishAgent
+from agents.backup import BackupAgent
 
 AGENT_REGISTRY = {
     "ingest": IngestAgent,
@@ -26,6 +27,7 @@ AGENT_REGISTRY = {
     "qa": QAAgent,
     "podcast_feed": PodcastFeedAgent,
     "publish": PublishAgent,
+    "backup": BackupAgent,
 }
 
 PIPELINE_ORDER = [
@@ -41,4 +43,5 @@ PIPELINE_ORDER = [
     "qa",
     "podcast_feed",
     "publish",
+    "backup",
 ]

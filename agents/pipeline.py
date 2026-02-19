@@ -1,8 +1,10 @@
-"""Pipeline orchestrator — runs agents sequentially, updates episode.json."""
+"""Pipeline orchestrator — DAG-based parallel agent execution, updates episode.json."""
 
 import json
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,6 +12,25 @@ from agents import AGENT_REGISTRY, PIPELINE_ORDER
 from agents.base import BaseAgent
 
 logger = logging.getLogger("cascade")
+
+# Dependency graph: agent -> set of agents that must complete first
+AGENT_DEPS = {
+    "ingest": set(),
+    "stitch": {"ingest"},
+    "audio_analysis": {"stitch"},
+    "speaker_cut": {"audio_analysis"},
+    "transcribe": {"stitch"},
+    "clip_miner": {"transcribe"},
+    "longform_render": {"speaker_cut", "transcribe"},
+    "shorts_render": {"clip_miner", "speaker_cut"},
+    "metadata_gen": {"clip_miner"},
+    "qa": {"longform_render", "shorts_render", "metadata_gen"},
+    "podcast_feed": {"qa"},
+    "publish": {"qa"},
+    "backup": {"qa"},
+}
+
+NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup"}
 
 
 def load_config() -> dict:
@@ -91,93 +112,177 @@ def run_pipeline(
 
     logger.info(f"Pipeline: running {len(agent_names)} agents for {episode_id}")
 
-    for agent_name in agent_names:
-        # Check for cancellation between agents
-        if _is_cancelled(episode_id):
-            logger.info(f"Pipeline cancelled for {episode_id}")
-            episode["status"] = "cancelled"
-            episode["pipeline"].pop("current_agent", None)
-            _save_episode(episode_file, episode)
-            return episode
-
-        if agent_name not in AGENT_REGISTRY:
-            logger.warning(f"Unknown agent: {agent_name}, skipping")
+    # Build dependency graph filtered to requested agents
+    requested_set = set(agent_names)
+    deps = {}
+    for name in agent_names:
+        if name not in AGENT_REGISTRY:
+            logger.warning(f"Unknown agent: {name}, skipping")
             continue
+        # Only include dependencies that are also in the requested set
+        deps[name] = AGENT_DEPS.get(name, set()) & requested_set
+
+    completed = set()
+    failed = set()
+    episode_lock = threading.Lock()
+
+    # Mutable refs that may change after clip_miner rename
+    mutable = {"episode_dir": episode_dir, "episode_id": episode_id,
+               "episode_file": episode_file}
+
+    def _get_ready():
+        """Return agents whose dependencies are all satisfied."""
+        return [
+            name for name in deps
+            if name not in completed and name not in failed
+            and deps[name] <= completed
+        ]
+
+    def _run_agent(agent_name):
+        """Execute a single agent and return (name, result_or_exception)."""
+        with episode_lock:
+            ed = mutable["episode_dir"]
+            ef = mutable["episode_file"]
 
         agent_cls = AGENT_REGISTRY[agent_name]
-        agent: BaseAgent = agent_cls(episode_dir, config)
+        agent = agent_cls(ed, config)
 
-        # Inject source_path for ingest agent
         if agent_name == "ingest":
             agent.source_path = source_path
 
-        episode["pipeline"]["current_agent"] = agent_name
-        _save_episode(episode_file, episode)
+        with episode_lock:
+            episode["pipeline"]["current_agent"] = agent_name
+            _save_episode(ef, episode)
 
-        try:
-            result = agent.run()
-        except Exception as e:
-            logger.error(f"Agent {agent_name} failed for {episode_id}: {e}")
-            episode["pipeline"]["current_agent"] = None
-            episode["pipeline"].setdefault("errors", {})[agent_name] = str(e)
-            # Non-critical agents: log error and continue
-            if agent_name in ("podcast_feed", "publish"):
-                logger.info(f"Skipping non-critical agent {agent_name}, continuing pipeline")
-                continue
-            # Critical agent failure: stop pipeline with error status
-            episode["status"] = "error"
-            _save_episode(episode_file, episode)
-            return episode
+        result = agent.run()
+        return result
 
-        # Update episode with agent results
-        episode["pipeline"]["agents_completed"].append(agent_name)
-        if "duration_seconds" in result and result["duration_seconds"]:
-            episode["duration_seconds"] = result["duration_seconds"]
-        if "clips" in result:
-            episode["clips"] = result["clips"]
-
-        _save_episode(episode_file, episode)
+    def _on_agent_complete(agent_name, result):
+        """Handle successful agent completion — update episode state."""
+        with episode_lock:
+            episode["pipeline"]["agents_completed"].append(agent_name)
+            if "duration_seconds" in result and result["duration_seconds"]:
+                episode["duration_seconds"] = result["duration_seconds"]
+            if "clips" in result:
+                episode["clips"] = result["clips"]
+            _save_episode(mutable["episode_file"], episode)
 
         # After clip_miner, rename episode dir if guest_name was extracted
         if agent_name == "clip_miner":
-            # Re-read episode.json (clip_miner may have updated it)
-            with open(episode_file) as f:
-                episode = json.load(f)
-            guest_name = episode.get("guest_name", "")
-            if guest_name and not _has_name_slug(episode_id):
-                slug = _slugify(guest_name)
-                new_id = f"{episode_id}_{slug}"
-                new_dir = output_dir / new_id
-                try:
-                    episode_dir.rename(new_dir)
-                    episode_dir = new_dir
-                    episode_id = new_id
-                    episode["episode_id"] = new_id
-                    episode_file = new_dir / "episode.json"
-                    _save_episode(episode_file, episode)
-                    logger.info(f"Renamed episode dir to {new_id}")
-                except OSError as e:
-                    logger.warning(f"Failed to rename episode dir: {e}")
+            with episode_lock:
+                ef = mutable["episode_file"]
+                with open(ef) as f:
+                    ep_data = json.load(f)
+                # Merge any updates clip_miner wrote directly
+                episode.update({k: ep_data[k] for k in
+                    ("guest_name", "guest_title", "episode_name", "episode_description")
+                    if k in ep_data})
+                guest_name = episode.get("guest_name", "")
+                if guest_name and not _has_name_slug(mutable["episode_id"]):
+                    slug = _slugify(guest_name)
+                    new_id = f"{mutable['episode_id']}_{slug}"
+                    new_dir = output_dir / new_id
+                    try:
+                        mutable["episode_dir"].rename(new_dir)
+                        mutable["episode_dir"] = new_dir
+                        mutable["episode_id"] = new_id
+                        episode["episode_id"] = new_id
+                        mutable["episode_file"] = new_dir / "episode.json"
+                        _save_episode(mutable["episode_file"], episode)
+                        logger.info(f"Renamed episode dir to {new_id}")
+                    except OSError as e:
+                        logger.warning(f"Failed to rename episode dir: {e}")
 
-        # After stitch, pause for crop setup if crop_config not yet set
-        if agent_name == "stitch" and "crop_config" not in episode:
-            episode["status"] = "awaiting_crop_setup"
-            episode["pipeline"].pop("current_agent", None)
-            _save_episode(episode_file, episode)
-            logger.info(f"Pipeline paused for {episode_id}: awaiting crop setup")
-            return episode
+    # --- DAG execution loop ---
+    # Special handling: stitch must pause for crop setup before continuing
+    stitch_pause_needed = ("stitch" in requested_set and "crop_config" not in episode)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        pending_futures = {}  # future -> agent_name
+
+        while len(completed) + len(failed) < len(deps):
+            # Check cancellation
+            if _is_cancelled(mutable["episode_id"]):
+                logger.info(f"Pipeline cancelled for {mutable['episode_id']}")
+                # Cancel pending futures
+                for f in pending_futures:
+                    f.cancel()
+                episode["status"] = "cancelled"
+                episode["pipeline"].pop("current_agent", None)
+                _save_episode(mutable["episode_file"], episode)
+                return episode
+
+            # Submit ready agents that aren't already running
+            running_names = set(pending_futures.values())
+            for name in _get_ready():
+                if name in running_names:
+                    continue
+                # If stitch just completed and we need crop setup, pause
+                if stitch_pause_needed and name != "stitch" and "stitch" in completed:
+                    # Check if crop_config has been set since we started
+                    with episode_lock:
+                        with open(mutable["episode_file"]) as f:
+                            ep_check = json.load(f)
+                        if "crop_config" not in ep_check:
+                            episode["status"] = "awaiting_crop_setup"
+                            episode["pipeline"].pop("current_agent", None)
+                            _save_episode(mutable["episode_file"], episode)
+                            logger.info(f"Pipeline paused for {mutable['episode_id']}: awaiting crop setup")
+                            # Cancel any pending futures
+                            for fut in pending_futures:
+                                fut.cancel()
+                            return episode
+                        else:
+                            episode.update(ep_check)
+                            stitch_pause_needed = False
+
+                future = executor.submit(_run_agent, name)
+                pending_futures[future] = name
+
+            if not pending_futures:
+                # No agents running and none ready — check for deadlock
+                break
+
+            # Wait for at least one to complete
+            done, _ = wait(pending_futures.keys(), return_when=FIRST_COMPLETED)
+
+            for future in done:
+                agent_name = pending_futures.pop(future)
+                try:
+                    result = future.result()
+                    _on_agent_complete(agent_name, result)
+                    completed.add(agent_name)
+                    logger.info(f"Agent {agent_name} completed for {mutable['episode_id']}")
+                except Exception as e:
+                    logger.error(f"Agent {agent_name} failed for {mutable['episode_id']}: {e}")
+                    with episode_lock:
+                        episode["pipeline"]["current_agent"] = None
+                        episode["pipeline"].setdefault("errors", {})[agent_name] = str(e)
+                        _save_episode(mutable["episode_file"], episode)
+
+                    if agent_name in NON_CRITICAL_AGENTS:
+                        logger.info(f"Skipping non-critical agent {agent_name}, continuing pipeline")
+                        # Mark as completed so dependents can still check
+                        completed.add(agent_name)
+                    else:
+                        failed.add(agent_name)
+                        # Cancel remaining futures
+                        for f in pending_futures:
+                            f.cancel()
+                        episode["status"] = "error"
+                        _save_episode(mutable["episode_file"], episode)
+                        return episode
 
     # Pipeline complete
     episode["pipeline"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     episode["pipeline"].pop("current_agent", None)
     episode["status"] = "ready_for_review"
-    # Clean up progress file
-    progress_file = episode_dir / "progress.json"
+    progress_file = mutable["episode_dir"] / "progress.json"
     if progress_file.exists():
         progress_file.unlink()
-    _save_episode(episode_file, episode)
+    _save_episode(mutable["episode_file"], episode)
 
-    logger.info(f"Pipeline complete for {episode_id}")
+    logger.info(f"Pipeline complete for {mutable['episode_id']}")
     return episode
 
 

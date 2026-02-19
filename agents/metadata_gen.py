@@ -1,4 +1,16 @@
-"""Metadata generation agent — generate per-platform metadata and publish schedule via Claude."""
+"""Metadata generation agent — generate per-platform metadata and publish schedule via Claude.
+
+Inputs:
+    - clips.json, diarized_transcript.json, episode_info.json
+Outputs:
+    - metadata/metadata.json (longform + per-clip platform metadata + schedule)
+Dependencies:
+    - anthropic SDK (Claude API)
+Config:
+    - clip_mining.llm_model, podcast.title, podcast.channel_handle
+Environment:
+    - ANTHROPIC_API_KEY
+"""
 
 import json
 import os
@@ -39,7 +51,7 @@ class MetadataGenAgent(BaseAgent):
         import anthropic
 
         client = anthropic.Anthropic(api_key=api_key)
-        model = self.config.get("clip_mining", {}).get("llm_model", "claude-opus-4-6")
+        model = self.config.get("clip_mining", {}).get("metadata_model", "claude-sonnet-4-20250514")
 
         # Build context: clips + transcript excerpts
         clip_summaries = []

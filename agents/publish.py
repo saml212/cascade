@@ -1,4 +1,18 @@
-"""Publish agent — distribute shorts and longform via Upload-Post to all platforms."""
+"""Publish agent — distribute shorts and longform via Upload-Post to all platforms.
+
+Inputs:
+    - clips.json, metadata/metadata.json
+    - shorts/<clip_id>.mp4, longform.mp4
+Outputs:
+    - publish.json (submission results, request IDs)
+Dependencies:
+    - httpx (Upload-Post REST API)
+Config:
+    - platforms.youtube.enabled, platforms.tiktok.enabled, platforms.instagram.enabled
+    - schedule.timezone, schedule.shorts_per_day_weekday, schedule.shorts_per_day_weekend
+Environment:
+    - UPLOAD_POST_API_KEY, UPLOAD_POST_USER
+"""
 
 import json
 import os

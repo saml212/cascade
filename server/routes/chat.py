@@ -1,24 +1,77 @@
-"""Chat and trim endpoints — AI-powered episode editing assistant."""
+"""Chat endpoint — AI-powered episode editing assistant."""
 
 import json
+import logging
 import os
 import re
-import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from lib.encoding import get_video_encoder_args
+from lib.paths import get_episodes_dir
+from lib.srt import escape_srt_path
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/episodes/{episode_id}", tags=["chat"])
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_output_env = os.getenv("CASCADE_OUTPUT_DIR", "")
-if _output_env:
-    EPISODES_DIR = Path(_output_env)
-else:
-    EPISODES_DIR = PROJECT_ROOT / "output" / "episodes"
+EPISODES_DIR = get_episodes_dir()
+
+# Episode context cache: {episode_id: {"ctx": dict, "mtime": float, "loaded_at": float}}
+_context_cache = {}
+_CACHE_TTL = 300  # 5 minutes
+
+
+def _load_episode_context_cached(ep_dir: Path, episode_id: str) -> dict:
+    """Load episode context with file-mtime-based caching."""
+    episode_file = ep_dir / "episode.json"
+    try:
+        current_mtime = episode_file.stat().st_mtime
+    except OSError:
+        current_mtime = 0
+
+    cached = _context_cache.get(episode_id)
+    now = time.time()
+
+    if (cached
+            and cached["mtime"] == current_mtime
+            and now - cached["loaded_at"] < _CACHE_TTL):
+        return cached["ctx"]
+
+    ctx = _load_episode_context(ep_dir)
+    _context_cache[episode_id] = {
+        "ctx": ctx,
+        "mtime": current_mtime,
+        "loaded_at": now,
+    }
+    return ctx
+
+
+def _load_chat_history(ep_dir: Path) -> list:
+    """Load conversation history from chat_history.json."""
+    history_file = ep_dir / "chat_history.json"
+    if not history_file.exists():
+        return []
+    try:
+        with open(history_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_chat_history(ep_dir: Path, history: list):
+    """Save conversation history to chat_history.json. Keep last 20 turns."""
+    history_file = ep_dir / "chat_history.json"
+    # Keep only last 20 message pairs (40 messages) to avoid context explosion
+    if len(history) > 40:
+        history = history[-40:]
+    with open(history_file, "w") as f:
+        json.dump(history, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -32,16 +85,6 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     actions_taken: List[dict]
-
-
-class TrimRequest(BaseModel):
-    trim_start_seconds: float = 0.0
-    trim_end_seconds: float = 0.0
-
-
-class TrimResponse(BaseModel):
-    new_duration: float
-    backup_path: str
 
 
 # ---------------------------------------------------------------------------
@@ -432,10 +475,16 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
     else:
         x_offset = (src_w - crop_w) // 2
 
+    # Load config for encoder args
+    from agents.pipeline import load_config
+    config = load_config()
+    encoder_args = get_video_encoder_args(config, crf_key="shorts_crf")
+    audio_bitrate = config.get("processing", {}).get("shorts_audio_bitrate", "128k")
+
     # Build subtitle filter if SRT exists
     srt_path = ep_dir / "subtitles" / f"{clip_id}.srt"
     if srt_path.exists():
-        srt_escaped = str(srt_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        srt_escaped = escape_srt_path(srt_path)
         vf = (
             f"crop={crop_w}:{src_h}:{x_offset}:0,"
             f"scale=1080:1920,"
@@ -452,10 +501,14 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
         "-i", str(merged_path),
         "-t", str(duration),
         "-vf", vf,
-        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+        "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+        *encoder_args,
         "-r", "30", "-g", "30", "-bf", "0",
+        "-vsync", "cfr",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
+        "-video_track_timescale", "30000",
+        "-c:a", "aac", "-b:a", audio_bitrate,
+        "-use_editlist", "0",
         "-movflags", "+faststart",
         str(output_path),
     ]
@@ -590,12 +643,13 @@ def _strip_action_blocks(text: str) -> str:
 async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
     """Chat with an AI assistant about the episode. The assistant can view and
     modify clips, suggest new ones, re-render shorts, and answer questions."""
+    logger.info("POST /api/episodes/%s/chat message_length=%d", episode_id, len(req.message))
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
     ep_dir = _episode_dir(episode_id)
-    ctx = _load_episode_context(ep_dir)
+    ctx = _load_episode_context_cached(ep_dir, episode_id)
     system_prompt = _build_system_prompt(ctx)
 
     # Call Anthropic API
@@ -606,24 +660,40 @@ async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Load config for model selection
+    from agents.pipeline import load_config
+    config = load_config()
+    chat_model = config.get("chat", {}).get("model", "claude-sonnet-4-20250514")
+
+    # Load conversation history for multi-turn context
+    history = _load_chat_history(ep_dir)
+    messages = history + [{"role": "user", "content": req.message}]
+
     try:
         message = client.messages.create(
-            model="claude-opus-4-6",
+            model=chat_model,
             max_tokens=4096,
             temperature=0.4,
             system=system_prompt,
-            messages=[
-                {"role": "user", "content": req.message},
-            ],
+            messages=messages,
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
+        logger.error("Anthropic API error for %s: %s", episode_id, e)
+        raise HTTPException(status_code=500, detail=f"Anthropic API error: {str(e)}")
 
     # Extract text from response
     ai_text = ""
     for block in message.content:
         if hasattr(block, "text"):
             ai_text += block.text
+
+    # Save conversation history
+    history.append({"role": "user", "content": req.message})
+    history.append({"role": "assistant", "content": ai_text})
+    _save_chat_history(ep_dir, history)
+
+    # Invalidate context cache since actions may have modified data
+    _context_cache.pop(episode_id, None)
 
     # Parse and execute actions
     actions = _parse_actions(ai_text)
@@ -636,176 +706,3 @@ async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
     clean_response = _strip_action_blocks(ai_text)
 
     return {"response": clean_response, "actions_taken": actions_taken}
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _fix_track_durations(mp4_path: Path) -> Path:
-    """Ensure audio and video tracks have matching durations.
-
-    Stream-copy trims cut video at keyframes but audio precisely, leaving a
-    duration mismatch that platforms like Spotify reject.  If the tracks
-    differ by more than 50 ms, re-mux with -t set to the shorter duration.
-    Returns the (possibly replaced) output path.
-    """
-    probe_cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", str(mp4_path),
-    ]
-    try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        streams = json.loads(result.stdout).get("streams", [])
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
-        return mp4_path  # Can't probe — return as-is
-
-    durations = {}
-    for s in streams:
-        if "duration" in s:
-            durations[s["codec_type"]] = float(s["duration"])
-
-    v_dur = durations.get("video")
-    a_dur = durations.get("audio")
-    if v_dur is None or a_dur is None:
-        return mp4_path
-
-    diff = abs(v_dur - a_dur)
-    if diff <= 0.05:
-        return mp4_path  # Close enough
-
-    shorter = min(v_dur, a_dur)
-    fixed_path = mp4_path.with_suffix(".fixed.mp4")
-    fix_cmd = [
-        "ffmpeg", "-y",
-        "-i", str(mp4_path),
-        "-t", str(shorter),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(fixed_path),
-    ]
-    try:
-        subprocess.run(fix_cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError:
-        return mp4_path  # Fix failed — return original
-
-    os.remove(str(mp4_path))
-    shutil.move(str(fixed_path), str(mp4_path))
-    return mp4_path
-
-
-# ---------------------------------------------------------------------------
-# Trim endpoint
-# ---------------------------------------------------------------------------
-
-@router.post("/trim")
-async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
-    """Trim the source_merged.mp4 by cutting off the beginning and/or end.
-
-    Creates a backup of the original before replacing it.
-    """
-    ep_dir = _episode_dir(episode_id)
-    source_path = ep_dir / "source_merged.mp4"
-
-    if not source_path.exists():
-        raise HTTPException(status_code=404, detail="source_merged.mp4 not found")
-
-    # Probe current duration
-    try:
-        probe_cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            str(source_path),
-        ]
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        probe_data = json.loads(probe_result.stdout)
-        current_duration = float(probe_data["format"]["duration"])
-    except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError, ValueError) as e:
-        raise HTTPException(status_code=500, detail=f"Could not probe source file: {e}")
-
-    trim_start = req.trim_start_seconds
-    trim_end = req.trim_end_seconds if req.trim_end_seconds > 0 else current_duration
-
-    if trim_start < 0 or trim_end < 0:
-        raise HTTPException(status_code=400, detail="Trim values must be non-negative")
-    if trim_end > current_duration:
-        trim_end = current_duration
-    if trim_start >= trim_end:
-        raise HTTPException(status_code=400, detail="Trim start must be before trim end")
-
-    new_duration = trim_end - trim_start
-
-    # Render trimmed version
-    trimmed_path = ep_dir / "source_merged_trimmed.mp4"
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(trim_start),
-        "-to", str(trim_end),
-        "-i", str(source_path),
-        "-c", "copy",
-        "-shortest",
-        "-avoid_negative_ts", "make_zero",
-        "-movflags", "+faststart",
-        str(trimmed_path),
-    ]
-
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"ffmpeg trim failed: {e.stderr[:500]}")
-
-    # Backup original and replace
-    backup_path = ep_dir / "source_merged_original.mp4"
-    if not backup_path.exists():
-        # Only backup if we haven't already (first trim)
-        shutil.move(str(source_path), str(backup_path))
-    else:
-        # Subsequent trims — just remove the current version
-        os.remove(str(source_path))
-
-    shutil.move(str(trimmed_path), str(source_path))
-
-    # Trim longform.mp4 the same way if it exists
-    longform_path = ep_dir / "longform.mp4"
-    if longform_path.exists():
-        longform_backup = ep_dir / "longform_original.mp4"
-        longform_trimmed = ep_dir / "longform_trimmed.mp4"
-        lf_cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(trim_start),
-            "-to", str(trim_end),
-            "-i", str(longform_path),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-            str(longform_trimmed),
-        ]
-        try:
-            subprocess.run(lf_cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=500, detail=f"ffmpeg longform trim failed: {e.stderr[:500]}")
-
-        # Verify audio/video track durations match; fix if they diverge
-        longform_trimmed = _fix_track_durations(longform_trimmed)
-
-        if not longform_backup.exists():
-            shutil.move(str(longform_path), str(longform_backup))
-        else:
-            os.remove(str(longform_path))
-        shutil.move(str(longform_trimmed), str(longform_path))
-
-    # Update episode.json with new duration
-    episode_file = ep_dir / "episode.json"
-    if episode_file.exists():
-        with open(episode_file) as f:
-            episode = json.load(f)
-        episode["duration_seconds"] = new_duration
-        with open(episode_file, "w") as f:
-            json.dump(episode, f, indent=2)
-
-    return {
-        "new_duration": new_duration,
-        "backup_path": str(backup_path),
-    }

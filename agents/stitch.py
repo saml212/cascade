@@ -1,11 +1,21 @@
-"""Stitch agent — concatenate source files into a single merged file."""
+"""Stitch agent — concatenate source files into a single merged file.
+
+Inputs:
+    - ingest.json (file list from ingest agent)
+Outputs:
+    - source_merged.mp4 (stitched video)
+    - crop_frame.jpg (frame capture for crop setup UI)
+    - stitch.json (output path, duration, file count)
+Dependencies:
+    - ffmpeg (concat + frame extraction), ffprobe (validation)
+"""
 
 import json
 import subprocess
-import tempfile
 from pathlib import Path
 
 from agents.base import BaseAgent
+from lib.ffprobe import probe as ffprobe
 
 
 class StitchAgent(BaseAgent):
@@ -46,7 +56,7 @@ class StitchAgent(BaseAgent):
             subprocess.run(cmd, capture_output=True, text=True, check=True)
 
         # Validate output
-        probe = self._ffprobe(output_path)
+        probe = ffprobe(output_path)
         output_duration = float(probe["format"]["duration"])
         expected_duration = sum(f["duration_seconds"] for f in files)
 
@@ -80,12 +90,3 @@ class StitchAgent(BaseAgent):
             "expected_duration_seconds": round(expected_duration, 3),
         }
 
-    def _ffprobe(self, path: Path) -> dict:
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)

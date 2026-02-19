@@ -21,11 +21,11 @@ clip_max_seconds = 90                     # Maximum clip duration
 clip_count = 10                           # Number of clips to generate
 output_resolution = "1920x1080"           # Longform output resolution
 shorts_resolution = "1080x1920"           # Shorts output resolution
-video_crf = 18                            # CRF for longform
+video_crf = 22                            # CRF for longform
 shorts_crf = 20                           # CRF for shorts
 audio_bitrate = "192k"                    # Audio bitrate for longform
 shorts_audio_bitrate = "128k"             # Audio bitrate for shorts
-use_hardware_accel = false                # Use VideoToolbox
+use_hardware_accel = true                # Use VideoToolbox
 
 [transcription]
 provider = "deepgram"                     # Transcription provider
@@ -40,6 +40,10 @@ method = "llm"                            # "baseline", "transcript", or "llm"
 llm_model = "claude-opus-4-6"            # Model for clip ranking + metadata
 llm_temperature = 0.3                     # LLM temperature
 boundary_snap_tolerance_seconds = 3.0     # Max distance to snap to silence
+metadata_model = "claude-sonnet-4-20250514"
+
+[chat]
+model = "claude-sonnet-4-20250514"
 
 [schedule]
 shorts_per_day_weekday = 1                # Mon-Thu
@@ -49,11 +53,7 @@ longform_delay_days = 0                   # Days after approval to publish longf
 timezone = "America/Los_Angeles"
 
 [automation]
-cron_enabled = false                      # Enable cron-based auto-ingest
 sd_card_mount = "/Volumes/7"              # SD card mount point (Canon SD)
-auto_backup = true                        # Auto backup to external HDD
-cleanup_after_publish = true              # Remove source files after all clips published
-cleanup_grace_days = 7                    # Keep files for N days after last publish
 
 [platforms.youtube]
 enabled = true

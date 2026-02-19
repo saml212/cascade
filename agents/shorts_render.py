@@ -1,4 +1,16 @@
-"""Shorts render agent — render 9:16 vertical clips with burned-in subtitles."""
+"""Shorts render agent — render 9:16 vertical clips with burned-in subtitles.
+
+Inputs:
+    - clips.json, segments.json, diarized_transcript.json, episode.json (crop_config)
+    - source_merged.mp4
+Outputs:
+    - shorts/<clip_id>.mp4 (9:16 vertical clips)
+    - subtitles/<clip_id>.srt (per-clip SRT files)
+Dependencies:
+    - ffmpeg (render + concat), ffprobe (dimensions)
+Config:
+    - processing.shorts_crf, processing.shorts_audio_bitrate
+"""
 
 import json
 import os
@@ -8,6 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent
+from lib.encoding import get_video_encoder_args
+from lib.ffprobe import probe as ffprobe
+from lib.srt import fmt_timecode, escape_srt_path
 
 
 class ShortsRenderAgent(BaseAgent):
@@ -32,7 +47,7 @@ class ShortsRenderAgent(BaseAgent):
         segments = segments_data.get("segments", [])
 
         # Get source dimensions
-        probe = self._ffprobe(merged_path)
+        probe = ffprobe(merged_path)
         video_stream = next(
             s for s in probe["streams"] if s["codec_type"] == "video"
         )
@@ -44,14 +59,14 @@ class ShortsRenderAgent(BaseAgent):
         subtitles_dir = self.episode_dir / "subtitles"
         subtitles_dir.mkdir(exist_ok=True)
 
-        crf = self.config.get("processing", {}).get("shorts_crf", 20)
         audio_bitrate = self.config.get("processing", {}).get("shorts_audio_bitrate", "128k")
+        encoder_args = get_video_encoder_args(self.config, crf_key="shorts_crf")
 
         # Generate per-clip SRT and render
         rendered = []
         self.logger.info(f"Rendering {len(clips)} shorts...")
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {}
             for clip in clips:
                 clip_id = clip["id"]
@@ -67,8 +82,8 @@ class ShortsRenderAgent(BaseAgent):
                     self._render_short,
                     merged_path, output_path, srt_path,
                     start, end, segments,
-                    src_w, src_h, crf, audio_bitrate,
-                    crop_config,
+                    src_w, src_h, audio_bitrate,
+                    crop_config, encoder_args,
                 )
                 futures[future] = clip_id
 
@@ -130,8 +145,8 @@ class ShortsRenderAgent(BaseAgent):
         self,
         source, output, srt_path,
         start, end, segments,
-        src_w, src_h, crf, audio_bitrate,
-        crop_config,
+        src_w, src_h, audio_bitrate,
+        crop_config, encoder_args,
     ):
         """Render a 9:16 short with per-segment dynamic speaker crops."""
         clip_segs = self._get_clip_segments(segments, start, end)
@@ -148,10 +163,14 @@ class ShortsRenderAgent(BaseAgent):
                 "-i", str(source),
                 "-t", str(duration),
                 "-vf", vf,
-                "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+                *encoder_args,
                 "-r", "30", "-g", "30", "-bf", "0",
+                "-vsync", "cfr",
                 "-pix_fmt", "yuv420p",
+                "-video_track_timescale", "30000",
                 "-c:a", "aac", "-b:a", audio_bitrate,
+                "-use_editlist", "0",
                 "-movflags", "+faststart",
                 str(output),
             ]
@@ -191,10 +210,14 @@ class ShortsRenderAgent(BaseAgent):
                     "-i", str(source),
                     "-t", str(seg_duration),
                     "-vf", vf,
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                    "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+                    *encoder_args,
                     "-r", "30", "-g", "30", "-bf", "0",
+                    "-vsync", "cfr",
                     "-pix_fmt", "yuv420p",
+                    "-video_track_timescale", "30000",
                     "-c:a", "aac", "-b:a", audio_bitrate,
+                    "-use_editlist", "0",
                     str(seg_output),
                 ]
                 result = subprocess.run(cmd, capture_output=True, text=True)
@@ -211,15 +234,44 @@ class ShortsRenderAgent(BaseAgent):
                 for sf in seg_files:
                     f.write(f"file '{sf}'\n")
 
-            cmd = [
+            # Concat segments, then re-mux with -t to match video duration.
+            # Segment concat can create timing gaps that make audio longer
+            # than video — platforms like Spotify reject this.
+            raw_concat = work_dir / "concat_raw.mp4"
+            concat_cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
                 "-i", str(concat_list),
                 "-c", "copy",
+                str(raw_concat),
+            ]
+            subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
+
+            # Probe video duration and hard-stop both tracks there
+            probe_cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", str(raw_concat),
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            streams = json.loads(probe_result.stdout).get("streams", [])
+            video_dur = None
+            for s in streams:
+                if s.get("codec_type") == "video" and "duration" in s:
+                    video_dur = float(s["duration"])
+                    break
+
+            mux_cmd = ["ffmpeg", "-y", "-i", str(raw_concat)]
+            if video_dur:
+                mux_cmd += ["-t", str(video_dur)]
+            mux_cmd += [
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", audio_bitrate,
+                "-use_editlist", "0",
                 "-movflags", "+faststart",
                 str(output),
             ]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(mux_cmd, capture_output=True, text=True, check=True)
+            raw_concat.unlink(missing_ok=True)
         finally:
             # Clean up work files
             for f in work_dir.glob("*"):
@@ -253,7 +305,7 @@ class ShortsRenderAgent(BaseAgent):
                 continue
             seg_entries.append(
                 f"{idx}\n"
-                f"{self._fmt(new_start)} --> {self._fmt(new_end)}\n"
+                f"{fmt_timecode(new_start)} --> {fmt_timecode(new_end)}\n"
                 f"{entry['text']}\n"
             )
             idx += 1
@@ -326,7 +378,7 @@ class ShortsRenderAgent(BaseAgent):
         x_offset = self._get_short_crop_x(speaker, crop_w, src_w, crop_config)
 
         # Escape the SRT path for ffmpeg filter (colons and backslashes)
-        srt_escaped = str(srt_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        srt_escaped = escape_srt_path(srt_path)
 
         # Crop -> scale -> burn subtitles
         return (
@@ -361,7 +413,7 @@ class ShortsRenderAgent(BaseAgent):
 
             srt_lines.append(
                 f"{idx}\n"
-                f"{self._fmt(t_start)} --> {self._fmt(t_end)}\n"
+                f"{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n"
                 f"{text}\n"
             )
             idx += 1
@@ -370,21 +422,3 @@ class ShortsRenderAgent(BaseAgent):
         with open(srt_path, "w") as f:
             f.write("\n".join(srt_lines))
 
-    @staticmethod
-    def _fmt(seconds):
-        seconds = max(0, seconds)
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds % 1) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    def _ffprobe(self, path):
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)

@@ -1,7 +1,7 @@
 """Episode endpoints."""
 
 import json
-import os
+import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,15 +11,14 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from lib.clips import normalize_clip as _normalize_clip
+from lib.paths import get_episodes_dir
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/episodes", tags=["episodes"])
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_output_env = os.getenv("CASCADE_OUTPUT_DIR", "")
-if _output_env:
-    # Env var points directly to episodes dir
-    EPISODES_DIR = Path(_output_env)
-else:
-    EPISODES_DIR = PROJECT_ROOT / "output" / "episodes"
+EPISODES_DIR = get_episodes_dir()
 
 
 class NewEpisodeRequest(BaseModel):
@@ -47,6 +46,7 @@ def write_episode(episode_id: str, data: dict):
 @router.get("/")
 async def list_episodes() -> list[dict]:
     """List all episodes with summary info."""
+    logger.info("GET /api/episodes/")
     if not EPISODES_DIR.exists():
         return []
 
@@ -81,6 +81,7 @@ async def list_episodes() -> list[dict]:
 @router.post("/")
 async def create_episode(req: NewEpisodeRequest) -> dict:
     """Trigger a new episode ingest."""
+    logger.info("POST /api/episodes/ source_path=%s", req.source_path)
     now = datetime.now(timezone.utc)
     episode_id = f"ep_{now.strftime('%Y-%m-%d')}_{now.strftime('%H%M%S')}"
 
@@ -109,18 +110,10 @@ async def create_episode(req: NewEpisodeRequest) -> dict:
     return {"episode_id": episode_id, "status": "processing"}
 
 
-def _normalize_clip(clip: dict) -> dict:
-    """Ensure clips have both start/end and start_seconds/end_seconds."""
-    if "start_seconds" in clip and "start" not in clip:
-        clip["start"] = clip["start_seconds"]
-    if "end_seconds" in clip and "end" not in clip:
-        clip["end"] = clip["end_seconds"]
-    return clip
-
-
 @router.get("/{episode_id}")
 async def get_episode(episode_id: str) -> dict:
     """Get full episode detail."""
+    logger.info("GET /api/episodes/%s", episode_id)
     ep = read_episode(episode_id)
 
     # Also load clips.json if it exists
@@ -176,6 +169,7 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
 @router.delete("/{episode_id}")
 async def delete_episode(episode_id: str) -> dict:
     """Delete an episode and all its files."""
+    logger.info("DELETE /api/episodes/%s", episode_id)
     ep_dir = EPISODES_DIR / episode_id
     if not ep_dir.exists():
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")

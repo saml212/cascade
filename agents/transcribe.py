@@ -1,4 +1,20 @@
-"""Transcribe agent — Deepgram Nova-3 transcription with diarization via REST API."""
+"""Transcribe agent — Deepgram Nova-3 transcription with diarization via REST API.
+
+Inputs:
+    - source_merged.mp4
+Outputs:
+    - transcript.json (raw Deepgram response)
+    - diarized_transcript.json (speaker-labeled utterances with word timestamps)
+    - subtitles/transcript.srt (full-episode SRT)
+    - work/audio.m4a (compact audio for upload)
+Dependencies:
+    - ffmpeg (audio extraction), httpx (Deepgram REST API)
+Config:
+    - transcription.model, transcription.language, transcription.diarize
+    - transcription.smart_format, transcription.utterances
+Environment:
+    - DEEPGRAM_API_KEY
+"""
 
 import json
 import os
@@ -8,6 +24,7 @@ from pathlib import Path
 import httpx
 
 from agents.base import BaseAgent
+from lib.srt import fmt_timecode
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 
@@ -147,7 +164,7 @@ class TranscribeAgent(BaseAgent):
 
             srt_lines.append(
                 f"{idx}\n"
-                f"{self._format_srt_time(start_time)} --> {self._format_srt_time(end_time)}\n"
+                f"{fmt_timecode(start_time)} --> {fmt_timecode(end_time)}\n"
                 f"{text}\n"
             )
             idx += 1
@@ -158,10 +175,3 @@ class TranscribeAgent(BaseAgent):
 
         self.logger.info(f"SRT generated with {idx - 1} blocks")
 
-    @staticmethod
-    def _format_srt_time(seconds: float) -> str:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds % 1) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"

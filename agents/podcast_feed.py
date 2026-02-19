@@ -1,4 +1,19 @@
-"""Podcast feed agent — extract audio, generate RSS feed, upload to Cloudflare R2."""
+"""Podcast feed agent — extract audio, generate RSS feed, upload to Cloudflare R2.
+
+Inputs:
+    - longform.mp4, episode.json
+Outputs:
+    - podcast_audio.mp3 (extracted audio)
+    - feed.xml (RSS feed, also uploaded to R2)
+    - podcast_feed.json (URLs, sizes, duration)
+Dependencies:
+    - ffmpeg (audio extraction), ffprobe (duration), httpx (R2 upload)
+Config:
+    - podcast.* (title, author, artwork, etc.)
+    - podcast.r2.bucket, podcast.r2.public_url
+Environment:
+    - CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN
+"""
 
 import json
 import os

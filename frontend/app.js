@@ -34,12 +34,13 @@ const AGENT_LABELS = {
   qa: 'QA',
   podcast_feed: 'Podcast Feed',
   publish: 'Publish',
+  backup: 'Backup',
 };
 
 const PIPELINE_AGENTS = [
   'ingest', 'stitch', 'audio_analysis', 'speaker_cut', 'transcribe',
   'clip_miner', 'longform_render', 'shorts_render', 'metadata_gen', 'qa',
-  'podcast_feed', 'publish',
+  'podcast_feed', 'publish', 'backup',
 ];
 
 const cropState = {

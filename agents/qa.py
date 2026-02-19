@@ -1,10 +1,22 @@
-"""QA agent — validate all pipeline outputs."""
+"""QA agent — validate all pipeline outputs.
+
+Inputs:
+    - source_merged.mp4, longform.mp4, clips.json
+    - subtitles/transcript.srt, metadata/metadata.json
+Outputs:
+    - qa/qa.json (checks, warnings, overall pass/fail)
+Dependencies:
+    - ffprobe (media validation)
+Config:
+    - processing.clip_min_seconds, processing.clip_max_seconds
+"""
 
 import json
 import subprocess
 from pathlib import Path
 
 from agents.base import BaseAgent
+from lib.ffprobe import probe as ffprobe
 
 
 class QAAgent(BaseAgent):
@@ -19,7 +31,7 @@ class QAAgent(BaseAgent):
         # 1. source_merged.mp4 exists and has audio
         merged = self.episode_dir / "source_merged.mp4"
         if merged.exists():
-            probe = self._ffprobe(merged)
+            probe = ffprobe(merged)
             duration = float(probe.get("format", {}).get("duration", 0))
             has_audio = any(
                 s["codec_type"] == "audio" for s in probe.get("streams", [])
@@ -49,7 +61,7 @@ class QAAgent(BaseAgent):
         # 2. longform.mp4 exists
         longform = self.episode_dir / "longform.mp4"
         if longform.exists():
-            probe = self._ffprobe(longform)
+            probe = ffprobe(longform)
             lf_duration = float(probe.get("format", {}).get("duration", 0))
             checks.append({
                 "name": "longform_exists",
@@ -163,12 +175,3 @@ class QAAgent(BaseAgent):
         )
         return result
 
-    def _ffprobe(self, path: Path) -> dict:
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)

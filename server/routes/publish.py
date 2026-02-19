@@ -1,22 +1,27 @@
 """Publishing and schedule endpoints."""
+# TODO: Implement publishing system (next priority)
 
 import json
-import os
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
+from lib.paths import get_project_root, get_episodes_dir
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api", tags=["publish"])
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
+PROJECT_ROOT = get_project_root()
 DATA_DIR = PROJECT_ROOT / "data"
-EPISODES_DIR = OUTPUT_DIR / "episodes"
+EPISODES_DIR = get_episodes_dir()
 
 
 @router.get("/schedule")
 async def get_schedule() -> dict:
     """Get the full publish schedule."""
+    logger.info("GET /api/schedule")
     # Try data/schedule.json first
     schedule_file = DATA_DIR / "schedule.json"
     if schedule_file.exists():
@@ -65,6 +70,7 @@ async def trigger_publish(episode_id: str) -> dict:
     Placeholder — the full implementation will invoke the Publisher Agent
     to push approved clips to YouTube, TikTok, and Instagram.
     """
+    logger.info("POST /api/schedule/%s/publish", episode_id)
     ep_dir = EPISODES_DIR / episode_id
     if not ep_dir.exists():
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")

@@ -1,4 +1,17 @@
-"""Speaker cut agent — segment audio into L/R/BOTH/NONE based on per-channel RMS energy."""
+"""Speaker cut agent — segment audio into L/R/BOTH/NONE based on per-channel RMS energy.
+
+Inputs:
+    - audio_analysis.json, stitch.json
+    - work/left.wav, work/right.wav (from audio_analysis)
+Outputs:
+    - segments.json (speaker segments with start/end/speaker)
+    - work/rms_data.json (per-frame RMS for silence snapping)
+Dependencies:
+    - numpy
+Config:
+    - processing.frame_seconds, processing.speech_db_margin
+    - processing.min_segment_seconds, processing.both_db_range
+"""
 
 import json
 import subprocess
@@ -36,12 +49,18 @@ class SpeakerCutAgent(BaseAgent):
             self.save_json("segments.json", result)
             return result
 
-        # Load L/R channel WAVs (created by audio_analysis)
+        # Load .npy if available (from audio_analysis), fall back to WAV
         work_dir = self.episode_dir / "work"
-        left_data = self._load_wav(work_dir / "left.wav")
-        right_data = self._load_wav(work_dir / "right.wav")
+        left_npy = work_dir / "left_channel.npy"
+        right_npy = work_dir / "right_channel.npy"
+        if left_npy.exists() and right_npy.exists():
+            left_data = np.load(str(left_npy))
+            right_data = np.load(str(right_npy))
+        else:
+            left_data = self._load_wav(work_dir / "left.wav")
+            right_data = self._load_wav(work_dir / "right.wav")
 
-        sample_rate = audio_data.get("sample_rate", 48000)
+        sample_rate = audio_data.get("extracted_sample_rate", audio_data.get("sample_rate", 48000))
         frame_seconds = self.config.get("processing", {}).get("frame_seconds", 0.1)
         speech_db_margin = self.config.get("processing", {}).get("speech_db_margin", 12)
         min_segment_seconds = self.config.get("processing", {}).get("min_segment_seconds", 2.0)
@@ -53,16 +72,11 @@ class SpeakerCutAgent(BaseAgent):
         min_len = min(len(left_data), len(right_data))
         n_frames = min_len // frame_size
 
-        left_rms = np.zeros(n_frames)
-        right_rms = np.zeros(n_frames)
-
-        for i in range(n_frames):
-            start = i * frame_size
-            end = start + frame_size
-            l_chunk = left_data[start:end].astype(np.float64)
-            r_chunk = right_data[start:end].astype(np.float64)
-            left_rms[i] = np.sqrt(np.mean(l_chunk ** 2)) + 1e-10
-            right_rms[i] = np.sqrt(np.mean(r_chunk ** 2)) + 1e-10
+        # Vectorized RMS computation (replaces Python for-loop)
+        left_frames = left_data[:n_frames * frame_size].reshape(n_frames, frame_size).astype(np.float64)
+        right_frames = right_data[:n_frames * frame_size].reshape(n_frames, frame_size).astype(np.float64)
+        left_rms = np.sqrt(np.mean(left_frames ** 2, axis=1)) + 1e-10
+        right_rms = np.sqrt(np.mean(right_frames ** 2, axis=1)) + 1e-10
 
         # Convert to dB
         left_db = 20 * np.log10(left_rms)
@@ -75,25 +89,22 @@ class SpeakerCutAgent(BaseAgent):
         left_thresh = left_floor + speech_db_margin
         right_thresh = right_floor + speech_db_margin
 
-        # Classify each frame
-        labels = []
-        for i in range(n_frames):
-            l_active = left_db[i] > left_thresh
-            r_active = right_db[i] > right_thresh
-            if l_active and r_active:
-                diff = abs(left_db[i] - right_db[i])
-                if diff <= both_db_range:
-                    labels.append("BOTH")
-                elif left_db[i] > right_db[i]:
-                    labels.append("L")
-                else:
-                    labels.append("R")
-            elif l_active:
-                labels.append("L")
-            elif r_active:
-                labels.append("R")
-            else:
-                labels.append("NONE")
+        # Vectorized classification (replaces Python for-loop)
+        l_active = left_db > left_thresh
+        r_active = right_db > right_thresh
+        both_active = l_active & r_active
+        diff = np.abs(left_db - right_db)
+
+        # Default to NONE, then layer on
+        label_arr = np.full(n_frames, 3, dtype=np.int8)  # 0=L, 1=R, 2=BOTH, 3=NONE
+        label_arr[l_active & ~r_active] = 0  # L only
+        label_arr[r_active & ~l_active] = 1  # R only
+        label_arr[both_active & (diff <= both_db_range)] = 2  # BOTH
+        label_arr[both_active & (diff > both_db_range) & (left_db > right_db)] = 0  # L louder
+        label_arr[both_active & (diff > both_db_range) & (left_db <= right_db)] = 1  # R louder
+
+        label_map = {0: "L", 1: "R", 2: "BOTH", 3: "NONE"}
+        labels = [label_map[v] for v in label_arr]
 
         # Debounce: replace NONE frames surrounded by same label
         for i in range(1, len(labels) - 1):
@@ -130,7 +141,12 @@ class SpeakerCutAgent(BaseAgent):
 
         self.logger.info(f"Generated {len(segments)} segments from {n_frames} frames")
 
-        # Save RMS data for clip_miner silence-snapping
+        # Save RMS data for clip_miner silence-snapping (.npy + small metadata)
+        np.save(str(work_dir / "left_rms_db.npy"), left_db)
+        np.save(str(work_dir / "right_rms_db.npy"), right_db)
+        rms_meta = {"frame_seconds": frame_seconds, "n_frames": int(n_frames)}
+        self.save_json("work/rms_meta.json", rms_meta)
+        # Also save JSON for backward compatibility
         rms_data = {
             "frame_seconds": frame_seconds,
             "left_rms_db": left_db.tolist(),

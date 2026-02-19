@@ -1,4 +1,15 @@
-"""Ingest agent — copy source files from SD card to SSD working storage."""
+"""Ingest agent — copy source files from SD card to SSD working storage.
+
+Inputs:
+    - source_path: SD card directory (e.g., /Volumes/7/DCIM/100CANON/)
+Outputs:
+    - ingest.json: File manifest with paths, durations, sizes
+    - source/: Copied MP4 files on SSD
+Dependencies:
+    - ffprobe (duration validation)
+Config:
+    - paths.output_dir (episode output root)
+"""
 
 import json
 import shutil
@@ -6,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 from agents.base import BaseAgent
+from lib.ffprobe import probe as ffprobe
 
 
 class IngestAgent(BaseAgent):
@@ -38,7 +50,7 @@ class IngestAgent(BaseAgent):
         # Extract creation_time via ffprobe and sort chronologically
         file_info = []
         for f in files:
-            probe = self._ffprobe(f)
+            probe = ffprobe(f)
             creation_time = probe.get("format", {}).get("tags", {}).get("creation_time", "")
             duration = float(probe.get("format", {}).get("duration", 0))
             file_info.append({
@@ -63,7 +75,7 @@ class IngestAgent(BaseAgent):
             shutil.copy2(src, dst)
 
             # Validate copy with ffprobe
-            probe = self._ffprobe(dst)
+            probe = ffprobe(dst)
             copy_duration = float(probe.get("format", {}).get("duration", 0))
             if abs(copy_duration - info["duration_seconds"]) > 1.0:
                 raise RuntimeError(
@@ -86,13 +98,3 @@ class IngestAgent(BaseAgent):
             "duration_seconds": round(total_duration, 3),
         }
 
-    def _ffprobe(self, path: Path) -> dict:
-        """Run ffprobe and return parsed JSON."""
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)

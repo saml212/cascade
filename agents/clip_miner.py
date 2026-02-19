@@ -1,4 +1,20 @@
-"""Clip miner agent — use Claude to identify the best short-form clips from the transcript."""
+"""Clip miner agent — use Claude to identify the best short-form clips from the transcript.
+
+Inputs:
+    - diarized_transcript.json, segments.json, stitch.json
+Outputs:
+    - clips.json (ranked clips with titles, hooks, scores)
+    - episode_info.json (guest name, title, description)
+    - Updates episode.json with guest/episode metadata
+Dependencies:
+    - anthropic SDK (Claude API)
+Config:
+    - clip_mining.llm_model, clip_mining.llm_temperature
+    - clip_mining.boundary_snap_tolerance_seconds
+    - processing.clip_count, processing.clip_min_seconds, processing.clip_max_seconds
+Environment:
+    - ANTHROPIC_API_KEY
+"""
 
 import json
 import os
@@ -35,23 +51,11 @@ class ClipMinerAgent(BaseAgent):
         model = self.config.get("clip_mining", {}).get("llm_model", "claude-opus-4-6")
         temperature = self.config.get("clip_mining", {}).get("llm_temperature", 0.3)
 
-        # Extract guest/episode info from early transcript
-        episode_info = self._extract_episode_info(client, model, diarized)
-        self.save_json("episode_info.json", episode_info)
+        # Single combined API call for episode info + clip mining
+        prompt = f"""You are an expert podcast clip editor. Analyze this transcript and:
 
-        # Update episode.json with extracted info
-        episode_file = self.episode_dir / "episode.json"
-        if episode_file.exists():
-            with open(episode_file) as f:
-                episode = json.load(f)
-            episode["guest_name"] = episode_info.get("guest_name", "")
-            episode["guest_title"] = episode_info.get("guest_title", "")
-            episode["episode_name"] = episode_info.get("episode_title", "")
-            episode["episode_description"] = episode_info.get("episode_description", "")
-            with open(episode_file, "w") as f:
-                json.dump(episode, f, indent=2, default=str)
-
-        prompt = f"""You are an expert podcast clip editor. Analyze this transcript and identify the {clip_count} best clips for short-form video (YouTube Shorts, TikTok, Instagram Reels).
+1. Extract guest/episode information from the opening
+2. Identify the {clip_count} best clips for short-form video (YouTube Shorts, TikTok, Instagram Reels)
 
 Each clip should be {clip_min}-{clip_max} seconds long and should:
 - Have a strong hook in the first 3 seconds
@@ -64,17 +68,25 @@ The total episode duration is {total_duration:.1f} seconds.
 TRANSCRIPT (with timestamps and speaker labels):
 {transcript_text}
 
-Return EXACTLY a JSON array of {clip_count} clips. Each clip must have these fields:
-- "start_seconds": number (start time in seconds)
-- "end_seconds": number (end time in seconds)
-- "title": string (catchy title, max 60 chars)
-- "hook_text": string (the opening hook line)
-- "compelling_reason": string (why this clip will perform well)
-- "virality_score": number (1-10, how viral this clip could be)
+Return EXACTLY a JSON object with two keys:
 
-Return ONLY the JSON array, no other text."""
+1. "episode_info": object with:
+   - "guest_name": full name of the guest (empty string if not mentioned)
+   - "guest_title": who they are / what they do (empty string if unknown)
+   - "episode_title": suggested episode title
+   - "episode_description": 2-3 sentence description
 
-        self.logger.info(f"Calling {model} for clip mining...")
+2. "clips": array of {clip_count} clips, each with:
+   - "start_seconds": number (start time in seconds)
+   - "end_seconds": number (end time in seconds)
+   - "title": string (catchy title, max 60 chars)
+   - "hook_text": string (the opening hook line)
+   - "compelling_reason": string (why this clip will perform well)
+   - "virality_score": number (1-10, how viral this clip could be)
+
+Return ONLY the JSON object, no other text."""
+
+        self.logger.info(f"Calling {model} for clip mining + episode info...")
         response = client.messages.create(
             model=model,
             max_tokens=4096,
@@ -91,7 +103,28 @@ Return ONLY the JSON array, no other text."""
                 response_text = response_text[:-3]
             response_text = response_text.strip()
 
-        clips = json.loads(response_text)
+        parsed = json.loads(response_text)
+
+        # Extract episode info
+        episode_info = parsed.get("episode_info", {
+            "guest_name": "", "guest_title": "", "episode_title": "", "episode_description": ""
+        })
+        self.save_json("episode_info.json", episode_info)
+
+        # Update episode.json with extracted info
+        episode_file = self.episode_dir / "episode.json"
+        if episode_file.exists():
+            with open(episode_file) as f:
+                episode = json.load(f)
+            episode["guest_name"] = episode_info.get("guest_name", "")
+            episode["guest_title"] = episode_info.get("guest_title", "")
+            episode["episode_name"] = episode_info.get("episode_title", "")
+            episode["episode_description"] = episode_info.get("episode_description", "")
+            with open(episode_file, "w") as f:
+                json.dump(episode, f, indent=2, default=str)
+
+        # Extract clips
+        clips = parsed.get("clips", [])
 
         # Snap clip boundaries to silence
         clips = self._snap_to_silence(clips, segments_data)
@@ -132,96 +165,54 @@ Return ONLY the JSON array, no other text."""
             "boundary_snap_tolerance_seconds", 3.0
         )
 
-        # Try to load RMS data for silence detection
-        rms_path = self.episode_dir / "work" / "rms_data.json"
-        if not rms_path.exists():
-            return clips
-
-        try:
-            with open(rms_path) as f:
-                rms_data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return clips
-
-        frame_sec = rms_data.get("frame_seconds", 0.1)
-        left_rms = rms_data.get("left_rms_db", [])
-        right_rms = rms_data.get("right_rms_db", [])
-
-        if not left_rms or not right_rms:
-            return clips
-
         import numpy as np
 
+        # Try .npy format first (from optimized speaker_cut), fall back to JSON
+        left_npy = self.episode_dir / "work" / "left_rms_db.npy"
+        right_npy = self.episode_dir / "work" / "right_rms_db.npy"
+        meta_path = self.episode_dir / "work" / "rms_meta.json"
+
+        if left_npy.exists() and right_npy.exists() and meta_path.exists():
+            try:
+                left_rms = np.load(str(left_npy))
+                right_rms = np.load(str(right_npy))
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                frame_sec = meta.get("frame_seconds", 0.1)
+            except (OSError, ValueError):
+                return clips
+        else:
+            # Fall back to legacy JSON format
+            rms_path = self.episode_dir / "work" / "rms_data.json"
+            if not rms_path.exists():
+                return clips
+            try:
+                with open(rms_path) as f:
+                    rms_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                return clips
+            frame_sec = rms_data.get("frame_seconds", 0.1)
+            left_rms = np.array(rms_data.get("left_rms_db", []))
+            right_rms = np.array(rms_data.get("right_rms_db", []))
+
+        if len(left_rms) == 0 or len(right_rms) == 0:
+            return clips
+
         # Combined energy
-        combined = np.array(left_rms) + np.array(right_rms)
+        combined = left_rms + right_rms
 
         for clip in clips:
             for key in ("start_seconds", "end_seconds"):
                 t = clip[key]
-                # Search window
                 lo = max(0, int((t - tolerance) / frame_sec))
                 hi = min(len(combined), int((t + tolerance) / frame_sec))
                 if lo >= hi:
                     continue
-                # Find minimum energy frame in window
                 window = combined[lo:hi]
                 min_idx = lo + int(np.argmin(window))
                 clip[key] = round(min_idx * frame_sec, 2)
 
         return clips
-
-    def _extract_episode_info(self, client, model: str, diarized: dict) -> dict:
-        """Extract guest name and episode info from the first ~3 minutes of transcript."""
-        # Get utterances from first 3 minutes
-        early_utterances = []
-        for utt in diarized.get("utterances", []):
-            if utt.get("start", 0) > 180:
-                break
-            early_utterances.append(utt)
-
-        if not early_utterances:
-            return {"guest_name": "", "guest_title": "", "episode_title": "", "episode_description": ""}
-
-        early_text = "\n".join(
-            f"Speaker {utt.get('speaker', '?')}: {utt.get('text', '')}"
-            for utt in early_utterances
-        )
-
-        prompt = f"""Analyze this podcast transcript opening and extract guest information.
-
-TRANSCRIPT (first ~3 minutes):
-{early_text}
-
-Return a JSON object with:
-- "guest_name": full name of the guest (empty string if not mentioned)
-- "guest_title": who they are / what they do (e.g. "Nuclear Navy Officer", empty string if unknown)
-- "episode_title": suggested episode title (default to guest name if available)
-- "episode_description": 2-3 sentence description of the episode topic and guest
-
-Return ONLY the JSON object, no other text."""
-
-        self.logger.info("Extracting guest/episode info from transcript...")
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            temperature=0.2,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        response_text = response.content[0].text.strip()
-        if response_text.startswith("```"):
-            response_text = response_text.split("\n", 1)[1]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            response_text = response_text.strip()
-
-        try:
-            info = json.loads(response_text)
-        except json.JSONDecodeError:
-            self.logger.warning("Failed to parse episode info response, using empty defaults")
-            info = {"guest_name": "", "guest_title": "", "episode_title": "", "episode_description": ""}
-
-        return info
 
     def _get_dominant_speaker(
         self, start: float, end: float, segments: list
