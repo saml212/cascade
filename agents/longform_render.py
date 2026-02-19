@@ -118,26 +118,44 @@ class LongformRenderAgent(BaseAgent):
                 video_dur = float(s["duration"])
                 break
 
-        # Step 3: Re-mux with -t to hard-stop both tracks at the video
-        # duration. This prevents audio from being longer than video
-        # (segment concat can introduce timing gaps that inflate audio).
-        # Re-encode audio to flush any accumulated timestamp drift;
-        # video is stream-copied (already encoded with correct settings).
-        mux_cmd = [
+        # Step 3: Fix audio nb_frames via WAV extraction + re-encode.
+        # Concatenating N segments accumulates ~3 extra AAC priming/padding
+        # frames per segment, inflating nb_frames in the sample table.
+        # Platforms like Spotify compute audio duration from nb_frames
+        # (nb_frames × 1024 / sample_rate) rather than the container
+        # duration, so the inflated count causes rejection.
+        # Extracting audio as WAV with -t gives exact sample count,
+        # then re-encoding from WAV produces correct nb_frames.
+        clean_wav = work_dir / "audio_clean.wav"
+        wav_cmd = [
             "ffmpeg", "-y",
             "-i", str(raw_concat),
         ]
         if video_dur:
-            mux_cmd += ["-t", str(video_dur)]
-        mux_cmd += [
+            wav_cmd += ["-t", str(video_dur)]
+        wav_cmd += [
+            "-vn",
+            "-c:a", "pcm_s16le", "-ar", "48000",
+            str(clean_wav),
+        ]
+        subprocess.run(wav_cmd, capture_output=True, text=True, check=True)
+
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(raw_concat),
+            "-i", str(clean_wav),
+            "-map", "0:v", "-map", "1:a",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", audio_bitrate,
+            "-shortest",
+            "-fflags", "+shortest",
             "-use_editlist", "0",
             "-movflags", "+faststart",
             str(output_path),
         ]
         subprocess.run(mux_cmd, capture_output=True, text=True, check=True)
         raw_concat.unlink(missing_ok=True)
+        clean_wav.unlink(missing_ok=True)
 
         # Validate
         probe = ffprobe(output_path)
