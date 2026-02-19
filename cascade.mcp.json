@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "cascade": {
+      "command": ".venv/bin/python",
+      "args": ["mcp_server.py"],
+      "env": {}
+    }
+  }
+}

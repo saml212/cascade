@@ -3,16 +3,25 @@
 import os
 from pathlib import Path
 
+# Load .env BEFORE importing routes (they read CASCADE_OUTPUT_DIR at import time)
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from server.routes import episodes, clips, publish, analytics
+from server.routes import episodes, clips, publish, analytics, pipeline, chat, trim
 
 # Project root is the parent of server/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
+_output_env = os.getenv("CASCADE_OUTPUT_DIR", "")
+if _output_env:
+    # Env var points directly to episodes dir — parent is the cascade root
+    OUTPUT_DIR = Path(_output_env).parent
+else:
+    OUTPUT_DIR = PROJECT_ROOT / "output"
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
 app = FastAPI(title="Cascade API", version="0.1.0")
@@ -31,6 +40,9 @@ app.include_router(episodes.router)
 app.include_router(clips.router)
 app.include_router(publish.router)
 app.include_router(analytics.router)
+app.include_router(pipeline.router)
+app.include_router(chat.router)
+app.include_router(trim.router)
 
 # Mount output directory for video file serving
 if OUTPUT_DIR.exists():

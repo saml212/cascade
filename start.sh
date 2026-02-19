@@ -27,37 +27,23 @@ cleanup() {
 }
 trap cleanup SIGINT
 
-# ── Check Python 3.10+ ─────────────────────────────────────────────────────
-if ! command -v python3 &> /dev/null; then
-    echo "ERROR: python3 not found. Please install Python 3.10 or later."
+# ── Check uv is installed ──────────────────────────────────────────────────
+if ! command -v uv &> /dev/null; then
+    echo "ERROR: uv not found. Install it: brew install uv"
     exit 1
 fi
 
-PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
-PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
-
-if [[ "$PYTHON_MAJOR" -lt 3 ]] || { [[ "$PYTHON_MAJOR" -eq 3 ]] && [[ "$PYTHON_MINOR" -lt 10 ]]; }; then
-    echo "ERROR: Python 3.10+ is required (found $PYTHON_VERSION)."
-    echo "       Install a newer version: https://www.python.org/downloads/"
-    exit 1
-fi
-
-echo "Using Python $PYTHON_VERSION"
+echo "Using uv $(uv --version | awk '{print $2}')"
 
 # ── Create virtual environment if it doesn't exist ──────────────────────────
 if [[ ! -d ".venv" ]]; then
-    echo "Creating virtual environment..."
-    python3 -m venv .venv
+    echo "Creating virtual environment (Python 3.12)..."
+    uv venv --python 3.12
 fi
-
-# ── Activate virtual environment ────────────────────────────────────────────
-source .venv/bin/activate
-echo "Virtual environment activated."
 
 # ── Install / update dependencies ───────────────────────────────────────────
 echo "Installing dependencies..."
-pip install -q -r requirements.txt
+uv pip install -r requirements.txt
 
 # ── Load .env if present ────────────────────────────────────────────────────
 if [[ -f ".env" ]]; then
@@ -79,7 +65,7 @@ if [[ -z "${DEEPGRAM_API_KEY:-}" ]]; then
 fi
 
 # ── Create default directories ──────────────────────────────────────────────
-mkdir -p output output/episodes work config data logs
+mkdir -p config
 echo "Directories verified."
 
 # ── Open browser after a short delay (background) ──────────────────────────
@@ -91,4 +77,4 @@ echo "Starting Cascade on http://localhost:8420"
 echo "Press Ctrl+C to stop."
 echo ""
 
-uvicorn server.app:app --host 0.0.0.0 --port 8420 --reload
+.venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 8420 --reload

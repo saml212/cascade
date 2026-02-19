@@ -1,18 +1,21 @@
 """Clip review endpoints."""
 
 import json
-import os
+import logging
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from lib.clips import normalize_clip as _normalize_clip, load_clips as _load_clips_from_dir, save_clips as _save_clips_to_dir
+from lib.paths import get_episodes_dir
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/episodes/{episode_id}/clips", tags=["clips"])
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
-EPISODES_DIR = OUTPUT_DIR / "episodes"
+EPISODES_DIR = get_episodes_dir()
 
 
 class ManualClipRequest(BaseModel):
@@ -29,17 +32,15 @@ class MetadataUpdate(BaseModel):
     metadata: Optional[dict] = None
 
 
-def load_clips(episode_id: str) -> tuple[list, Path]:
+def load_clips(episode_id: str) -> tuple:
     """Load clips from clips.json, falling back to episode.json."""
     ep_dir = EPISODES_DIR / episode_id
-    if not ep_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-
     clips_file = ep_dir / "clips.json"
-    if clips_file.exists():
-        with open(clips_file) as f:
-            data = json.load(f)
-        clips = data.get("clips", data) if isinstance(data, dict) else data
+    if not ep_dir.exists():
+        return [], clips_file
+
+    clips = _load_clips_from_dir(ep_dir)
+    if clips:
         return clips, clips_file
 
     # Fallback to episode.json
@@ -47,16 +48,14 @@ def load_clips(episode_id: str) -> tuple[list, Path]:
     if ep_file.exists():
         with open(ep_file) as f:
             ep = json.load(f)
-        return ep.get("clips", []), clips_file
+        return [_normalize_clip(c) for c in ep.get("clips", [])], clips_file
 
     return [], clips_file
 
 
 def save_clips(clips: list, clips_file: Path):
     """Save clips list to clips.json."""
-    clips_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(clips_file, "w") as f:
-        json.dump({"clips": clips}, f, indent=2)
+    _save_clips_to_dir(clips_file.parent, clips)
 
 
 def find_clip(clips: list, clip_id: str) -> tuple[dict, int]:
@@ -67,9 +66,11 @@ def find_clip(clips: list, clip_id: str) -> tuple[dict, int]:
     raise HTTPException(status_code=404, detail=f"Clip {clip_id} not found")
 
 
+@router.get("")
 @router.get("/")
 async def list_clips(episode_id: str) -> list[dict]:
     """List all clip candidates."""
+    logger.info("GET /api/episodes/%s/clips", episode_id)
     clips, _ = load_clips(episode_id)
     return clips
 
@@ -85,6 +86,7 @@ async def get_clip(episode_id: str, clip_id: str) -> dict:
 @router.post("/{clip_id}/approve")
 async def approve_clip(episode_id: str, clip_id: str) -> dict:
     """Approve a clip."""
+    logger.info("POST /api/episodes/%s/clips/%s/approve", episode_id, clip_id)
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)
     clip["status"] = "approved"
@@ -96,6 +98,7 @@ async def approve_clip(episode_id: str, clip_id: str) -> dict:
 @router.post("/{clip_id}/reject")
 async def reject_clip(episode_id: str, clip_id: str) -> dict:
     """Reject a clip."""
+    logger.info("POST /api/episodes/%s/clips/%s/reject", episode_id, clip_id)
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)
     clip["status"] = "rejected"

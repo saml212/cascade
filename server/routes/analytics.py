@@ -1,22 +1,27 @@
 """Analytics endpoints."""
+# TODO: Implement analytics dashboard (after publishing)
 
 import json
-import os
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
+from lib.paths import get_project_root, get_episodes_dir
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = Path(os.getenv("CASCADE_OUTPUT_DIR", PROJECT_ROOT / "output"))
+PROJECT_ROOT = get_project_root()
 DATA_DIR = PROJECT_ROOT / "data"
-EPISODES_DIR = OUTPUT_DIR / "episodes"
+EPISODES_DIR = get_episodes_dir()
 
 
 @router.get("/")
 async def get_analytics() -> dict:
     """Aggregate analytics dashboard data."""
+    logger.info("GET /api/analytics/")
     # Try data/analytics.json
     analytics_file = DATA_DIR / "analytics.json"
     if analytics_file.exists():
@@ -60,6 +65,7 @@ async def get_analytics() -> dict:
 @router.get("/{episode_id}")
 async def get_episode_analytics(episode_id: str) -> dict:
     """Get analytics for a specific episode."""
+    logger.info("GET /api/analytics/%s", episode_id)
     ep_dir = EPISODES_DIR / episode_id
     if not ep_dir.exists():
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
