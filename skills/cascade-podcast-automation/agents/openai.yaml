@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cascade Podcast Automation"
+  short_description: "Automate Cascade ingest and workflow verification."
+  default_prompt: "Use $cascade-podcast-automation to run and troubleshoot a full Cascade ingest workflow for a source path."
