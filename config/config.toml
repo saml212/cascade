@@ -4,10 +4,14 @@ version = "0.1.0"
 
 [paths]
 ingest_dir = "~/podcast_ingest"          # Watch folder / SD card mount point
-output_dir = "/Volumes/1TB_SSD/cascade/episodes"  # Episode output (SSD — primary working storage)
-work_dir = "/Volumes/1TB_SSD/cascade/work"        # Temporary processing files (SSD)
-backup_dir = "/Volumes/Seagate Portable Drive/podcast"  # External HDD backup
-public_media_dir = ""                     # Public URL base for Instagram uploads
+output_dir = "episodes"                  # Episode output (local by default; set absolute path for SSD)
+work_dir = "work"                        # Temporary processing files
+backup_dir = ""                          # External HDD backup (leave empty to skip)
+public_media_dir = ""                    # Public URL base for Instagram uploads
+# To use an external SSD (recommended for large episodes):
+#   output_dir = "/Volumes/1TB_SSD/cascade/episodes"
+#   work_dir = "/Volumes/1TB_SSD/cascade/work"
+#   backup_dir = "/Volumes/Seagate Portable Drive/podcast"
 
 [processing]
 frame_seconds = 0.1                       # Audio analysis frame size
@@ -91,6 +95,16 @@ category = "Society & Culture"
 explicit = "false"
 link = "https://www.youtube.com/channel/UC3PAf5CnfDAvzIjs6nSlTlA"
 owner_email = "samlarson16@gmail.com"
+
+[podcast.links]
+tagline = "Real conversations with real people."
+spotify = "https://open.spotify.com/show/1GipBGmWYyH8rWEuYTZjLf"
+youtube = "https://youtube.com/@local-pod"
+instagram = "https://www.instagram.com/the_local_pod/"
+x = "https://x.com/the_local_pod"
+tiktok = ""
+apple_podcasts = ""
+iheartradio = ""
 
 [podcast.r2]
 bucket = "the-local-podcast"

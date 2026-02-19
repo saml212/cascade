@@ -56,9 +56,10 @@ def _load_config():
 
 
 def _episodes_dir() -> Path:
-    """Get the episodes output directory from config."""
+    """Get the episodes output directory from config, with local fallback."""
     config = _load_config()
-    return Path(config["paths"]["output_dir"])
+    from lib.paths import resolve_path
+    return resolve_path(config["paths"]["output_dir"], "episodes")
 
 
 def _load_env():

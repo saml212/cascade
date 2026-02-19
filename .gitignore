@@ -1,11 +1,16 @@
 # Environment
 .env
+.env.*
 .venv/
 __pycache__/
 *.pyc
 
+# User config (copy config.example.toml to config.toml)
+config/config.toml
+
 # Output artifacts
 output/
+episodes/
 work/
 data/
 
@@ -29,3 +34,6 @@ logs/
 
 # Node
 node_modules/
+
+# Generated files
+links/index.html

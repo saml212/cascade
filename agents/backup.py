@@ -27,9 +27,14 @@ class BackupAgent(BaseAgent):
         )
 
         if not backup_dir:
-            raise RuntimeError(
-                "backup_dir not set in config.toml or CASCADE_BACKUP_DIR env var"
-            )
+            self.logger.info("No backup_dir configured — skipping backup")
+            return {
+                "backup_path": "",
+                "backup_size": "0",
+                "episode_id": self.episode_dir.name,
+                "skipped": True,
+                "reason": "backup_dir not set in config.toml (set it to enable backups)",
+            }
 
         backup_root = Path(backup_dir)
         if not backup_root.parent.exists():

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agents import AGENT_REGISTRY, PIPELINE_ORDER
 from agents.base import BaseAgent
+from lib.paths import resolve_path
 
 logger = logging.getLogger("cascade")
 
@@ -60,7 +61,7 @@ def run_pipeline(
         The final episode.json dict.
     """
     config = load_config()
-    output_dir = Path(config["paths"]["output_dir"])
+    output_dir = resolve_path(config["paths"]["output_dir"], "episodes")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create or load episode

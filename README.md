@@ -173,11 +173,26 @@ cascade/
 └── start.sh         # One-command setup + launch
 ```
 
+## Storage
+
+By default, Cascade stores everything locally in `./episodes/` and `./work/`. This works out of the box with no external drives.
+
+For large episodes (multi-GB source files), you can point to an external SSD by editing `config/config.toml`:
+
+```toml
+[paths]
+output_dir = "/Volumes/1TB_SSD/cascade/episodes"
+work_dir = "/Volumes/1TB_SSD/cascade/work"
+backup_dir = "/Volumes/Seagate Portable Drive/podcast"
+```
+
+If an external drive path is configured but the volume isn't mounted, Cascade automatically falls back to local storage.
+
 ## Configuration
 
 All settings live in `config/config.toml`. Key sections:
 
-- **`[paths]`** — Output directory, work directory, backup drive
+- **`[paths]`** — Output directory, work directory, backup drive (local fallback if drive missing)
 - **`[processing]`** — CRF, resolution, clip duration limits, hardware acceleration
 - **`[transcription]`** — Deepgram model, language, diarization settings
 - **`[clip_mining]`** — LLM model, temperature, clip count

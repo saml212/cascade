@@ -65,7 +65,7 @@ if [[ -z "${DEEPGRAM_API_KEY:-}" ]]; then
 fi
 
 # ── Create default directories ──────────────────────────────────────────────
-mkdir -p config
+mkdir -p config episodes work
 echo "Directories verified."
 
 # ── Open browser after a short delay (background) ──────────────────────────

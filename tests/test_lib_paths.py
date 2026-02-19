@@ -22,7 +22,7 @@ def test_get_episodes_dir_default():
         importlib.reload(lib.paths)
         from lib.paths import get_episodes_dir as ged
         ep_dir = ged()
-        assert str(ep_dir).endswith("output/episodes")
+        assert str(ep_dir).endswith("episodes")
     finally:
         if old:
             os.environ["CASCADE_OUTPUT_DIR"] = old
