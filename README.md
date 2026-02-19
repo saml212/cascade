@@ -33,9 +33,10 @@ Agents run in parallel where possible (transcribe runs alongside audio analysis 
 ### Setup
 
 ```bash
-git clone https://github.com/yourusername/cascade.git && cd cascade
-cp .env.example .env   # Fill in your API keys (see below)
-./start.sh             # Creates venv, installs deps, opens UI
+git clone https://github.com/saml212/cascade.git && cd cascade
+cp config/config.example.toml config/config.toml  # Edit paths & podcast info
+cp .env.example .env                               # Fill in your API keys (see below)
+./start.sh                                         # Creates venv, installs deps, opens UI
 ```
 
 Or manually:
@@ -43,7 +44,8 @@ Or manually:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # Fill in API keys
+cp config/config.example.toml config/config.toml   # Edit paths & podcast info
+cp .env.example .env                               # Fill in API keys
 ```
 
 ### API Keys
@@ -58,8 +60,12 @@ cp .env.example .env   # Fill in API keys
 | `TIKTOK_CLIENT_SECRET` | No | TikTok publishing |
 | `INSTAGRAM_ACCESS_TOKEN` | No | Instagram publishing |
 | `FACEBOOK_PAGE_ID` | No | Instagram publishing |
+| `CLOUDFLARE_ACCOUNT_ID` | No | Podcast RSS feed (R2 storage) |
+| `CLOUDFLARE_API_TOKEN` | No | Podcast RSS feed (R2 storage) |
+| `UPLOAD_POST_API_KEY` | No | Upload-Post publishing |
+| `UPLOAD_POST_USER` | No | Upload-Post publishing |
 
-Only `ANTHROPIC_API_KEY` and `DEEPGRAM_API_KEY` are required for the core pipeline (ingest through QA). Publishing keys are only needed if you use the publish agent.
+Only `ANTHROPIC_API_KEY` and `DEEPGRAM_API_KEY` are required for the core pipeline (ingest through QA). Publishing and RSS keys are only needed for those specific agents.
 
 ### Run the Pipeline
 
@@ -135,8 +141,8 @@ An AI agent can run a complete end-to-end episode with:
 ```
 1. check_prerequisites()
 2. setup_environment()
-3. list_source_media("/Volumes/7/DCIM/100CANON/")
-4. run_pipeline(source_path="/Volumes/7/DCIM/100CANON/")
+3. list_source_media("/path/to/SD/DCIM/100CANON/")
+4. run_pipeline(source_path="/path/to/SD/DCIM/100CANON/")
 5. extract_frame(episode_id="ep_...")     # Determine crop positions
 6. set_crop_config(episode_id="ep_...", ...)
 7. run_pipeline(source_path="...", agents="longform_render,shorts_render,metadata_gen,qa")
@@ -181,9 +187,9 @@ For large episodes (multi-GB source files), you can point to an external SSD by 
 
 ```toml
 [paths]
-output_dir = "/Volumes/1TB_SSD/cascade/episodes"
-work_dir = "/Volumes/1TB_SSD/cascade/work"
-backup_dir = "/Volumes/Seagate Portable Drive/podcast"
+output_dir = "~/cascade/episodes"
+work_dir = "~/cascade/work"
+backup_dir = "~/cascade/backup"
 ```
 
 If an external drive path is configured but the volume isn't mounted, Cascade automatically falls back to local storage.
@@ -199,6 +205,19 @@ All settings live in `config/config.toml`. Key sections:
 - **`[schedule]`** — Shorts posting cadence, peak days, timezone
 - **`[platforms.*]`** — Per-platform publishing settings
 - **`[podcast]`** — RSS feed metadata (title, author, artwork)
+- **`[podcast.links]`** — Link-in-bio page URLs (see below)
+
+## Links Page (Link-in-Bio)
+
+Cascade includes a built-in link-in-bio page generator. Fill in the `[podcast.links]` section of your config with your platform URLs, then generate the static HTML:
+
+```bash
+python -m links.generate
+```
+
+This produces `links/index.html` — a single-file, dark-themed page with your podcast artwork, platform links, and an embedded Spotify player. Deploy it to Cloudflare Pages, GitHub Pages, Netlify, or any static host.
+
+Supported platforms: Spotify, Apple Podcasts, YouTube, Instagram, X, TikTok, iHeartRadio, GitHub. Empty URLs are automatically excluded.
 
 ## API Costs per Episode
 

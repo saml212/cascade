@@ -9,7 +9,7 @@ Cascade is a 13-agent pipeline that processes podcast recordings from SD card to
 - **Lib:** `lib/` — shared utilities (paths, ffprobe, clips, SRT formatting)
 - **Server:** `server/` — FastAPI app on port 8420 with episode/clip/pipeline routes
 - **Frontend:** `frontend/` — SPA for clip review and approval
-- **Working storage:** `/Volumes/1TB_SSD/cascade/` — all episode data lives on external SSD
+- **Working storage:** Configured via `[paths]` in `config/config.toml`
 
 ## Pipeline Order
 1. `ingest` — Copy MP4s from SD card to SSD, validate with ffprobe
@@ -33,8 +33,8 @@ Cascade is a 13-agent pipeline that processes podcast recordings from SD card to
 # Ensure .env has API keys
 cat .env  # Check ANTHROPIC_API_KEY and DEEPGRAM_API_KEY are set
 
-# Ensure SSD is mounted
-ls /Volumes/1TB_SSD/cascade/
+# Ensure output directory exists (configured in config/config.toml)
+ls "$(grep output_dir config/config.toml)"
 
 # Ensure ffmpeg is installed
 ffmpeg -version
@@ -42,18 +42,17 @@ ffmpeg -version
 
 ### Full Pipeline (CLI)
 ```bash
-cd /Users/samuellarson/Local/Github/cascade
-python -m agents --source-path "/Volumes/7/DCIM/100CANON/"
+python -m agents --source-path "/path/to/media/"
 ```
 
 ### With specific episode ID
 ```bash
-python -m agents --source-path "/Volumes/7/DCIM/100CANON/" --episode-id ep_2026-02-13_test
+python -m agents --source-path "/path/to/media/" --episode-id ep_2026-02-13_test
 ```
 
 ### Run specific agents only
 ```bash
-python -m agents --source-path "/Volumes/7/DCIM/100CANON/" --agents ingest stitch audio_analysis
+python -m agents --source-path "/path/to/media/" --agents ingest stitch audio_analysis
 ```
 
 ### Via API
@@ -64,7 +63,7 @@ python -m agents --source-path "/Volumes/7/DCIM/100CANON/" --agents ingest stitc
 # Trigger pipeline
 curl -X POST http://localhost:8420/api/episodes/ep_001/run-pipeline \
   -H "Content-Type: application/json" \
-  -d '{"source_path": "/Volumes/7/DCIM/100CANON/"}'
+  -d '{"source_path": "/path/to/media/"}'
 
 # Check status
 curl http://localhost:8420/api/episodes/ep_001/pipeline-status
@@ -73,19 +72,18 @@ curl http://localhost:8420/api/episodes/ep_001/pipeline-status
 curl -X POST http://localhost:8420/api/episodes/ep_001/auto-approve
 ```
 
-### Backup to Seagate HDD
+### Backup
 ```bash
-rsync -av --progress "/Volumes/1TB_SSD/cascade/episodes/<episode_id>/" "/Volumes/Seagate Portable Drive/podcast/<episode_id>/"
+rsync -av --progress "<output_dir>/episodes/<episode_id>/" "<backup_dir>/<episode_id>/"
 ```
 
 ## Key Paths
 | Path | Purpose |
 |------|---------|
-| `/Volumes/1TB_SSD/cascade/episodes/` | Episode output (SSD working storage) |
-| `/Volumes/1TB_SSD/cascade/work/` | Temp processing files |
-| `/Volumes/7/DCIM/100CANON/` | SD card source (Canon) |
-| `config/config.toml` | All configuration |
-| `.env` | API keys (gitignored) |
+| `config/config.toml` | All configuration (copy from `config.example.toml`) |
+| `.env` | API keys (copy from `.env.example`, gitignored) |
+| `[paths].output_dir` | Episode output (configured in config) |
+| `[paths].work_dir` | Temp processing files (configured in config) |
 
 ## Episode Directory Structure
 ```

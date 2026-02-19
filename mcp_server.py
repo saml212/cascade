@@ -309,10 +309,12 @@ def list_source_media(path: str = "") -> str:
     if not path:
         try:
             config = _load_config()
-            sd_mount = config.get("automation", {}).get("sd_card_mount", "/Volumes/7")
+            sd_mount = config.get("automation", {}).get("sd_card_mount", "")
+            if not sd_mount:
+                return "No SD card mount configured. Set [automation].sd_card_mount in config/config.toml"
             path = f"{sd_mount}/DCIM/100CANON"
         except Exception:
-            path = "/Volumes/7/DCIM/100CANON"
+            return "Could not load config. Set [automation].sd_card_mount in config/config.toml"
 
     p = Path(path)
     if not p.exists():
