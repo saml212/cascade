@@ -94,6 +94,8 @@ owner_email = ""                          # Email for RSS feed (required by Appl
 
 [podcast.links]
 # Fill in the platforms you use — empty strings are skipped in the generated page
+# Handles are auto-extracted from URLs and shown as link labels
+display_name = ""                         # Override title on links page (optional)
 tagline = ""                              # Shown below your podcast name
 spotify = ""
 youtube = ""

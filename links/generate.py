@@ -99,14 +99,37 @@ def extract_spotify_id(url):
     return m.group(1) if m else None
 
 
+def extract_handle(platform, url):
+    """Extract a display handle from a platform URL."""
+    url = url.rstrip("/")
+    if platform in ("youtube",):
+        m = re.search(r"/@?([^/?]+)$", url)
+        if m:
+            handle = m.group(1)
+            return f"@{handle}" if not handle.startswith("@") else handle
+    elif platform in ("instagram", "x", "tiktok"):
+        m = re.search(r"/(@?[^/?]+)$", url)
+        if m:
+            handle = m.group(1)
+            return f"@{handle}" if not handle.startswith("@") else handle
+    elif platform == "github":
+        m = re.search(r"github\.com/(.+)$", url)
+        if m:
+            return m.group(1)
+    # Fallback to platform name
+    return PLATFORM_ICONS[platform][0]
+
+
 def build_link_block(platform, url):
     """Build one <a> link block for the given platform."""
-    label, svg = PLATFORM_ICONS[platform]
+    _, svg = PLATFORM_ICONS[platform]
+    label = extract_handle(platform, url)
     escaped_url = html.escape(url, quote=True)
+    escaped_label = html.escape(label)
     return (
         f'      <a href="{escaped_url}" class="link" target="_blank" rel="noopener">\n'
         f'        <span class="link-icon">{svg}</span>\n'
-        f"        {label}\n"
+        f"        {escaped_label}\n"
         f"      </a>"
     )
 
@@ -119,6 +142,7 @@ def generate(config_path, template_path, output_path):
     links_cfg = podcast.get("links", {})
 
     title = podcast.get("title", "My Podcast")
+    display_name = links_cfg.get("display_name", "") or title
     artwork_url = podcast.get("artwork_url", "")
     tagline = links_cfg.get("tagline", "")
 
@@ -149,7 +173,7 @@ def generate(config_path, template_path, output_path):
     with open(template_path) as f:
         template = f.read()
 
-    result = template.replace("{{title}}", html.escape(title))
+    result = template.replace("{{title}}", html.escape(display_name))
     result = result.replace("{{tagline}}", html.escape(tagline))
     result = result.replace("{{artwork_url}}", html.escape(artwork_url, quote=True))
     result = result.replace("{{year}}", str(datetime.now().year))
