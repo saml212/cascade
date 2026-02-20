@@ -99,7 +99,7 @@ def extract_spotify_id(url):
     return m.group(1) if m else None
 
 
-def extract_handle(platform, url):
+def extract_handle(platform, url, display_name=""):
     """Extract a display handle from a platform URL."""
     url = url.rstrip("/")
     if platform in ("youtube",):
@@ -116,14 +116,16 @@ def extract_handle(platform, url):
         m = re.search(r"github\.com/(.+)$", url)
         if m:
             return m.group(1)
-    # Fallback to platform name
+    # For platforms without handles (Spotify, Apple, iHeart), use display name
+    if display_name:
+        return display_name
     return PLATFORM_ICONS[platform][0]
 
 
-def build_link_block(platform, url):
+def build_link_block(platform, url, display_name=""):
     """Build one <a> link block for the given platform."""
     _, svg = PLATFORM_ICONS[platform]
-    label = extract_handle(platform, url)
+    label = extract_handle(platform, url, display_name)
     escaped_url = html.escape(url, quote=True)
     escaped_label = html.escape(label)
     return (
@@ -151,7 +153,7 @@ def generate(config_path, template_path, output_path):
     for platform in PLATFORM_ORDER:
         url = links_cfg.get(platform, "").strip()
         if url and platform in PLATFORM_ICONS:
-            link_blocks.append(build_link_block(platform, url))
+            link_blocks.append(build_link_block(platform, url, display_name))
 
     # Spotify embed
     spotify_url = links_cfg.get("spotify", "").strip()
