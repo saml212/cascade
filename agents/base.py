@@ -2,11 +2,25 @@
 
 import json
 import logging
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 logger = logging.getLogger("cascade")
+
+
+def timed_ffmpeg(cmd: list, agent_logger=None, **kwargs) -> subprocess.CompletedProcess:
+    """Run an ffmpeg/ffprobe subprocess with timing. Logs command summary and elapsed time."""
+    start = time.time()
+    result = subprocess.run(cmd, **kwargs)
+    elapsed = time.time() - start
+    # Log a short summary: binary name + key args
+    binary = Path(cmd[0]).name
+    summary = f"{binary} ({elapsed:.1f}s)"
+    if agent_logger:
+        agent_logger.info(f"  {summary}")
+    return result
 
 
 class BaseAgent(ABC):

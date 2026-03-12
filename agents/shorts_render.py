@@ -19,7 +19,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from agents.base import BaseAgent
+from agents.base import BaseAgent, timed_ffmpeg
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
@@ -69,7 +69,7 @@ class ShortsRenderAgent(BaseAgent):
         rendered = []
         self.logger.info(f"Rendering {len(clips)} shorts...")
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() // 2, 6)) as executor:
             futures = {}
             for clip in clips:
                 clip_id = clip["id"]
@@ -179,7 +179,7 @@ class ShortsRenderAgent(BaseAgent):
                 "-movflags", "+faststart",
                 str(output),
             ]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
             return
 
         # Multiple segments with different speakers — render each, then concat
@@ -227,7 +227,7 @@ class ShortsRenderAgent(BaseAgent):
                     "-use_editlist", "0",
                     str(seg_output),
                 ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True)
                 if result.returncode != 0:
                     raise RuntimeError(
                         f"ffmpeg failed (exit {result.returncode}) for segment {idx} "

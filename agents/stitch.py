@@ -31,9 +31,9 @@ class StitchAgent(BaseAgent):
         output_path = self.episode_dir / "source_merged.mp4"
 
         if len(files) == 1:
-            # Single file — just symlink or copy
-            import shutil
-            shutil.copy2(files[0]["dest_path"], output_path)
+            # Single file — symlink to avoid duplicating 10-20GB
+            import os
+            os.symlink(files[0]["dest_path"], output_path)
         else:
             # Write ffmpeg concat list
             concat_list = self.episode_dir / "work" / "concat_list.txt"

@@ -178,6 +178,18 @@ def run_pipeline(
                 episode["audio_tracks"] = result["audio"].get("tracks", [])
             _save_episode(mutable["episode_file"], episode)
 
+        # After stitch, remove source/ directory to reclaim ~20GB
+        # (source_merged.mp4 contains everything needed downstream)
+        if agent_name == "stitch":
+            source_dir = mutable["episode_dir"] / "source"
+            if source_dir.exists():
+                import shutil
+                try:
+                    shutil.rmtree(source_dir)
+                    logger.info(f"Cleaned up source/ directory after stitch")
+                except OSError as e:
+                    logger.warning(f"Failed to clean source/ directory: {e}")
+
         # After clip_miner, rename episode dir if guest_name was extracted
         if agent_name == "clip_miner":
             with episode_lock:
@@ -210,7 +222,7 @@ def run_pipeline(
     # Special handling: backup must pause for user approval (destructive SD cleanup)
     backup_pause_needed = ("backup" in requested_set and not episode.get("backup_approved"))
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         pending_futures = {}  # future -> agent_name
 
         while len(completed) + len(failed) < len(deps):
@@ -311,6 +323,22 @@ def run_pipeline(
     if progress_file.exists():
         progress_file.unlink()
     _save_episode(mutable["episode_file"], episode)
+
+    # Log per-agent timing summary
+    ed = mutable["episode_dir"]
+    summary_parts = []
+    for name in PIPELINE_ORDER:
+        agent_json = ed / f"{name}.json"
+        if agent_json.exists():
+            try:
+                with open(agent_json) as f:
+                    data = json.load(f)
+                elapsed = data.get("_elapsed_seconds", "?")
+                summary_parts.append(f"{name}: {elapsed}s")
+            except (json.JSONDecodeError, OSError):
+                pass
+    if summary_parts:
+        logger.info(f"Pipeline timing: {', '.join(summary_parts)}")
 
     logger.info(f"Pipeline complete for {mutable['episode_id']}")
     return episode

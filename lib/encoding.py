@@ -24,19 +24,22 @@ def has_videotoolbox() -> bool:
 def get_video_encoder_args(config: dict, crf_key: str = "video_crf") -> list:
     """Return ffmpeg encoder arguments based on config and platform capabilities.
 
-    VideoToolbox path: ["-c:v", "h264_videotoolbox", "-q:v", "65"]
-    Software fallback: ["-c:v", "libx264", "-crf", "<value>", "-preset", "fast"]
+    On Apple Silicon with VideoToolbox available, uses hardware encoding by
+    default (10-20x faster, dedicated Media Engine). Set use_hardware_accel=false
+    in config to force software encoding.
+
+    VideoToolbox path: ["-c:v", "h264_videotoolbox", "-q:v", "75"]
+    Software fallback: ["-c:v", "libx264", "-crf", "<value>", "-preset", "medium"]
     """
     use_hw = config.get("processing", {}).get("use_hardware_accel", True)
 
     if use_hw and has_videotoolbox():
-        # Only use hardware if explicitly preferred over quality
-        hw_prefer = config.get("processing", {}).get("prefer_hardware_speed", False)
-        if hw_prefer:
-            return ["-c:v", "h264_videotoolbox", "-q:v", "85"]
+        # Apple Silicon Media Engine — fast and high quality for podcast content
+        vt_quality = config.get("processing", {}).get("videotoolbox_quality", 75)
+        return ["-c:v", "h264_videotoolbox", "-q:v", str(vt_quality)]
 
-    crf = config.get("processing", {}).get(crf_key, 18)
-    preset = config.get("processing", {}).get("encode_preset", "slow")
+    crf = config.get("processing", {}).get(crf_key, 22)
+    preset = config.get("processing", {}).get("encode_preset", "medium")
     return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
 
 

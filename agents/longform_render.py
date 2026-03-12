@@ -17,7 +17,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from agents.base import BaseAgent
+from agents.base import BaseAgent, timed_ffmpeg
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
@@ -130,7 +130,7 @@ class LongformRenderAgent(BaseAgent):
             "-c", "copy",
             str(raw_concat),
         ]
-        subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
+        timed_ffmpeg(concat_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
         # Step 2: Get exact video track duration
         raw_probe = ffprobe(raw_concat)
@@ -160,7 +160,7 @@ class LongformRenderAgent(BaseAgent):
             "-c:a", "pcm_s16le", "-ar", "48000",
             str(clean_wav),
         ]
-        subprocess.run(wav_cmd, capture_output=True, text=True, check=True)
+        timed_ffmpeg(wav_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
         mux_cmd = [
             "ffmpeg", "-y",
@@ -174,7 +174,7 @@ class LongformRenderAgent(BaseAgent):
             "-movflags", "+faststart",
             str(output_path),
         ]
-        subprocess.run(mux_cmd, capture_output=True, text=True, check=True)
+        timed_ffmpeg(mux_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
         raw_concat.unlink(missing_ok=True)
         clean_wav.unlink(missing_ok=True)
 
@@ -243,7 +243,7 @@ class LongformRenderAgent(BaseAgent):
             "-movflags", "+faststart",
             str(output),
         ]
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
         """Get ffmpeg crop filter for speaker type using crop_config center points.
