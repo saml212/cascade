@@ -44,7 +44,7 @@ class StitchAgent(BaseAgent):
                     safe_path = file_info["dest_path"].replace("'", "'\\''")
                     f.write(f"file '{safe_path}'\n")
 
-            # Stream-copy merge (files are uniform H.264/AAC)
+            # Stream-copy merge (files must have uniform codec/resolution)
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",

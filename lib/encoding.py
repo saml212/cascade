@@ -1,8 +1,9 @@
-"""Shared video encoder infrastructure — VideoToolbox detection and argument selection."""
+"""Shared video encoder infrastructure — VideoToolbox detection, LUT support, argument selection."""
 
 import functools
 import subprocess
 import sys
+from pathlib import Path
 
 
 @functools.lru_cache(maxsize=1)
@@ -29,7 +30,37 @@ def get_video_encoder_args(config: dict, crf_key: str = "video_crf") -> list:
     use_hw = config.get("processing", {}).get("use_hardware_accel", True)
 
     if use_hw and has_videotoolbox():
-        return ["-c:v", "h264_videotoolbox", "-q:v", "65"]
+        # Only use hardware if explicitly preferred over quality
+        hw_prefer = config.get("processing", {}).get("prefer_hardware_speed", False)
+        if hw_prefer:
+            return ["-c:v", "h264_videotoolbox", "-q:v", "85"]
 
-    crf = config.get("processing", {}).get(crf_key, 22)
-    return ["-c:v", "libx264", "-crf", str(crf), "-preset", "fast"]
+    crf = config.get("processing", {}).get(crf_key, 18)
+    preset = config.get("processing", {}).get("encode_preset", "slow")
+    return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
+
+
+def get_lut_filter(config: dict) -> str:
+    """Return the ffmpeg lut3d filter string if a LUT is configured, else empty string.
+
+    Resolves relative paths against the project root (config/ directory's parent).
+    """
+    processing = config.get("processing", {})
+    lut_path = processing.get("lut_path", "")
+    if not lut_path:
+        return ""
+
+    lut_file = Path(lut_path)
+    if not lut_file.is_absolute():
+        # Resolve relative to project root
+        project_root = Path(__file__).resolve().parent.parent
+        lut_file = project_root / lut_file
+
+    if not lut_file.exists():
+        return ""
+
+    interp = processing.get("lut_interpolation", "tetrahedral")
+    # Escape path for ffmpeg filter — use backslash escaping, no quotes
+    # (single quotes conflict with subtitles filter quoting)
+    escaped = str(lut_file).replace("\\", "\\\\\\\\").replace(":", "\\\\:").replace("'", "\\\\'").replace(" ", "\\\\ ")
+    return f"lut3d={escaped}:interp={interp}"

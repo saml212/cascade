@@ -63,6 +63,8 @@ Each clip should be {clip_min}-{clip_max} seconds long and should:
 - Be emotionally engaging, funny, surprising, or deeply insightful
 - End on a strong note (punchline, revelation, call-to-action)
 
+CONTENT PRIORITY: This is a Bay Area / San Francisco local podcast. While you should always prioritize the most engaging and viral content first, ensure that at least 2-3 of the {clip_count} clips focus on Bay Area, San Francisco, Oakland, or local community themes when the conversation touches on those topics. Local-focused content helps build a dedicated regional audience.
+
 The total episode duration is {total_duration:.1f} seconds.
 
 TRANSCRIPT (with timestamps and speaker labels):

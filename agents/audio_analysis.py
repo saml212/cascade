@@ -13,7 +13,6 @@ Config:
 
 import json
 import subprocess
-import wave
 from pathlib import Path
 
 import numpy as np
@@ -110,20 +109,25 @@ class AudioAnalysisAgent(BaseAgent):
         }
 
     def _extract_channels(self, input_path: Path, left_out: Path, right_out: Path):
-        """Extract L and R channels in a single ffmpeg call, downsampled to 16kHz."""
+        """Extract L and R channels as raw PCM files, downsampled to 16kHz."""
+        # Output raw s16le PCM (no container) to avoid WAV format compatibility issues
+        left_raw = left_out.with_suffix('.raw')
+        right_raw = right_out.with_suffix('.raw')
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-filter_complex", "channelsplit=channel_layout=stereo[L][R]",
-            "-map", "[L]", "-ar", "16000", str(left_out),
-            "-map", "[R]", "-ar", "16000", str(right_out),
+            "-map", "[L]", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", str(left_raw),
+            "-map", "[R]", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", str(right_raw),
         ]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # Rename so callers can find them
+        left_raw.rename(left_out)
+        right_raw.rename(right_out)
 
     def _load_wav(self, path: Path) -> np.ndarray:
-        with wave.open(str(path), "rb") as wf:
-            n_frames = wf.getnframes()
-            raw = wf.readframes(n_frames)
-            data = np.frombuffer(raw, dtype=np.int16)
+        """Load raw s16le PCM data."""
+        raw = path.read_bytes()
+        data = np.frombuffer(raw, dtype=np.int16)
         return data.astype(np.float32)
 

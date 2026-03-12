@@ -6,7 +6,7 @@ Inputs:
 Outputs:
     - publish.json (submission results, request IDs)
 Dependencies:
-    - httpx (Upload-Post REST API)
+    - curl (Upload-Post REST API — httpx can't handle repeated platform[] fields)
 Config:
     - platforms.youtube.enabled, platforms.tiktok.enabled, platforms.instagram.enabled
     - schedule.timezone, schedule.shorts_per_day_weekday, schedule.shorts_per_day_weekend
@@ -16,14 +16,13 @@ Environment:
 
 import json
 import os
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import httpx
-
 from agents.base import BaseAgent
 
-UPLOAD_POST_URL = "https://api.upload-post.com/api/upload_videos"
+UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 STATUS_URL = "https://api.upload-post.com/api/uploadposts/status"
 
 
@@ -63,19 +62,20 @@ class PublishAgent(BaseAgent):
             platforms.append("tiktok")
         if platform_cfg.get("instagram", {}).get("enabled"):
             platforms.append("instagram")
-        # X is always included if we have Upload-Post
-        platforms.append("x")
+        if platform_cfg.get("x", {}).get("enabled"):
+            platforms.append("x")
+
+        if not platforms:
+            raise RuntimeError("No platforms enabled in config")
 
         tz_name = self.config.get("schedule", {}).get("timezone", "America/Los_Angeles")
         shorts_weekday = self.config.get("schedule", {}).get("shorts_per_day_weekday", 1)
         shorts_weekend = self.config.get("schedule", {}).get("shorts_per_day_weekend", 2)
 
-        headers = {"Authorization": f"Apikey {api_key}"}
-
         results = []
 
         # === Publish shorts ===
-        self.logger.info(f"Publishing {len(clips)} shorts to {platforms}...")
+        self.logger.info("Publishing %d shorts to %s..." % (len(clips), platforms))
 
         # Build schedule if metadata didn't provide one
         if not schedule:
@@ -88,87 +88,122 @@ class PublishAgent(BaseAgent):
             if cid not in clip_schedules:
                 clip_schedules[cid] = entry
 
-        for clip in clips:
+        for i, clip in enumerate(clips):
             clip_id = clip.get("id", "")
             if clip.get("status") == "rejected":
-                self.logger.info(f"  Skipping rejected clip {clip_id}")
+                self.logger.info("  Skipping rejected clip %s" % clip_id)
                 continue
 
-            short_path = self.episode_dir / "shorts" / f"{clip_id}.mp4"
+            short_path = self.episode_dir / "shorts" / ("%s.mp4" % clip_id)
             if not short_path.exists():
-                self.logger.warning(f"  Short not found: {clip_id}")
+                self.logger.warning("  Short not found: %s" % clip_id)
                 continue
 
-            # Get per-platform metadata
-            cmeta = clip_metadata.get(clip_id, {})
-            title = clip.get("title", f"Clip {clip_id}")
+            # Get per-platform metadata — prefer inline clips.json metadata,
+            # fall back to metadata.json lookup
+            cmeta = clip.get("metadata", {}) or clip_metadata.get(clip_id, {})
+            title = clip.get("title", "Clip %s" % clip_id)
 
-            # Build platform-specific fields
-            data = {
-                "user": user,
-                "title": title,
-                "async_upload": "true",
-            }
+            # Build curl command with repeated platform[] fields
+            cmd = [
+                "curl", "-s", "--max-time", "600",
+                "-H", "Authorization: Apikey %s" % api_key,
+                "-F", "video=@%s" % str(short_path),
+                "-F", "user=%s" % user,
+                "-F", "title=%s" % title,
+                "-F", "async_upload=true",
+            ]
 
-            # Add platforms
-            for i, p in enumerate(platforms):
-                data[f"platform[{i}]"] = p
+            # Add platforms (repeated platform[] fields)
+            for p in platforms:
+                cmd.extend(["-F", "platform[]=%s" % p])
 
             # Platform-specific captions
             yt = cmeta.get("youtube", {})
             tt = cmeta.get("tiktok", {})
             ig = cmeta.get("instagram", {})
+            x_meta = cmeta.get("x", {})
+            li = cmeta.get("linkedin", {})
+            fb = cmeta.get("facebook", {})
+            th = cmeta.get("threads", {})
+            pin = cmeta.get("pinterest", {})
+            bs = cmeta.get("bluesky", {})
 
             if yt:
-                data["youtube_title"] = yt.get("title", title)
-                data["youtube_description"] = yt.get("description", "")
+                cmd.extend(["-F", "youtube_title=%s" % yt.get("title", title)])
+                cmd.extend(["-F", "youtube_description=%s" % yt.get("description", "")])
             if tt:
                 caption = tt.get("caption", title)
                 hashtags = " ".join(tt.get("hashtags", []))
-                data["tiktok_title"] = f"{caption} {hashtags}".strip()
+                cmd.extend(["-F", "tiktok_title=%s" % ("%s %s" % (caption, hashtags)).strip()])
             if ig:
                 caption = ig.get("caption", title)
                 hashtags = " ".join(ig.get("hashtags", []))
-                data["instagram_caption"] = f"{caption}\n\n{hashtags}".strip()
+                cmd.extend(["-F", "instagram_title=%s" % ("%s\n\n%s" % (caption, hashtags)).strip()])
+            if x_meta:
+                cmd.extend(["-F", "x_title=%s" % x_meta.get("text", title)])
+            if li:
+                cmd.extend(["-F", "linkedin_title=%s" % li.get("title", title)])
+                cmd.extend(["-F", "linkedin_description=%s" % li.get("description", "")])
+            if fb:
+                cmd.extend(["-F", "facebook_title=%s" % fb.get("title", title)])
+            if th:
+                cmd.extend(["-F", "threads_title=%s" % th.get("text", title)])
+            if pin:
+                cmd.extend(["-F", "pinterest_title=%s" % pin.get("title", title)])
+                cmd.extend(["-F", "pinterest_description=%s" % pin.get("description", "")])
+            if bs:
+                cmd.extend(["-F", "bluesky_title=%s" % bs.get("text", title)])
 
             # Scheduling
             sched = clip_schedules.get(clip_id)
             if sched:
                 scheduled_dt = self._schedule_to_datetime(sched, tz_name)
-                data["scheduled_date"] = scheduled_dt.isoformat()
-                data["timezone"] = tz_name
+                cmd.extend(["-F", "scheduled_date=%s" % scheduled_dt.isoformat()])
+                cmd.extend(["-F", "timezone=%s" % tz_name])
 
-            # Upload the video file
-            with open(short_path, "rb") as vf:
-                files = {"video": (f"{clip_id}.mp4", vf, "video/mp4")}
-                self.logger.info(f"  Uploading {clip_id} ({short_path.stat().st_size / 1e6:.1f} MB)...")
-                response = httpx.post(
-                    UPLOAD_POST_URL,
-                    headers=headers,
-                    data=data,
-                    files=files,
-                    timeout=300.0,
-                )
+            cmd.extend(["-X", "POST", UPLOAD_POST_URL])
 
-            if response.status_code in (200, 202):
-                resp_data = response.json()
+            size_mb = short_path.stat().st_size / 1e6
+            self.logger.info("  Uploading %s (%.1f MB)..." % (clip_id, size_mb))
+            self.report_progress(i + 1, len(clips), "Uploading %s" % clip_id)
+
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if proc.returncode != 0:
+                    results.append({
+                        "clip_id": clip_id,
+                        "status": "failed",
+                        "error": "curl error: %s" % proc.stderr[:500],
+                    })
+                    self.logger.error("  %s curl failed: %s" % (clip_id, proc.stderr[:200]))
+                    continue
+
+                resp_data = json.loads(proc.stdout)
                 request_id = resp_data.get("request_id", resp_data.get("job_id", ""))
                 results.append({
                     "clip_id": clip_id,
                     "status": "submitted",
                     "platforms": platforms,
                     "request_id": request_id,
-                    "scheduled": data.get("scheduled_date"),
+                    "scheduled": sched is not None,
                 })
-                self.logger.info(f"  {clip_id} submitted (id: {request_id})")
-            else:
+                self.logger.info("  %s submitted (id: %s)" % (clip_id, request_id))
+
+            except subprocess.TimeoutExpired:
                 results.append({
                     "clip_id": clip_id,
                     "status": "failed",
-                    "error": response.text,
-                    "status_code": response.status_code,
+                    "error": "Upload timed out (600s)",
                 })
-                self.logger.error(f"  {clip_id} failed: {response.status_code} {response.text}")
+                self.logger.error("  %s upload timed out" % clip_id)
+            except (json.JSONDecodeError, Exception) as e:
+                results.append({
+                    "clip_id": clip_id,
+                    "status": "failed",
+                    "error": str(e),
+                })
+                self.logger.error("  %s failed: %s" % (clip_id, e))
 
         # === Publish longform to YouTube ===
         longform_path = self.episode_dir / "longform.mp4"
@@ -179,44 +214,47 @@ class PublishAgent(BaseAgent):
             lf_desc = longform_meta.get("description", "")
             lf_tags = longform_meta.get("tags", [])
 
-            data = {
-                "user": user,
-                "platform[0]": "youtube",
-                "title": lf_title,
-                "description": lf_desc,
-                "youtube_title": lf_title,
-                "youtube_description": lf_desc,
-                "async_upload": "true",
-            }
+            cmd = [
+                "curl", "-s", "--max-time", "1200",
+                "-H", "Authorization: Apikey %s" % api_key,
+                "-F", "video=@%s" % str(longform_path),
+                "-F", "user=%s" % user,
+                "-F", "title=%s" % lf_title,
+                "-F", "platform[]=youtube",
+                "-F", "async_upload=true",
+                "-F", "youtube_title=%s" % lf_title,
+                "-F", "youtube_description=%s" % lf_desc,
+            ]
             if lf_tags:
-                data["tags"] = ",".join(lf_tags)
+                cmd.extend(["-F", "tags=%s" % ",".join(lf_tags)])
 
-            with open(longform_path, "rb") as vf:
-                files = {"video": ("longform.mp4", vf, "video/mp4")}
-                self.logger.info(f"  Longform: {longform_path.stat().st_size / 1e6:.0f} MB")
-                response = httpx.post(
-                    UPLOAD_POST_URL,
-                    headers=headers,
-                    data=data,
-                    files=files,
-                    timeout=600.0,
-                )
+            cmd.extend(["-X", "POST", UPLOAD_POST_URL])
 
-            if response.status_code in (200, 202):
-                resp_data = response.json()
-                longform_result = {
-                    "status": "submitted",
-                    "platform": "youtube",
-                    "request_id": resp_data.get("request_id", resp_data.get("job_id", "")),
-                }
-                self.logger.info(f"  Longform submitted")
-            else:
-                longform_result = {
-                    "status": "failed",
-                    "error": response.text,
-                    "status_code": response.status_code,
-                }
-                self.logger.error(f"  Longform failed: {response.status_code}")
+            size_mb = longform_path.stat().st_size / 1e6
+            self.logger.info("  Longform: %.0f MB" % size_mb)
+
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+                if proc.returncode != 0:
+                    longform_result = {
+                        "status": "failed",
+                        "error": "curl error: %s" % proc.stderr[:500],
+                    }
+                    self.logger.error("  Longform curl failed")
+                else:
+                    resp_data = json.loads(proc.stdout)
+                    longform_result = {
+                        "status": "submitted",
+                        "platform": "youtube",
+                        "request_id": resp_data.get("request_id", resp_data.get("job_id", "")),
+                    }
+                    self.logger.info("  Longform submitted")
+            except subprocess.TimeoutExpired:
+                longform_result = {"status": "failed", "error": "Upload timed out (1200s)"}
+                self.logger.error("  Longform upload timed out")
+            except Exception as e:
+                longform_result = {"status": "failed", "error": str(e)}
+                self.logger.error("  Longform failed: %s" % e)
 
         submitted = sum(1 for r in results if r["status"] == "submitted")
         failed = sum(1 for r in results if r["status"] == "failed")
@@ -233,7 +271,7 @@ class PublishAgent(BaseAgent):
         """Generate a simple schedule: assign clips to upcoming days."""
         schedule = []
         now = datetime.now(timezone.utc)
-        day_offset = 0
+        day_offset = 1  # Start scheduling from tomorrow
         clip_idx = 0
 
         while clip_idx < len(clips):

@@ -1,110 +1,92 @@
-# Cascade — Podcast Automation Pipeline
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
-Cascade is a 13-agent pipeline that processes podcast recordings from SD card to publish-ready shorts + longform video. It ingests Canon MP4 clips, stitches them, analyzes audio channels, segments speakers, transcribes via Deepgram, mines clips via Claude, renders longform (16:9) and shorts (9:16 with subtitles), generates platform metadata, runs QA validation, generates a podcast RSS feed, publishes to platforms, and backs up to external storage.
+Cascade is a 14-agent pipeline that processes podcast recordings from SD card to publish-ready shorts + longform video. It ingests Canon MP4 clips, stitches them, analyzes audio channels, segments speakers, transcribes via Deepgram, mines clips via Claude, renders longform (16:9) and shorts (9:16 with subtitles), generates platform metadata, generates caricature thumbnails via OpenAI, runs QA validation, generates a podcast RSS feed, publishes to platforms, and backs up to external storage.
 
-## Architecture
-- **Config:** `config/config.toml` — all paths, thresholds, API settings
-- **Agents:** `agents/` — 13 sequential agents, each producing JSON + media artifacts
-- **Lib:** `lib/` — shared utilities (paths, ffprobe, clips, SRT formatting)
-- **Server:** `server/` — FastAPI app on port 8420 with episode/clip/pipeline routes
-- **Frontend:** `frontend/` — SPA for clip review and approval
-- **Working storage:** Configured via `[paths]` in `config/config.toml`
+## Commands
 
-## Pipeline Order
-1. `ingest` — Copy MP4s from SD card to SSD, validate with ffprobe
-2. `stitch` — Concatenate clips via ffmpeg stream-copy
-3. `audio_analysis` — Detect true stereo vs identical channels
-4. `speaker_cut` — Segment into L/R/BOTH based on per-channel RMS energy
-5. `transcribe` — Deepgram Nova-3 with diarization + SRT generation
-6. `clip_miner` — Claude identifies top 10 clips from transcript
-7. `longform_render` — Render speaker-cropped 16:9 longform
-8. `shorts_render` — Render 9:16 shorts with burned subtitles
-9. `metadata_gen` — Claude generates per-platform metadata + schedule
-10. `qa` — Validate all outputs
-11. `podcast_feed` — Extract audio, generate RSS feed, upload to Cloudflare R2
-12. `publish` — Distribute to YouTube, TikTok, Instagram via Upload-Post
-13. `backup` — rsync episode to external HDD
-
-## How to Run
-
-### Prerequisites
+### Setup & Server
 ```bash
-# Ensure .env has API keys
-cat .env  # Check ANTHROPIC_API_KEY and DEEPGRAM_API_KEY are set
-
-# Ensure output directory exists (configured in config/config.toml)
-ls "$(grep output_dir config/config.toml)"
-
-# Ensure ffmpeg is installed
-ffmpeg -version
+./start.sh                    # Creates .venv (Python 3.12 via uv), installs deps, starts uvicorn on :8420
 ```
 
-### Full Pipeline (CLI)
+### Pipeline (CLI)
 ```bash
-python -m agents --source-path "/path/to/media/"
+.venv/bin/python -m agents --source-path "/path/to/media/"
+.venv/bin/python -m agents --source-path "/path/to/media/" --episode-id ep_2026-02-13_test
+.venv/bin/python -m agents --source-path "/path/to/media/" --agents ingest stitch audio_analysis
 ```
 
-### With specific episode ID
+### Tests
 ```bash
-python -m agents --source-path "/path/to/media/" --episode-id ep_2026-02-13_test
+.venv/bin/pytest              # All Python tests
+.venv/bin/pytest -v           # Verbose
+.venv/bin/pytest tests/test_agent_ingest.py  # Single test file
+cd frontend && npm test       # Frontend Jest tests (jsdom)
 ```
 
-### Run specific agents only
+### API
 ```bash
-python -m agents --source-path "/path/to/media/" --agents ingest stitch audio_analysis
-```
-
-### Via API
-```bash
-# Start server
-./start.sh
-
-# Trigger pipeline
 curl -X POST http://localhost:8420/api/episodes/ep_001/run-pipeline \
   -H "Content-Type: application/json" \
   -d '{"source_path": "/path/to/media/"}'
-
-# Check status
 curl http://localhost:8420/api/episodes/ep_001/pipeline-status
-
-# Auto-approve clips
 curl -X POST http://localhost:8420/api/episodes/ep_001/auto-approve
 ```
 
-### Backup
-```bash
-rsync -av --progress "<output_dir>/episodes/<episode_id>/" "<backup_dir>/<episode_id>/"
-```
+## Architecture
 
-## Key Paths
-| Path | Purpose |
-|------|---------|
-| `config/config.toml` | All configuration (copy from `config.example.toml`) |
-| `.env` | API keys (copy from `.env.example`, gitignored) |
-| `[paths].output_dir` | Episode output (configured in config) |
-| `[paths].work_dir` | Temp processing files (configured in config) |
+### Agent System (`agents/`)
+- **`base.py`** — `BaseAgent` ABC: agents implement `execute() -> dict`. The `run()` wrapper handles timing, logging, writing `<agent_name>.json`, and `progress.json` for polling.
+- **`pipeline.py`** — DAG-based parallel orchestrator using `ThreadPoolExecutor(max_workers=3)`. `AGENT_DEPS` defines the dependency graph (e.g., `longform_render` depends on both `speaker_cut` and `transcribe`). Agents run concurrently when deps are satisfied.
+- **`__init__.py`** — `AGENT_REGISTRY` (name → class) and `PIPELINE_ORDER` (ordered list of 13 names).
+- **`__main__.py`** — CLI entry point for `python -m agents`.
 
-## Episode Directory Structure
-```
-episodes/<episode_id>/
-├── episode.json          # Master state
-├── ingest.json           # Ingest results
-├── stitch.json           # Stitch results
-├── source_merged.mp4     # Stitched source
-├── audio_analysis.json   # Channel analysis
-├── segments.json         # Speaker segments
-├── transcript.json       # Raw Deepgram response
-├── diarized_transcript.json  # Speaker-labeled utterances
-├── clips.json            # Mined clips
-├── longform.mp4          # Final longform render
-├── source/               # Copied source files
-├── shorts/               # Rendered 9:16 clips
-├── subtitles/            # SRT files
-├── metadata/             # Platform metadata
-├── qa/                   # QA results
-└── work/                 # Temp files (WAVs, concat lists, RMS data)
-```
+### Pipeline Behaviors
+- After `stitch`, the pipeline **pauses** with `status: "awaiting_crop_setup"` if crop config isn't set — the user must configure speaker crop points via the API before resuming.
+- After `clip_miner`, the episode directory is **renamed** to include the guest name slug.
+- `NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup"}` — failures here don't abort the pipeline.
+- `episode.json` is the master state file, updated continuously.
+
+### Pipeline Order
+1. `ingest` → 2. `stitch` → 3. `audio_analysis` → 4. `speaker_cut` → 5. `transcribe` → 6. `clip_miner` → 7. `longform_render` → 8. `shorts_render` → 9. `metadata_gen` → 10. `thumbnail_gen` → 11. `qa` → 12. `podcast_feed` → 13. `publish` → 14. `backup`
+
+### Shared Libraries (`lib/`)
+| Module | Purpose |
+|--------|---------|
+| `paths.py` | `resolve_path()` — checks if external volume is mounted, falls back to local; `get_episodes_dir()` checks `CASCADE_OUTPUT_DIR` env var |
+| `ffprobe.py` | `probe()`, `get_duration()`, `get_dimensions()` — wrappers over `ffprobe -print_format json` |
+| `clips.py` | `normalize_clip()` — ensures both `start`/`end` and `start_seconds`/`end_seconds` exist |
+| `srt.py` | `fmt_timecode()`, `escape_srt_path()` — SRT formatting and ffmpeg subtitle filter escaping |
+| `encoding.py` | `has_videotoolbox()` — detects macOS GPU encoder; `get_video_encoder_args()` — returns VideoToolbox or libx264 args; `get_lut_filter()` — returns ffmpeg lut3d filter string from config |
+
+### Server (`server/`)
+- FastAPI app on port 8420 (`server/app.py`)
+- Routes in `server/routes/`: `episodes.py`, `clips.py`, `pipeline.py`, `chat.py`, `publish.py`, `analytics.py`, `trim.py`
+- `chat.py` is an AI-powered multi-turn chat route: maintains `chat_history.json`, loads full episode context into a system prompt, parses `action` JSON blocks from Claude's response to execute operations (approve/reject clips, update metadata, re-render shorts, etc.)
+- Serves `frontend/` as static files with SPA catch-all
+
+### Frontend (`frontend/`)
+- Vanilla JS SPA — no framework, no build step
+- Served directly as static files by FastAPI
+
+### MCP Server (`mcp_server.py`)
+- Exposes the full pipeline as AI-callable tools
+- Configured in `cascade.mcp.json`
+
+## Configuration
+- **`config/config.toml`** — All paths, thresholds, API settings (copy from `config.example.toml`)
+- **`.env`** — API keys: `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` (copy from `.env.example`, gitignored)
+- Dependencies in `requirements.txt`, installed via `uv pip install`
+
+## Key Constraints
+- Python 3.11+ required; `.venv` is 3.11+, `start.sh` uses 3.12 via `uv`
+- Uses `tomllib` (stdlib); `tomli` no longer needed
+- macOS resource fork files (`._*.MP4`) appear on SD cards — must filter in globs
+- Deepgram SDK v5 has a different API from v3 — use httpx REST API directly instead
+- After modifying Python files, clear `__pycache__` or restart uvicorn (stale bytecode with `--reload`)
 
 ## Error Handling
 - If a pipeline fails mid-run, fix the issue and re-run with `--agents <remaining_agents>`
@@ -115,8 +97,3 @@ episodes/<episode_id>/
 - Deepgram transcription: ~$0.50
 - Claude clip mining: ~$0.10-0.30
 - Claude metadata: ~$0.10-0.20
-
-## Roadmap
-- **Publishing system**: Full Upload-Post integration with schedule management and retry logic
-- **Analytics dashboard**: Track clip performance across platforms, adjust scoring weights
-- **Shared utilities**: `lib/` package provides common ffprobe, path resolution, clip normalization, and SRT formatting

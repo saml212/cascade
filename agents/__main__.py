@@ -19,8 +19,20 @@ def main():
     )
     parser.add_argument(
         "--source-path",
+        nargs="+",
         required=True,
-        help="Path to source media (SD card directory or single file)",
+        help="Path(s) to source media (directory, single file, or multiple files)",
+    )
+    parser.add_argument(
+        "--audio-path",
+        default=None,
+        help="Path to external audio recorder directory (e.g., Zoom H6E SD card folder)",
+    )
+    parser.add_argument(
+        "--speaker-count",
+        type=int,
+        default=None,
+        help="Number of speakers (for multi-track audio mapping)",
     )
     parser.add_argument(
         "--episode-id",
@@ -48,13 +60,24 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    source = Path(args.source_path)
-    if not source.exists():
-        print(f"Error: source path does not exist: {source}")
+    # Validate all source paths
+    source_paths = args.source_path
+    for sp in source_paths:
+        if not Path(sp).exists():
+            print(f"Error: source path does not exist: {sp}")
+            sys.exit(1)
+
+    if args.audio_path and not Path(args.audio_path).exists():
+        print(f"Error: audio path does not exist: {args.audio_path}")
         sys.exit(1)
 
+    # Single path: pass as string (backward compat); multiple: pass as list
+    source = source_paths[0] if len(source_paths) == 1 else source_paths
+
     result = run_pipeline(
-        source_path=str(source),
+        source_path=source,
+        audio_path=args.audio_path,
+        speaker_count=args.speaker_count,
         episode_id=args.episode_id,
         agents=args.agents,
     )

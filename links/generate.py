@@ -13,10 +13,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib  # Python < 3.11
+import tomllib
 
 
 # SVG icons for each supported platform (brand colors baked in)

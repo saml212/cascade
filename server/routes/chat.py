@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from lib.encoding import get_video_encoder_args
 from lib.paths import get_episodes_dir
-from lib.srt import escape_srt_path
+from lib.srt import escape_srt_path, fmt_timecode
 
 logger = logging.getLogger(__name__)
 
@@ -152,8 +152,8 @@ You have access to the following episode data:
 ## Clips
 {clips_json}
 
-## Diarized transcript (summary)
-{transcript_summary}
+## Full transcript (timestamped)
+{transcript_text}
 
 ## Metadata
 {metadata_json}
@@ -220,6 +220,35 @@ Available actions:
    {{"action": "delete_clip", "clip_id": "clip_03"}}
    ```
 
+10. **update_longform_metadata** — Update the longform episode title, description, and/or tags.
+   ```action
+   {{"action": "update_longform_metadata", "title": "...", "description": "...", "tags": ["tag1", "tag2"]}}
+   ```
+
+11. **update_episode_info** — Update episode info fields (guest_name, guest_title, episode_name, episode_description).
+   ```action
+   {{"action": "update_episode_info", "guest_name": "...", "guest_title": "...", "episode_name": "...", "episode_description": "..."}}
+   ```
+
+12. **edit_longform** — Cut or trim sections from the longform video. Use the transcript to find precise timestamps.
+   To cut out a section (e.g., a break, dead time, off-topic tangent):
+   ```action
+   {{"action": "edit_longform", "type": "cut", "start_seconds": 1234.5, "end_seconds": 1289.3, "reason": "Parking payment break"}}
+   ```
+   To set where the longform should start (e.g., "start when the guest introduces themselves"):
+   ```action
+   {{"action": "edit_longform", "type": "trim_start", "seconds": 45.2, "reason": "Start at guest introduction"}}
+   ```
+   To set where the longform should end:
+   ```action
+   {{"action": "edit_longform", "type": "trim_end", "seconds": 3600.0, "reason": "End after final question"}}
+   ```
+
+13. **rerender_longform** — Re-render the longform video (e.g., after making edits).
+   ```action
+   {{"action": "rerender_longform"}}
+   ```
+
 ## Platform metadata schema
 Each clip can have per-platform metadata. The supported platforms and their fields:
 - **youtube**: title, description
@@ -234,14 +263,63 @@ Each clip can have per-platform metadata. The supported platforms and their fiel
 
 ## Guidelines
 
+- You have the FULL transcript above with timestamps. Use it to find clips with precise start/end times.
+- When suggesting new clips, cite the exact timestamps from the transcript.
+- Good clips have: a strong hook in the first 5 seconds, 30-90 second duration, a complete micro-story or insight, and emotional engagement.
 - Respond conversationally and confirm what you changed.
 - When the user asks you to edit clips, include the appropriate action blocks.
 - You can include multiple action blocks in a single response.
-- When suggesting new clips, reference the transcript to find compelling moments.
 - Always explain your reasoning when making changes.
 - If the user asks a question, answer it based on the episode data without taking actions.
 - When approving or rejecting multiple clips, use the bulk actions (approve_clips/reject_clips) instead of individual actions.
+- For longform editing: search the transcript carefully for the exact moments the user describes. Find where they mention stopping (e.g. "gotta pay for parking") and where they resume (next question or topic). Use precise timestamps from the transcript for cuts.
+- Multiple edits can be stacked — each cut/trim is stored and applied in order during re-render.
+- After making longform edits, suggest running rerender_longform to apply them.
 """
+
+
+_MAX_TRANSCRIPT_CHARS = 320_000  # ~80K tokens at ~4 chars/token
+
+
+def _format_transcript_text(diarized: Optional[dict]) -> str:
+    """Format the full diarized transcript as compact timestamped text lines.
+
+    Format: [0.0s - 3.5s] Speaker L: Welcome...
+    If the transcript exceeds ~80K tokens, truncate from the middle.
+    """
+    if not diarized:
+        return "No transcript available."
+
+    utterances = diarized.get("utterances", [])
+    if not utterances:
+        return "No transcript available."
+
+    lines = []
+    for utt in utterances:
+        start = utt.get("start", 0)
+        end = utt.get("end", 0)
+        channel = utt.get("channel", utt.get("speaker", "?"))
+        # Map channel index to L/R if numeric
+        if isinstance(channel, int):
+            channel = "L" if channel == 0 else "R"
+        text = utt.get("text", "").strip()
+        if text:
+            lines.append(f"[{start:.1f}s - {end:.1f}s] Speaker {channel}: {text}")
+
+    full_text = "\n".join(lines)
+
+    if len(full_text) <= _MAX_TRANSCRIPT_CHARS:
+        return full_text
+
+    # Truncate from the middle, keeping first and last halves
+    half = _MAX_TRANSCRIPT_CHARS // 2
+    first_half = full_text[:half]
+    second_half = full_text[-half:]
+    # Trim to line boundaries
+    first_half = first_half[:first_half.rfind("\n")]
+    second_half = second_half[second_half.find("\n") + 1:]
+    omitted = len(lines) - first_half.count("\n") - second_half.count("\n") - 2
+    return f"{first_half}\n\n... [{omitted} utterances omitted for length] ...\n\n{second_half}"
 
 
 def _build_system_prompt(ctx: dict) -> str:
@@ -257,18 +335,8 @@ def _build_system_prompt(ctx: dict) -> str:
     else:
         clips_json = "No clips data available."
 
-    # Transcript summary — include first/last utterances and total count
-    transcript = ctx.get("diarized_transcript")
-    if transcript:
-        utterances = transcript.get("utterances", [])
-        total = len(utterances)
-        if total > 20:
-            preview = utterances[:10] + [{"text": f"... ({total - 20} more utterances) ..."}] + utterances[-10:]
-        else:
-            preview = utterances
-        transcript_summary = json.dumps(preview, indent=2)
-    else:
-        transcript_summary = "No transcript available."
+    # Full transcript as compact text lines
+    transcript_text = _format_transcript_text(ctx.get("diarized_transcript"))
 
     # Metadata
     metadata_json = json.dumps(ctx.get("metadata") or {}, indent=2)
@@ -284,7 +352,7 @@ def _build_system_prompt(ctx: dict) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         episode_json=episode_json,
         clips_json=clips_json,
-        transcript_summary=transcript_summary,
+        transcript_text=transcript_text,
         metadata_json=metadata_json,
         segments_summary=segments_summary,
     )
@@ -316,6 +384,14 @@ def _execute_action(action: dict, ep_dir: Path) -> dict:
         return _action_update_platform_metadata(action, ep_dir)
     elif action_type == "delete_clip":
         return _action_delete_clip(action, ep_dir)
+    elif action_type == "update_longform_metadata":
+        return _action_update_longform_metadata(action, ep_dir)
+    elif action_type == "update_episode_info":
+        return _action_update_episode_info(action, ep_dir)
+    elif action_type == "edit_longform":
+        return _action_edit_longform(action, ep_dir)
+    elif action_type == "rerender_longform":
+        return _action_rerender_longform(action, ep_dir)
     else:
         return {"action": action_type, "status": "error", "detail": f"Unknown action: {action_type}"}
 
@@ -395,7 +471,68 @@ def _action_add_clip(action: dict, ep_dir: Path) -> dict:
 
     clips.append(new_clip)
     _save_clips(clips, clips_file)
-    return {"action": "add_clip", "status": "ok", "clip_id": clip_id}
+
+    # Auto-generate subtitles and render the short
+    render_result = _auto_render_new_clip(clip_id, start, end, ep_dir)
+
+    return {"action": "add_clip", "status": "ok", "clip_id": clip_id, "render": render_result}
+
+
+def _generate_clip_srt(ep_dir: Path, clip_id: str, start: float, end: float):
+    """Generate SRT subtitles for a clip from diarized transcript word timings."""
+    diarized = _load_json_safe(ep_dir / "diarized_transcript.json")
+    if not diarized:
+        return False
+
+    words = []
+    for utt in diarized.get("utterances", []):
+        for w in utt.get("words", []):
+            w_start = w.get("start", 0)
+            w_end = w.get("end", 0)
+            if w_start >= start and w_end <= end:
+                words.append(w)
+
+    if not words:
+        return False
+
+    # Group into ~4-word subtitle blocks, offset times to clip-relative
+    srt_lines = []
+    idx = 1
+    i = 0
+    while i < len(words):
+        chunk = words[i : i + 4]
+        t_start = chunk[0]["start"] - start
+        t_end = chunk[-1]["end"] - start
+        text = " ".join(w.get("word", "") for w in chunk)
+
+        srt_lines.append(
+            f"{idx}\n"
+            f"{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n"
+            f"{text}\n"
+        )
+        idx += 1
+        i += 4
+
+    srt_dir = ep_dir / "subtitles"
+    srt_dir.mkdir(exist_ok=True)
+    srt_path = srt_dir / f"{clip_id}.srt"
+    with open(srt_path, "w") as f:
+        f.write("\n".join(srt_lines))
+
+    return True
+
+
+def _auto_render_new_clip(clip_id: str, start: float, end: float, ep_dir: Path) -> dict:
+    """Generate subtitles and render a newly added clip."""
+    try:
+        _generate_clip_srt(ep_dir, clip_id, start, end)
+    except Exception as e:
+        logger.warning("SRT generation failed for %s: %s", clip_id, e)
+
+    try:
+        return _action_rerender_short({"clip_id": clip_id}, ep_dir)
+    except Exception as e:
+        return {"status": "error", "detail": f"Render failed: {e}"}
 
 
 def _action_reject_clip(action: dict, ep_dir: Path) -> dict:
@@ -611,6 +748,158 @@ def _action_delete_clip(action: dict, ep_dir: Path) -> dict:
     return {"action": "delete_clip", "status": "ok", "clip_id": clip_id}
 
 
+def _action_update_longform_metadata(action: dict, ep_dir: Path) -> dict:
+    """Update longform title/description/tags in episode.json."""
+    episode_file = ep_dir / "episode.json"
+    episode_data = _load_json_safe(episode_file) or {}
+
+    updated = []
+    for field in ("title", "description", "tags"):
+        if field in action:
+            episode_data[field] = action[field]
+            updated.append(field)
+
+    if not updated:
+        return {"action": "update_longform_metadata", "status": "error", "detail": "No fields to update"}
+
+    with open(episode_file, "w") as f:
+        json.dump(episode_data, f, indent=2)
+
+    return {"action": "update_longform_metadata", "status": "ok", "updated_fields": updated}
+
+
+def _action_update_episode_info(action: dict, ep_dir: Path) -> dict:
+    """Update episode info fields (guest_name, guest_title, etc.) in episode.json."""
+    episode_file = ep_dir / "episode.json"
+    episode_data = _load_json_safe(episode_file) or {}
+
+    updated = []
+    for field in ("guest_name", "guest_title", "episode_name", "episode_description"):
+        if field in action:
+            episode_data[field] = action[field]
+            updated.append(field)
+
+    if not updated:
+        return {"action": "update_episode_info", "status": "error", "detail": "No fields to update"}
+
+    with open(episode_file, "w") as f:
+        json.dump(episode_data, f, indent=2)
+
+    return {"action": "update_episode_info", "status": "ok", "updated_fields": updated}
+
+
+def _action_edit_longform(action: dict, ep_dir: Path) -> dict:
+    """Add a cut or trim edit to the longform video."""
+    edit_type = action.get("type")
+    if edit_type not in ("cut", "trim_start", "trim_end"):
+        return {"action": "edit_longform", "status": "error", "detail": f"Unknown edit type: {edit_type}"}
+
+    episode_file = ep_dir / "episode.json"
+    episode_data = _load_json_safe(episode_file) or {}
+    edits = episode_data.get("longform_edits", [])
+
+    if edit_type == "cut":
+        start = action.get("start_seconds")
+        end = action.get("end_seconds")
+        if start is None or end is None:
+            return {"action": "edit_longform", "status": "error", "detail": "Missing start_seconds or end_seconds"}
+        if end <= start:
+            return {"action": "edit_longform", "status": "error", "detail": "end_seconds must be > start_seconds"}
+        edit = {"type": "cut", "start_seconds": start, "end_seconds": end,
+                "reason": action.get("reason", ""), "duration_removed": round(end - start, 2)}
+    elif edit_type == "trim_start":
+        seconds = action.get("seconds")
+        if seconds is None:
+            return {"action": "edit_longform", "status": "error", "detail": "Missing seconds"}
+        edit = {"type": "trim_start", "seconds": seconds, "reason": action.get("reason", "")}
+    elif edit_type == "trim_end":
+        seconds = action.get("seconds")
+        if seconds is None:
+            return {"action": "edit_longform", "status": "error", "detail": "Missing seconds"}
+        edit = {"type": "trim_end", "seconds": seconds, "reason": action.get("reason", "")}
+
+    edits.append(edit)
+    episode_data["longform_edits"] = edits
+
+    with open(episode_file, "w") as f:
+        json.dump(episode_data, f, indent=2)
+
+    return {"action": "edit_longform", "status": "ok", "edit": edit, "total_edits": len(edits)}
+
+
+def _action_rerender_longform(action: dict, ep_dir: Path) -> dict:
+    """Re-render the longform video by running the longform_render agent."""
+    # Clear previously rendered segment files to force re-render
+    work_dir = ep_dir / "work"
+    if work_dir.exists():
+        for f in work_dir.glob("longform_seg_*.mp4"):
+            f.unlink()
+
+    try:
+        from agents.pipeline import load_config
+        from agents import AGENT_REGISTRY
+        config = load_config()
+        agent_cls = AGENT_REGISTRY["longform_render"]
+        agent = agent_cls(ep_dir, config)
+        result = agent.run()
+        return {"action": "rerender_longform", "status": "ok", "result": result}
+    except Exception as e:
+        return {"action": "rerender_longform", "status": "error", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Metadata completeness checker
+# ---------------------------------------------------------------------------
+
+def _check_metadata_completeness(ep_dir: Path) -> dict:
+    """Check what metadata fields are missing for the episode and its clips.
+
+    Returns dict with 'missing_longform', 'missing_clips', and 'complete' flag.
+    """
+    episode_data = _load_json_safe(ep_dir / "episode.json") or {}
+    clips, _ = _load_clips(ep_dir)
+    metadata = _load_json_safe(ep_dir / "metadata" / "metadata.json") or {}
+    meta_clips = {c["id"]: c for c in metadata.get("clips", [])}
+
+    # Check longform fields
+    missing_longform = []
+    for field in ("title", "description", "tags", "guest_name", "episode_name"):
+        val = episode_data.get(field)
+        if not val or (isinstance(val, list) and len(val) == 0):
+            missing_longform.append(field)
+
+    # Check per-clip metadata (only non-rejected clips)
+    platforms = ["youtube", "tiktok", "instagram", "linkedin", "x", "facebook", "threads", "pinterest", "bluesky"]
+    missing_clips = {}
+    for clip in clips:
+        if clip.get("status") == "rejected":
+            continue
+        clip_id = clip.get("id", "")
+        clip_missing = []
+
+        # Check clip title
+        if not clip.get("title"):
+            clip_missing.append("title")
+
+        # Check per-platform metadata (from metadata.json or clips.json inline)
+        clip_meta = clip.get("metadata", {})
+        meta_clip = meta_clips.get(clip_id, {})
+
+        for platform in platforms:
+            pm = clip_meta.get(platform) or meta_clip.get(platform) or {}
+            if not pm:
+                clip_missing.append(f"{platform} (all fields)")
+
+        if clip_missing:
+            missing_clips[clip_id] = clip_missing
+
+    return {
+        "missing_longform": missing_longform,
+        "missing_clips": missing_clips,
+        "complete": len(missing_longform) == 0 and len(missing_clips) == 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Parse action blocks from AI response
 # ---------------------------------------------------------------------------
@@ -638,6 +927,14 @@ def _strip_action_blocks(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Chat endpoint
 # ---------------------------------------------------------------------------
+
+@router.get("/chat/history")
+async def get_chat_history(episode_id: str) -> dict:
+    """Return persisted chat history for an episode."""
+    ep_dir = _episode_dir(episode_id)
+    history = _load_chat_history(ep_dir)
+    return {"messages": history}
+
 
 @router.post("/chat")
 async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
@@ -706,3 +1003,121 @@ async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
     clean_response = _strip_action_blocks(ai_text)
 
     return {"response": clean_response, "actions_taken": actions_taken}
+
+
+# ---------------------------------------------------------------------------
+# Auto-complete metadata endpoint
+# ---------------------------------------------------------------------------
+
+class CompleteMetadataResponse(BaseModel):
+    complete: bool
+    iterations: int
+    actions_taken: List[dict]
+    summary: str
+
+
+@router.post("/complete-metadata")
+async def complete_metadata(episode_id: str) -> dict:
+    """Iteratively fill in all missing metadata using Claude.
+
+    Loops up to 5 times: check what's missing, ask Claude to fill it, execute actions.
+    """
+    logger.info("POST /api/episodes/%s/complete-metadata", episode_id)
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+
+    ep_dir = _episode_dir(episode_id)
+
+    try:
+        import anthropic
+    except ImportError:
+        raise HTTPException(status_code=500, detail="anthropic package is not installed")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    from agents.pipeline import load_config
+    config = load_config()
+    chat_model = config.get("chat", {}).get("model", "claude-sonnet-4-20250514")
+
+    all_actions = []
+    max_iterations = 5
+
+    for iteration in range(max_iterations):
+        # Check completeness
+        status = _check_metadata_completeness(ep_dir)
+        if status["complete"]:
+            return {
+                "complete": True,
+                "iterations": iteration,
+                "actions_taken": all_actions,
+                "summary": f"All metadata complete after {iteration} iteration(s).",
+            }
+
+        # Build targeted prompt
+        ctx = _load_episode_context(ep_dir)
+        system_prompt = _build_system_prompt(ctx)
+
+        missing_parts = []
+        if status["missing_longform"]:
+            missing_parts.append(f"Missing longform fields: {', '.join(status['missing_longform'])}")
+        if status["missing_clips"]:
+            # Only list first 5 clips to keep prompt manageable
+            clip_items = list(status["missing_clips"].items())[:5]
+            for clip_id, fields in clip_items:
+                missing_parts.append(f"  {clip_id}: missing {', '.join(fields)}")
+            remaining = len(status["missing_clips"]) - len(clip_items)
+            if remaining > 0:
+                missing_parts.append(f"  ... and {remaining} more clips with missing metadata")
+
+        user_prompt = (
+            "Please fill in all the missing metadata listed below. "
+            "Use action blocks for each update.\n\n"
+            "MISSING METADATA:\n" + "\n".join(missing_parts) + "\n\n"
+            "For clips missing platform metadata, use update_platform_metadata actions. "
+            "For missing longform fields, use update_longform_metadata. "
+            "For missing episode info, use update_episode_info. "
+            "Generate compelling, platform-appropriate content for each field."
+        )
+
+        try:
+            message = client.messages.create(
+                model=chat_model,
+                max_tokens=8192,
+                temperature=0.4,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception as e:
+            logger.error("Anthropic API error in complete-metadata: %s", e)
+            return {
+                "complete": False,
+                "iterations": iteration + 1,
+                "actions_taken": all_actions,
+                "summary": f"API error on iteration {iteration + 1}: {str(e)}",
+            }
+
+        ai_text = ""
+        for block in message.content:
+            if hasattr(block, "text"):
+                ai_text += block.text
+
+        # Parse and execute actions
+        actions = _parse_actions(ai_text)
+        _context_cache.pop(episode_id, None)
+
+        for action in actions:
+            result = _execute_action(action, ep_dir)
+            all_actions.append(result)
+
+        if not actions:
+            # Claude didn't produce any actions — stop looping
+            break
+
+    # Final check
+    final_status = _check_metadata_completeness(ep_dir)
+    return {
+        "complete": final_status["complete"],
+        "iterations": max_iterations,
+        "actions_taken": all_actions,
+        "summary": f"Completed {max_iterations} iterations. {'All metadata filled.' if final_status['complete'] else 'Some fields still missing.'}",
+    }

@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent
-from lib.encoding import get_video_encoder_args
+from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
 
@@ -30,14 +30,20 @@ class LongformRenderAgent(BaseAgent):
         segments_data = self.load_json("segments.json")
         diarized = self.load_json("diarized_transcript.json")
         segments = segments_data["segments"]
+
+        # Apply longform edits (cuts/trims) if present
+        episode_data = self.load_json("episode.json")
+        edits = episode_data.get("longform_edits", [])
+        if edits:
+            segments = self._apply_edits(segments, edits)
+            self.logger.info(f"Applied {len(edits)} edits, {len(segments)} segments remaining")
+
         merged_path = self.episode_dir / "source_merged.mp4"
         work_dir = self.episode_dir / "work"
         work_dir.mkdir(exist_ok=True)
         srt_dir = work_dir / "longform_srt"
         srt_dir.mkdir(exist_ok=True)
 
-        # Load crop config from episode.json
-        episode_data = self.load_json("episode.json")
         crop_config = episode_data.get("crop_config")
         if not crop_config:
             raise ValueError(
@@ -55,6 +61,9 @@ class LongformRenderAgent(BaseAgent):
 
         audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
         encoder_args = get_video_encoder_args(self.config)
+        lut_filter = get_lut_filter(self.config)
+        if lut_filter:
+            self.logger.info(f"LUT enabled: {self.config['processing'].get('lut_path')}")
 
         # Pre-generate per-segment SRT files
         self.logger.info("Generating per-segment subtitles...")
@@ -66,15 +75,28 @@ class LongformRenderAgent(BaseAgent):
         segment_files = []
         self.logger.info(f"Rendering {len(segments)} segments with speaker crops...")
 
+        # Resume support: skip segments that are already rendered (non-zero size)
+        skipped = 0
+        to_render = []
+        for i, seg in enumerate(segments):
+            seg_path = work_dir / f"longform_seg_{i:04d}.mp4"
+            if seg_path.exists() and seg_path.stat().st_size > 0:
+                segment_files.append((i, seg_path))
+                skipped += 1
+            else:
+                to_render.append((i, seg))
+        if skipped:
+            self.logger.info(f"Resuming: {skipped} segments already rendered, {len(to_render)} remaining")
+
         with ThreadPoolExecutor(max_workers=min(os.cpu_count() // 2, 6)) as executor:
             futures = {}
-            for i, seg in enumerate(segments):
+            for i, seg in to_render:
                 seg_path = work_dir / f"longform_seg_{i:04d}.mp4"
                 srt_path = srt_dir / f"seg_{i:04d}.srt"
                 future = executor.submit(
                     self._render_segment,
                     merged_path, seg_path, seg, src_w, src_h, audio_bitrate,
-                    crop_config, srt_path, encoder_args,
+                    crop_config, srt_path, encoder_args, lut_filter,
                 )
                 futures[future] = (i, seg_path)
 
@@ -148,7 +170,6 @@ class LongformRenderAgent(BaseAgent):
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", audio_bitrate,
             "-shortest",
-            "-fflags", "+shortest",
             "-use_editlist", "0",
             "-movflags", "+faststart",
             str(output_path),
@@ -179,14 +200,19 @@ class LongformRenderAgent(BaseAgent):
         crop_config: dict,
         srt_path: Path = None,
         encoder_args: list = None,
+        lut_filter: str = "",
     ):
         """Render a single segment with speaker-appropriate crop and subtitles."""
         start = segment["start"]
         duration = segment["end"] - segment["start"]
         speaker = segment["speaker"]
 
-        # Build video filter based on speaker
-        vf = self._get_crop_filter(speaker, src_w, src_h, crop_config)
+        # Build video filter: LUT (color grade) → crop → scale
+        vf_parts = []
+        if lut_filter:
+            vf_parts.append(lut_filter)
+        vf_parts.append(self._get_crop_filter(speaker, src_w, src_h, crop_config))
+        vf = ",".join(vf_parts)
 
         # Append subtitle burn-in if SRT has content
         if srt_path and srt_path.exists() and srt_path.stat().st_size > 0:
@@ -222,23 +248,30 @@ class LongformRenderAgent(BaseAgent):
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
         """Get ffmpeg crop filter for speaker type using crop_config center points.
 
-        Centers a 16:9 crop (half-width x corresponding height) on the speaker's
-        configured center point, clamped to frame bounds.
-        BOTH: passthrough at 1920x1080.
+        Centers a 16:9 crop on the speaker's configured center point, clamped to
+        frame bounds. Zoom controls how tight the crop is (higher = more zoomed in).
+        BOTH: uses zoom to crop from full frame if set, else passthrough at 1920x1080.
         """
-        if speaker not in ("L", "R"):
-            return "scale=1920:1080"
-
-        # Crop dimensions: half the source width, 16:9 aspect
-        crop_w = src_w // 2  # 960 for 1920
-        crop_h = int(crop_w * 9 / 16)  # 540 for 960
-
         if speaker == "L":
             cx = crop_config["speaker_l_center_x"]
             cy = crop_config["speaker_l_center_y"]
-        else:
+            zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
+        elif speaker == "R":
             cx = crop_config["speaker_r_center_x"]
             cy = crop_config["speaker_r_center_y"]
+            zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
+        else:
+            zoom = crop_config.get("wide_zoom", crop_config.get("zoom", 1.0))
+            if zoom <= 1.0:
+                return "scale=1920:1080"
+            # BOTH/wide: use configured center or frame center
+            cx = crop_config.get("wide_center_x", src_w // 2)
+            cy = crop_config.get("wide_center_y", src_h // 2)
+
+        # Crop dimensions: base is half the source width, divided by zoom
+        # zoom=1.0: crop_w=960 (half frame), zoom=2.0: crop_w=480 (quarter frame)
+        crop_w = max(64, int(src_w / (2 * zoom)))
+        crop_h = max(36, int(crop_w * 9 / 16))
 
         # Clamp crop origin to frame bounds
         x = max(0, min(cx - crop_w // 2, src_w - crop_w))
@@ -275,4 +308,70 @@ class LongformRenderAgent(BaseAgent):
 
         with open(srt_path, "w") as f:
             f.write("\n".join(srt_lines))
+
+    def _apply_edits(self, segments: list, edits: list) -> list:
+        """Apply longform edits (cuts/trims) to the segment list.
+
+        Edit types:
+          - cut: Remove time range [start, end] from the video
+          - trim_start: Set global start time (remove everything before)
+          - trim_end: Set global end time (remove everything after)
+        """
+        result = [dict(s) for s in segments]  # deep copy
+
+        for edit in edits:
+            edit_type = edit.get("type")
+            if edit_type == "trim_start":
+                trim_at = edit["seconds"]
+                result = [s for s in result if s["end"] > trim_at]
+                if result and result[0]["start"] < trim_at:
+                    result[0] = dict(result[0])
+                    result[0]["start"] = trim_at
+                    result[0]["duration"] = result[0]["end"] - result[0]["start"]
+
+            elif edit_type == "trim_end":
+                trim_at = edit["seconds"]
+                result = [s for s in result if s["start"] < trim_at]
+                if result and result[-1]["end"] > trim_at:
+                    result[-1] = dict(result[-1])
+                    result[-1]["end"] = trim_at
+                    result[-1]["duration"] = result[-1]["end"] - result[-1]["start"]
+
+            elif edit_type == "cut":
+                cut_start = edit["start_seconds"]
+                cut_end = edit["end_seconds"]
+                new_result = []
+                for s in result:
+                    if s["end"] <= cut_start or s["start"] >= cut_end:
+                        # Segment is entirely outside the cut — keep
+                        new_result.append(s)
+                    elif s["start"] >= cut_start and s["end"] <= cut_end:
+                        # Segment is entirely within the cut — remove
+                        continue
+                    elif s["start"] < cut_start and s["end"] > cut_end:
+                        # Cut is in the middle of this segment — split into two
+                        left = dict(s)
+                        left["end"] = cut_start
+                        left["duration"] = left["end"] - left["start"]
+                        right = dict(s)
+                        right["start"] = cut_end
+                        right["duration"] = right["end"] - right["start"]
+                        new_result.extend([left, right])
+                    elif s["start"] < cut_start:
+                        # Segment starts before cut — trim end
+                        trimmed = dict(s)
+                        trimmed["end"] = cut_start
+                        trimmed["duration"] = trimmed["end"] - trimmed["start"]
+                        new_result.append(trimmed)
+                    else:
+                        # Segment ends after cut — trim start
+                        trimmed = dict(s)
+                        trimmed["start"] = cut_end
+                        trimmed["duration"] = trimmed["end"] - trimmed["start"]
+                        new_result.append(trimmed)
+                result = new_result
+
+        # Filter out tiny segments (< 0.1s)
+        result = [s for s in result if s.get("duration", s["end"] - s["start"]) >= 0.1]
+        return result
 

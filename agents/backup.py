@@ -72,8 +72,70 @@ class BackupAgent(BaseAgent):
 
         self.logger.info("Backup complete: %s (%s)" % (dst, backup_size))
 
+        # Clean up source files from SD card after successful backup
+        cleaned = self._cleanup_sd_card()
+
         return {
             "backup_path": str(dest),
             "backup_size": backup_size,
             "episode_id": episode_id,
+            "sd_cleanup": cleaned,
+        }
+
+    def _cleanup_sd_card(self) -> dict:
+        """Delete ingested source files from the SD card.
+
+        Reads ingest.json to find the original source paths and removes
+        the MP4 files plus their corresponding LRF proxy files.
+        """
+        ingest_file = self.episode_dir / "ingest.json"
+        if not ingest_file.exists():
+            self.logger.info("No ingest.json found — skipping SD cleanup")
+            return {"skipped": True, "reason": "no ingest.json"}
+
+        import json
+        with open(ingest_file) as f:
+            ingest_data = json.load(f)
+
+        files = ingest_data.get("files", [])
+        if not files:
+            return {"skipped": True, "reason": "no files in ingest.json"}
+
+        deleted = []
+        skipped = []
+
+        for file_info in files:
+            src_path = Path(file_info.get("source_path", ""))
+            if not src_path.exists():
+                skipped.append(str(src_path))
+                continue
+
+            # Verify the file is on a removable volume (safety check)
+            if not str(src_path).startswith("/Volumes/"):
+                self.logger.warning(
+                    "Skipping non-volume source: %s" % src_path
+                )
+                skipped.append(str(src_path))
+                continue
+
+            # Delete the MP4 file
+            self.logger.info("Deleting source: %s" % src_path)
+            src_path.unlink()
+            deleted.append(str(src_path))
+
+            # Also delete corresponding LRF proxy file if it exists
+            lrf_path = src_path.with_suffix(".LRF")
+            if lrf_path.exists():
+                self.logger.info("Deleting LRF proxy: %s" % lrf_path)
+                lrf_path.unlink()
+                deleted.append(str(lrf_path))
+
+        self.logger.info(
+            "SD cleanup: deleted %d files, skipped %d" % (len(deleted), len(skipped))
+        )
+
+        return {
+            "deleted": deleted,
+            "skipped": skipped,
+            "deleted_count": len(deleted),
         }

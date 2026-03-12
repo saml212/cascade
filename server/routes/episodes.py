@@ -23,6 +23,8 @@ EPISODES_DIR = get_episodes_dir()
 
 class NewEpisodeRequest(BaseModel):
     source_path: Optional[str] = None
+    audio_path: Optional[str] = None
+    speaker_count: Optional[int] = None
 
 
 def read_episode(episode_id: str) -> dict:
@@ -90,6 +92,8 @@ async def create_episode(req: NewEpisodeRequest) -> dict:
         "title": "",
         "status": "processing",
         "source_path": req.source_path,
+        "audio_path": req.audio_path,
+        "speaker_count": req.speaker_count,
         "duration_seconds": None,
         "created_at": now.isoformat(),
         "clips": [],
@@ -142,6 +146,9 @@ class EpisodeUpdateRequest(BaseModel):
     guest_title: Optional[str] = None
     episode_name: Optional[str] = None
     episode_description: Optional[str] = None
+    youtube_longform_url: Optional[str] = None
+    spotify_longform_url: Optional[str] = None
+    link_tree_url: Optional[str] = None
 
 
 @router.patch("/{episode_id}")
@@ -162,6 +169,12 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         ep["episode_name"] = req.episode_name
     if req.episode_description is not None:
         ep["episode_description"] = req.episode_description
+    if req.youtube_longform_url is not None:
+        ep["youtube_longform_url"] = req.youtube_longform_url
+    if req.spotify_longform_url is not None:
+        ep["spotify_longform_url"] = req.spotify_longform_url
+    if req.link_tree_url is not None:
+        ep["link_tree_url"] = req.link_tree_url
     write_episode(episode_id, ep)
     return {"status": "updated", "episode_id": episode_id}
 
@@ -235,11 +248,92 @@ async def get_crop_frame(episode_id: str):
     return FileResponse(frame_path, media_type="image/jpeg")
 
 
+@router.get("/{episode_id}/audio-preview/{track_name}")
+async def get_audio_preview(
+    episode_id: str,
+    track_name: str,
+    start: float = 30.0,
+    duration: float = 60.0,
+):
+    """Serve an MP3 preview clip of an audio track, time-aligned to video time.
+
+    start/duration are in video time; the sync offset from episode.json is
+    applied automatically so the audio lines up with what's on screen.
+    """
+    import subprocess
+
+    ep = read_episode(episode_id)
+    ep_dir = EPISODES_DIR / episode_id
+
+    # Find track by stem name
+    audio_tracks = ep.get("audio_tracks", [])
+    track = None
+    for t in audio_tracks:
+        stem = Path(t["filename"]).stem
+        if stem == track_name or t.get("filename") == track_name:
+            track = t
+            break
+    if not track:
+        raise HTTPException(status_code=404, detail=f"Track '{track_name}' not found")
+
+    wav_path = Path(track["dest_path"])
+    if not wav_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found on disk")
+
+    # audio_time = video_time + offset_seconds
+    offset = ep.get("audio_sync", {}).get("offset_seconds", 0)
+    audio_start = max(0, start + offset)
+
+    cache_dir = ep_dir / "work" / "audio_preview"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{track_name}_{int(start)}_{int(duration)}.mp3"
+
+    if not cache_file.exists():
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(audio_start),
+            "-i", str(wav_path),
+            "-t", str(duration),
+            "-ac", "1", "-ar", "44100", "-b:a", "128k",
+            str(cache_file),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}")
+
+    return FileResponse(cache_file, media_type="audio/mpeg")
+
+
+class SpeakerCropConfig(BaseModel):
+    label: str
+    center_x: int
+    center_y: int
+    zoom: float = 1.0
+    track: Optional[int] = None  # H6E track number (1-based) mapped to this speaker
+    volume: float = 1.0  # Audio volume for this speaker's track (0.0-2.0)
+
+
+class AmbientTrackConfig(BaseModel):
+    track_number: int
+    volume: float = 0.2
+
+
 class CropConfigRequest(BaseModel):
-    speaker_l_center_x: int
-    speaker_l_center_y: int
-    speaker_r_center_x: int
-    speaker_r_center_y: int
+    # New N-speaker format
+    speakers: Optional[list[SpeakerCropConfig]] = None
+    ambient_tracks: Optional[list[AmbientTrackConfig]] = None
+    # Wide shot (all speakers) crop
+    wide_center_x: Optional[int] = None
+    wide_center_y: Optional[int] = None
+    wide_zoom: Optional[float] = None
+    # Legacy 2-speaker format (backward compat)
+    speaker_l_center_x: Optional[int] = None
+    speaker_l_center_y: Optional[int] = None
+    speaker_r_center_x: Optional[int] = None
+    speaker_r_center_y: Optional[int] = None
+    speaker_l_zoom: float = 1.0
+    speaker_r_zoom: float = 1.0
+    zoom: float = 1.0
 
 
 @router.post("/{episode_id}/crop-config")
@@ -274,14 +368,53 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
             except (subprocess.CalledProcessError, KeyError, ValueError):
                 pass
 
-    ep["crop_config"] = {
-        "source_width": source_width,
-        "source_height": source_height,
-        "speaker_l_center_x": req.speaker_l_center_x,
-        "speaker_l_center_y": req.speaker_l_center_y,
-        "speaker_r_center_x": req.speaker_r_center_x,
-        "speaker_r_center_y": req.speaker_r_center_y,
-    }
+    if req.speakers:
+        # New N-speaker format
+        ep["crop_config"] = {
+            "source_width": source_width,
+            "source_height": source_height,
+            "speakers": [s.model_dump() for s in req.speakers],
+        }
+        if req.ambient_tracks:
+            ep["crop_config"]["ambient_tracks"] = [t.model_dump() for t in req.ambient_tracks]
+        if req.wide_center_x is not None:
+            ep["crop_config"]["wide_center_x"] = req.wide_center_x
+            ep["crop_config"]["wide_center_y"] = req.wide_center_y
+            ep["crop_config"]["wide_zoom"] = req.wide_zoom or 1.0
+        # Also store legacy fields for backward compat with existing render agents
+        if len(req.speakers) >= 2:
+            ep["crop_config"]["speaker_l_center_x"] = req.speakers[0].center_x
+            ep["crop_config"]["speaker_l_center_y"] = req.speakers[0].center_y
+            ep["crop_config"]["speaker_r_center_x"] = req.speakers[1].center_x
+            ep["crop_config"]["speaker_r_center_y"] = req.speakers[1].center_y
+            ep["crop_config"]["speaker_l_zoom"] = req.speakers[0].zoom
+            ep["crop_config"]["speaker_r_zoom"] = req.speakers[1].zoom
+        elif len(req.speakers) == 1:
+            ep["crop_config"]["speaker_l_center_x"] = req.speakers[0].center_x
+            ep["crop_config"]["speaker_l_center_y"] = req.speakers[0].center_y
+            ep["crop_config"]["speaker_r_center_x"] = req.speakers[0].center_x
+            ep["crop_config"]["speaker_r_center_y"] = req.speakers[0].center_y
+            ep["crop_config"]["speaker_l_zoom"] = req.speakers[0].zoom
+            ep["crop_config"]["speaker_r_zoom"] = req.speakers[0].zoom
+    else:
+        # Legacy 2-speaker format
+        ep["crop_config"] = {
+            "source_width": source_width,
+            "source_height": source_height,
+            "speaker_l_center_x": req.speaker_l_center_x,
+            "speaker_l_center_y": req.speaker_l_center_y,
+            "speaker_r_center_x": req.speaker_r_center_x,
+            "speaker_r_center_y": req.speaker_r_center_y,
+            "speaker_l_zoom": req.speaker_l_zoom,
+            "speaker_r_zoom": req.speaker_r_zoom,
+            "zoom": req.zoom,
+            "speakers": [
+                {"label": "Speaker L", "center_x": req.speaker_l_center_x,
+                 "center_y": req.speaker_l_center_y, "zoom": req.speaker_l_zoom},
+                {"label": "Speaker R", "center_x": req.speaker_r_center_x,
+                 "center_y": req.speaker_r_center_y, "zoom": req.speaker_r_zoom},
+            ],
+        }
 
     # Transition from awaiting_crop_setup to processing
     if ep.get("status") == "awaiting_crop_setup":

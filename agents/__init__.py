@@ -1,4 +1,4 @@
-"""Cascade agents package — 13-agent podcast automation pipeline."""
+"""Cascade agents package — 14-agent podcast automation pipeline."""
 
 from agents.ingest import IngestAgent
 from agents.stitch import StitchAgent
@@ -9,6 +9,7 @@ from agents.clip_miner import ClipMinerAgent
 from agents.longform_render import LongformRenderAgent
 from agents.shorts_render import ShortsRenderAgent
 from agents.metadata_gen import MetadataGenAgent
+from agents.thumbnail_gen import ThumbnailGenAgent
 from agents.qa import QAAgent
 from agents.podcast_feed import PodcastFeedAgent
 from agents.publish import PublishAgent
@@ -24,6 +25,7 @@ AGENT_REGISTRY = {
     "longform_render": LongformRenderAgent,
     "shorts_render": ShortsRenderAgent,
     "metadata_gen": MetadataGenAgent,
+    "thumbnail_gen": ThumbnailGenAgent,
     "qa": QAAgent,
     "podcast_feed": PodcastFeedAgent,
     "publish": PublishAgent,
@@ -40,6 +42,7 @@ PIPELINE_ORDER = [
     "longform_render",
     "shorts_render",
     "metadata_gen",
+    "thumbnail_gen",
     "qa",
     "podcast_feed",
     "publish",

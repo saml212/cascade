@@ -43,6 +43,18 @@ class MetadataGenAgent(BaseAgent):
         podcast_config = self.config.get("podcast", {})
         podcast_title = podcast_config.get("title", "The Local Podcast")
         channel_handle = podcast_config.get("channel_handle", "@local")
+        link_in_bio = podcast_config.get("links", {}).get("link_in_bio", "")
+
+        # Load longform URLs from episode.json for cross-linking
+        episode_data = {}
+        try:
+            episode_data = self.load_json("episode.json")
+        except (FileNotFoundError, Exception):
+            pass
+
+        youtube_longform_url = episode_data.get("youtube_longform_url", "")
+        spotify_longform_url = episode_data.get("spotify_longform_url", "")
+        link_tree_url = episode_data.get("link_tree_url", "")
 
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -82,8 +94,13 @@ IMPORTANT RULES:
 - ALL short-form clip metadata MUST include a reference to the full episode channel ({channel_handle})
 - Include "{guest_name}" in clip captions/descriptions where natural
 - YouTube Shorts descriptions should include "Full episode on {channel_handle}"
+{f'- YouTube Shorts descriptions MUST include the longform link: {youtube_longform_url}' if youtube_longform_url else ''}
+{f'- LinkedIn and Facebook descriptions should include "Watch the full episode: {youtube_longform_url}"' if youtube_longform_url else ''}
+{f'- LinkedIn and Facebook descriptions should include "Listen on Spotify: {spotify_longform_url}"' if spotify_longform_url else ''}
 - TikTok captions should include "{channel_handle}"
 - Instagram captions should include "Full ep on {channel_handle}"
+{f'- Instagram and TikTok captions should include "Link in bio: {link_in_bio}"' if link_in_bio else ''}
+{f'- Threads and Bluesky should include the YouTube link: {youtube_longform_url}' if youtube_longform_url else ''}
 """
         else:
             guest_context = f"""
@@ -93,12 +110,32 @@ EPISODE CONTEXT:
 IMPORTANT RULES:
 - ALL short-form clip metadata MUST include a reference to the full episode channel ({channel_handle})
 - YouTube Shorts descriptions should include "Full episode on {channel_handle}"
+{f'- YouTube Shorts descriptions MUST include the longform link: {youtube_longform_url}' if youtube_longform_url else ''}
+{f'- LinkedIn and Facebook descriptions should include "Watch the full episode: {youtube_longform_url}"' if youtube_longform_url else ''}
+{f'- LinkedIn and Facebook descriptions should include "Listen on Spotify: {spotify_longform_url}"' if spotify_longform_url else ''}
 - TikTok captions should include "{channel_handle}"
 - Instagram captions should include "Full ep on {channel_handle}"
+{f'- Instagram and TikTok captions should include "Link in bio: {link_in_bio}"' if link_in_bio else ''}
+{f'- Threads and Bluesky should include the YouTube link: {youtube_longform_url}' if youtube_longform_url else ''}
 """
 
         prompt = f"""You are a social media strategist for a podcast. Generate metadata for these clips and the longform episode.
 {guest_context}
+PLATFORM AUDIENCE GUIDANCE — each platform MUST have unique, tailored content:
+- YouTube Shorts: Searchable titles with keywords. Include "Full episode on {channel_handle}".
+- TikTok: Casual, trend-aware. Hook in first line. Mix trending + niche hashtags. Include link-in-bio CTA.
+- Instagram Reels: Polished, aspirational. Strong CTA. 10 hashtags mixing broad + niche. Link in bio.
+- LinkedIn: Professional, insight-driven. Focus on career/industry takeaways. No hashtag spam.
+- X: Punchy, provocative. Max 280 chars. 2-3 inline hashtags.
+- Facebook: Conversational, community-oriented. Slightly longer descriptions.
+- Threads: Casual/personal, like texting a friend. 500 char limit.
+- Pinterest: SEO-heavy, keyword-rich. Searchable descriptions.
+- Bluesky: Casual early-Twitter vibe. 300 char limit.
+
+CRITICAL: Do NOT copy the same text across platforms. Each must feel native to that platform.
+
+LOCAL CONTENT: This is a Bay Area / San Francisco local podcast. When clips touch on Bay Area themes (neighborhoods, culture, community, local issues), lean into local hashtags and references (#BayArea, #SanFrancisco, #Oakland, #local) to build regional audience.
+
 CLIPS:
 {json.dumps(clip_summaries, indent=2)}
 
@@ -159,12 +196,75 @@ Return ONLY the JSON object, no other text."""
         metadata_dir.mkdir(exist_ok=True)
         self.save_json("metadata/metadata.json", metadata)
 
+        # Write longform fields + guest info to episode.json so the UI can display them
+        self._write_longform_to_episode(metadata, episode_info)
+
+        # Sync per-clip platform metadata into clips.json for the UI
+        self._sync_clip_metadata_to_clips(metadata)
+
         return {
             "metadata_path": str(metadata_dir / "metadata.json"),
             "longform_title": metadata.get("longform", {}).get("title", ""),
             "clip_metadata_count": len(metadata.get("clips", [])),
             "schedule_entries": len(metadata.get("schedule", [])),
         }
+
+    def _write_longform_to_episode(self, metadata: dict, episode_info: dict):
+        """Copy longform title/description/tags and guest info into episode.json."""
+        episode_file = self.episode_dir / "episode.json"
+        episode_data = {}
+        if episode_file.exists():
+            with open(episode_file) as f:
+                episode_data = json.load(f)
+
+        longform = metadata.get("longform", {})
+        if longform.get("title"):
+            episode_data["title"] = longform["title"]
+        if longform.get("description"):
+            episode_data["description"] = longform["description"]
+        if longform.get("tags"):
+            episode_data["tags"] = longform["tags"]
+
+        # Copy guest info from episode_info if present
+        for field in ("guest_name", "guest_title", "episode_name", "episode_description"):
+            val = episode_info.get(field)
+            if val and not episode_data.get(field):
+                episode_data[field] = val
+
+        with open(episode_file, "w") as f:
+            json.dump(episode_data, f, indent=2)
+
+        self.logger.info("Wrote longform metadata to episode.json: title=%s", longform.get("title", ""))
+
+    def _sync_clip_metadata_to_clips(self, metadata: dict):
+        """Merge per-clip platform metadata from metadata.json into clips.json."""
+        clips_file = self.episode_dir / "clips.json"
+        if not clips_file.exists():
+            return
+
+        with open(clips_file) as f:
+            clips_data = json.load(f)
+        clips = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+
+        # Build lookup from metadata clips
+        meta_clips = {c["id"]: c for c in metadata.get("clips", []) if "id" in c}
+        platforms = ["youtube", "tiktok", "instagram", "linkedin", "x", "facebook", "threads", "pinterest", "bluesky"]
+
+        for clip in clips:
+            clip_id = clip.get("id", "")
+            mc = meta_clips.get(clip_id)
+            if not mc:
+                continue
+            clip_meta = clip.get("metadata", {})
+            for platform in platforms:
+                if platform in mc:
+                    clip_meta[platform] = mc[platform]
+            clip["metadata"] = clip_meta
+
+        with open(clips_file, "w") as f:
+            json.dump({"clips": clips}, f, indent=2)
+
+        self.logger.info("Synced platform metadata into clips.json for %d clips", len(meta_clips))
 
     def _get_excerpt(self, diarized: dict, start: float, end: float) -> str:
         lines = []

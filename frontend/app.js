@@ -31,6 +31,7 @@ const AGENT_LABELS = {
   longform_render: 'Longform Render',
   shorts_render: 'Shorts Render',
   metadata_gen: 'Metadata',
+  thumbnail_gen: 'Thumbnails',
   qa: 'QA',
   podcast_feed: 'Podcast Feed',
   publish: 'Publish',
@@ -39,18 +40,46 @@ const AGENT_LABELS = {
 
 const PIPELINE_AGENTS = [
   'ingest', 'stitch', 'audio_analysis', 'speaker_cut', 'transcribe',
-  'clip_miner', 'longform_render', 'shorts_render', 'metadata_gen', 'qa',
+  'clip_miner', 'longform_render', 'shorts_render', 'metadata_gen', 'thumbnail_gen', 'qa',
   'podcast_feed', 'publish', 'backup',
 ];
 
+const SPEAKER_COLORS = [
+  { name: 'Blue', css: 'rgba(59, 130, 246, 0.8)', bg: 'bg-blue-700', ring: 'ring-blue-500' },
+  { name: 'Green', css: 'rgba(16, 185, 129, 0.8)', bg: 'bg-emerald-700', ring: 'ring-emerald-500' },
+  { name: 'Amber', css: 'rgba(245, 158, 11, 0.8)', bg: 'bg-amber-700', ring: 'ring-amber-500' },
+  { name: 'Purple', css: 'rgba(168, 85, 247, 0.8)', bg: 'bg-purple-700', ring: 'ring-purple-500' },
+  { name: 'Rose', css: 'rgba(244, 63, 94, 0.8)', bg: 'bg-rose-700', ring: 'ring-rose-500' },
+  { name: 'Cyan', css: 'rgba(6, 182, 212, 0.8)', bg: 'bg-cyan-700', ring: 'ring-cyan-500' },
+  { name: 'Lime', css: 'rgba(132, 204, 22, 0.8)', bg: 'bg-lime-700', ring: 'ring-lime-500' },
+  { name: 'Pink', css: 'rgba(236, 72, 153, 0.8)', bg: 'bg-pink-700', ring: 'ring-pink-500' },
+];
+
 const cropState = {
-  mode: 'L',          // 'L' or 'R' — which speaker we're placing
+  activeIdx: 0,       // which speaker index we're placing
   image: null,        // HTMLImageElement
   scaleFactor: 1,     // canvas-to-source ratio
   sourceWidth: 1920,
   sourceHeight: 1080,
-  speakerL: { x: 480, y: 540 },
-  speakerR: { x: 1440, y: 540 },
+  speakers: [],       // [{label, x, y, zoom, track}]
+  // Legacy compat
+  get mode() { return this.activeIdx === 0 ? 'L' : 'R'; },
+  get speakerL() { return this.speakers[0] || { x: 480, y: 540 }; },
+  get speakerR() { return this.speakers[1] || { x: 1440, y: 540 }; },
+  get zoomL() { return (this.speakers[0] || {}).zoom || 1.0; },
+  get zoomR() { return (this.speakers[1] || {}).zoom || 1.0; },
+};
+
+// ── Audio Mixer State ──
+const mixerState = {
+  audioCtx: null,
+  playing: false,
+  loaded: false,
+  previewStart: 30,
+  previewDuration: 60,
+  tracks: [],
+  animFrame: null,
+  episodeId: null,
 };
 
 // ── Router ─────────────────────────────────────────────────────────
@@ -377,22 +406,67 @@ async function loadScheduleSidebar() {
   }
 }
 
-async function triggerNewEpisode() {
-  const path = prompt('Enter source video path (or leave blank for auto-ingest):');
-  if (path === null) return; // user cancelled
+function triggerNewEpisode() {
+  // Show modal dialog for episode creation
+  const overlay = document.createElement('div');
+  overlay.id = 'new-episode-overlay';
+  overlay.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50';
+  overlay.innerHTML = `
+    <div class="bg-zinc-900 border border-zinc-700 rounded-xl p-6 w-full max-w-md mx-4 space-y-4">
+      <h2 class="text-lg font-bold text-white">New Episode</h2>
+      <div>
+        <label class="block text-sm text-zinc-400 mb-1">Source Video Path</label>
+        <input id="ne-source-path" type="text" placeholder="/Volumes/CAMERA/DCIM/DJI_001/"
+          class="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-600 focus:border-brand-500 focus:outline-none">
+      </div>
+      <div>
+        <label class="block text-sm text-zinc-400 mb-1">External Audio Path <span class="text-zinc-600">(optional — Zoom H6E, etc.)</span></label>
+        <input id="ne-audio-path" type="text" placeholder="/Volumes/ZOOM_H6E/260311_143505/"
+          class="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-600 focus:border-brand-500 focus:outline-none">
+      </div>
+      <div>
+        <label class="block text-sm text-zinc-400 mb-1">Number of Speakers <span class="text-zinc-600">(for crop setup)</span></label>
+        <input id="ne-speaker-count" type="number" min="1" max="8" value="2"
+          class="w-24 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white focus:border-brand-500 focus:outline-none">
+      </div>
+      <div class="flex gap-3 pt-2">
+        <button onclick="submitNewEpisode()" class="flex-1 px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition-colors">Create &amp; Run Pipeline</button>
+        <button onclick="document.getElementById('new-episode-overlay').remove()" class="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg text-sm text-zinc-400 transition-colors">Cancel</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.getElementById('ne-source-path').focus();
+}
+
+async function submitNewEpisode() {
+  const sourcePath = document.getElementById('ne-source-path').value.trim();
+  const audioPath = document.getElementById('ne-audio-path').value.trim();
+  const speakerCount = parseInt(document.getElementById('ne-speaker-count').value) || 2;
+
+  document.getElementById('new-episode-overlay').remove();
+
   try {
     const ep = await api('/episodes/', {
       method: 'POST',
-      body: JSON.stringify({ source_path: path || null }),
+      body: JSON.stringify({
+        source_path: sourcePath || null,
+        audio_path: audioPath || null,
+        speaker_count: speakerCount,
+      }),
     });
     const id = ep.episode_id || ep.id;
 
     // Trigger pipeline if source path was provided
-    if (path) {
+    if (sourcePath) {
       try {
         await api(`/episodes/${id}/run-pipeline`, {
           method: 'POST',
-          body: JSON.stringify({ source_path: path }),
+          body: JSON.stringify({
+            source_path: sourcePath,
+            audio_path: audioPath || null,
+          }),
         });
       } catch {
         // Pipeline trigger is best-effort; episode was created
@@ -418,6 +492,18 @@ async function renderEpisodeDetail(episodeId, tab) {
   state.currentEpisode = ep;
   state.chatMessages = [];
   state.expandedClipId = null;
+
+  // Load persisted chat history
+  try {
+    const historyResp = await api(`/episodes/${episodeId}/chat/history`);
+    if (historyResp.messages && historyResp.messages.length > 0) {
+      state.chatMessages = historyResp.messages.map(msg => ({
+        role: msg.role,
+        content: msg.content,
+        actions: [],
+      }));
+    }
+  } catch { /* no history yet */ }
 
   const activeTab = tab || state.activeTab || 'longform';
   state.activeTab = activeTab;
@@ -472,6 +558,21 @@ async function renderEpisodeDetail(episodeId, tab) {
       <a href="#/episodes/${episodeId}/crop-setup" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium transition-colors text-white">
         Set Up Crops
       </a>
+    </div>
+    ` : ''}
+
+    ${ep.status === 'awaiting_backup_approval' ? `
+    <div class="mb-6 bg-blue-900/30 border border-blue-700/50 rounded-lg p-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+        <div>
+          <p class="text-sm font-medium text-blue-200">Backup &amp; SD card cleanup ready</p>
+          <p class="text-xs text-blue-400/70">This will back up the episode to the external drive and delete the source files from the SD card.</p>
+        </div>
+      </div>
+      <button onclick="approveBackup('${episodeId}')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors text-white">
+        Approve Backup
+      </button>
     </div>
     ` : ''}
 
@@ -691,7 +792,7 @@ function updatePipelineBar(status) {
   }
 
   // Update the status badge in the episode header
-  const statusBadgeEl = document.querySelector('.status-processing, .status-ready_for_review, .status-error, .status-cancelled, .status-approved, .status-awaiting_crop_setup');
+  const statusBadgeEl = document.querySelector('.status-processing, .status-ready_for_review, .status-error, .status-cancelled, .status-approved, .status-awaiting_crop_setup, .status-awaiting_backup_approval');
   if (statusBadgeEl && status.status) {
     statusBadgeEl.className = `inline-block px-2 py-0.5 rounded text-xs font-medium status-${status.status}`;
     statusBadgeEl.textContent = status.status.replace(/_/g, ' ');
@@ -888,7 +989,7 @@ async function rerunPipeline(episodeId) {
 }
 
 async function approveAll(episodeId) {
-  // Require episode name and description before approving
+  // Require episode name, description, and longform links before approving
   const ep = state.currentEpisode;
   if (ep && (!ep.episode_name || !ep.episode_description)) {
     showToast('Please fill in the Episode Name and Description before approving.', 'error');
@@ -909,10 +1010,29 @@ async function approveAll(episodeId) {
     }
     return;
   }
+  if (ep && (!ep.youtube_longform_url || !ep.spotify_longform_url || !ep.link_tree_url)) {
+    const missing = [];
+    if (!ep.youtube_longform_url) missing.push('YouTube Longform URL');
+    if (!ep.spotify_longform_url) missing.push('Spotify Longform URL');
+    if (!ep.link_tree_url) missing.push('Link Tree URL');
+    showToast(`Please fill in ${missing.join(', ')} in the Metadata tab before approving.`, 'error');
+    return;
+  }
   if (!confirm('Approve all pending clips and schedule for publishing?')) return;
   try {
     await api(`/episodes/${episodeId}/auto-approve`, { method: 'POST' });
     showToast('All clips approved.', 'success');
+    await renderEpisodeDetail(episodeId);
+  } catch (err) {
+    showToast('Failed: ' + err.message, 'error');
+  }
+}
+
+async function approveBackup(episodeId) {
+  if (!confirm('Back up episode to external drive and delete source files from SD card?')) return;
+  try {
+    await api(`/episodes/${episodeId}/approve-backup`, { method: 'POST' });
+    showToast('Backup approved — backing up and cleaning SD card.', 'success');
     await renderEpisodeDetail(episodeId);
   } catch (err) {
     showToast('Failed: ' + err.message, 'error');
@@ -1188,9 +1308,39 @@ function renderMetadataTab(episodeId, ep, clips) {
             <textarea id="lf-desc" rows="4" class="mt-1 block w-full bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-brand-500">${escapeHtml(ep.description || '')}</textarea>
           </label>
         </div>
-        <button onclick="saveLongformMetadata('${episodeId}')" class="mt-3 px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-xs font-medium transition-colors">
-          Save Longform Metadata
-        </button>
+        <div class="mt-3 flex gap-3">
+          <button onclick="saveLongformMetadata('${episodeId}')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-xs font-medium transition-colors">
+            Save Longform Metadata
+          </button>
+          <button onclick="autoCompleteMetadata('${episodeId}')" id="auto-complete-btn" class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors">
+            Auto-Complete Metadata
+          </button>
+        </div>
+      </div>
+
+      <!-- Longform Links -->
+      <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+        <h3 class="text-sm font-semibold text-zinc-300 mb-4">Longform Links</h3>
+        <p class="text-xs text-zinc-500 mb-3">Required before approval. Paste the URLs after uploading longform content.</p>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <label class="block">
+            <span class="text-xs text-zinc-500">YouTube Longform URL</span>
+            <input type="text" id="lf-youtube-url" value="${escapeHtml(ep.youtube_longform_url || '')}" placeholder="https://youtube.com/watch?v=..." class="mt-1 block w-full bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-brand-500">
+          </label>
+          <label class="block">
+            <span class="text-xs text-zinc-500">Spotify Longform URL</span>
+            <input type="text" id="lf-spotify-url" value="${escapeHtml(ep.spotify_longform_url || '')}" placeholder="https://open.spotify.com/episode/..." class="mt-1 block w-full bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-brand-500">
+          </label>
+          <label class="block">
+            <span class="text-xs text-zinc-500">Link Tree URL</span>
+            <input type="text" id="lf-linktree-url" value="${escapeHtml(ep.link_tree_url || 'https://pub-eb7a2f9e3c574c519db9e95d779b30c4.r2.dev/links/index.html')}" class="mt-1 block w-full bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-brand-500">
+          </label>
+        </div>
+        <div class="mt-3">
+          <button onclick="saveLongformLinks('${episodeId}')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-xs font-medium transition-colors">
+            Save Longform Links
+          </button>
+        </div>
       </div>
 
       <!-- Per-clip metadata table -->
@@ -1268,7 +1418,7 @@ function metadataClipRow(episodeId, clip, index) {
         <div class="flex items-center gap-2">
           <span class="text-xs font-bold text-zinc-600">#${index + 1}</span>
           ${scoreBadge(Math.round(clip.virality_score || 0))}
-          <span class="text-sm font-medium">${escapeHtml(clip.title || clipId)}</span>
+          <input type="text" data-clip-title="${clipId}" value="${escapeHtml(clip.title || clipId)}" class="text-sm font-medium bg-transparent border border-transparent hover:border-zinc-700 focus:border-brand-500 rounded px-1.5 py-0.5 text-zinc-200 focus:outline-none transition-colors w-64">
           ${statusBadge(clip.status || 'pending')}
         </div>
         <button onclick="saveClipMetadata('${episodeId}', '${clipId}')" class="px-3 py-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-medium transition-colors">Save</button>
@@ -1322,10 +1472,13 @@ async function saveClipMetadata(episodeId, clipId) {
     if (!meta[p]) meta[p] = {};
     meta[p][f] = el.value;
   });
+  // Include clip title if edited
+  const titleInput = document.querySelector(`[data-clip-title="${clipId}"]`);
+  const title = titleInput ? titleInput.value : undefined;
   try {
     await api(`/episodes/${episodeId}/clips/${clipId}/metadata`, {
       method: 'PATCH',
-      body: JSON.stringify({ metadata: meta }),
+      body: JSON.stringify({ metadata: meta, ...(title !== undefined && { title }) }),
     });
     showToast('Clip metadata saved.', 'success');
   } catch (err) {
@@ -1349,6 +1502,56 @@ async function saveLongformMetadata(episodeId) {
     showToast('Longform metadata saved.', 'success');
   } catch (err) {
     showToast('Save failed: ' + err.message, 'error');
+  }
+}
+
+async function saveLongformLinks(episodeId) {
+  const youtubeUrl = document.getElementById('lf-youtube-url')?.value;
+  const spotifyUrl = document.getElementById('lf-spotify-url')?.value;
+  const linkTreeUrl = document.getElementById('lf-linktree-url')?.value;
+  try {
+    await api(`/episodes/${episodeId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        youtube_longform_url: youtubeUrl,
+        spotify_longform_url: spotifyUrl,
+        link_tree_url: linkTreeUrl,
+      }),
+    });
+    // Update local state
+    if (state.currentEpisode) {
+      state.currentEpisode.youtube_longform_url = youtubeUrl;
+      state.currentEpisode.spotify_longform_url = spotifyUrl;
+      state.currentEpisode.link_tree_url = linkTreeUrl;
+    }
+    showToast('Longform links saved.', 'success');
+  } catch (err) {
+    showToast('Save failed: ' + err.message, 'error');
+  }
+}
+
+async function autoCompleteMetadata(episodeId) {
+  const btn = document.getElementById('auto-complete-btn');
+  if (!btn) return;
+  const originalText = btn.textContent;
+  btn.textContent = 'Working...';
+  btn.disabled = true;
+  btn.classList.add('opacity-50');
+  try {
+    const result = await api(`/episodes/${episodeId}/complete-metadata`, { method: 'POST' });
+    if (result.complete) {
+      showToast(`All metadata filled in ${result.iterations} iteration(s). ${result.actions_taken.length} actions taken.`, 'success');
+    } else {
+      showToast(`Completed ${result.iterations} iterations, ${result.actions_taken.length} actions. Some fields may still be missing.`, 'info');
+    }
+    // Reload episode detail to show updated metadata
+    navigate();
+  } catch (err) {
+    showToast('Auto-complete failed: ' + err.message, 'error');
+  } finally {
+    btn.textContent = originalText;
+    btn.disabled = false;
+    btn.classList.remove('opacity-50');
   }
 }
 
@@ -2000,28 +2203,101 @@ async function saveClipDetailMetadata(episodeId, clipId) {
 // ════════════════════════════════════════════════════════════════════
 
 async function renderCropSetup(episodeId) {
-  // Load existing crop config if any
+  // Load existing config
   let ep;
   try { ep = await api(`/episodes/${episodeId}`); } catch { ep = {}; }
 
+  const speakerCount = ep.speaker_count || 2;
   const existing = ep.crop_config;
-  if (existing) {
-    cropState.speakerL = { x: existing.speaker_l_center_x, y: existing.speaker_l_center_y };
-    cropState.speakerR = { x: existing.speaker_r_center_x, y: existing.speaker_r_center_y };
-    cropState.sourceWidth = existing.source_width || 1920;
-    cropState.sourceHeight = existing.source_height || 1080;
+
+  // Initialize speakers array
+  cropState.sourceWidth = (existing && existing.source_width) || 1920;
+  cropState.sourceHeight = (existing && existing.source_height) || 1080;
+
+  if (existing && existing.speakers && existing.speakers.length) {
+    cropState.speakers = existing.speakers.map(s => ({
+      label: s.label, x: s.center_x, y: s.center_y, zoom: s.zoom || 1.0, track: s.track || null,
+    }));
+  } else if (existing && existing.speaker_l_center_x != null) {
+    // Legacy L/R format
+    cropState.speakers = [
+      { label: 'Speaker 1', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, track: 1 },
+      { label: 'Speaker 2', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, track: 2 },
+    ];
   } else {
-    // Defaults: center of each half
-    cropState.speakerL = { x: 480, y: 540 };
-    cropState.speakerR = { x: 1440, y: 540 };
-    cropState.sourceWidth = 1920;
-    cropState.sourceHeight = 1080;
+    // Defaults: spread speakers evenly across the frame
+    cropState.speakers = [];
+    for (let i = 0; i < speakerCount; i++) {
+      const xFrac = (i + 1) / (speakerCount + 1);
+      cropState.speakers.push({
+        label: `Speaker ${i + 1}`,
+        x: Math.round(cropState.sourceWidth * xFrac),
+        y: Math.round(cropState.sourceHeight / 2),
+        zoom: 1.0,
+        track: i + 1,
+      });
+    }
   }
-  cropState.mode = 'L';
+  cropState.activeIdx = 0;
+
+  // Initialize wide shot (all-speakers) crop
+  cropState.wide = {
+    x: (existing && existing.wide_center_x) || Math.round(cropState.sourceWidth / 2),
+    y: (existing && existing.wide_center_y) || Math.round(cropState.sourceHeight / 2),
+    zoom: (existing && existing.wide_zoom) || 1.0,
+  };
+
+  // Get audio track info from episode data
+  const allAudioTracks = ep.audio_tracks || [];
+  const inputTracks = allAudioTracks.filter(t => t.track_type === 'input');
+
+  // Initialize mixer state
+  if (mixerState.playing) stopMixerPlayback();
+  if (mixerState.audioCtx) { mixerState.audioCtx.close().catch(() => {}); mixerState.audioCtx = null; }
+  mixerState.loaded = false;
+  mixerState.episodeId = episodeId;
+  mixerState.tracks = allAudioTracks.map(t => {
+    const isInput = t.track_type === 'input';
+    return {
+      stem: t.filename.replace(/\.(WAV|wav)$/, ''),
+      label: t.track_type === 'stereo_mix' ? 'Mix' : t.track_type === 'builtin_mic' ? 'Mic' : 'Tr' + t.track_number,
+      trackNumber: t.track_number || null,
+      trackType: t.track_type,
+      volume: isInput ? 1.0 : 0.2,
+      muted: false, soloed: false, assignment: '',
+      buffer: null, source: null, gain: null, analyser: null,
+    };
+  });
+  // Pre-fill assignments from existing crop config
+  for (let si = 0; si < cropState.speakers.length; si++) {
+    const trk = cropState.speakers[si].track;
+    if (trk) {
+      const ti = mixerState.tracks.findIndex(t => t.trackNumber === trk);
+      if (ti >= 0) mixerState.tracks[ti].assignment = `speaker-${si}`;
+    }
+  }
+  for (const t of mixerState.tracks) {
+    if (!t.assignment && t.trackType !== 'input') t.assignment = 'ambient';
+  }
+  // Load existing volumes from crop config
+  const existingAmbient = (existing && existing.ambient_tracks) || [];
+  for (const t of mixerState.tracks) {
+    if (t.assignment === 'ambient' && t.trackNumber) {
+      const ea = existingAmbient.find(a => a.track_number === t.trackNumber);
+      if (ea) t.volume = ea.volume;
+    }
+  }
+  if (existing && existing.speakers) {
+    for (const spk of existing.speakers) {
+      if (spk.track && spk.volume != null) {
+        const mt = mixerState.tracks.find(t => t.trackNumber === spk.track);
+        if (mt) mt.volume = spk.volume;
+      }
+    }
+  }
 
   const app = document.getElementById('app');
   app.innerHTML = `${container()}
-    <!-- Breadcrumb -->
     <div class="flex items-center gap-2 text-sm text-zinc-500 mb-6">
       <a href="#/" class="hover:text-white transition-colors">Dashboard</a>
       <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
@@ -2033,42 +2309,106 @@ async function renderCropSetup(episodeId) {
     <h1 class="text-xl font-bold mb-2">Speaker Crop Setup</h1>
     <p class="text-zinc-500 text-sm mb-6">Click on the video frame to set each speaker's center point. The system derives both 9:16 (shorts) and 16:9 (longform) crop rectangles from these centers.</p>
 
+    ${allAudioTracks.length > 0 ? `
+    <div id="audio-mixer" class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-semibold text-zinc-300">Audio Track Mixer</h3>
+        <div class="flex items-center gap-3">
+          <span class="text-xs text-zinc-500">Preview: <span id="mixer-range">${fmtMixerTime(mixerState.previewStart)} – ${fmtMixerTime(mixerState.previewStart + mixerState.previewDuration)}</span></span>
+          <button onclick="shiftMixerWindow(-30,'${episodeId}')" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">&larr;</button>
+          <button onclick="shiftMixerWindow(30,'${episodeId}')" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">&rarr;</button>
+          <button id="mixer-load-btn" onclick="loadAudioPreviews('${episodeId}')" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Load Audio</button>
+          <button id="mixer-play-btn" onclick="toggleMixerPlayback()" disabled class="px-3 py-1.5 text-xs bg-zinc-700 rounded font-medium text-zinc-500 transition-colors">&#9654; Play</button>
+        </div>
+      </div>
+      <div id="mixer-tracks" class="space-y-1">
+        ${mixerState.tracks.map((t, i) => `
+        <div class="flex items-center gap-2 py-0.5">
+          <div class="w-10 text-xs font-mono ${t.trackType === 'input' ? 'text-zinc-300' : 'text-zinc-500'} truncate">${escapeHtml(t.label)}</div>
+          <button onclick="toggleTrackSolo(${i})" id="mixer-solo-${i}" class="w-6 h-6 text-[10px] font-bold rounded bg-zinc-800 text-zinc-500 hover:text-yellow-400 transition-colors" title="Solo">S</button>
+          <button onclick="toggleTrackMute(${i})" id="mixer-mute-${i}" class="w-6 h-6 text-[10px] font-bold rounded bg-zinc-800 text-zinc-500 hover:text-red-400 transition-colors" title="Mute">M</button>
+          <canvas id="mixer-meter-${i}" width="200" height="16" class="rounded" style="background:#111;min-width:100px;height:16px;flex:2;"></canvas>
+          <input type="range" id="mixer-vol-${i}" min="0" max="200" value="${Math.round(t.volume * 100)}" oninput="setMixerTrackVolume(${i},this.value)" class="w-16 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+          <span id="mixer-vol-label-${i}" class="text-xs text-zinc-400 w-8 text-right font-mono">${Math.round(t.volume * 100)}%</span>
+          <select id="mixer-assign-${i}" onchange="assignMixerTrack(${i},this.value)" class="bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 px-1.5 py-1 w-24">
+            <option value="">—</option>
+            ${cropState.speakers.map((s, si) => `<option value="speaker-${si}" ${t.assignment === 'speaker-' + si ? 'selected' : ''}>${escapeHtml(s.label)}</option>`).join('')}
+            <option value="ambient" ${t.assignment === 'ambient' ? 'selected' : ''}>Ambient</option>
+          </select>
+        </div>`).join('')}
+      </div>
+      <p id="mixer-status" class="text-xs text-zinc-600 mt-2">Click "Load Audio" to preview tracks and identify speakers.</p>
+    </div>` : ''}
+
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
-      <!-- Canvas area -->
       <div class="lg:col-span-3">
         <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
           <canvas id="crop-canvas" class="w-full cursor-crosshair rounded-lg" style="background: #000;"></canvas>
         </div>
       </div>
 
-      <!-- Controls sidebar -->
       <div class="space-y-4">
-        <!-- Mode toggle -->
+        <!-- Speaker selector -->
         <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
           <h3 class="text-sm font-semibold text-zinc-300 mb-3">Placing Speaker</h3>
-          <div class="flex gap-2">
-            <button id="crop-mode-L" onclick="setCropMode('L')" class="flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-blue-700 text-white">
-              L (Blue)
-            </button>
-            <button id="crop-mode-R" onclick="setCropMode('R')" class="flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700">
-              R (Green)
-            </button>
+          <div id="crop-speaker-btns" class="flex flex-wrap gap-2">
+            ${cropState.speakers.map((s, i) => {
+              const c = SPEAKER_COLORS[i % SPEAKER_COLORS.length];
+              const active = i === 0;
+              return `<button id="crop-mode-${i}" onclick="setCropSpeaker(${i})" class="flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors ${active ? c.bg + ' text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}">${i + 1}</button>`;
+            }).join('')}
+            <button id="crop-mode-wide" onclick="setCropSpeaker(-1)" class="flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700">Wide</button>
           </div>
           <p class="text-xs text-zinc-600 mt-2">Click the frame to set the selected speaker's center point.</p>
         </div>
 
-        <!-- Position readouts -->
+        <!-- Positions & zoom per speaker -->
         <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-3">
-          <h3 class="text-sm font-semibold text-zinc-300">Positions</h3>
-          <div class="space-y-2 text-sm">
-            <div class="flex justify-between items-center">
-              <span class="text-blue-400 font-medium">Speaker L</span>
-              <span id="crop-pos-L" class="text-zinc-400 font-mono text-xs">${cropState.speakerL.x}, ${cropState.speakerL.y}</span>
+          <h3 class="text-sm font-semibold text-zinc-300">Speakers</h3>
+          <div id="crop-speaker-details" class="space-y-3">
+            ${cropState.speakers.map((s, i) => {
+              const c = SPEAKER_COLORS[i % SPEAKER_COLORS.length];
+              return `
+              <div class="border-b border-zinc-800 pb-2 last:border-0 last:pb-0">
+                <div class="flex justify-between items-center mb-1">
+                  <input type="text" value="${escapeHtml(s.label)}" onchange="cropState.speakers[${i}].label=this.value"
+                    class="bg-transparent text-sm font-medium border-none focus:outline-none p-0" style="color: ${c.css}; width: 120px;">
+                  <span id="crop-pos-${i}" class="text-zinc-400 font-mono text-xs">${s.x}, ${s.y}</span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span class="text-xs text-zinc-500 w-10">Zoom</span>
+                  <input type="range" id="crop-zoom-${i}" min="0.5" max="3.0" step="0.1" value="${s.zoom}"
+                    oninput="setCropZoomN(${i}, this.value)"
+                    class="flex-1 h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+                  <span id="crop-zoom-${i}-val" class="text-zinc-400 font-mono text-xs w-8">${s.zoom.toFixed(1)}x</span>
+                </div>
+                ${inputTracks.length > 0 ? `
+                <div class="flex items-center gap-2 mt-1">
+                  <span class="text-xs text-zinc-500 w-10">Track</span>
+                  <select id="crop-track-${i}" onchange="cropState.speakers[${i}].track=parseInt(this.value)||null"
+                    class="flex-1 bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 px-2 py-1">
+                    <option value="">None</option>
+                    ${inputTracks.map(t => `<option value="${t.track_number}" ${s.track === t.track_number ? 'selected' : ''}>Tr${t.track_number}</option>`).join('')}
+                  </select>
+                </div>` : ''}
+              </div>`;
+            }).join('')}
+          </div>
+
+          <!-- Wide shot (all speakers) -->
+          <div class="border-t border-zinc-800 pt-2 mt-2">
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-sm font-medium text-zinc-400">Wide Shot</span>
+              <span id="crop-pos-wide" class="text-zinc-400 font-mono text-xs">${cropState.wide.x}, ${cropState.wide.y}</span>
             </div>
-            <div class="flex justify-between items-center">
-              <span class="text-emerald-400 font-medium">Speaker R</span>
-              <span id="crop-pos-R" class="text-zinc-400 font-mono text-xs">${cropState.speakerR.x}, ${cropState.speakerR.y}</span>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-zinc-500 w-10">Zoom</span>
+              <input type="range" id="crop-zoom-wide" min="0.5" max="3.0" step="0.1" value="${cropState.wide.zoom}"
+                oninput="setCropWideZoom(this.value)"
+                class="flex-1 h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+              <span id="crop-zoom-wide-val" class="text-zinc-400 font-mono text-xs w-8">${cropState.wide.zoom.toFixed(1)}x</span>
             </div>
+            <p class="text-xs text-zinc-600 mt-1">Used when all speakers are on screen.</p>
           </div>
         </div>
 
@@ -2076,16 +2416,15 @@ async function renderCropSetup(episodeId) {
         <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
           <h3 class="text-sm font-semibold text-zinc-300 mb-2">How it works</h3>
           <ul class="text-xs text-zinc-500 space-y-1 list-disc list-inside">
-            <li>Select L or R speaker mode above</li>
+            <li>Select a speaker number above</li>
             <li>Click on the frame where that speaker's face is centered</li>
-            <li>Blue dashed rect = L speaker crop</li>
-            <li>Green dashed rect = R speaker crop</li>
+            <li>Use zoom sliders to adjust how tight the crop is</li>
+            <li>Dashed rect = 9:16 shorts crop</li>
             <li>Inner rect = 16:9 longform crop</li>
-            <li>Outer rect = 9:16 shorts crop</li>
+            ${inputTracks.length > 0 ? '<li>Map each speaker to their H6E audio track</li>' : ''}
           </ul>
         </div>
 
-        <!-- Save button -->
         <button onclick="saveCropConfig('${episodeId}')" id="crop-save-btn" class="w-full px-4 py-3 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition-colors">
           Save &amp; Continue
         </button>
@@ -2100,14 +2439,11 @@ async function renderCropSetup(episodeId) {
     cropState.image = img;
     cropState.sourceWidth = img.naturalWidth;
     cropState.sourceHeight = img.naturalHeight;
-
-    // Set canvas size to match container width, maintain aspect ratio
-    const containerWidth = canvas.parentElement.clientWidth - 32; // padding
+    const containerWidth = canvas.parentElement.clientWidth - 32;
     const aspect = img.naturalHeight / img.naturalWidth;
     canvas.width = containerWidth;
     canvas.height = Math.round(containerWidth * aspect);
     cropState.scaleFactor = img.naturalWidth / canvas.width;
-
     redrawCropCanvas();
   };
   img.onerror = function() {
@@ -2122,53 +2458,67 @@ async function renderCropSetup(episodeId) {
     ctx.fillText(cropState._loadError || 'Crop frame not available. Run stitch first.', canvas.width / 2, canvas.height / 2);
   };
   fetch(`${API}/episodes/${episodeId}/crop-frame`)
-    .then(res => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.blob();
-    })
-    .then(blob => {
-      img.src = URL.createObjectURL(blob);
-    })
-    .catch(err => {
-      cropState._loadError = `Failed to load crop frame: ${err.message}`;
-      img.onerror();
-    });
+    .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.blob(); })
+    .then(blob => { img.src = URL.createObjectURL(blob); })
+    .catch(err => { cropState._loadError = `Failed to load crop frame: ${err.message}`; img.onerror(); });
 
   // Canvas click handler
   canvas.addEventListener('click', function(e) {
     const rect = canvas.getBoundingClientRect();
-    const canvasX = e.clientX - rect.left;
-    const canvasY = e.clientY - rect.top;
-
-    // Convert to source coordinates
-    const srcX = Math.round(canvasX * cropState.scaleFactor);
-    const srcY = Math.round(canvasY * cropState.scaleFactor);
-
-    if (cropState.mode === 'L') {
-      cropState.speakerL = { x: srcX, y: srcY };
+    const srcX = Math.round((e.clientX - rect.left) * cropState.scaleFactor);
+    const srcY = Math.round((e.clientY - rect.top) * cropState.scaleFactor);
+    if (cropState.activeIdx === -1) {
+      // Wide shot mode
+      cropState.wide.x = srcX;
+      cropState.wide.y = srcY;
+      const posEl = document.getElementById('crop-pos-wide');
+      if (posEl) posEl.textContent = `${srcX}, ${srcY}`;
     } else {
-      cropState.speakerR = { x: srcX, y: srcY };
+      const spk = cropState.speakers[cropState.activeIdx];
+      if (spk) {
+        spk.x = srcX;
+        spk.y = srcY;
+        const posEl = document.getElementById(`crop-pos-${cropState.activeIdx}`);
+        if (posEl) posEl.textContent = `${srcX}, ${srcY}`;
+      }
     }
-
-    // Update position readouts
-    document.getElementById('crop-pos-L').textContent = `${cropState.speakerL.x}, ${cropState.speakerL.y}`;
-    document.getElementById('crop-pos-R').textContent = `${cropState.speakerR.x}, ${cropState.speakerR.y}`;
-
     redrawCropCanvas();
   });
 }
 
+function setCropSpeaker(idx) {
+  cropState.activeIdx = idx;
+  cropState.speakers.forEach((_, i) => {
+    const btn = document.getElementById(`crop-mode-${i}`);
+    if (!btn) return;
+    const c = SPEAKER_COLORS[i % SPEAKER_COLORS.length];
+    btn.className = `flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors ${i === idx ? c.bg + ' text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`;
+  });
+  const wideBtn = document.getElementById('crop-mode-wide');
+  if (wideBtn) wideBtn.className = `flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors ${idx === -1 ? 'bg-zinc-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`;
+}
+
+function setCropWideZoom(value) {
+  cropState.wide.zoom = parseFloat(value);
+  const valEl = document.getElementById('crop-zoom-wide-val');
+  if (valEl) valEl.textContent = cropState.wide.zoom.toFixed(1) + 'x';
+  redrawCropCanvas();
+}
+
+function setCropZoomN(idx, value) {
+  const zoom = parseFloat(value);
+  if (cropState.speakers[idx]) cropState.speakers[idx].zoom = zoom;
+  const valEl = document.getElementById(`crop-zoom-${idx}-val`);
+  if (valEl) valEl.textContent = zoom.toFixed(1) + 'x';
+  redrawCropCanvas();
+}
+
+// Legacy compat wrappers
+function setCropZoom(speaker, value) {
+  setCropZoomN(speaker === 'L' ? 0 : 1, value);
+}
 function setCropMode(mode) {
-  cropState.mode = mode;
-  const btnL = document.getElementById('crop-mode-L');
-  const btnR = document.getElementById('crop-mode-R');
-  if (mode === 'L') {
-    btnL.className = 'flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-blue-700 text-white';
-    btnR.className = 'flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700';
-  } else {
-    btnL.className = 'flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700';
-    btnR.className = 'flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-emerald-700 text-white';
-  }
+  setCropSpeaker(mode === 'L' ? 0 : 1);
 }
 
 function redrawCropCanvas() {
@@ -2179,93 +2529,331 @@ function redrawCropCanvas() {
   const srcW = cropState.sourceWidth;
   const srcH = cropState.sourceHeight;
 
-  // Draw the video frame
   ctx.drawImage(cropState.image, 0, 0, canvas.width, canvas.height);
 
-  // Draw crop rectangles for each speaker
-  const speakers = [
-    { pos: cropState.speakerL, color: 'rgba(59, 130, 246, 0.8)', label: 'L' },   // blue
-    { pos: cropState.speakerR, color: 'rgba(16, 185, 129, 0.8)', label: 'R' },    // green
-  ];
+  // Draw wide shot crop rect
+  if (cropState.wide && cropState.wide.zoom > 1.0) {
+    const wZoom = cropState.wide.zoom;
+    const wCx = cropState.wide.x / sf;
+    const wCy = cropState.wide.y / sf;
+    const wCropW = Math.round((srcW / wZoom) / sf);
+    const wCropH = Math.round(wCropW * 9 / 16);
+    const wX = Math.max(0, Math.min(wCx - wCropW / 2, canvas.width - wCropW));
+    const wY = Math.max(0, Math.min(wCy - wCropH / 2, canvas.height - wCropH));
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(wX, wY, wCropW, wCropH);
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(wX, wY, wCropW, wCropH);
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = 'bold 12px system-ui';
+    ctx.fillText(`Wide ${wZoom.toFixed(1)}x`, wX + 4, wY + 14);
+  }
 
-  speakers.forEach(function(spk) {
-    const cx = spk.pos.x / sf;
-    const cy = spk.pos.y / sf;
+  cropState.speakers.forEach(function(spk, idx) {
+    const color = SPEAKER_COLORS[idx % SPEAKER_COLORS.length].css;
+    const cx = spk.x / sf;
+    const cy = spk.y / sf;
+    const zoom = spk.zoom;
 
-    // 9:16 shorts crop rect (outer, taller)
-    const shortsCropW = Math.round((srcH * 9 / 16) / sf);
-    const shortsCropH = Math.round(srcH / sf);
+    // 9:16 shorts crop rect
+    const shortsCropH = Math.round((srcH / zoom) / sf);
+    const shortsCropW = Math.round((shortsCropH * 9 / 16));
     const shortsX = Math.max(0, Math.min(cx - shortsCropW / 2, canvas.width - shortsCropW));
-    const shortsY = 0;
-
-    ctx.strokeStyle = spk.color;
+    const shortsY = Math.max(0, Math.min(cy - shortsCropH / 2, canvas.height - shortsCropH));
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.setLineDash([8, 4]);
     ctx.strokeRect(shortsX, shortsY, shortsCropW, shortsCropH);
 
-    // 16:9 longform crop rect (inner, wider)
-    const lfCropW = Math.round((srcW / 2) / sf);
-    const lfCropH = Math.round((srcW / 2 * 9 / 16) / sf);
+    // 16:9 longform crop rect
+    const lfCropW = Math.round((srcW / (2 * zoom)) / sf);
+    const lfCropH = Math.round(lfCropW * 9 / 16);
     const lfX = Math.max(0, Math.min(cx - lfCropW / 2, canvas.width - lfCropW));
     const lfY = Math.max(0, Math.min(cy - lfCropH / 2, canvas.height - lfCropH));
-
     ctx.setLineDash([4, 4]);
     ctx.lineWidth = 1.5;
     ctx.strokeRect(lfX, lfY, lfCropW, lfCropH);
 
+    ctx.fillStyle = color.replace('0.8', '0.08');
+    ctx.fillRect(lfX, lfY, lfCropW, lfCropH);
     ctx.setLineDash([]);
 
-    // Center crosshair
+    // Crosshair
     const crossSize = 12;
     ctx.beginPath();
-    ctx.moveTo(cx - crossSize, cy);
-    ctx.lineTo(cx + crossSize, cy);
-    ctx.moveTo(cx, cy - crossSize);
-    ctx.lineTo(cx, cy + crossSize);
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    ctx.moveTo(cx - crossSize, cy); ctx.lineTo(cx + crossSize, cy);
+    ctx.moveTo(cx, cy - crossSize); ctx.lineTo(cx, cy + crossSize);
+    ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.stroke();
 
     // Label
-    ctx.fillStyle = spk.color;
+    ctx.fillStyle = color;
     ctx.font = 'bold 14px system-ui';
-    ctx.fillText(spk.label, cx + crossSize + 4, cy - crossSize + 4);
+    ctx.fillText(`${idx + 1} ${zoom.toFixed(1)}x`, cx + crossSize + 4, cy - crossSize + 4);
+
+    // Highlight active speaker
+    if (idx === cropState.activeIdx) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, crossSize + 4, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
   });
 }
 
 async function saveCropConfig(episodeId) {
   const btn = document.getElementById('crop-save-btn');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'Saving...';
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
+
+  // Collect ambient tracks from mixer
+  const ambientTracks = [];
+  for (const t of mixerState.tracks) {
+    if (t.assignment === 'ambient' && t.trackNumber) {
+      ambientTracks.push({ track_number: t.trackNumber, volume: t.volume });
+    }
   }
 
   try {
     await api(`/episodes/${episodeId}/crop-config`, {
       method: 'POST',
       body: JSON.stringify({
-        speaker_l_center_x: cropState.speakerL.x,
-        speaker_l_center_y: cropState.speakerL.y,
-        speaker_r_center_x: cropState.speakerR.x,
-        speaker_r_center_y: cropState.speakerR.y,
+        speakers: cropState.speakers.map(s => {
+          let volume = 1.0;
+          if (mixerState.tracks.length > 0 && s.track) {
+            const mt = mixerState.tracks.find(t => t.trackNumber === s.track);
+            if (mt) volume = mt.volume;
+          }
+          return {
+            label: s.label,
+            center_x: s.x,
+            center_y: s.y,
+            zoom: s.zoom,
+            track: s.track,
+            volume: volume,
+          };
+        }),
+        ambient_tracks: ambientTracks.length > 0 ? ambientTracks : undefined,
+        wide_center_x: cropState.wide ? cropState.wide.x : undefined,
+        wide_center_y: cropState.wide ? cropState.wide.y : undefined,
+        wide_zoom: cropState.wide ? cropState.wide.zoom : undefined,
       }),
     });
 
-    // Resume pipeline
-    try {
-      await api(`/episodes/${episodeId}/resume-pipeline`, { method: 'POST' });
-    } catch {
-      // Pipeline resume is best-effort
-    }
-
+    if (mixerState.playing) stopMixerPlayback();
+    try { await api(`/episodes/${episodeId}/resume-pipeline`, { method: 'POST' }); } catch {}
     showToast('Crop config saved. Pipeline resuming.', 'success');
     window.location.hash = `#/episodes/${episodeId}`;
   } catch (err) {
     showToast('Failed to save crop config: ' + err.message, 'error');
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = 'Save & Continue';
+    if (btn) { btn.disabled = false; btn.textContent = 'Save & Continue'; }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  AUDIO MIXER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════
+
+function fmtMixerTime(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+async function loadAudioPreviews(episodeId) {
+  const btn = document.getElementById('mixer-load-btn');
+  const status = document.getElementById('mixer-status');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
+  if (status) status.textContent = 'Generating audio previews...';
+
+  if (!mixerState.audioCtx) {
+    mixerState.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (mixerState.audioCtx.state === 'suspended') mixerState.audioCtx.resume();
+
+  try {
+    const promises = mixerState.tracks.map(async (track) => {
+      const url = `${API}/episodes/${episodeId}/audio-preview/${track.stem}?start=${mixerState.previewStart}&duration=${mixerState.previewDuration}`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`${track.label}: HTTP ${resp.status}`);
+      const buf = await resp.arrayBuffer();
+      track.buffer = await mixerState.audioCtx.decodeAudioData(buf);
+    });
+    await Promise.all(promises);
+    mixerState.loaded = true;
+
+    if (btn) { btn.textContent = 'Reload'; btn.disabled = false; }
+    if (status) status.textContent = `${mixerState.tracks.length} tracks loaded. Hit Play to listen — solo (S) individual tracks to identify speakers.`;
+    const playBtn = document.getElementById('mixer-play-btn');
+    if (playBtn) { playBtn.disabled = false; playBtn.className = playBtn.className.replace('text-zinc-500', 'text-white').replace('bg-zinc-700', 'bg-brand-600'); }
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+    if (status) status.textContent = `Error: ${err.message}`;
+  }
+}
+
+function toggleMixerPlayback() {
+  if (mixerState.playing) stopMixerPlayback(); else startMixerPlayback();
+}
+
+function startMixerPlayback() {
+  if (!mixerState.loaded || !mixerState.audioCtx) return;
+  if (mixerState.audioCtx.state === 'suspended') mixerState.audioCtx.resume();
+
+  const anySoloed = mixerState.tracks.some(t => t.soloed);
+
+  for (const track of mixerState.tracks) {
+    if (!track.buffer) continue;
+    const source = mixerState.audioCtx.createBufferSource();
+    source.buffer = track.buffer;
+    const gain = mixerState.audioCtx.createGain();
+    if (anySoloed) {
+      gain.gain.value = (track.soloed && !track.muted) ? track.volume : 0;
+    } else {
+      gain.gain.value = track.muted ? 0 : track.volume;
+    }
+    const analyser = mixerState.audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(gain); gain.connect(analyser); analyser.connect(mixerState.audioCtx.destination);
+    source.start(0);
+    track.source = source; track.gain = gain; track.analyser = analyser;
+    source.onended = () => { if (mixerState.playing) stopMixerPlayback(); };
+  }
+
+  mixerState.playing = true;
+  const playBtn = document.getElementById('mixer-play-btn');
+  if (playBtn) playBtn.innerHTML = '&#9724; Stop';
+  updateMixerMeters();
+}
+
+function stopMixerPlayback() {
+  for (const track of mixerState.tracks) {
+    if (track.source) { try { track.source.stop(); } catch {} track.source = null; }
+    track.gain = null; track.analyser = null;
+  }
+  mixerState.playing = false;
+  if (mixerState.animFrame) { cancelAnimationFrame(mixerState.animFrame); mixerState.animFrame = null; }
+  const playBtn = document.getElementById('mixer-play-btn');
+  if (playBtn) playBtn.innerHTML = '&#9654; Play';
+  for (let i = 0; i < mixerState.tracks.length; i++) drawMixerMeter(i, 0);
+}
+
+function updateMixerMeters() {
+  for (let i = 0; i < mixerState.tracks.length; i++) {
+    const track = mixerState.tracks[i];
+    if (!track.analyser) { drawMixerMeter(i, 0); continue; }
+    const data = new Float32Array(track.analyser.fftSize);
+    track.analyser.getFloatTimeDomainData(data);
+    let sum = 0;
+    for (let j = 0; j < data.length; j++) sum += data[j] * data[j];
+    drawMixerMeter(i, Math.sqrt(sum / data.length));
+  }
+  if (mixerState.playing) mixerState.animFrame = requestAnimationFrame(updateMixerMeters);
+}
+
+function drawMixerMeter(idx, level) {
+  const canvas = document.getElementById(`mixer-meter-${idx}`);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, w, h);
+  if (level <= 0) return;
+  const db = 20 * Math.log10(Math.max(level, 1e-10));
+  const norm = Math.max(0, Math.min(1, (db + 50) / 50));
+  const barW = Math.round(norm * w);
+  if (barW > 0) {
+    const grad = ctx.createLinearGradient(0, 0, w, 0);
+    grad.addColorStop(0, '#22c55e');
+    grad.addColorStop(0.75, '#eab308');
+    grad.addColorStop(1, '#ef4444');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 2, barW, h - 4);
+  }
+}
+
+function setMixerTrackVolume(idx, value) {
+  const vol = parseInt(value) / 100;
+  mixerState.tracks[idx].volume = vol;
+  const anySoloed = mixerState.tracks.some(t => t.soloed);
+  if (mixerState.tracks[idx].gain && !mixerState.tracks[idx].muted) {
+    if (!anySoloed || mixerState.tracks[idx].soloed) {
+      mixerState.tracks[idx].gain.gain.value = vol;
     }
   }
+  const label = document.getElementById(`mixer-vol-label-${idx}`);
+  if (label) label.textContent = value + '%';
+}
+
+function toggleTrackMute(idx) {
+  const track = mixerState.tracks[idx];
+  track.muted = !track.muted;
+  applyMixerGains();
+  const btn = document.getElementById(`mixer-mute-${idx}`);
+  if (btn) btn.className = `w-6 h-6 text-[10px] font-bold rounded transition-colors ${track.muted ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:text-red-400'}`;
+}
+
+function toggleTrackSolo(idx) {
+  mixerState.tracks[idx].soloed = !mixerState.tracks[idx].soloed;
+  applyMixerGains();
+  for (let i = 0; i < mixerState.tracks.length; i++) {
+    const t = mixerState.tracks[i];
+    const btn = document.getElementById(`mixer-solo-${i}`);
+    if (btn) btn.className = `w-6 h-6 text-[10px] font-bold rounded transition-colors ${t.soloed ? 'bg-yellow-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:text-yellow-400'}`;
+  }
+}
+
+function applyMixerGains() {
+  const anySoloed = mixerState.tracks.some(t => t.soloed);
+  for (const t of mixerState.tracks) {
+    if (!t.gain) continue;
+    if (anySoloed) {
+      t.gain.gain.value = (t.soloed && !t.muted) ? t.volume : 0;
+    } else {
+      t.gain.gain.value = t.muted ? 0 : t.volume;
+    }
+  }
+}
+
+function assignMixerTrack(trackIdx, value) {
+  mixerState.tracks[trackIdx].assignment = value;
+  const trackNum = mixerState.tracks[trackIdx].trackNumber;
+  if (value.startsWith('speaker-')) {
+    const si = parseInt(value.split('-')[1]);
+    // Clear this track from other speakers
+    for (const spk of cropState.speakers) { if (spk.track === trackNum) spk.track = null; }
+    if (cropState.speakers[si]) cropState.speakers[si].track = trackNum;
+    // Clear other tracks assigned to this speaker in mixer
+    for (let i = 0; i < mixerState.tracks.length; i++) {
+      if (i !== trackIdx && mixerState.tracks[i].assignment === value) {
+        mixerState.tracks[i].assignment = '';
+        const sel = document.getElementById(`mixer-assign-${i}`);
+        if (sel) sel.value = '';
+      }
+    }
+  } else {
+    // Unassigned or ambient — clear from speakers
+    for (const spk of cropState.speakers) { if (spk.track === trackNum) spk.track = null; }
+  }
+  // Sync sidebar track dropdowns
+  for (let i = 0; i < cropState.speakers.length; i++) {
+    const sel = document.getElementById(`crop-track-${i}`);
+    if (sel) sel.value = cropState.speakers[i].track || '';
+  }
+}
+
+function shiftMixerWindow(delta, episodeId) {
+  if (mixerState.playing) stopMixerPlayback();
+  mixerState.previewStart = Math.max(0, mixerState.previewStart + delta);
+  mixerState.loaded = false;
+  const range = document.getElementById('mixer-range');
+  if (range) range.textContent = `${fmtMixerTime(mixerState.previewStart)} – ${fmtMixerTime(mixerState.previewStart + mixerState.previewDuration)}`;
+  const playBtn = document.getElementById('mixer-play-btn');
+  if (playBtn) { playBtn.disabled = true; playBtn.className = playBtn.className.replace('text-white', 'text-zinc-500').replace('bg-brand-600', 'bg-zinc-700'); }
+  loadAudioPreviews(episodeId);
 }
 
 

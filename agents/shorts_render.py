@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent
-from lib.encoding import get_video_encoder_args
+from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
 
@@ -61,6 +61,9 @@ class ShortsRenderAgent(BaseAgent):
 
         audio_bitrate = self.config.get("processing", {}).get("shorts_audio_bitrate", "128k")
         encoder_args = get_video_encoder_args(self.config, crf_key="shorts_crf")
+        lut_filter = get_lut_filter(self.config)
+        if lut_filter:
+            self.logger.info(f"LUT enabled: {self.config['processing'].get('lut_path')}")
 
         # Generate per-clip SRT and render
         rendered = []
@@ -83,7 +86,7 @@ class ShortsRenderAgent(BaseAgent):
                     merged_path, output_path, srt_path,
                     start, end, segments,
                     src_w, src_h, audio_bitrate,
-                    crop_config, encoder_args,
+                    crop_config, encoder_args, lut_filter,
                 )
                 futures[future] = clip_id
 
@@ -146,7 +149,7 @@ class ShortsRenderAgent(BaseAgent):
         source, output, srt_path,
         start, end, segments,
         src_w, src_h, audio_bitrate,
-        crop_config, encoder_args,
+        crop_config, encoder_args, lut_filter="",
     ):
         """Render a 9:16 short with per-segment dynamic speaker crops."""
         clip_segs = self._get_clip_segments(segments, start, end)
@@ -157,6 +160,8 @@ class ShortsRenderAgent(BaseAgent):
             speaker = clip_segs[0]["speaker"]
             duration = end - start
             vf = self._get_short_crop_filter(speaker, src_w, src_h, srt_path, crop_config)
+            if lut_filter:
+                vf = lut_filter + "," + vf
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start),
@@ -203,6 +208,8 @@ class ShortsRenderAgent(BaseAgent):
                     vf = self._get_short_crop_filter(speaker, src_w, src_h, seg_srt_path, crop_config)
                 else:
                     vf = self._get_short_crop_filter_no_subs(speaker, src_w, src_h, crop_config)
+                if lut_filter:
+                    vf = lut_filter + "," + vf
 
                 cmd = [
                     "ffmpeg", "-y",
@@ -277,12 +284,13 @@ class ShortsRenderAgent(BaseAgent):
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", audio_bitrate,
                 "-shortest",
-                "-fflags", "+shortest",
                 "-use_editlist", "0",
                 "-movflags", "+faststart",
                 str(output),
             ]
             subprocess.run(mux_cmd, capture_output=True, text=True, check=True)
+            if not output.exists() or output.stat().st_size == 0:
+                raise RuntimeError(f"Mux produced empty output: {output}")
             raw_concat.unlink(missing_ok=True)
             clean_wav.unlink(missing_ok=True)
         finally:
@@ -360,42 +368,50 @@ class ShortsRenderAgent(BaseAgent):
             return 0.0
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
-    def _get_short_crop_x(self, speaker, crop_w, src_w, crop_config):
-        """Compute x offset for 9:16 crop centered on speaker point, clamped to bounds.
+    def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
+        """Compute 9:16 crop region (w, h, x, y) centered on speaker, with zoom.
 
-        BOTH defaults to L speaker — centering between speakers shows empty space.
+        Zoom controls how tight the crop is. Higher zoom = more zoomed in.
+        BOTH defaults to L speaker position.
         """
         if speaker == "R":
             cx = crop_config["speaker_r_center_x"]
+            cy = crop_config.get("speaker_r_center_y", src_h // 2)
+            zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
-            # L and BOTH both use L speaker position
             cx = crop_config["speaker_l_center_x"]
-        return max(0, min(cx - crop_w // 2, src_w - crop_w))
+            cy = crop_config.get("speaker_l_center_y", src_h // 2)
+            zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
+
+        # Base crop: 9:16 from full height. Zoom shrinks the crop region.
+        crop_h = max(36, int(src_h / zoom))
+        crop_w = max(64, int(crop_h * 9 / 16))
+
+        x = max(0, min(cx - crop_w // 2, src_w - crop_w))
+        y = max(0, min(cy - crop_h // 2, src_h - crop_h))
+        return crop_w, crop_h, x, y
 
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
         """Build 9:16 crop filter without subtitle burn-in."""
-        crop_w = int(src_h * 9 / 16)  # 607 for 1080p
-        x_offset = self._get_short_crop_x(speaker, crop_w, src_w, crop_config)
-        return f"crop={crop_w}:{src_h}:{x_offset}:0,scale=1080:1920"
+        crop_w, crop_h, x, y = self._get_short_crop_region(speaker, src_w, src_h, crop_config)
+        return f"crop={crop_w}:{crop_h}:{x}:{y},scale=1080:1920"
 
     def _get_short_crop_filter(
         self, speaker, src_w, src_h, srt_path, crop_config
     ):
         """Build 9:16 crop filter chain with subtitle burn-in.
 
-        Centers a 9:16 crop (607x1080 for 1080p) on the speaker's configured
-        center point, clamped to frame bounds.
-        BOTH: center crop.
+        Centers a 9:16 crop on the speaker's configured center point with zoom,
+        clamped to frame bounds.
         """
-        crop_w = int(src_h * 9 / 16)  # 607 for 1080p
-        x_offset = self._get_short_crop_x(speaker, crop_w, src_w, crop_config)
+        crop_w, crop_h, x, y = self._get_short_crop_region(speaker, src_w, src_h, crop_config)
 
         # Escape the SRT path for ffmpeg filter (colons and backslashes)
         srt_escaped = escape_srt_path(srt_path)
 
         # Crop -> scale -> burn subtitles
         return (
-            f"crop={crop_w}:{src_h}:{x_offset}:0,"
+            f"crop={crop_w}:{crop_h}:{x}:{y},"
             f"scale=1080:1920,"
             f"subtitles='{srt_escaped}':force_style="
             f"'FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"

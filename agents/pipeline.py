@@ -25,35 +25,37 @@ AGENT_DEPS = {
     "longform_render": {"speaker_cut", "transcribe"},
     "shorts_render": {"clip_miner", "speaker_cut"},
     "metadata_gen": {"clip_miner"},
-    "qa": {"longform_render", "shorts_render", "metadata_gen"},
+    "thumbnail_gen": {"transcribe"},
+    "qa": {"longform_render", "shorts_render", "metadata_gen", "thumbnail_gen"},
     "podcast_feed": {"qa"},
     "publish": {"qa"},
-    "backup": {"qa"},
+    "backup": {"publish", "podcast_feed", "thumbnail_gen"},
 }
 
-NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup"}
+NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup", "thumbnail_gen"}
 
 
 def load_config() -> dict:
     """Load config.toml from project root."""
     config_path = Path(__file__).resolve().parent.parent / "config" / "config.toml"
-    try:
-        import tomli
-    except ImportError:
-        import tomllib as tomli
+    import tomllib
     with open(config_path, "rb") as f:
-        return tomli.load(f)
+        return tomllib.load(f)
 
 
 def run_pipeline(
     source_path: str,
+    audio_path: str = None,
+    speaker_count: int = None,
     episode_id=None,
     agents=None,
 ) -> dict:
     """Run the full pipeline (or a subset of agents) for an episode.
 
     Args:
-        source_path: Path to source media (SD card directory or single file).
+        source_path: Path(s) to source media (directory, file, or list of files).
+        audio_path: Optional path to external audio recorder directory (e.g., Zoom H6E).
+        speaker_count: Optional number of speakers for multi-track audio.
         episode_id: Optional episode ID. If None, one is generated.
         agents: Optional list of agent names to run. If None, runs all.
 
@@ -86,6 +88,8 @@ def run_pipeline(
             "title": "",
             "status": "processing",
             "source_path": source_path,
+            "audio_path": audio_path,
+            "speaker_count": speaker_count,
             "duration_seconds": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "clips": [],
@@ -150,6 +154,7 @@ def run_pipeline(
 
         if agent_name == "ingest":
             agent.source_path = source_path
+            agent.audio_path = audio_path or episode.get("audio_path")
 
         with episode_lock:
             episode["pipeline"]["current_agent"] = agent_name
@@ -166,6 +171,11 @@ def run_pipeline(
                 episode["duration_seconds"] = result["duration_seconds"]
             if "clips" in result:
                 episode["clips"] = result["clips"]
+            # Merge audio sync/track data from ingest
+            if "audio_sync" in result:
+                episode["audio_sync"] = result["audio_sync"]
+            if "audio" in result:
+                episode["audio_tracks"] = result["audio"].get("tracks", [])
             _save_episode(mutable["episode_file"], episode)
 
         # After clip_miner, rename episode dir if guest_name was extracted
@@ -197,6 +207,8 @@ def run_pipeline(
     # --- DAG execution loop ---
     # Special handling: stitch must pause for crop setup before continuing
     stitch_pause_needed = ("stitch" in requested_set and "crop_config" not in episode)
+    # Special handling: backup must pause for user approval (destructive SD cleanup)
+    backup_pause_needed = ("backup" in requested_set and not episode.get("backup_approved"))
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         pending_futures = {}  # future -> agent_name
@@ -236,6 +248,23 @@ def run_pipeline(
                         else:
                             episode.update(ep_check)
                             stitch_pause_needed = False
+
+                # If backup is ready but not approved, pause for user confirmation
+                if backup_pause_needed and name == "backup":
+                    with episode_lock:
+                        with open(mutable["episode_file"]) as f:
+                            ep_check = json.load(f)
+                        if not ep_check.get("backup_approved"):
+                            episode["status"] = "awaiting_backup_approval"
+                            episode["pipeline"].pop("current_agent", None)
+                            _save_episode(mutable["episode_file"], episode)
+                            logger.info(f"Pipeline paused for {mutable['episode_id']}: awaiting backup approval")
+                            for fut in pending_futures:
+                                fut.cancel()
+                            return episode
+                        else:
+                            episode.update(ep_check)
+                            backup_pause_needed = False
 
                 future = executor.submit(_run_agent, name)
                 pending_futures[future] = name

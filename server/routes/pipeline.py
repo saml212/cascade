@@ -27,6 +27,7 @@ _pipeline_lock = asyncio.Lock()
 
 class RunPipelineRequest(BaseModel):
     source_path: Optional[str] = None
+    audio_path: Optional[str] = None
     agents: Optional[list[str]] = None
 
 
@@ -42,14 +43,18 @@ async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dic
         if episode_id in _running and _running[episode_id].is_alive():
             raise HTTPException(status_code=409, detail="Pipeline already running for this episode")
 
-        # Resolve source_path: use request value, fall back to episode.json
+        # Resolve source_path and audio_path: use request value, fall back to episode.json
         source_path = req.source_path
-        if not source_path:
+        audio_path = req.audio_path
+        if not source_path or not audio_path:
             episode_file = OUTPUT_DIR / episode_id / "episode.json"
             if episode_file.exists():
                 with open(episode_file) as f:
                     ep_data = json.load(f)
-                source_path = ep_data.get("source_path", "")
+                if not source_path:
+                    source_path = ep_data.get("source_path", "")
+                if not audio_path:
+                    audio_path = ep_data.get("audio_path")
         if not source_path:
             raise HTTPException(status_code=400, detail="source_path required (not found in request or episode.json)")
 
@@ -57,6 +62,7 @@ async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dic
             from agents.pipeline import run_pipeline
             run_pipeline(
                 source_path=source_path,
+                audio_path=audio_path,
                 episode_id=episode_id,
                 agents=req.agents,
             )
@@ -242,3 +248,44 @@ async def auto_approve(episode_id: str) -> dict:
             json.dump(clips_data, f, indent=2)
 
     return {"status": "approved", "episode_id": episode_id}
+
+
+@router.post("/{episode_id}/approve-backup")
+async def approve_backup(episode_id: str) -> dict:
+    """Approve backup + SD card cleanup, then resume pipeline to run backup agent."""
+    logger.info("POST /api/episodes/%s/approve-backup", episode_id)
+    async with _pipeline_lock:
+        if episode_id in _running and _running[episode_id].is_alive():
+            raise HTTPException(status_code=409, detail="Pipeline already running for this episode")
+
+        episode_file = OUTPUT_DIR / episode_id / "episode.json"
+        if not episode_file.exists():
+            raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+
+        with open(episode_file) as f:
+            episode = json.load(f)
+
+        episode["backup_approved"] = True
+        episode["backup_approved_at"] = datetime.now(timezone.utc).isoformat()
+        episode["status"] = "processing"
+
+        with open(episode_file, "w") as f:
+            json.dump(episode, f, indent=2)
+
+        # Resume pipeline with just backup
+        source_path = episode.get("source_path", "")
+
+        def _run():
+            from agents.pipeline import run_pipeline
+            run_pipeline(
+                source_path=source_path,
+                episode_id=episode_id,
+                agents=["backup"],
+            )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        _running[episode_id] = thread
+
+    logger.info("Backup approved and started for %s", episode_id)
+    return {"status": "backup_started", "episode_id": episode_id}
