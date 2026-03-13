@@ -16,7 +16,6 @@
 - No full ingest/stitch/transcribe/clip-mining/render pipeline is wired into API episode creation.
 - No real publisher adapter execution to YouTube/TikTok/Instagram is currently performed.
 - “Trigger publish” endpoint is a placeholder acknowledgement.
-- MCP server implementation was not found in the repository.
 
 ## Expected Artifacts Today
 

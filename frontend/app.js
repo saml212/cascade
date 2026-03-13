@@ -70,6 +70,26 @@ const cropState = {
   get zoomR() { return (this.speakers[1] || {}).zoom || 1.0; },
 };
 
+// ── Audio Sync Verification State ──
+const syncState = {
+  loaded: false,
+  cameraWaveform: [],
+  h6eWaveform: [],
+  offset: 0,           // current offset in seconds
+  autoOffset: null,     // auto-detected offset (for reset)
+  duration: 120,
+  pps: 200,             // peaks per second
+  animFrame: null,
+  videoElement: null,
+  episodeId: null,
+  // Zoom/pan state
+  viewStart: 0,         // visible window start (seconds)
+  viewEnd: 30,          // visible window end (seconds)
+  isDragging: false,
+  dragStartX: 0,
+  dragStartViewStart: 0,
+};
+
 // ── Audio Mixer State ──
 const mixerState = {
   audioCtx: null,
@@ -638,6 +658,9 @@ async function renderEpisodeDetail(episodeId, tab) {
         </div>
       </div>
     </div>
+
+    <!-- Audio Mix Panel -->
+    ${renderAudioMixPanel(episodeId, ep)}
 
     <!-- Tab navigation -->
     <div class="flex items-center gap-1 mb-6 border-b border-zinc-800 pb-px">
@@ -2309,6 +2332,47 @@ async function renderCropSetup(episodeId) {
     <h1 class="text-xl font-bold mb-2">Speaker Crop Setup</h1>
     <p class="text-zinc-500 text-sm mb-6">Click on the video frame to set each speaker's center point. The system derives both 9:16 (shorts) and 16:9 (longform) crop rectangles from these centers.</p>
 
+    ${(ep.audio_sync && ep.audio_sync.offset_seconds != null) ? `
+    <div id="sync-verify" class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-semibold text-zinc-300">Audio Sync Verification</h3>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-zinc-500">Auto-detected: ${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
+          <span id="sync-status" class="text-xs text-zinc-600">Loading waveforms...</span>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <video id="sync-video" width="480" class="rounded-lg bg-black mb-3" preload="metadata" controls>
+          <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
+        </video>
+      </div>
+
+      <div class="mb-1 flex items-center gap-4">
+        <div class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm" style="background:rgba(251,146,60,0.8);"></span><span class="text-xs text-zinc-400">Camera</span></div>
+        <div class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm" style="background:rgba(96,165,250,0.8);"></span><span class="text-xs text-zinc-400">H6E (shifted by offset)</span></div>
+        <span class="text-xs text-zinc-600 ml-auto">Scroll to zoom, drag to pan, click to seek</span>
+      </div>
+      <canvas id="sync-waveform" class="w-full rounded cursor-crosshair" style="height:180px;background:#0a0a0a;"></canvas>
+      <div class="flex items-center justify-between mt-1 mb-3">
+        <span id="sync-view-range" class="text-xs text-zinc-600 font-mono"></span>
+        <button onclick="syncZoomToFit()" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">Zoom to fit</button>
+      </div>
+
+      <div class="flex items-center gap-3 flex-wrap">
+        <span class="text-xs text-zinc-500">Offset:</span>
+        <button onclick="adjustSyncOffset(-1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1.0</button>
+        <button onclick="adjustSyncOffset(-0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.1</button>
+        <button onclick="adjustSyncOffset(-0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.01</button>
+        <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[80px] text-center">${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
+        <button onclick="adjustSyncOffset(0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.01</button>
+        <button onclick="adjustSyncOffset(0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.1</button>
+        <button onclick="adjustSyncOffset(1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1.0</button>
+        <button onclick="saveSyncOffset('${episodeId}')" id="sync-save-btn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Save Offset</button>
+        <button onclick="resetSyncOffset()" id="sync-reset-btn" class="px-3 py-1.5 text-xs bg-zinc-700 hover:bg-zinc-600 rounded font-medium transition-colors text-zinc-300">Reset</button>
+      </div>
+    </div>` : ''}
+
     ${allAudioTracks.length > 0 ? `
     <div id="audio-mixer" class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">
       <div class="flex items-center justify-between mb-3">
@@ -2484,6 +2548,11 @@ async function renderCropSetup(episodeId) {
     }
     redrawCropCanvas();
   });
+
+  // Load sync preview if audio_sync data exists
+  if (ep.audio_sync && ep.audio_sync.offset_seconds != null) {
+    loadSyncPreview(episodeId, ep.audio_sync.offset_seconds);
+  }
 }
 
 function setCropSpeaker(idx) {
@@ -2651,6 +2720,485 @@ async function saveCropConfig(episodeId) {
     showToast('Failed to save crop config: ' + err.message, 'error');
     if (btn) { btn.disabled = false; btn.textContent = 'Save & Continue'; }
   }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  AUDIO MIX PANEL (universal volume control for renders)
+// ════════════════════════════════════════════════════════════════════
+
+function renderAudioMixPanel(episodeId, ep) {
+  const audioTracks = ep.audio_tracks || [];
+  if (audioTracks.length === 0) return '';
+
+  const mixCfg = ep.audio_mix || { tracks: [], master_volume: 1.0 };
+  const mixMap = {};
+  for (const t of mixCfg.tracks) mixMap[t.stem] = t.volume;
+  const cropSpeakers = (ep.crop_config || {}).speakers || [];
+  const ambientTracks = (ep.crop_config || {}).ambient_tracks || [];
+
+  // Speaker cut config (sensitivity params)
+  const cutCfg = ep.speaker_cut_config || {};
+  const speechMargin = cutCfg.speech_db_margin || 12;
+  const minSegment = cutCfg.min_segment_seconds || 2.0;
+  const bothRange = cutCfg.both_db_range || 6.0;
+
+  const rows = audioTracks.map(t => {
+    const stem = t.filename.replace(/\.[^.]+$/, '');
+    const isInput = t.track_type === 'input';
+
+    // Determine default volume
+    let defaultVol = isInput ? 1.0 : 0.2;
+    // Check crop_config for speaker/ambient assignment
+    for (const spk of cropSpeakers) {
+      if (spk.track === t.track_number) defaultVol = spk.volume || 1.0;
+    }
+    for (const amb of ambientTracks) {
+      if (amb.track_number === t.track_number) defaultVol = amb.volume || 0.2;
+    }
+
+    const vol = stem in mixMap ? mixMap[stem] : defaultVol;
+    const pct = Math.round(vol * 100);
+
+    // Find speaker assignment
+    let assignment = '';
+    for (let i = 0; i < cropSpeakers.length; i++) {
+      if (cropSpeakers[i].track === t.track_number) {
+        assignment = cropSpeakers[i].label || `Speaker ${i + 1}`;
+        break;
+      }
+    }
+    for (const amb of ambientTracks) {
+      if (amb.track_number === t.track_number) assignment = 'Ambient';
+    }
+
+    return `
+      <div class="flex items-center gap-2 py-0.5">
+        <div class="w-14 text-xs font-mono ${isInput ? 'text-zinc-300' : 'text-zinc-500'} truncate" title="${escapeHtml(t.filename)}">${escapeHtml(stem.replace('audio_', ''))}</div>
+        <span class="w-16 text-xs ${assignment ? 'text-zinc-400' : 'text-zinc-600'} truncate">${escapeHtml(assignment || '—')}</span>
+        <input type="range" data-mix-stem="${escapeHtml(stem)}" min="0" max="300" value="${pct}"
+          oninput="updateMixSliderLabel(this)"
+          class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+        <span class="mix-vol-label text-xs text-zinc-400 w-10 text-right font-mono">${pct}%</span>
+      </div>`;
+  }).join('');
+
+  const masterPct = Math.round((mixCfg.master_volume || 1.0) * 100);
+  const hasMix = (ep_dir_check => {
+    // We can't check file existence from frontend, but if audio_mix config exists, it was generated
+    return mixCfg.tracks.length > 0;
+  })();
+
+  return `
+    <div class="mb-6">
+      <button onclick="toggleMixPanel()" class="w-full flex items-center justify-between bg-zinc-900 border border-zinc-800 rounded-lg px-4 py-3 hover:bg-zinc-800/80 transition-colors">
+        <div class="flex items-center gap-2">
+          <svg class="w-4 h-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072M12 6v12m-3.536-8.464a5 5 0 000 7.072M18.364 5.636a9 9 0 010 12.728M5.636 5.636a9 9 0 000 12.728"/></svg>
+          <span class="text-sm font-semibold text-zinc-300">Audio Mix & Speaker Settings</span>
+        </div>
+        <div class="flex items-center gap-2">
+          ${hasMix ? '<span class="text-xs text-green-500">Mix applied</span>' : '<span class="text-xs text-zinc-600">No mix generated</span>'}
+          <svg id="mix-panel-chevron" class="w-4 h-4 text-zinc-500 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+        </div>
+      </button>
+
+      <div id="mix-panel-body" class="hidden bg-zinc-900 border border-zinc-800 border-t-0 rounded-b-lg p-4">
+        <!-- Track volumes -->
+        <div class="mb-4">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-xs font-semibold text-zinc-400 uppercase tracking-wide">Track Volumes</h4>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-zinc-500">Master:</span>
+              <input type="range" id="mix-master-vol" min="0" max="200" value="${masterPct}"
+                oninput="document.getElementById('mix-master-label').textContent=this.value+'%'"
+                class="w-16 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+              <span id="mix-master-label" class="text-xs text-zinc-400 font-mono w-8">${masterPct}%</span>
+            </div>
+          </div>
+          <div class="space-y-0.5">${rows}</div>
+          <p class="text-xs text-zinc-600 mt-2">Set volume levels for each audio track. These are applied to ALL renders (longform + shorts).</p>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="flex items-center gap-2 mb-4">
+          <button onclick="applyAudioMix('${episodeId}')" id="mix-apply-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-xs font-medium transition-colors">
+            Apply Mix
+          </button>
+          <button onclick="rerenderAll('${episodeId}')" id="mix-rerender-btn" class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors">
+            Re-render All
+          </button>
+          <span id="mix-status" class="text-xs text-zinc-500"></span>
+        </div>
+
+        <!-- Speaker cut sensitivity -->
+        <div class="border-t border-zinc-800 pt-3">
+          <h4 class="text-xs font-semibold text-zinc-400 uppercase tracking-wide mb-2">Speaker Cut Sensitivity</h4>
+          <div class="grid grid-cols-3 gap-3">
+            <div>
+              <label class="text-xs text-zinc-500 block mb-1">Speech Margin (dB)</label>
+              <div class="flex items-center gap-1">
+                <input type="range" id="cut-speech-margin" min="3" max="24" step="1" value="${speechMargin}"
+                  oninput="document.getElementById('cut-speech-margin-val').textContent=this.value"
+                  class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+                <span id="cut-speech-margin-val" class="text-xs text-zinc-400 font-mono w-6">${speechMargin}</span>
+              </div>
+            </div>
+            <div>
+              <label class="text-xs text-zinc-500 block mb-1">Min Segment (s)</label>
+              <div class="flex items-center gap-1">
+                <input type="range" id="cut-min-segment" min="0.3" max="5" step="0.1" value="${minSegment}"
+                  oninput="document.getElementById('cut-min-segment-val').textContent=parseFloat(this.value).toFixed(1)"
+                  class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+                <span id="cut-min-segment-val" class="text-xs text-zinc-400 font-mono w-6">${minSegment.toFixed ? minSegment.toFixed(1) : minSegment}</span>
+              </div>
+            </div>
+            <div>
+              <label class="text-xs text-zinc-500 block mb-1">Both Range (dB)</label>
+              <div class="flex items-center gap-1">
+                <input type="range" id="cut-both-range" min="1" max="15" step="0.5" value="${bothRange}"
+                  oninput="document.getElementById('cut-both-range-val').textContent=parseFloat(this.value).toFixed(1)"
+                  class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+                <span id="cut-both-range-val" class="text-xs text-zinc-400 font-mono w-6">${bothRange}</span>
+              </div>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 mt-2">
+            <button onclick="reanalyzeSpeakers('${episodeId}')" class="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-medium transition-colors">
+              Re-analyze Speakers
+            </button>
+            <span class="text-xs text-zinc-600">Lower margin = more sensitive, shorter segments = more frequent cuts</span>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function toggleMixPanel() {
+  const body = document.getElementById('mix-panel-body');
+  const chevron = document.getElementById('mix-panel-chevron');
+  if (!body) return;
+  body.classList.toggle('hidden');
+  if (chevron) chevron.style.transform = body.classList.contains('hidden') ? '' : 'rotate(180deg)';
+}
+
+function updateMixSliderLabel(slider) {
+  const label = slider.nextElementSibling;
+  if (label) label.textContent = slider.value + '%';
+}
+
+async function applyAudioMix(episodeId) {
+  const btn = document.getElementById('mix-apply-btn');
+  const status = document.getElementById('mix-status');
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating...'; }
+  if (status) status.textContent = 'Generating audio mix...';
+
+  // Collect track volumes from sliders
+  const tracks = [];
+  document.querySelectorAll('[data-mix-stem]').forEach(slider => {
+    tracks.push({
+      stem: slider.dataset.mixStem,
+      volume: parseInt(slider.value) / 100,
+    });
+  });
+
+  const masterEl = document.getElementById('mix-master-vol');
+  const masterVolume = masterEl ? parseInt(masterEl.value) / 100 : 1.0;
+
+  try {
+    const result = await api(`/episodes/${episodeId}/audio-mix`, {
+      method: 'POST',
+      body: JSON.stringify({ tracks, master_volume: masterVolume }),
+    });
+    if (status) status.textContent = `Mix generated (${result.size_mb} MB)`;
+    showToast('Audio mix generated. Click "Re-render All" to apply.', 'success');
+  } catch (err) {
+    if (status) status.textContent = 'Failed: ' + err.message;
+    showToast('Audio mix failed: ' + err.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Apply Mix'; }
+  }
+}
+
+async function rerenderAll(episodeId) {
+  const btn = document.getElementById('mix-rerender-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
+
+  try {
+    await api(`/episodes/${episodeId}/run-pipeline`, {
+      method: 'POST',
+      body: JSON.stringify({ agents: ['longform_render', 'shorts_render'] }),
+    });
+    showToast('Re-rendering longform + shorts with new audio mix...', 'success');
+    // Start polling pipeline status
+    checkAndShowPipeline(episodeId);
+  } catch (err) {
+    showToast('Re-render failed: ' + err.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Re-render All'; }
+  }
+}
+
+async function reanalyzeSpeakers(episodeId) {
+  // Save sensitivity config first
+  const speechMargin = parseFloat(document.getElementById('cut-speech-margin')?.value || 12);
+  const minSegment = parseFloat(document.getElementById('cut-min-segment')?.value || 2.0);
+  const bothRange = parseFloat(document.getElementById('cut-both-range')?.value || 6.0);
+
+  try {
+    await api(`/episodes/${episodeId}/speaker-cut-config`, {
+      method: 'POST',
+      body: JSON.stringify({
+        speech_db_margin: speechMargin,
+        min_segment_seconds: minSegment,
+        both_db_range: bothRange,
+      }),
+    });
+
+    // Re-run speaker_cut + render agents
+    await api(`/episodes/${episodeId}/run-pipeline`, {
+      method: 'POST',
+      body: JSON.stringify({ agents: ['speaker_cut', 'longform_render', 'shorts_render'] }),
+    });
+    showToast('Re-analyzing speakers and re-rendering...', 'success');
+    checkAndShowPipeline(episodeId);
+  } catch (err) {
+    showToast('Re-analysis failed: ' + err.message, 'error');
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  AUDIO SYNC VERIFICATION FUNCTIONS
+// ════════════════════════════════════════════════════════════════════
+
+async function loadSyncPreview(episodeId, currentOffset) {
+  syncState.episodeId = episodeId;
+  syncState.offset = currentOffset;
+  syncState.autoOffset = currentOffset;
+
+  const statusEl = document.getElementById('sync-status');
+
+  try {
+    const data = await api(`/episodes/${episodeId}/sync-preview?duration=120`);
+    syncState.cameraWaveform = data.camera_waveform;
+    syncState.h6eWaveform = data.h6e_waveform;
+    syncState.offset = data.offset_seconds;
+    syncState.duration = data.duration;
+    syncState.pps = data.peaks_per_second;
+    syncState.loaded = true;
+    syncState.viewStart = 0;
+    syncState.viewEnd = Math.min(30, data.duration);
+    if (syncState.autoOffset === null) syncState.autoOffset = data.offset_seconds;
+
+    if (statusEl) statusEl.textContent = 'Loaded. Scroll to zoom, drag to pan.';
+
+    initSyncCanvas();
+    drawSyncWaveform();
+    initSyncPlayhead();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'Failed to load: ' + err.message;
+  }
+}
+
+function initSyncCanvas() {
+  const canvas = document.getElementById('sync-waveform');
+  if (!canvas) return;
+
+  // Mouse wheel = zoom
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = (e.clientX - rect.left) / rect.width; // 0-1 position
+    const viewSpan = syncState.viewEnd - syncState.viewStart;
+    const zoomFactor = e.deltaY > 0 ? 1.3 : 0.7;
+    const newSpan = Math.max(1, Math.min(syncState.duration, viewSpan * zoomFactor));
+
+    // Zoom centered on mouse position
+    const mouseTime = syncState.viewStart + mouseX * viewSpan;
+    syncState.viewStart = Math.max(0, mouseTime - mouseX * newSpan);
+    syncState.viewEnd = Math.min(syncState.duration, syncState.viewStart + newSpan);
+    if (syncState.viewStart < 0) { syncState.viewEnd -= syncState.viewStart; syncState.viewStart = 0; }
+
+    drawSyncWaveform();
+  }, { passive: false });
+
+  // Drag to pan
+  canvas.addEventListener('mousedown', (e) => {
+    syncState.isDragging = true;
+    syncState.dragStartX = e.clientX;
+    syncState.dragStartViewStart = syncState.viewStart;
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!syncState.isDragging) return;
+    const canvas = document.getElementById('sync-waveform');
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const dx = e.clientX - syncState.dragStartX;
+    const viewSpan = syncState.viewEnd - syncState.viewStart;
+    const timeDelta = -(dx / rect.width) * viewSpan;
+    let newStart = syncState.dragStartViewStart + timeDelta;
+    newStart = Math.max(0, Math.min(syncState.duration - viewSpan, newStart));
+    syncState.viewStart = newStart;
+    syncState.viewEnd = newStart + viewSpan;
+    drawSyncWaveform();
+  });
+  window.addEventListener('mouseup', () => { syncState.isDragging = false; });
+
+  // Click to seek video
+  canvas.addEventListener('click', (e) => {
+    if (Math.abs(e.clientX - syncState.dragStartX) > 5) return; // was a drag
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = (e.clientX - rect.left) / rect.width;
+    const clickTime = syncState.viewStart + mouseX * (syncState.viewEnd - syncState.viewStart);
+    const video = syncState.videoElement;
+    if (video) video.currentTime = Math.max(0, clickTime);
+  });
+}
+
+function drawSyncWaveform() {
+  const canvas = document.getElementById('sync-waveform');
+  if (!canvas || !syncState.loaded) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const midY = h / 2;
+  const pps = syncState.pps;
+  const viewStart = syncState.viewStart;
+  const viewEnd = syncState.viewEnd;
+  const viewSpan = viewEnd - viewStart;
+
+  // Background
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, w, h);
+
+  // Center line
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, midY);
+  ctx.lineTo(w, midY);
+  ctx.stroke();
+
+  // Time grid — adaptive spacing
+  const gridIntervals = [0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60];
+  let gridStep = gridIntervals.find(s => (viewSpan / s) <= 30) || 60;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.font = `${10 * dpr}px system-ui`;
+  const gridStart = Math.ceil(viewStart / gridStep) * gridStep;
+  for (let t = gridStart; t <= viewEnd; t += gridStep) {
+    const x = ((t - viewStart) / viewSpan) * w;
+    ctx.fillRect(x, 0, 1, h);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    const label = gridStep < 1 ? t.toFixed(2) + 's' : gridStep < 10 ? t.toFixed(1) + 's' : Math.round(t) + 's';
+    ctx.fillText(label, x + 3 * dpr, h - 4 * dpr);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  }
+
+  // Draw camera waveform (orange, top half)
+  _drawWaveformHalf(ctx, syncState.cameraWaveform, 'rgba(251,146,60,0.8)', w, h, 0, pps, viewStart, viewEnd, true);
+
+  // Draw H6E waveform (blue, bottom half) — shifted by offset
+  _drawWaveformHalf(ctx, syncState.h6eWaveform, 'rgba(96,165,250,0.8)', w, h, syncState.offset, pps, viewStart, viewEnd, false);
+
+  // Video playhead
+  const video = syncState.videoElement;
+  if (video && video.currentTime >= viewStart && video.currentTime <= viewEnd) {
+    const x = ((video.currentTime - viewStart) / viewSpan) * w;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+
+  // View range label
+  const rangeEl = document.getElementById('sync-view-range');
+  if (rangeEl) rangeEl.textContent = `${viewStart.toFixed(2)}s — ${viewEnd.toFixed(2)}s (${viewSpan.toFixed(1)}s visible)`;
+}
+
+function _drawWaveformHalf(ctx, waveform, color, w, h, offsetSeconds, pps, viewStart, viewEnd, isTop) {
+  if (!waveform.length) return;
+  const viewSpan = viewEnd - viewStart;
+  const midY = h / 2;
+  const halfH = h * 0.45;
+
+  ctx.fillStyle = color;
+  for (let px = 0; px < w; px++) {
+    const time = viewStart + (px / w) * viewSpan;
+    // For H6E: time in camera space → h6e sample = (time + offset) * pps
+    const sampleTime = time + offsetSeconds;
+    const sampleIdx = Math.floor(sampleTime * pps);
+    if (sampleIdx < 0 || sampleIdx >= waveform.length) continue;
+
+    const amp = waveform[sampleIdx];
+    const barH = Math.max(0.5, amp * halfH);
+
+    if (isTop) {
+      ctx.fillRect(px, midY - barH, 1, barH);
+    } else {
+      ctx.fillRect(px, midY, 1, barH);
+    }
+  }
+}
+
+function syncZoomToFit() {
+  syncState.viewStart = 0;
+  syncState.viewEnd = syncState.duration;
+  drawSyncWaveform();
+}
+
+function initSyncPlayhead() {
+  const video = document.getElementById('sync-video');
+  if (!video) return;
+  syncState.videoElement = video;
+  video.currentTime = 2;
+
+  function animate() {
+    drawSyncWaveform();
+    syncState.animFrame = requestAnimationFrame(animate);
+  }
+  if (syncState.animFrame) cancelAnimationFrame(syncState.animFrame);
+  animate();
+}
+
+function adjustSyncOffset(delta) {
+  syncState.offset = Math.round((syncState.offset + delta) * 10000) / 10000;
+
+  const display = document.getElementById('sync-offset-display');
+  if (display) display.textContent = syncState.offset.toFixed(4) + 's';
+
+  if (syncState.loaded) drawSyncWaveform();
+}
+
+async function saveSyncOffset(episodeId) {
+  const btn = document.getElementById('sync-save-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
+
+  try {
+    await api(`/episodes/${episodeId}/sync-offset`, {
+      method: 'POST',
+      body: JSON.stringify({ offset_seconds: syncState.offset }),
+    });
+    showToast(`Sync offset saved: ${syncState.offset.toFixed(4)}s`, 'success');
+  } catch (err) {
+    showToast('Failed to save offset: ' + err.message, 'error');
+  }
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Save Offset'; }
+}
+
+function resetSyncOffset() {
+  if (syncState.autoOffset !== null) syncState.offset = syncState.autoOffset;
+
+  const display = document.getElementById('sync-offset-display');
+  if (display) display.textContent = syncState.offset.toFixed(4) + 's';
+
+  if (syncState.loaded) drawSyncWaveform();
 }
 
 // ════════════════════════════════════════════════════════════════════

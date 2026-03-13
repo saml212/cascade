@@ -249,6 +249,13 @@ Available actions:
    {{"action": "rerender_longform"}}
    ```
 
+14. **auto_trim** — Automatically detect and trim fluff from the start and end of the episode.
+   Analyzes the transcript to find where the real conversation begins (after setup, mic checks, greetings)
+   and where it ends (before goodbyes, wrap-up). Creates trim_start and trim_end edits automatically.
+   ```action
+   {{"action": "auto_trim"}}
+   ```
+
 ## Platform metadata schema
 Each clip can have per-platform metadata. The supported platforms and their fields:
 - **youtube**: title, description
@@ -275,6 +282,9 @@ Each clip can have per-platform metadata. The supported platforms and their fiel
 - For longform editing: search the transcript carefully for the exact moments the user describes. Find where they mention stopping (e.g. "gotta pay for parking") and where they resume (next question or topic). Use precise timestamps from the transcript for cuts.
 - Multiple edits can be stacked — each cut/trim is stored and applied in order during re-render.
 - After making longform edits, suggest running rerender_longform to apply them.
+- When asked to auto-trim, clean up, or edit the episode, analyze the transcript to find: (1) where the actual substantive conversation begins (skip mic checks, "are we rolling?", casual pre-show chatter, "let me get settled"), and (2) where the conversation actually ends (skip "thanks for coming", "okay we're done", casual post-show chatter). Use edit_longform trim_start/trim_end with precise timestamps. You can also use the auto_trim action to have AI automatically detect these points.
+- If this is the first message in the conversation and there are no existing longform_edits, proactively offer to auto-trim the episode and identify any sections that should be cut (breaks, technical issues, off-topic tangents).
+- When the user describes a section to cut (e.g. "we took a break to deal with parking"), search the transcript thoroughly for that moment, find the exact start and end timestamps, and use edit_longform with type "cut".
 """
 
 
@@ -392,6 +402,8 @@ def _execute_action(action: dict, ep_dir: Path) -> dict:
         return _action_edit_longform(action, ep_dir)
     elif action_type == "rerender_longform":
         return _action_rerender_longform(action, ep_dir)
+    elif action_type == "auto_trim":
+        return _action_auto_trim(action, ep_dir)
     else:
         return {"action": action_type, "status": "error", "detail": f"Unknown action: {action_type}"}
 
@@ -825,6 +837,105 @@ def _action_edit_longform(action: dict, ep_dir: Path) -> dict:
         json.dump(episode_data, f, indent=2)
 
     return {"action": "edit_longform", "status": "ok", "edit": edit, "total_edits": len(edits)}
+
+
+def _action_auto_trim(action: dict, ep_dir: Path) -> dict:
+    """Auto-detect fluff at start/end and create trim edits using Claude."""
+    import httpx
+
+    # Load transcript
+    transcribe_file = ep_dir / "transcribe.json"
+    if not transcribe_file.exists():
+        return {"action": "auto_trim", "status": "error", "detail": "No transcript available. Run transcribe first."}
+
+    transcribe_data = _load_json_safe(transcribe_file) or {}
+    diarized = transcribe_data.get("diarized", {})
+    utterances = diarized.get("utterances", [])
+    if not utterances:
+        return {"action": "auto_trim", "status": "error", "detail": "No utterances in transcript."}
+
+    episode_data = _load_json_safe(ep_dir / "episode.json") or {}
+    duration = episode_data.get("duration_seconds", 0)
+
+    # Format first 3 min and last 3 min of transcript for analysis
+    first_lines, last_lines = [], []
+    for utt in utterances:
+        start = utt.get("start", 0)
+        end = utt.get("end", 0)
+        ch = utt.get("channel", utt.get("speaker", "?"))
+        if isinstance(ch, int):
+            ch = "L" if ch == 0 else "R"
+        text = utt.get("text", "").strip()
+        if not text:
+            continue
+        line = f"[{start:.1f}s - {end:.1f}s] Speaker {ch}: {text}"
+        if start < 300:
+            first_lines.append(line)
+        if end > duration - 300:
+            last_lines.append(line)
+
+    prompt = f"""Analyze this podcast transcript to find where the real conversation starts and ends.
+
+## First 5 minutes of transcript:
+{chr(10).join(first_lines[:100])}
+
+## Last 5 minutes of transcript:
+{chr(10).join(last_lines[-100:])}
+
+## Total episode duration: {duration:.1f} seconds ({duration/60:.1f} minutes)
+
+Find:
+1. **trim_start**: The timestamp (in seconds) where the actual substantive conversation/interview begins. Skip past any: mic checks, "are we rolling?", "let me adjust this", greetings before the interview actually starts, test claps, setup talk. Find where the host's first real question or introduction begins.
+
+2. **trim_end**: The timestamp (in seconds) where the conversation actually ends. Skip any: "thanks for coming", "okay we're done", "let me stop the recording", post-show chatter, goodbyes.
+
+Respond with ONLY a JSON object, no other text:
+{{"trim_start": {{"seconds": <number>, "reason": "<brief reason>"}}, "trim_end": {{"seconds": <number>, "reason": "<brief reason>"}}}}
+
+If the episode starts or ends cleanly (no fluff to trim), use 0 for trim_start or the full duration for trim_end."""
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"action": "auto_trim", "status": "error", "detail": "ANTHROPIC_API_KEY not set"}
+
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        content = resp.json()["content"][0]["text"]
+        # Extract JSON from response
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            return {"action": "auto_trim", "status": "error", "detail": f"Could not parse AI response: {content[:200]}"}
+        trim_data = json.loads(json_match.group())
+    except Exception as e:
+        return {"action": "auto_trim", "status": "error", "detail": f"AI analysis failed: {e}"}
+
+    edits = episode_data.get("longform_edits", [])
+    results = []
+
+    ts = trim_data.get("trim_start", {})
+    if ts and ts.get("seconds", 0) > 5:  # Only trim if more than 5s of fluff
+        edit = {"type": "trim_start", "seconds": ts["seconds"], "reason": ts.get("reason", "Auto-detected start")}
+        edits.append(edit)
+        results.append(edit)
+
+    te = trim_data.get("trim_end", {})
+    if te and te.get("seconds", duration) < duration - 5:  # Only trim if more than 5s of fluff
+        edit = {"type": "trim_end", "seconds": te["seconds"], "reason": te.get("reason", "Auto-detected end")}
+        edits.append(edit)
+        results.append(edit)
+
+    episode_data["longform_edits"] = edits
+    with open(ep_dir / "episode.json", "w") as f:
+        json.dump(episode_data, f, indent=2)
+
+    return {"action": "auto_trim", "status": "ok", "edits": results, "total_edits": len(edits)}
 
 
 def _action_rerender_longform(action: dict, ep_dir: Path) -> dict:

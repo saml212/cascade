@@ -51,6 +51,13 @@ class LongformRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
+        # Check for pre-mixed audio (from audio mix panel)
+        audio_mix_path = work_dir / "audio_mix.wav"
+        if audio_mix_path.exists():
+            self.logger.info("Using pre-mixed audio from audio_mix.wav")
+        else:
+            audio_mix_path = None
+
         # Get source video dimensions
         probe = ffprobe(merged_path)
         video_stream = next(
@@ -97,6 +104,7 @@ class LongformRenderAgent(BaseAgent):
                     self._render_segment,
                     merged_path, seg_path, seg, src_w, src_h, audio_bitrate,
                     crop_config, srt_path, encoder_args, lut_filter,
+                    audio_mix_path,
                 )
                 futures[future] = (i, seg_path)
 
@@ -201,6 +209,7 @@ class LongformRenderAgent(BaseAgent):
         srt_path: Path = None,
         encoder_args: list = None,
         lut_filter: str = "",
+        audio_mix_path: Path = None,
     ):
         """Render a single segment with speaker-appropriate crop and subtitles."""
         start = segment["start"]
@@ -226,50 +235,83 @@ class LongformRenderAgent(BaseAgent):
                 f"Alignment=2'"
             )
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-i", str(source),
-            "-t", str(duration),
-            "-vf", vf,
-            "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
-            *encoder_args,
-            "-r", "30", "-g", "30", "-bf", "0",
-            "-vsync", "cfr",
-            "-pix_fmt", "yuv420p",
-            "-video_track_timescale", "30000",
-            "-c:a", "aac", "-b:a", audio_bitrate,
-            "-use_editlist", "0",
-            "-movflags", "+faststart",
-            str(output),
-        ]
+        if audio_mix_path and audio_mix_path.exists():
+            # Use pre-mixed H6E audio
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start), "-i", str(source),
+                "-ss", str(start), "-i", str(audio_mix_path),
+                "-t", str(duration),
+                "-map", "0:v", "-map", "1:a",
+                "-vf", vf,
+                *encoder_args,
+                "-r", "30", "-g", "30", "-bf", "0",
+                "-vsync", "cfr",
+                "-pix_fmt", "yuv420p",
+                "-video_track_timescale", "30000",
+                "-c:a", "aac", "-b:a", audio_bitrate,
+                "-use_editlist", "0",
+                "-movflags", "+faststart",
+                str(output),
+            ]
+        else:
+            # Fallback: camera stereo audio merged to mono
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-i", str(source),
+                "-t", str(duration),
+                "-vf", vf,
+                "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+                *encoder_args,
+                "-r", "30", "-g", "30", "-bf", "0",
+                "-vsync", "cfr",
+                "-pix_fmt", "yuv420p",
+                "-video_track_timescale", "30000",
+                "-c:a", "aac", "-b:a", audio_bitrate,
+                "-use_editlist", "0",
+                "-movflags", "+faststart",
+                str(output),
+            ]
         timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
         """Get ffmpeg crop filter for speaker type using crop_config center points.
 
-        Centers a 16:9 crop on the speaker's configured center point, clamped to
-        frame bounds. Zoom controls how tight the crop is (higher = more zoomed in).
-        BOTH: uses zoom to crop from full frame if set, else passthrough at 1920x1080.
+        Supports both N-speaker labels (speaker_0, speaker_1, ...) and legacy
+        L/R labels. Centers a 16:9 crop on the speaker's configured center point,
+        clamped to frame bounds.
         """
-        if speaker == "L":
-            cx = crop_config["speaker_l_center_x"]
-            cy = crop_config["speaker_l_center_y"]
+        speakers = crop_config.get("speakers", [])
+
+        # N-speaker format: speaker_0, speaker_1, etc.
+        if speaker.startswith("speaker_"):
+            idx = int(speaker.split("_")[1])
+            if idx < len(speakers):
+                s = speakers[idx]
+                cx = s["center_x"]
+                cy = s["center_y"]
+                zoom = s.get("zoom", 1.0)
+            else:
+                return "scale=1920:1080"
+        # Legacy L/R format
+        elif speaker == "L":
+            cx = crop_config.get("speaker_l_center_x", speakers[0]["center_x"] if speakers else src_w // 4)
+            cy = crop_config.get("speaker_l_center_y", speakers[0]["center_y"] if speakers else src_h // 2)
             zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
         elif speaker == "R":
-            cx = crop_config["speaker_r_center_x"]
-            cy = crop_config["speaker_r_center_y"]
+            cx = crop_config.get("speaker_r_center_x", speakers[1]["center_x"] if len(speakers) > 1 else 3 * src_w // 4)
+            cy = crop_config.get("speaker_r_center_y", speakers[1]["center_y"] if len(speakers) > 1 else src_h // 2)
             zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
+            # BOTH/NONE — wide shot
             zoom = crop_config.get("wide_zoom", crop_config.get("zoom", 1.0))
             if zoom <= 1.0:
                 return "scale=1920:1080"
-            # BOTH/wide: use configured center or frame center
             cx = crop_config.get("wide_center_x", src_w // 2)
             cy = crop_config.get("wide_center_y", src_h // 2)
 
         # Crop dimensions: base is half the source width, divided by zoom
-        # zoom=1.0: crop_w=960 (half frame), zoom=2.0: crop_w=480 (quarter frame)
         crop_w = max(64, int(src_w / (2 * zoom)))
         crop_h = max(36, int(crop_w * 9 / 16))
 

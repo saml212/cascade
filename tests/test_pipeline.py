@@ -211,7 +211,7 @@ class TestPipelinePauseAtCropSetup:
              patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents):
             result = run_pipeline(
                 source_path="/fake/source",
-                agents=["ingest", "stitch", "audio_analysis"],
+                agents=["ingest", "stitch", "audio_analysis", "speaker_cut"],
             )
 
         assert result["status"] == "awaiting_crop_setup"
@@ -240,10 +240,10 @@ class TestPipelinePauseAtCropSetup:
 
         with patch("agents.pipeline.resolve_path", return_value=episodes_dir), \
              patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents):
-            # First run pauses at crop_setup
+            # First run pauses at crop_setup (needs crop-dependent agent to trigger pause)
             result = run_pipeline(
                 source_path="/fake/source",
-                agents=["ingest", "stitch", "audio_analysis"],
+                agents=["ingest", "stitch", "audio_analysis", "speaker_cut"],
             )
             assert result["status"] == "awaiting_crop_setup"
 

@@ -43,6 +43,13 @@ class ShortsRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
+        # Check for pre-mixed audio
+        audio_mix_path = self.episode_dir / "work" / "audio_mix.wav"
+        if audio_mix_path.exists():
+            self.logger.info("Using pre-mixed audio from audio_mix.wav")
+        else:
+            audio_mix_path = None
+
         clips = clips_data.get("clips", [])
         segments = segments_data.get("segments", [])
 
@@ -87,6 +94,7 @@ class ShortsRenderAgent(BaseAgent):
                     start, end, segments,
                     src_w, src_h, audio_bitrate,
                     crop_config, encoder_args, lut_filter,
+                    audio_mix_path,
                 )
                 futures[future] = clip_id
 
@@ -150,9 +158,20 @@ class ShortsRenderAgent(BaseAgent):
         start, end, segments,
         src_w, src_h, audio_bitrate,
         crop_config, encoder_args, lut_filter="",
+        audio_mix_path=None,
     ):
         """Render a 9:16 short with per-segment dynamic speaker crops."""
         clip_segs = self._get_clip_segments(segments, start, end)
+
+        def _audio_args(seek_time):
+            """Return input + mapping args for audio (mix or camera fallback)."""
+            if audio_mix_path and audio_mix_path.exists():
+                return (
+                    ["-ss", str(seek_time), "-i", str(audio_mix_path)],
+                    ["-map", "0:v", "-map", "1:a"],
+                    [],
+                )
+            return ([], [], ["-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"])
 
         # If only one segment (or all same speaker), render directly
         speakers = set(s["speaker"] for s in clip_segs)
@@ -162,13 +181,16 @@ class ShortsRenderAgent(BaseAgent):
             vf = self._get_short_crop_filter(speaker, src_w, src_h, srt_path, crop_config)
             if lut_filter:
                 vf = lut_filter + "," + vf
+            extra_inputs, map_args, af_args = _audio_args(start)
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start),
                 "-i", str(source),
+                *extra_inputs,
                 "-t", str(duration),
+                *map_args,
                 "-vf", vf,
-                "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+                *af_args,
                 *encoder_args,
                 "-r", "30", "-g", "30", "-bf", "0",
                 "-vsync", "cfr",
@@ -183,7 +205,6 @@ class ShortsRenderAgent(BaseAgent):
             return
 
         # Multiple segments with different speakers — render each, then concat
-        # Use episode work dir (not system temp) so ffmpeg/libass can reliably access SRT files
         clip_name = output.stem
         work_dir = output.parent.parent / "work" / f"shorts_{clip_name}"
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -211,13 +232,16 @@ class ShortsRenderAgent(BaseAgent):
                 if lut_filter:
                     vf = lut_filter + "," + vf
 
+                extra_inputs, map_args, af_args = _audio_args(seg_start)
                 cmd = [
                     "ffmpeg", "-y",
                     "-ss", str(seg_start),
                     "-i", str(source),
+                    *extra_inputs,
                     "-t", str(seg_duration),
+                    *map_args,
                     "-vf", vf,
-                    "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+                    *af_args,
                     *encoder_args,
                     "-r", "30", "-g", "30", "-bf", "0",
                     "-vsync", "cfr",
@@ -371,15 +395,30 @@ class ShortsRenderAgent(BaseAgent):
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
         """Compute 9:16 crop region (w, h, x, y) centered on speaker, with zoom.
 
-        Zoom controls how tight the crop is. Higher zoom = more zoomed in.
-        BOTH defaults to L speaker position.
+        Supports N-speaker labels (speaker_0, speaker_1, ...) and legacy L/R.
+        BOTH defaults to speaker_0 / L position.
         """
-        if speaker == "R":
-            cx = crop_config["speaker_r_center_x"]
+        speakers = crop_config.get("speakers", [])
+
+        if speaker.startswith("speaker_"):
+            idx = int(speaker.split("_")[1])
+            if idx < len(speakers):
+                s = speakers[idx]
+                cx = s["center_x"]
+                cy = s["center_y"]
+                zoom = s.get("zoom", 1.0)
+            else:
+                # Fallback to first speaker
+                cx = speakers[0]["center_x"] if speakers else src_w // 2
+                cy = speakers[0]["center_y"] if speakers else src_h // 2
+                zoom = speakers[0].get("zoom", 1.0) if speakers else 1.0
+        elif speaker == "R":
+            cx = crop_config.get("speaker_r_center_x", speakers[1]["center_x"] if len(speakers) > 1 else 3 * src_w // 4)
             cy = crop_config.get("speaker_r_center_y", src_h // 2)
             zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
-            cx = crop_config["speaker_l_center_x"]
+            # L, BOTH, NONE — use first speaker / L position
+            cx = crop_config.get("speaker_l_center_x", speakers[0]["center_x"] if speakers else src_w // 4)
             cy = crop_config.get("speaker_l_center_y", src_h // 2)
             zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
 

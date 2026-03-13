@@ -31,6 +31,9 @@ class TestSpeakerCutAgent:
             }, f)
         with open(episode_dir / "stitch.json", "w") as f:
             json.dump({"duration_seconds": 10.0}, f)
+        # episode.json needed for N-speaker check (falls back to L/R mode)
+        with open(episode_dir / "episode.json", "w") as f:
+            json.dump({"episode_id": "test", "status": "processing"}, f)
 
     def test_identical_channels_single_both_segment(self, tmp_episode_dir, sample_config):
         self._setup_identical_channels(tmp_episode_dir)

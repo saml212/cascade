@@ -205,20 +205,35 @@ def run_pipeline(
                     slug = _slugify(guest_name)
                     new_id = f"{mutable['episode_id']}_{slug}"
                     new_dir = output_dir / new_id
+                    old_dir_str = str(mutable["episode_dir"])
                     try:
                         mutable["episode_dir"].rename(new_dir)
                         mutable["episode_dir"] = new_dir
                         mutable["episode_id"] = new_id
                         episode["episode_id"] = new_id
                         mutable["episode_file"] = new_dir / "episode.json"
+
+                        # Update stale paths in all agent JSON outputs
+                        new_dir_str = str(new_dir)
+                        for jf in new_dir.glob("*.json"):
+                            try:
+                                raw = jf.read_text()
+                                if old_dir_str in raw:
+                                    jf.write_text(raw.replace(old_dir_str, new_dir_str))
+                            except OSError:
+                                pass
+
                         _save_episode(mutable["episode_file"], episode)
                         logger.info(f"Renamed episode dir to {new_id}")
                     except OSError as e:
                         logger.warning(f"Failed to rename episode dir: {e}")
 
     # --- DAG execution loop ---
-    # Special handling: stitch must pause for crop setup before continuing
-    stitch_pause_needed = ("stitch" in requested_set and "crop_config" not in episode)
+    # Special handling: pause for crop setup if crop_config isn't set and we're about
+    # to run agents that depend on it (anything after stitch)
+    # Agents that require crop_config to produce correct results
+    crop_dependent_agents = {"speaker_cut", "longform_render", "shorts_render"}
+    stitch_pause_needed = (bool(requested_set & crop_dependent_agents) and "crop_config" not in episode)
     # Special handling: backup must pause for user approval (destructive SD cleanup)
     backup_pause_needed = ("backup" in requested_set and not episode.get("backup_approved"))
 
@@ -242,8 +257,8 @@ def run_pipeline(
             for name in _get_ready():
                 if name in running_names:
                     continue
-                # If stitch just completed and we need crop setup, pause
-                if stitch_pause_needed and name != "stitch" and "stitch" in completed:
+                # If crop setup needed, pause before running crop-dependent agents
+                if stitch_pause_needed and name in crop_dependent_agents:
                     # Check if crop_config has been set since we started
                     with episode_lock:
                         with open(mutable["episode_file"]) as f:

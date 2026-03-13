@@ -89,67 +89,6 @@ python -m agents --source-path "/path/to/media/" --episode-id ep_2026-02-19_1200
 
 The web UI lets you review clips, approve/reject them, trim boundaries, chat with the AI about your episode, and trigger pipeline runs.
 
-## MCP Server (AI Agent Integration)
-
-Cascade includes an MCP server that lets Claude Code, Codex, or any MCP-compatible AI agent run the full pipeline autonomously.
-
-### Setup for Claude Code
-
-Add to your Claude Code MCP config or use the included `cascade.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "cascade": {
-      "command": ".venv/bin/python",
-      "args": ["mcp_server.py"],
-      "env": {}
-    }
-  }
-}
-```
-
-### Available MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `check_prerequisites` | Verify Python, ffmpeg, API keys, disk space |
-| `setup_environment` | Create venv, install deps, copy .env.example |
-| `start_server` | Start the web UI (FastAPI on port 8420) |
-| `stop_server` | Stop the web server |
-| `get_server_status` | Check if server is running |
-| `list_source_media` | List MP4 files on SD card or given path |
-| `run_pipeline` | Run full or partial pipeline |
-| `get_pipeline_status` | Check pipeline progress for an episode |
-| `list_episodes` | List all episodes with status |
-| `get_episode` | Get full episode details (clips, files, metadata) |
-| `set_crop_config` | Set speaker crop positions for rendering |
-| `extract_frame` | Extract a frame for visual crop reference |
-| `list_clips` | List clips with status and scores |
-| `approve_clips` | Approve specific clips or by score threshold |
-| `auto_approve_clips` | Auto-approve all pending clips |
-| `chat_with_episode` | Chat with the AI about an episode |
-| `run_single_agent` | Re-run a specific pipeline agent |
-| `get_config` | View current configuration |
-| `get_transcript` | Read the diarized transcript |
-| `backup_episode` | Backup to external HDD |
-
-### Example AI Workflow
-
-An AI agent can run a complete end-to-end episode with:
-
-```
-1. check_prerequisites()
-2. setup_environment()
-3. list_source_media("/path/to/SD/DCIM/100CANON/")
-4. run_pipeline(source_path="/path/to/SD/DCIM/100CANON/")
-5. extract_frame(episode_id="ep_...")     # Determine crop positions
-6. set_crop_config(episode_id="ep_...", ...)
-7. run_pipeline(source_path="...", agents="longform_render,shorts_render,metadata_gen,qa")
-8. auto_approve_clips(episode_id="ep_...")
-9. start_server()                          # For human review at localhost:8420
-```
-
 ## Architecture
 
 ```
@@ -174,7 +113,6 @@ cascade/
 │   └── routes/      # API endpoints (episodes, clips, pipeline, chat, etc.)
 ├── frontend/        # Vanilla JS SPA for clip review + chat
 ├── config/          # config.toml — all settings
-├── mcp_server.py    # MCP server for AI agent integration
 ├── tests/           # pytest + Jest test suites
 └── start.sh         # One-command setup + launch
 ```

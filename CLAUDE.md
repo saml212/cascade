@@ -72,10 +72,6 @@ curl -X POST http://localhost:8420/api/episodes/ep_001/auto-approve
 - Vanilla JS SPA — no framework, no build step
 - Served directly as static files by FastAPI
 
-### MCP Server (`mcp_server.py`)
-- Exposes the full pipeline as AI-callable tools
-- Configured in `cascade.mcp.json`
-
 ## Configuration
 - **`config/config.toml`** — All paths, thresholds, API settings (copy from `config.example.toml`)
 - **`.env`** — API keys: `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` (copy from `.env.example`, gitignored)
