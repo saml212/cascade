@@ -2,13 +2,14 @@
 
 import json
 import pytest
+import numpy as np
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 from agents.ingest import IngestAgent
 
 
-def _mock_ffprobe(duration=100.0, creation_time="2026-01-01T10:00:00Z"):
+def _mock_ffprobe(duration=100.0, creation_time="2026-01-01T10:00:00Z", channels=2):
     """Return a mock ffprobe result dict."""
     return {
         "format": {
@@ -17,7 +18,8 @@ def _mock_ffprobe(duration=100.0, creation_time="2026-01-01T10:00:00Z"):
         },
         "streams": [
             {"codec_type": "video", "width": 1920, "height": 1080},
-            {"codec_type": "audio", "channels": 2, "sample_rate": "48000"},
+            {"codec_type": "audio", "channels": channels, "sample_rate": "48000",
+             "bits_per_raw_sample": "32"},
         ],
     }
 
@@ -92,6 +94,25 @@ class TestIngestAgent:
 
     @patch("shutil.copy2")
     @patch("agents.ingest.ffprobe")
+    def test_duration_validation_within_tolerance(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """A small duration difference (<1s) should not raise."""
+        source_file = tmp_path / "test.MP4"
+        source_file.write_bytes(b"\x00" * 100)
+
+        mock_probe.side_effect = [
+            _mock_ffprobe(duration=120.0),
+            _mock_ffprobe(duration=120.5),  # Within 1.0s tolerance
+        ]
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(source_file)
+        result = agent.execute()
+
+        assert result["file_count"] == 1
+        assert result["files"][0]["copy_validated"] is True
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
     def test_files_sorted_by_creation_time(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
         source_dir = tmp_path / "DCIM"
         source_dir.mkdir()
@@ -113,6 +134,7 @@ class TestIngestAgent:
 
         # First file should be the one with earlier creation time
         assert "0001" in result["files"][0]["filename"]
+        assert "0002" in result["files"][1]["filename"]
 
     @patch("shutil.copy2")
     @patch("agents.ingest.ffprobe")
@@ -129,6 +151,7 @@ class TestIngestAgent:
         assert "file_count" in result
         assert "total_duration_seconds" in result
         assert "total_size_bytes" in result
+        assert "duration_seconds" in result
 
     @patch("shutil.copy2")
     @patch("agents.ingest.ffprobe")
@@ -143,3 +166,346 @@ class TestIngestAgent:
 
         assert result["files"][0]["dest_path"] is not None
         assert result["files"][0]["copy_validated"] is True
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_multi_source_path_list(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Test that source_path can be a list of paths."""
+        dir_a = tmp_path / "dir_a"
+        dir_b = tmp_path / "dir_b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "clip_a.MP4").write_bytes(b"\x00" * 100)
+        (dir_b / "clip_b.mp4").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = [str(dir_a), str(dir_b)]
+        result = agent.execute()
+
+        assert result["file_count"] == 2
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_lowercase_mp4_extension(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Test that lowercase .mp4 files are also discovered."""
+        source_dir = tmp_path / "DCIM"
+        source_dir.mkdir()
+        (source_dir / "video.mp4").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=30.0)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(source_dir)
+        result = agent.execute()
+
+        assert result["file_count"] == 1
+
+
+class TestAudioFileClassification:
+    """Test audio track classification from Zoom H6E filenames."""
+
+    @patch.object(IngestAgent, "_sync_audio", return_value={"status": "skipped"})
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_builtin_mic_classification(self, mock_probe, mock_copy, mock_sync, tmp_episode_dir, sample_config, tmp_path):
+        """TrMic suffix should be classified as builtin_mic."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrMic.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+        result = agent.execute()
+
+        tracks = result["audio"]["tracks"]
+        assert len(tracks) == 1
+        assert tracks[0]["track_type"] == "builtin_mic"
+
+    @patch.object(IngestAgent, "_sync_audio", return_value={"status": "skipped"})
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_stereo_mix_classification(self, mock_probe, mock_copy, mock_sync, tmp_episode_dir, sample_config, tmp_path):
+        """TrLR suffix should be classified as stereo_mix."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=2)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+        result = agent.execute()
+
+        tracks = result["audio"]["tracks"]
+        assert len(tracks) == 1
+        assert tracks[0]["track_type"] == "stereo_mix"
+
+    @patch.object(IngestAgent, "_sync_audio", return_value={"status": "skipped"})
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_input_track_classification(self, mock_probe, mock_copy, mock_sync, tmp_episode_dir, sample_config, tmp_path):
+        """TrN suffix should be classified as input with track_number."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_Tr1.WAV").write_bytes(b"\x00" * 100)
+        (audio_dir / "260311_143505_Tr2.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+        result = agent.execute()
+
+        tracks = result["audio"]["tracks"]
+        assert len(tracks) == 2
+        for t in tracks:
+            assert t["track_type"] == "input"
+
+    @patch.object(IngestAgent, "_sync_audio", return_value={"status": "skipped"})
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_track_number_extraction(self, mock_probe, mock_copy, mock_sync, tmp_episode_dir, sample_config, tmp_path):
+        """Track numbers should be extracted from TrN suffixes."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        for i in range(1, 5):
+            (audio_dir / f"260311_143505_Tr{i}.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+        result = agent.execute()
+
+        tracks = result["audio"]["tracks"]
+        track_numbers = sorted([t["track_number"] for t in tracks])
+        assert track_numbers == [1, 2, 3, 4]
+
+    @patch.object(IngestAgent, "_sync_audio", return_value={"status": "skipped"})
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_audio_resource_fork_filtered(self, mock_probe, mock_copy, mock_sync, tmp_episode_dir, sample_config, tmp_path):
+        """macOS ._ resource fork WAV files should be filtered out."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_Tr1.WAV").write_bytes(b"\x00" * 100)
+        (audio_dir / "._260311_143505_Tr1.WAV").write_bytes(b"\x00" * 50)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+        result = agent.execute()
+
+        assert result["audio"]["track_count"] == 1
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_no_wav_files_raises(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Empty audio directory should raise FileNotFoundError."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with pytest.raises(FileNotFoundError, match="No WAV files"):
+            agent.execute()
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_missing_audio_path_raises(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Non-existent audio_path should raise FileNotFoundError."""
+        mock_probe.return_value = _mock_ffprobe(duration=60.0)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(tmp_path / "nonexistent")
+
+        with pytest.raises(FileNotFoundError, match="Audio path not found"):
+            agent.execute()
+
+    @patch.object(IngestAgent, "_sync_audio", return_value={"status": "skipped"})
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_mixed_track_types(self, mock_probe, mock_copy, mock_sync, tmp_episode_dir, sample_config, tmp_path):
+        """All three track types should be correctly classified when mixed."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_Tr1.WAV").write_bytes(b"\x00" * 100)
+        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
+        (audio_dir / "260311_143505_TrMic.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+        result = agent.execute()
+
+        types = {t["track_type"] for t in result["audio"]["tracks"]}
+        assert types == {"input", "stereo_mix", "builtin_mic"}
+
+
+class TestAudioSyncOffset:
+    """Test the audio sync cross-correlation logic."""
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_sync_prefers_stereo_mix(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Sync should prefer stereo_mix track over others."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_Tr1.WAV").write_bytes(b"\x00" * 100)
+        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        # Mock _extract_audio_pcm to return signals with known offset
+        sr = 16000
+        signal = np.zeros(sr * 10, dtype=np.float32)
+        signal[sr:sr + 100] = 10000  # Impulse at 1s
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with patch.object(agent, "_extract_audio_pcm", return_value=signal):
+            result = agent.execute()
+
+        assert result["audio_sync"]["status"] == "synced"
+        assert result["audio_sync"]["sync_track"] == "260311_143505_TrLR.WAV"
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_sync_fallback_to_builtin_mic(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """If no stereo_mix, sync should fall back to builtin_mic."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrMic.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        sr = 16000
+        signal = np.zeros(sr * 10, dtype=np.float32)
+        signal[sr:sr + 100] = 10000
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with patch.object(agent, "_extract_audio_pcm", return_value=signal):
+            result = agent.execute()
+
+        assert result["audio_sync"]["status"] == "synced"
+        assert result["audio_sync"]["sync_track"] == "260311_143505_TrMic.WAV"
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_sync_short_audio_returns_too_short(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Audio shorter than 1 second should return too_short status."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        sr = 16000
+        short_signal = np.zeros(100, dtype=np.float32)  # Very short
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with patch.object(agent, "_extract_audio_pcm", return_value=short_signal):
+            result = agent.execute()
+
+        assert result["audio_sync"]["status"] == "too_short"
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_sync_result_fields(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Sync result should contain all expected fields."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        sr = 16000
+        signal = np.zeros(sr * 10, dtype=np.float32)
+        signal[sr:sr + 100] = 10000
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with patch.object(agent, "_extract_audio_pcm", return_value=signal):
+            result = agent.execute()
+
+        sync = result["audio_sync"]
+        assert sync["status"] == "synced"
+        assert "offset_seconds" in sync
+        assert "offset_samples" in sync
+        assert "sync_sample_rate" in sync
+        assert "sync_track" in sync
+        assert "video_file" in sync
+        assert "confidence" in sync
+        assert "description" in sync
+
+    def test_extract_audio_pcm_failure(self, tmp_episode_dir, sample_config):
+        """Failed ffmpeg extraction should raise RuntimeError."""
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stderr=b"error")
+            with pytest.raises(RuntimeError, match="ffmpeg audio extraction failed"):
+                agent._extract_audio_pcm("/fake/path.mp4", 16000)

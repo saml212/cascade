@@ -20,9 +20,9 @@ class TestStitchAgent:
             agent.execute()
 
     @patch("subprocess.run")
-    @patch("shutil.copy2")
+    @patch("os.symlink")
     @patch("agents.stitch.ffprobe")
-    def test_single_file_copies(self, mock_probe, mock_copy, mock_run, tmp_episode_dir, sample_config):
+    def test_single_file_symlinks(self, mock_probe, mock_symlink, mock_run, tmp_episode_dir, sample_config):
         files = [{"dest_path": "/tmp/source/test.MP4", "duration_seconds": 120.0}]
         self._make_ingest_json(tmp_episode_dir, files)
 
@@ -34,7 +34,7 @@ class TestStitchAgent:
         agent = StitchAgent(tmp_episode_dir, sample_config)
         result = agent.execute()
 
-        mock_copy.assert_called_once()
+        mock_symlink.assert_called_once()
         assert result["input_count"] == 1
 
     @patch("subprocess.run")
@@ -75,9 +75,9 @@ class TestStitchAgent:
         assert result["duration_seconds"] == pytest.approx(100.0, abs=1)
 
     @patch("subprocess.run")
-    @patch("shutil.copy2")
+    @patch("os.symlink")
     @patch("agents.stitch.ffprobe")
-    def test_result_structure(self, mock_probe, mock_copy, mock_run, tmp_episode_dir, sample_config):
+    def test_result_structure(self, mock_probe, mock_symlink, mock_run, tmp_episode_dir, sample_config):
         files = [{"dest_path": "/tmp/source/test.MP4", "duration_seconds": 120.0}]
         self._make_ingest_json(tmp_episode_dir, files)
         mock_probe.return_value = {"format": {"duration": "120.0"}, "streams": []}
