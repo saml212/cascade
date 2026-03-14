@@ -21,10 +21,7 @@ class BackupAgent(BaseAgent):
     name = "backup"
 
     def execute(self) -> dict:
-        backup_dir = self.config.get("paths", {}).get(
-            "backup_dir",
-            os.getenv("CASCADE_BACKUP_DIR", ""),
-        )
+        backup_dir = self.get_config("paths", "backup_dir", default=os.getenv("CASCADE_BACKUP_DIR", ""))
 
         if not backup_dir:
             self.logger.info("No backup_dir configured — skipping backup")

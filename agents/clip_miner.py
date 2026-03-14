@@ -32,9 +32,9 @@ class ClipMinerAgent(BaseAgent):
         stitch_data = self.load_json("stitch.json")
 
         total_duration = stitch_data["duration_seconds"]
-        clip_count = self.config.get("processing", {}).get("clip_count", 10)
-        clip_min = self.config.get("processing", {}).get("clip_min_seconds", 30)
-        clip_max = self.config.get("processing", {}).get("clip_max_seconds", 90)
+        clip_count = self.get_config("processing", "clip_count", default=10)
+        clip_min = self.get_config("processing", "clip_min_seconds", default=30)
+        clip_max = self.get_config("processing", "clip_max_seconds", default=90)
 
         # Format transcript for Claude
         transcript_text = self._format_transcript(diarized)
@@ -48,8 +48,8 @@ class ClipMinerAgent(BaseAgent):
 
         client = anthropic.Anthropic(api_key=api_key)
 
-        model = self.config.get("clip_mining", {}).get("llm_model", "claude-opus-4-6")
-        temperature = self.config.get("clip_mining", {}).get("llm_temperature", 0.3)
+        model = self.get_config("clip_mining", "llm_model", default="claude-opus-4-6")
+        temperature = self.get_config("clip_mining", "llm_temperature", default=0.3)
 
         # Single combined API call for episode info + clip mining
         prompt = f"""You are an expert podcast clip editor. Analyze this transcript and:
@@ -114,16 +114,13 @@ Return ONLY the JSON object, no other text."""
         self.save_json("episode_info.json", episode_info)
 
         # Update episode.json with extracted info
-        episode_file = self.episode_dir / "episode.json"
-        if episode_file.exists():
-            with open(episode_file) as f:
-                episode = json.load(f)
+        episode = self.load_json_safe("episode.json")
+        if episode:
             episode["guest_name"] = episode_info.get("guest_name", "")
             episode["guest_title"] = episode_info.get("guest_title", "")
             episode["episode_name"] = episode_info.get("episode_title", "")
             episode["episode_description"] = episode_info.get("episode_description", "")
-            with open(episode_file, "w") as f:
-                json.dump(episode, f, indent=2, default=str)
+            self.save_json("episode.json", episode)
 
         # Extract clips
         clips = parsed.get("clips", [])
@@ -163,9 +160,7 @@ Return ONLY the JSON object, no other text."""
 
     def _snap_to_silence(self, clips: list, segments_data: dict) -> list:
         """Snap clip boundaries to nearest low-energy point."""
-        tolerance = self.config.get("clip_mining", {}).get(
-            "boundary_snap_tolerance_seconds", 3.0
-        )
+        tolerance = self.get_config("clip_mining", "boundary_snap_tolerance_seconds", default=3.0)
 
         import numpy as np
 

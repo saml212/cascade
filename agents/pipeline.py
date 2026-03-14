@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from agents import AGENT_REGISTRY, PIPELINE_ORDER
 from agents.base import BaseAgent
+from lib.atomic_write import atomic_write_json
 from lib.paths import resolve_path
 
 logger = logging.getLogger("cascade")
@@ -387,5 +389,4 @@ def _has_name_slug(episode_id: str) -> bool:
 
 
 def _save_episode(path: Path, episode: dict):
-    with open(path, "w") as f:
-        json.dump(episode, f, indent=2, default=str)
+    atomic_write_json(path, episode)

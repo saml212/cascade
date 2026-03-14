@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
+from lib.audio_mix import generate_audio_mix
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
@@ -43,11 +44,22 @@ class ShortsRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
-        # Check for pre-mixed audio
+        # Resolve audio source: prefer pre-mixed H6E audio, auto-generate if needed
         audio_mix_path = self.episode_dir / "work" / "audio_mix.wav"
+        has_h6e_tracks = bool(episode_data.get("audio_tracks"))
         if audio_mix_path.exists():
-            self.logger.info("Using pre-mixed audio from audio_mix.wav")
+            self.logger.info("Using pre-mixed H6E audio from audio_mix.wav")
+        elif has_h6e_tracks:
+            self.logger.info("H6E audio tracks found but audio_mix.wav missing — generating...")
+            mix_result = generate_audio_mix(self.episode_dir, episode_data)
+            if mix_result and mix_result.exists():
+                audio_mix_path = mix_result
+                self.logger.info("Generated audio_mix.wav from H6E tracks")
+            else:
+                self.logger.warning("Failed to generate audio_mix.wav, falling back to camera audio")
+                audio_mix_path = None
         else:
+            self.logger.info("No H6E audio tracks — using camera audio from source_merged.mp4")
             audio_mix_path = None
 
         clips = clips_data.get("clips", [])
@@ -164,7 +176,12 @@ class ShortsRenderAgent(BaseAgent):
         clip_segs = self._get_clip_segments(segments, start, end)
 
         def _audio_args(seek_time):
-            """Return input + mapping args for audio (mix or camera fallback)."""
+            """Return (extra_inputs, map_args, af_args) for audio source.
+
+            When audio_mix_path exists, use pre-mixed H6E audio (offset already
+            baked in — only seek to segment time, no additional offset).
+            Otherwise fall back to camera audio with stereo-to-mono pan.
+            """
             if audio_mix_path and audio_mix_path.exists():
                 return (
                     ["-ss", str(seek_time), "-i", str(audio_mix_path)],
@@ -205,6 +222,7 @@ class ShortsRenderAgent(BaseAgent):
             return
 
         # Multiple segments with different speakers — render each, then concat
+        # Use episode work dir (not system temp) so ffmpeg/libass can reliably access SRT files
         clip_name = output.stem
         work_dir = output.parent.parent / "work" / f"shorts_{clip_name}"
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -395,30 +413,15 @@ class ShortsRenderAgent(BaseAgent):
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
         """Compute 9:16 crop region (w, h, x, y) centered on speaker, with zoom.
 
-        Supports N-speaker labels (speaker_0, speaker_1, ...) and legacy L/R.
-        BOTH defaults to speaker_0 / L position.
+        Zoom controls how tight the crop is. Higher zoom = more zoomed in.
+        BOTH defaults to L speaker position.
         """
-        speakers = crop_config.get("speakers", [])
-
-        if speaker.startswith("speaker_"):
-            idx = int(speaker.split("_")[1])
-            if idx < len(speakers):
-                s = speakers[idx]
-                cx = s["center_x"]
-                cy = s["center_y"]
-                zoom = s.get("zoom", 1.0)
-            else:
-                # Fallback to first speaker
-                cx = speakers[0]["center_x"] if speakers else src_w // 2
-                cy = speakers[0]["center_y"] if speakers else src_h // 2
-                zoom = speakers[0].get("zoom", 1.0) if speakers else 1.0
-        elif speaker == "R":
-            cx = crop_config.get("speaker_r_center_x", speakers[1]["center_x"] if len(speakers) > 1 else 3 * src_w // 4)
+        if speaker == "R":
+            cx = crop_config["speaker_r_center_x"]
             cy = crop_config.get("speaker_r_center_y", src_h // 2)
             zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
-            # L, BOTH, NONE — use first speaker / L position
-            cx = crop_config.get("speaker_l_center_x", speakers[0]["center_x"] if speakers else src_w // 4)
+            cx = crop_config["speaker_l_center_x"]
             cy = crop_config.get("speaker_l_center_y", src_h // 2)
             zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
 

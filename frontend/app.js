@@ -263,8 +263,8 @@ function startPipelinePoller(episodeId, onUpdate) {
       if (!status.is_running) {
         clearInterval(state.pipelinePollers[key]);
         delete state.pipelinePollers[key];
-        // Pipeline finished — refresh the page to show newly available media
-        if (status.status === 'ready_for_review' || status.status === 'error') {
+        // Pipeline finished or paused — refresh the page to show banners/media
+        if (['ready_for_review', 'error', 'awaiting_crop_setup', 'awaiting_backup_approval'].includes(status.status)) {
           setTimeout(() => navigate(), 1000);
         }
       }
@@ -337,12 +337,21 @@ async function renderDashboard() {
 
   loadScheduleSidebar();
 
-  // Start polling for any running pipelines
-  episodes.forEach(ep => {
+  // Check pipeline status for episodes that might be running
+  // (status could be 'processing', 'awaiting_crop_setup', 'awaiting_backup_approval', etc.)
+  episodes.forEach(async (ep) => {
+    const id = ep.episode_id || ep.id;
     if (ep.status === 'processing') {
-      startPipelinePoller(ep.episode_id || ep.id, (status) => {
-        updateEpisodeCardStatus(ep.episode_id || ep.id, status);
-      });
+      startPipelinePoller(id, (status) => updateEpisodeCardStatus(id, status));
+    } else if (!['ready_for_review', 'error', 'cancelled', 'approved'].includes(ep.status)) {
+      // Check if pipeline is actually running despite non-processing status
+      try {
+        const status = await api(`/episodes/${id}/pipeline-status`);
+        if (status.is_running) {
+          updateEpisodeCardStatus(id, status);
+          startPipelinePoller(id, (status) => updateEpisodeCardStatus(id, status));
+        }
+      } catch {}
     }
   });
 }
@@ -373,26 +382,26 @@ function episodeCard(ep) {
           <svg class="w-4 h-4 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
         </div>
       </div>
-      ${isProcessing ? `
-        <div class="mt-3 pipeline-progress-mini" id="pipeline-mini-${id}">
-          <div class="flex items-center gap-2 text-xs text-blue-400">
-            <span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
-            <span>Pipeline running...</span>
-          </div>
+      <div class="mt-3 pipeline-progress-mini ${isProcessing ? '' : 'hidden'}" id="pipeline-mini-${id}">
+        <div class="flex items-center gap-2 text-xs text-blue-400">
+          <span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+          <span>Pipeline running...</span>
         </div>
-      ` : ''}
+      </div>
     </a>`;
 }
 
 function updateEpisodeCardStatus(episodeId, status) {
   const mini = document.getElementById(`pipeline-mini-${episodeId}`);
   if (!mini) return;
+  mini.classList.remove('hidden');
   if (status.is_running) {
+    const pct = status.progress ? Math.round(status.progress.percent || 0) : 0;
+    const pctText = pct > 0 ? ` (${pct}%)` : '';
     mini.innerHTML = `
       <div class="flex items-center gap-2 text-xs text-blue-400">
         <span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
-        <span>${escapeHtml(status.current_agent || 'Running')}...</span>
-        <span class="text-zinc-500">(${(status.agents_completed || []).length} agents done)</span>
+        <span>${escapeHtml(status.current_agent || 'Running')}${pctText}...</span>
       </div>`;
   } else {
     mini.innerHTML = `
@@ -565,8 +574,8 @@ async function renderEpisodeDetail(episodeId, tab) {
       </div>
     </div>
 
-    <!-- Crop setup banner -->
-    ${ep.status === 'awaiting_crop_setup' ? `
+    <!-- Crop setup banner — show when crop_config is missing and stitch is done -->
+    ${(!ep.crop_config && (ep.pipeline?.agents_completed || []).includes('stitch')) || ep.status === 'awaiting_crop_setup' ? `
     <div class="mb-6 bg-amber-900/30 border border-amber-700/50 rounded-lg p-4 flex items-center justify-between">
       <div class="flex items-center gap-3">
         <span class="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
@@ -659,8 +668,7 @@ async function renderEpisodeDetail(episodeId, tab) {
       </div>
     </div>
 
-    <!-- Audio Mix Panel -->
-    ${renderAudioMixPanel(episodeId, ep)}
+    <!-- Audio mix controls are in the Audio tab -->
 
     <!-- Tab navigation -->
     <div class="flex items-center gap-1 mb-6 border-b border-zinc-800 pb-px">
@@ -669,6 +677,7 @@ async function renderEpisodeDetail(episodeId, tab) {
         Shorts
         <span class="ml-1 text-xs text-zinc-500">(${clips.length})</span>
       </button>
+      <button onclick="switchEpisodeTab('audio')" class="episode-tab px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${activeTab === 'audio' ? 'active' : ''}" data-tab="audio">Audio</button>
       <button onclick="switchEpisodeTab('metadata')" class="episode-tab px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${activeTab === 'metadata' ? 'active' : ''}" data-tab="metadata">Metadata</button>
       <button onclick="switchEpisodeTab('chat')" class="episode-tab px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${activeTab === 'chat' ? 'active' : ''}" data-tab="chat">Chat</button>
     </div>
@@ -676,6 +685,7 @@ async function renderEpisodeDetail(episodeId, tab) {
     <!-- Tab content -->
     <div id="tab-longform" class="tab-panel ${activeTab !== 'longform' ? 'hidden' : ''}"></div>
     <div id="tab-shorts" class="tab-panel ${activeTab !== 'shorts' ? 'hidden' : ''}"></div>
+    <div id="tab-audio" class="tab-panel ${activeTab !== 'audio' ? 'hidden' : ''}"></div>
     <div id="tab-metadata" class="tab-panel ${activeTab !== 'metadata' ? 'hidden' : ''}"></div>
     <div id="tab-chat" class="tab-panel ${activeTab !== 'chat' ? 'hidden' : ''}"></div>
   </div>`;
@@ -683,6 +693,7 @@ async function renderEpisodeDetail(episodeId, tab) {
   // Render active tab content
   renderLongformTab(episodeId, ep);
   renderShortsTab(episodeId, clips, ep);
+  renderAudioTab(episodeId, ep);
   renderMetadataTab(episodeId, ep, clips);
   renderChatTab(episodeId);
 
@@ -698,6 +709,14 @@ function switchEpisodeTab(tabName) {
   document.querySelectorAll('.tab-panel').forEach(panel => {
     panel.classList.toggle('hidden', panel.id !== `tab-${tabName}`);
   });
+
+  // Load sync waveforms when switching to Audio tab
+  if (tabName === 'audio' && state.currentEpisode) {
+    const ep = state.currentEpisode;
+    if (ep.audio_sync && ep.audio_sync.offset_seconds != null && !syncState.loaded) {
+      loadSyncPreview(state.currentEpisodeId, ep.audio_sync.offset_seconds);
+    }
+  }
 }
 
 async function checkAndShowPipeline(episodeId) {
@@ -2723,7 +2742,280 @@ async function saveCropConfig(episodeId) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  AUDIO MIX PANEL (universal volume control for renders)
+//  AUDIO TAB (dedicated tab with sync, mixer, volume controls)
+// ════════════════════════════════════════════════════════════════════
+
+function renderAudioTab(episodeId, ep) {
+  const panel = document.getElementById('tab-audio');
+  if (!panel) return;
+
+  const audioTracks = ep.audio_tracks || [];
+  const hasH6E = audioTracks.length > 0;
+  const hasSync = ep.audio_sync && ep.audio_sync.offset_seconds != null;
+  const mixCfg = ep.audio_mix || { tracks: [], master_volume: 1.0 };
+  const mixMap = {};
+  for (const t of (mixCfg.tracks || [])) mixMap[t.stem] = t.volume;
+  const cropSpeakers = (ep.crop_config || {}).speakers || [];
+  const ambientTracks = (ep.crop_config || {}).ambient_tracks || [];
+  const cutCfg = ep.speaker_cut_config || {};
+  const speechMargin = cutCfg.speech_db_margin || 12;
+  const minSegment = cutCfg.min_segment_seconds || 2.0;
+  const bothRange = cutCfg.both_db_range || 6.0;
+  const masterPct = Math.round((mixCfg.master_volume || 1.0) * 100);
+  const hasMix = (mixCfg.tracks || []).length > 0;
+
+  // Initialize unified mixer state from ALL audio tracks
+  if (audioTracks.length > 0 && mixerState.tracks.length === 0) {
+    mixerState.tracks = audioTracks.map(t => {
+      const stem = t.filename.replace(/\.[^.]+$/, '');
+      const isInput = t.track_type === 'input';
+      let defaultVol = isInput ? 1.0 : 0.2;
+      let assignment = '';
+      for (let si = 0; si < cropSpeakers.length; si++) {
+        if (cropSpeakers[si].track === t.track_number) {
+          defaultVol = cropSpeakers[si].volume || 1.0;
+          assignment = `speaker-${si}`;
+          break;
+        }
+      }
+      for (const amb of ambientTracks) {
+        if (amb.track_number === t.track_number) {
+          defaultVol = amb.volume || 0.2;
+          assignment = 'ambient';
+        }
+      }
+      return {
+        stem,
+        label: isInput ? `Tr${t.track_number}` : (t.track_type === 'stereo_mix' ? 'LR' : 'Mic'),
+        trackNumber: t.track_number || null,
+        trackType: t.track_type,
+        volume: stem in mixMap ? mixMap[stem] : defaultVol,
+        muted: false,
+        soloed: false,
+        buffer: null,
+        source: null,
+        gain: null,
+        analyser: null,
+        assignment,
+      };
+    });
+  }
+  // Sync volumes from mixMap if tracks already exist
+  if (mixerState.tracks.length > 0 && Object.keys(mixMap).length > 0) {
+    for (const t of mixerState.tracks) {
+      if (t.stem in mixMap) t.volume = mixMap[t.stem];
+    }
+  }
+
+  // Build the speaker assignment label for each track
+  function getAssignmentLabel(t) {
+    for (let i = 0; i < cropSpeakers.length; i++) {
+      if (cropSpeakers[i].track === t.trackNumber) return cropSpeakers[i].label || `Speaker ${i + 1}`;
+    }
+    for (const amb of ambientTracks) {
+      if (amb.track_number === t.trackNumber) return 'Ambient';
+    }
+    if (t.trackType === 'stereo_mix') return 'Stereo Mix';
+    if (t.trackType === 'builtin_mic') return 'XY Mic';
+    return '';
+  }
+
+  panel.innerHTML = `
+    <div class="space-y-6">
+
+      ${!hasH6E ? `
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 text-center">
+        <p class="text-zinc-400 text-sm">No external audio tracks detected.</p>
+        <p class="text-zinc-600 text-xs mt-1">Camera audio is used directly. External audio controls are available when recording with a Zoom H6E or similar.</p>
+      </div>` : ''}
+
+      ${hasSync ? `
+      <!-- Audio Sync -->
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-zinc-300">Audio Sync</h3>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-zinc-500">Auto: ${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
+            ${ep.audio_sync.confidence ? `<span class="text-xs ${parseFloat(ep.audio_sync.confidence) > 0.3 ? 'text-green-500' : 'text-amber-500'}">conf: ${parseFloat(ep.audio_sync.confidence).toFixed(3)}</span>` : ''}
+            ${ep.audio_sync.drift_rate_ppm ? `<span class="text-xs text-zinc-500">drift: ${ep.audio_sync.drift_rate_ppm.toFixed(1)} ppm</span>` : ''}
+            <span id="sync-status" class="text-xs text-zinc-600"></span>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <video id="sync-video" width="100%" style="max-height:240px;" class="rounded-lg bg-black" preload="metadata" controls>
+            <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
+          </video>
+        </div>
+
+        <div class="mb-1 flex items-center gap-4">
+          <div class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm" style="background:rgba(251,146,60,0.8);"></span><span class="text-xs text-zinc-400">Camera</span></div>
+          <div class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm" style="background:rgba(96,165,250,0.8);"></span><span class="text-xs text-zinc-400">H6E (shifted by offset)</span></div>
+          <span class="text-xs text-zinc-600 ml-auto">Scroll to zoom, drag to pan, click to seek</span>
+        </div>
+        <canvas id="sync-waveform" class="w-full rounded cursor-crosshair" style="height:140px;background:#0a0a0a;"></canvas>
+        <div class="flex items-center justify-between mt-1 mb-3">
+          <span id="sync-view-range" class="text-xs text-zinc-600 font-mono"></span>
+          <button onclick="syncZoomToFit()" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">Zoom to fit</button>
+        </div>
+
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs text-zinc-500">Offset:</span>
+          <button onclick="adjustSyncOffset(-1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1.0</button>
+          <button onclick="adjustSyncOffset(-0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.1</button>
+          <button onclick="adjustSyncOffset(-0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.01</button>
+          <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[80px] text-center">${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
+          <button onclick="adjustSyncOffset(0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.01</button>
+          <button onclick="adjustSyncOffset(0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.1</button>
+          <button onclick="adjustSyncOffset(1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1.0</button>
+          <button onclick="saveSyncOffset('${episodeId}')" id="sync-save-btn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Save Offset</button>
+          <button onclick="resetSyncOffset()" class="px-3 py-1.5 text-xs bg-zinc-700 hover:bg-zinc-600 rounded font-medium transition-colors text-zinc-300">Reset</button>
+        </div>
+      </div>` : ''}
+
+      ${hasH6E ? `
+      <!-- Unified Audio Mixer -->
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-zinc-300">Audio Mixer</h3>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-zinc-500">Master:</span>
+            <input type="range" id="mix-master-vol" min="0" max="200" value="${masterPct}"
+              oninput="document.getElementById('mix-master-label').textContent=this.value+'%'"
+              class="w-20 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+            <span id="mix-master-label" class="text-xs text-zinc-400 font-mono w-8">${masterPct}%</span>
+          </div>
+        </div>
+
+        <!-- Track rows -->
+        <div class="space-y-1.5" id="mixer-tracks">
+          ${mixerState.tracks.map((t, i) => {
+            const assignLabel = getAssignmentLabel(t);
+            const pct = Math.round(t.volume * 100);
+            return `
+          <div class="flex items-center gap-2 py-0.5">
+            <div class="w-8 text-xs font-mono ${t.trackType === 'input' ? 'text-zinc-300' : 'text-zinc-500'} truncate" title="${escapeHtml(t.stem)}">${escapeHtml(t.label)}</div>
+            <span class="w-16 text-xs ${assignLabel ? 'text-zinc-400' : 'text-zinc-600'} truncate">${escapeHtml(assignLabel || '\u2014')}</span>
+            <button onclick="toggleTrackSolo(${i})" id="mixer-solo-${i}" class="w-6 h-6 text-[10px] font-bold rounded ${t.soloed ? 'bg-yellow-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:text-yellow-400'} transition-colors" title="Solo">S</button>
+            <button onclick="toggleTrackMute(${i})" id="mixer-mute-${i}" class="w-6 h-6 text-[10px] font-bold rounded ${t.muted ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:text-red-400'} transition-colors" title="Mute">M</button>
+            <canvas id="mixer-meter-${i}" width="200" height="16" class="rounded" style="background:#111;min-width:80px;height:16px;flex:2;"></canvas>
+            <input type="range" id="mixer-vol-${i}" data-mix-stem="${escapeHtml(t.stem)}" min="0" max="300" value="${pct}"
+              oninput="setMixerTrackVolume(${i},this.value)"
+              class="w-20 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+            <span id="mixer-vol-label-${i}" class="text-xs text-zinc-400 w-10 text-right font-mono">${pct}%</span>
+          </div>`;
+          }).join('')}
+        </div>
+
+        <!-- Playback controls -->
+        <div class="flex items-center gap-3 mt-3 pt-3 border-t border-zinc-800">
+          <div class="flex items-center gap-2">
+            <button id="mixer-load-btn" onclick="loadAudioPreviews('${episodeId}')" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Load Audio</button>
+            <button id="mixer-play-btn" onclick="toggleMixerPlayback()" disabled class="px-3 py-1.5 text-xs bg-zinc-700 rounded font-medium text-zinc-500 transition-colors">&#9654; Play</button>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-zinc-500"><span id="mixer-range">${fmtMixerTime(mixerState.previewStart)} \u2013 ${fmtMixerTime(mixerState.previewStart + mixerState.previewDuration)}</span></span>
+            <button onclick="shiftMixerWindow(-30,'${episodeId}')" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">&larr; 30s</button>
+            <button onclick="shiftMixerWindow(30,'${episodeId}')" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">30s &rarr;</button>
+          </div>
+          <span id="mixer-status" class="text-xs text-zinc-600 ml-auto">${mixerState.loaded ? 'Ready' : 'Click "Load Audio" to preview'}</span>
+        </div>
+
+        <!-- Apply / Re-render -->
+        <div class="flex items-center gap-2 mt-3 pt-3 border-t border-zinc-800">
+          <button onclick="applyAudioMixFromMixer('${episodeId}')" id="mix-apply-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-xs font-medium transition-colors">
+            ${hasMix ? 'Update Mix' : 'Apply Mix'}
+          </button>
+          <button onclick="rerenderAll('${episodeId}')" id="mix-rerender-btn" class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors">
+            Re-render All
+          </button>
+          <span id="mix-status" class="text-xs text-zinc-500">${hasMix ? 'Mix applied' : 'Set volumes, then Apply Mix to save for rendering'}</span>
+        </div>
+      </div>
+
+      <!-- Speaker Cut Sensitivity -->
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+        <h3 class="text-sm font-semibold text-zinc-300 mb-3">Speaker Cut Sensitivity</h3>
+        <div class="grid grid-cols-3 gap-4">
+          <div>
+            <label class="text-xs text-zinc-500 block mb-1">Speech Margin (dB)</label>
+            <div class="flex items-center gap-1">
+              <input type="range" id="cut-speech-margin" min="3" max="24" step="1" value="${speechMargin}"
+                oninput="document.getElementById('cut-speech-margin-val').textContent=this.value"
+                class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+              <span id="cut-speech-margin-val" class="text-xs text-zinc-400 font-mono w-6">${speechMargin}</span>
+            </div>
+            <p class="text-xs text-zinc-600 mt-0.5">Lower = more sensitive</p>
+          </div>
+          <div>
+            <label class="text-xs text-zinc-500 block mb-1">Min Segment (s)</label>
+            <div class="flex items-center gap-1">
+              <input type="range" id="cut-min-segment" min="0.3" max="5" step="0.1" value="${minSegment}"
+                oninput="document.getElementById('cut-min-segment-val').textContent=parseFloat(this.value).toFixed(1)"
+                class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+              <span id="cut-min-segment-val" class="text-xs text-zinc-400 font-mono w-6">${minSegment.toFixed ? minSegment.toFixed(1) : minSegment}</span>
+            </div>
+            <p class="text-xs text-zinc-600 mt-0.5">Shorter = more cuts</p>
+          </div>
+          <div>
+            <label class="text-xs text-zinc-500 block mb-1">Both Range (dB)</label>
+            <div class="flex items-center gap-1">
+              <input type="range" id="cut-both-range" min="1" max="15" step="0.5" value="${bothRange}"
+                oninput="document.getElementById('cut-both-range-val').textContent=parseFloat(this.value).toFixed(1)"
+                class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+              <span id="cut-both-range-val" class="text-xs text-zinc-400 font-mono w-6">${bothRange}</span>
+            </div>
+            <p class="text-xs text-zinc-600 mt-0.5">How close levels must be to count as "both"</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 mt-3 pt-3 border-t border-zinc-800">
+          <button onclick="reanalyzeSpeakers('${episodeId}')" class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors">
+            Re-analyze Speakers
+          </button>
+          <span class="text-xs text-zinc-600">Re-runs speaker cut + renders with new sensitivity settings</span>
+        </div>
+      </div>
+      ` : ''}
+    </div>`;
+
+  // Load sync waveforms if on the Audio tab and we have sync data
+  if (hasSync && state.activeTab === 'audio') {
+    loadSyncPreview(episodeId, ep.audio_sync.offset_seconds);
+  }
+}
+
+async function applyAudioMixFromMixer(episodeId) {
+  const btn = document.getElementById('mix-apply-btn');
+  const status = document.getElementById('mix-status');
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating...'; }
+  if (status) status.textContent = 'Generating audio mix...';
+
+  // Collect volumes from the unified mixer state
+  const tracks = mixerState.tracks.map(t => ({
+    stem: t.stem,
+    volume: t.volume,
+  }));
+
+  const masterEl = document.getElementById('mix-master-vol');
+  const masterVolume = masterEl ? parseInt(masterEl.value) / 100 : 1.0;
+
+  try {
+    const result = await api(`/episodes/${episodeId}/audio-mix`, {
+      method: 'POST',
+      body: JSON.stringify({ tracks, master_volume: masterVolume }),
+    });
+    if (status) status.textContent = `Mix generated (${result.size_mb} MB)`;
+    showToast('Audio mix generated. Click "Re-render All" to apply to video.', 'success');
+  } catch (err) {
+    if (status) status.textContent = 'Failed: ' + err.message;
+    showToast('Audio mix failed: ' + err.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Update Mix'; }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  AUDIO MIX PANEL (legacy collapsible — kept for crop setup page)
 // ════════════════════════════════════════════════════════════════════
 
 function renderAudioMixPanel(episodeId, ep) {

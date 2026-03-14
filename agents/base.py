@@ -7,6 +7,8 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from lib.atomic_write import atomic_write_json
+
 logger = logging.getLogger("cascade")
 
 
@@ -46,9 +48,7 @@ class BaseAgent(ABC):
             "percent": round(current / total * 100, 1) if total > 0 else 0,
             "detail": detail,
         }
-        path = self.episode_dir / "progress.json"
-        with open(path, "w") as f:
-            json.dump(progress, f)
+        atomic_write_json(self.episode_dir / "progress.json", progress, indent=0)
 
     @abstractmethod
     def execute(self) -> dict:
@@ -91,9 +91,27 @@ class BaseAgent(ABC):
         with open(path) as f:
             return json.load(f)
 
+    def load_json_safe(self, filename: str, default: dict | None = None) -> dict:
+        """Load a JSON file, returning default (empty dict) on missing/invalid file."""
+        try:
+            return self.load_json(filename)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return default if default is not None else {}
+
+    def get_config(self, *keys: str, default=None):
+        """Traverse nested config keys. e.g. get_config('processing', 'video_crf', default=22)."""
+        val = self.config
+        for key in keys:
+            if isinstance(val, dict):
+                val = val.get(key)
+            else:
+                return default
+            if val is None:
+                return default
+        return val
+
     def save_json(self, filename: str, data: dict):
-        """Save a JSON file to the episode directory."""
+        """Save a JSON file to the episode directory (atomic write)."""
         path = self.episode_dir / filename
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+        atomic_write_json(path, data)

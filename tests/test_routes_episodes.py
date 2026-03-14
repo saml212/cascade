@@ -31,12 +31,6 @@ def test_client(tmp_path, monkeypatch):
     import server.routes.chat as chat_mod
     importlib.reload(chat_mod)
 
-    import server.routes.publish as pub_mod
-    importlib.reload(pub_mod)
-
-    import server.routes.analytics as analytics_mod
-    importlib.reload(analytics_mod)
-
     import server.app as app_mod
     importlib.reload(app_mod)
 

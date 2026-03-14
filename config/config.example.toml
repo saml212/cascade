@@ -26,6 +26,9 @@ shorts_crf = 20                           # CRF for shorts
 audio_bitrate = "192k"                    # Audio bitrate for longform
 shorts_audio_bitrate = "128k"             # Audio bitrate for shorts
 use_hardware_accel = true                 # Use VideoToolbox (macOS) or VAAPI (Linux)
+videotoolbox_quality = 80                 # VideoToolbox quality (lower = higher quality, 60-85 typical)
+lut_path = ""                             # Path to .cube LUT file for color grading (optional)
+lut_interpolation = "tetrahedral"         # LUT interpolation: "tetrahedral" (accurate) or "trilinear" (fast)
 
 [transcription]
 provider = "deepgram"                     # Transcription provider

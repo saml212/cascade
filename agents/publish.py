@@ -42,11 +42,7 @@ class PublishAgent(BaseAgent):
         clips = clips_data.get("clips", [])
 
         # Load metadata for per-platform captions
-        metadata = {}
-        metadata_path = self.episode_dir / "metadata" / "metadata.json"
-        if metadata_path.exists():
-            with open(metadata_path) as f:
-                metadata = json.load(f)
+        metadata = self.load_json_safe("metadata/metadata.json")
 
         # Load schedule from metadata
         schedule = metadata.get("schedule", [])
@@ -68,9 +64,9 @@ class PublishAgent(BaseAgent):
         if not platforms:
             raise RuntimeError("No platforms enabled in config")
 
-        tz_name = self.config.get("schedule", {}).get("timezone", "America/Los_Angeles")
-        shorts_weekday = self.config.get("schedule", {}).get("shorts_per_day_weekday", 1)
-        shorts_weekend = self.config.get("schedule", {}).get("shorts_per_day_weekend", 2)
+        tz_name = self.get_config("schedule", "timezone", default="America/Los_Angeles")
+        shorts_weekday = self.get_config("schedule", "shorts_per_day_weekday", default=1)
+        shorts_weekend = self.get_config("schedule", "shorts_per_day_weekend", default=2)
 
         results = []
 

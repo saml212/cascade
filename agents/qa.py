@@ -102,8 +102,8 @@ class QAAgent(BaseAgent):
             # === Soft checks (warnings) ===
 
             # Clip durations in range
-            clip_min = self.config.get("processing", {}).get("clip_min_seconds", 30)
-            clip_max = self.config.get("processing", {}).get("clip_max_seconds", 90)
+            clip_min = self.get_config("processing", "clip_min_seconds", default=30)
+            clip_max = self.get_config("processing", "clip_max_seconds", default=90)
             for clip in clips:
                 dur = clip.get("duration", 0)
                 if dur < clip_min or dur > clip_max:

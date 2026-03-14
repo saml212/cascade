@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from lib.ffprobe import probe as ffprobe_json
 from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
@@ -64,14 +65,10 @@ def _fix_track_durations(mp4_path: Path) -> Path:
     differ by more than 50 ms, re-mux with -t set to the shorter duration.
     Returns the (possibly replaced) output path.
     """
-    probe_cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", str(mp4_path),
-    ]
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        streams = json.loads(result.stdout).get("streams", [])
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
+        probe_data = ffprobe_json(mp4_path)
+        streams = probe_data.get("streams", [])
+    except (subprocess.CalledProcessError, KeyError):
         return mp4_path  # Can't probe — return as-is
 
     durations = {}
@@ -129,16 +126,9 @@ async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
 
     # Probe current duration
     try:
-        probe_cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            str(source_path),
-        ]
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        probe_data = json.loads(probe_result.stdout)
+        probe_data = ffprobe_json(source_path)
         current_duration = float(probe_data["format"]["duration"])
-    except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError, ValueError) as e:
+    except (subprocess.CalledProcessError, KeyError, ValueError) as e:
         logger.error("Failed to probe source file for %s: %s", episode_id, e)
         raise HTTPException(status_code=500, detail=f"Could not probe source file: {e}")
 

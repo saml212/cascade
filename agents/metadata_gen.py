@@ -14,7 +14,7 @@ Environment:
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agents.base import BaseAgent
@@ -29,11 +29,7 @@ class MetadataGenAgent(BaseAgent):
         clips = clips_data.get("clips", [])
 
         # Load episode info for cross-references
-        episode_info = {}
-        try:
-            episode_info = self.load_json("episode_info.json")
-        except (FileNotFoundError, Exception):
-            pass
+        episode_info = self.load_json_safe("episode_info.json")
 
         guest_name = episode_info.get("guest_name", "")
         guest_title = episode_info.get("guest_title", "")
@@ -46,11 +42,7 @@ class MetadataGenAgent(BaseAgent):
         link_in_bio = podcast_config.get("links", {}).get("link_in_bio", "")
 
         # Load longform URLs from episode.json for cross-linking
-        episode_data = {}
-        try:
-            episode_data = self.load_json("episode.json")
-        except (FileNotFoundError, Exception):
-            pass
+        episode_data = self.load_json_safe("episode.json")
 
         youtube_longform_url = episode_data.get("youtube_longform_url", "")
         spotify_longform_url = episode_data.get("spotify_longform_url", "")
@@ -63,7 +55,7 @@ class MetadataGenAgent(BaseAgent):
         import anthropic
 
         client = anthropic.Anthropic(api_key=api_key)
-        model = self.config.get("clip_mining", {}).get("metadata_model", "claude-sonnet-4-20250514")
+        model = self.get_config("clip_mining", "metadata_model", default="claude-sonnet-4-20250514")
 
         # Build context: clips + transcript excerpts
         clip_summaries = []

@@ -284,14 +284,71 @@ class IngestAgent(BaseAgent):
             ),
         }
 
+        # ── Measure drift by correlating at the END of the recording ──
+        # Independent clocks drift over time; measure offset at the end
+        # and compute a tempo correction factor for audio_mix.
+        total_dur = None
+        for t in audio_result["tracks"]:
+            if t.get("duration_seconds"):
+                total_dur = t["duration_seconds"]
+                break
+        if not total_dur:
+            total_dur = 3600  # fallback
+
+        if total_dur > 300:
+            # Measure offset at the end (last 60 seconds)
+            end_start = max(0, total_dur - 120)  # start extraction 120s from end
+            cam_end = self._extract_audio_pcm(video_path, sr, seek=end_start, max_duration=60)
+            h6e_end = self._extract_audio_pcm(sync_track["dest_path"], sr, seek=end_start, max_duration=60)
+
+            if len(cam_end) > sr * 5 and len(h6e_end) > sr * 5:
+                cam_end = cam_end - np.mean(cam_end)
+                h6e_end = h6e_end - np.mean(h6e_end)
+                n_end = len(cam_end) + len(h6e_end) - 1
+                fft_end = 2 ** int(np.ceil(np.log2(n_end)))
+                cc_end = np.real(np.fft.ifft(
+                    np.fft.fft(cam_end, fft_end) * np.conj(np.fft.fft(h6e_end, fft_end))
+                ))
+                end_idx = int(np.argmax(cc_end))
+                if end_idx > fft_end // 2:
+                    end_idx -= fft_end
+                end_offset = end_idx / sr
+
+                end_conf = float(cc_end[end_idx % fft_end]) / (
+                    np.sqrt(np.sum(cam_end**2) * np.sum(h6e_end**2)) + 1e-10
+                )
+
+                drift_total = end_offset - offset_seconds
+                drift_rate_ppm = (drift_total / total_dur) * 1e6
+                tempo_factor = 1.0 + drift_total / total_dur
+
+                self.logger.info(
+                    f"Audio drift: {drift_total:.4f}s over {total_dur:.0f}s "
+                    f"({drift_rate_ppm:.1f} ppm), tempo correction: {tempo_factor:.8f}"
+                )
+
+                sync_result["end_offset_seconds"] = round(end_offset, 4)
+                sync_result["end_confidence"] = round(end_conf, 6)
+                sync_result["drift_total_seconds"] = round(drift_total, 6)
+                sync_result["drift_rate_ppm"] = round(drift_rate_ppm, 1)
+                sync_result["tempo_factor"] = tempo_factor
+            else:
+                self.logger.warning(
+                    "End-of-recording audio too short for drift measurement"
+                )
+        else:
+            self.logger.info(
+                f"Recording too short ({total_dur:.0f}s) for drift measurement, skipping"
+            )
+
         return sync_result
 
-    def _extract_audio_pcm(self, input_path: str, sample_rate: int, max_duration: int = None) -> np.ndarray:
+    def _extract_audio_pcm(self, input_path: str, sample_rate: int, seek: float = 0, max_duration: int = None) -> np.ndarray:
         """Extract mono audio as float32 numpy array."""
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-        ]
+        cmd = ["ffmpeg", "-y"]
+        if seek > 0:
+            cmd += ["-ss", str(seek)]
+        cmd += ["-i", str(input_path)]
         if max_duration:
             cmd += ["-t", str(max_duration)]
         cmd += [

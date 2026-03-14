@@ -31,6 +31,7 @@ def generate_audio_mix(episode_dir: Path, episode_data: dict) -> Path | None:
     output_path = work_dir / "audio_mix.wav"
 
     offset = episode_data.get("audio_sync", {}).get("offset_seconds", 0)
+    tempo_factor = episode_data.get("audio_sync", {}).get("tempo_factor", 1.0)
     mix_cfg = episode_data.get("audio_mix", {})
     mix_tracks = mix_cfg.get("tracks", [])
     master_vol = mix_cfg.get("master_volume", 1.0)
@@ -72,6 +73,8 @@ def generate_audio_mix(episode_dir: Path, episode_data: dict) -> Path | None:
         if offset < 0:
             delay_ms = int(abs(offset) * 1000)
             f += f",adelay={delay_ms}|{delay_ms}"
+        if abs(tempo_factor - 1.0) > 1e-7:
+            f += f",atempo={tempo_factor:.8f}"
         f += f",volume={vol:.3f}[t{i}]"
         filters.append(f)
         labels.append(f"[t{i}]")

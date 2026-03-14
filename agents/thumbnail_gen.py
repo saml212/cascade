@@ -32,17 +32,8 @@ class ThumbnailGenAgent(BaseAgent):
 
     def execute(self) -> dict:
         diarized = self.load_json("diarized_transcript.json")
-        episode_data = {}
-        try:
-            episode_data = self.load_json("episode.json")
-        except (FileNotFoundError, Exception):
-            pass
-
-        episode_info = {}
-        try:
-            episode_info = self.load_json("episode_info.json")
-        except (FileNotFoundError, Exception):
-            pass
+        episode_data = self.load_json_safe("episode.json")
+        episode_info = self.load_json_safe("episode_info.json")
 
         # Merge episode context
         guest_name = episode_data.get("guest_name") or episode_info.get("guest_name", "")
@@ -65,7 +56,7 @@ class ThumbnailGenAgent(BaseAgent):
         import anthropic
 
         client = anthropic.Anthropic(api_key=anthropic_key)
-        model = self.config.get("clip_mining", {}).get("llm_model", "claude-sonnet-4-20250514")
+        model = self.get_config("clip_mining", "llm_model", default="claude-sonnet-4-20250514")
 
         self.report_progress(1, 3, "Analyzing transcript for thumbnail concept")
 

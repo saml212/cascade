@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
+from lib.audio_mix import generate_audio_mix
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
@@ -51,11 +52,23 @@ class LongformRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
-        # Check for pre-mixed audio (from audio mix panel)
+        # Resolve audio source: prefer pre-mixed H6E audio, auto-generate if needed
         audio_mix_path = work_dir / "audio_mix.wav"
+        has_h6e_tracks = bool(episode_data.get("audio_tracks"))
         if audio_mix_path.exists():
-            self.logger.info("Using pre-mixed audio from audio_mix.wav")
+            self.logger.info("Using pre-mixed H6E audio from audio_mix.wav")
+        elif has_h6e_tracks:
+            # H6E tracks exist but audio_mix.wav hasn't been generated yet
+            self.logger.info("H6E audio tracks found but audio_mix.wav missing — generating...")
+            mix_result = generate_audio_mix(self.episode_dir, episode_data)
+            if mix_result and mix_result.exists():
+                audio_mix_path = mix_result
+                self.logger.info("Generated audio_mix.wav from H6E tracks")
+            else:
+                self.logger.warning("Failed to generate audio_mix.wav, falling back to camera audio")
+                audio_mix_path = None
         else:
+            self.logger.info("No H6E audio tracks — using camera audio from source_merged.mp4")
             audio_mix_path = None
 
         # Get source video dimensions
@@ -236,7 +249,8 @@ class LongformRenderAgent(BaseAgent):
             )
 
         if audio_mix_path and audio_mix_path.exists():
-            # Use pre-mixed H6E audio
+            # Use pre-mixed H6E audio — offset is already baked into audio_mix.wav,
+            # so we only seek to the segment start time (no additional offset)
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start), "-i", str(source),
@@ -278,40 +292,28 @@ class LongformRenderAgent(BaseAgent):
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
         """Get ffmpeg crop filter for speaker type using crop_config center points.
 
-        Supports both N-speaker labels (speaker_0, speaker_1, ...) and legacy
-        L/R labels. Centers a 16:9 crop on the speaker's configured center point,
-        clamped to frame bounds.
+        Centers a 16:9 crop on the speaker's configured center point, clamped to
+        frame bounds. Zoom controls how tight the crop is (higher = more zoomed in).
+        BOTH: uses zoom to crop from full frame if set, else passthrough at 1920x1080.
         """
-        speakers = crop_config.get("speakers", [])
-
-        # N-speaker format: speaker_0, speaker_1, etc.
-        if speaker.startswith("speaker_"):
-            idx = int(speaker.split("_")[1])
-            if idx < len(speakers):
-                s = speakers[idx]
-                cx = s["center_x"]
-                cy = s["center_y"]
-                zoom = s.get("zoom", 1.0)
-            else:
-                return "scale=1920:1080"
-        # Legacy L/R format
-        elif speaker == "L":
-            cx = crop_config.get("speaker_l_center_x", speakers[0]["center_x"] if speakers else src_w // 4)
-            cy = crop_config.get("speaker_l_center_y", speakers[0]["center_y"] if speakers else src_h // 2)
+        if speaker == "L":
+            cx = crop_config["speaker_l_center_x"]
+            cy = crop_config["speaker_l_center_y"]
             zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
         elif speaker == "R":
-            cx = crop_config.get("speaker_r_center_x", speakers[1]["center_x"] if len(speakers) > 1 else 3 * src_w // 4)
-            cy = crop_config.get("speaker_r_center_y", speakers[1]["center_y"] if len(speakers) > 1 else src_h // 2)
+            cx = crop_config["speaker_r_center_x"]
+            cy = crop_config["speaker_r_center_y"]
             zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
-            # BOTH/NONE — wide shot
             zoom = crop_config.get("wide_zoom", crop_config.get("zoom", 1.0))
             if zoom <= 1.0:
                 return "scale=1920:1080"
+            # BOTH/wide: use configured center or frame center
             cx = crop_config.get("wide_center_x", src_w // 2)
             cy = crop_config.get("wide_center_y", src_h // 2)
 
         # Crop dimensions: base is half the source width, divided by zoom
+        # zoom=1.0: crop_w=960 (half frame), zoom=2.0: crop_w=480 (quarter frame)
         crop_w = max(64, int(src_w / (2 * zoom)))
         crop_h = max(36, int(crop_w * 9 / 16))
 

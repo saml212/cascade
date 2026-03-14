@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from lib.atomic_write import atomic_write_json
 from lib.clips import normalize_clip as _normalize_clip
 from lib.paths import get_episodes_dir
 
@@ -28,35 +29,20 @@ class NewEpisodeRequest(BaseModel):
 
 
 def read_episode(episode_id: str) -> dict:
-    """Read episode.json for a given episode, with audio_tracks merged from ingest."""
+    """Read episode.json for a given episode."""
     ep_dir = EPISODES_DIR / episode_id
     ep_file = ep_dir / "episode.json"
     if not ep_file.exists():
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
     with open(ep_file) as f:
-        ep = json.load(f)
-
-    # Merge audio tracks from ingest.json if not in episode.json
-    if not ep.get("audio_tracks"):
-        ingest_file = ep_dir / "ingest.json"
-        if ingest_file.exists():
-            try:
-                with open(ingest_file) as f:
-                    tracks = json.load(f).get("audio", {}).get("tracks", [])
-                if tracks:
-                    ep["audio_tracks"] = tracks
-            except (json.JSONDecodeError, OSError):
-                pass
-
-    return ep
+        return json.load(f)
 
 
 def write_episode(episode_id: str, data: dict):
-    """Write episode.json for a given episode."""
+    """Write episode.json for a given episode (atomic write)."""
     ep_dir = EPISODES_DIR / episode_id
     ep_dir.mkdir(parents=True, exist_ok=True)
-    with open(ep_dir / "episode.json", "w") as f:
-        json.dump(data, f, indent=2)
+    atomic_write_json(ep_dir / "episode.json", data)
 
 
 @router.get("/")
@@ -435,309 +421,29 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
         ep["status"] = "processing"
 
     write_episode(episode_id, ep)
-    return {"status": "saved", "crop_config": ep["crop_config"]}
 
-
-# ── Sync Preview Endpoints ─────────────────────────────────────────
-
-
-def _extract_waveform(input_path: str, sample_rate: int, duration: float, peaks_per_second: int = 200) -> list[float]:
-    """Extract downsampled amplitude envelope from an audio source.
-
-    Returns a list of peak amplitude values (0.0-1.0), one per time bucket.
-    """
-    import subprocess
-    import numpy as np
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-t", str(duration),
-        "-i", str(input_path),
-        "-ar", str(sample_rate),
-        "-ac", "1",
-        "-f", "s16le",
-        "-acodec", "pcm_s16le",
-        "-",
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg waveform extraction failed: {result.stderr[:300]}")
-
-    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)
-    if len(samples) == 0:
-        return []
-
-    # Normalize to -1..1
-    peak = np.max(np.abs(samples))
-    if peak > 0:
-        samples = samples / peak
-
-    # Downsample to peaks_per_second buckets
-    total_buckets = int(duration * peaks_per_second)
-    samples_per_bucket = max(1, len(samples) // total_buckets)
-    envelope = []
-    for i in range(total_buckets):
-        start = i * samples_per_bucket
-        end = min(start + samples_per_bucket, len(samples))
-        if start >= len(samples):
-            envelope.append(0.0)
-        else:
-            chunk = samples[start:end]
-            envelope.append(float(np.max(np.abs(chunk))))
-    return envelope
-
-
-@router.get("/{episode_id}/sync-preview")
-async def get_sync_preview(episode_id: str, duration: float = 120.0):
-    """Return waveform data for camera and H6E audio for sync verification."""
-    ep = read_episode(episode_id)
-    ep_dir = EPISODES_DIR / episode_id
-
-    # Paths
-    merged_path = ep_dir / "source_merged.mp4"
-    if not merged_path.exists():
-        raise HTTPException(status_code=404, detail="source_merged.mp4 not found. Run stitch first.")
-
-    # Find the H6E sync track
-    audio_sync = ep.get("audio_sync", {})
-    offset_seconds = audio_sync.get("offset_seconds", 0)
-    sync_track_name = audio_sync.get("sync_track", "")
-
-    # Get audio tracks from episode or ingest.json
+    # Auto-generate audio_mix.wav if H6E audio tracks exist
+    # This uses speaker-to-track assignments and volumes from crop_config
     audio_tracks = ep.get("audio_tracks", [])
-    if not audio_tracks:
-        ingest_file = ep_dir / "ingest.json"
-        if ingest_file.exists():
-            try:
-                with open(ingest_file) as f:
-                    audio_tracks = json.load(f).get("audio", {}).get("tracks", [])
-            except (json.JSONDecodeError, OSError):
-                pass
+    if audio_tracks:
+        from lib.audio_mix import generate_audio_mix
 
-    h6e_path = None
-    for t in audio_tracks:
-        if t.get("filename") == sync_track_name or t.get("track_type") == "stereo_mix":
-            h6e_path = Path(t["dest_path"])
-            break
-
-    if not h6e_path or not h6e_path.exists():
-        raise HTTPException(status_code=404, detail="H6E sync track not found.")
-
-    # Check cache
-    cache_dir = ep_dir / "work" / "sync_preview"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"waveforms_{int(duration)}s.json"
-
-    if cache_file.exists():
+        ep_dir = EPISODES_DIR / episode_id
+        # Re-read to get full data with audio_tracks merged
+        ep_fresh = read_episode(episode_id)
         try:
-            with open(cache_file) as f:
-                cached = json.load(f)
-            # Return cached data with possibly updated offset
-            cached["offset_seconds"] = offset_seconds
-            return cached
-        except (json.JSONDecodeError, OSError):
-            pass
+            mix_path = generate_audio_mix(ep_dir, ep_fresh)
+            if mix_path:
+                logger.info(
+                    "Generated audio_mix.wav for %s (%.1f MB)",
+                    episode_id,
+                    mix_path.stat().st_size / 1e6,
+                )
+                # Invalidate existing rendered segments so re-render picks up new audio
+                work_dir = ep_dir / "work"
+                for f in work_dir.glob("longform_seg_*.mp4"):
+                    f.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Failed to generate audio_mix.wav for %s", episode_id)
 
-    # Generate waveforms at 200 peaks/sec, 16kHz sample rate
-    duration = min(max(duration, 10.0), 300.0)  # clamp 10-300s
-    sample_rate = 16000
-    pps = 200
-
-    try:
-        camera_waveform = _extract_waveform(str(merged_path), sample_rate, duration, pps)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=f"Camera waveform extraction failed: {e}")
-
-    try:
-        h6e_waveform = _extract_waveform(str(h6e_path), sample_rate, duration, pps)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=f"H6E waveform extraction failed: {e}")
-
-    result = {
-        "camera_waveform": camera_waveform,
-        "h6e_waveform": h6e_waveform,
-        "offset_seconds": offset_seconds,
-        "duration": duration,
-        "peaks_per_second": pps,
-        "confidence": audio_sync.get("confidence", 0),
-        "description": audio_sync.get("description", ""),
-    }
-
-    # Cache the waveform data
-    with open(cache_file, "w") as f:
-        json.dump(result, f)
-
-    return result
-
-
-class SyncOffsetRequest(BaseModel):
-    offset_seconds: float
-
-
-@router.post("/{episode_id}/sync-offset")
-async def update_sync_offset(episode_id: str, req: SyncOffsetRequest):
-    """Manually override the audio sync offset in episode.json."""
-    ep = read_episode(episode_id)
-
-    if "audio_sync" not in ep:
-        ep["audio_sync"] = {}
-
-    # Store original auto-detected offset if not already saved
-    if "auto_offset_seconds" not in ep["audio_sync"] and "offset_seconds" in ep["audio_sync"]:
-        ep["audio_sync"]["auto_offset_seconds"] = ep["audio_sync"]["offset_seconds"]
-
-    ep["audio_sync"]["offset_seconds"] = round(req.offset_seconds, 4)
-    ep["audio_sync"]["manually_adjusted"] = True
-
-    write_episode(episode_id, ep)
-
-    # Invalidate audio preview cache since offset changed
-    cache_dir = EPISODES_DIR / episode_id / "work" / "audio_preview"
-    if cache_dir.exists():
-        shutil.rmtree(cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-    return {
-        "status": "updated",
-        "offset_seconds": ep["audio_sync"]["offset_seconds"],
-        "auto_offset_seconds": ep["audio_sync"].get("auto_offset_seconds"),
-    }
-
-
-@router.get("/{episode_id}/video-preview")
-async def get_video_preview(episode_id: str, request: Request):
-    """Serve source_merged.mp4 with Range request support for video seeking."""
-    ep_dir = EPISODES_DIR / episode_id
-    video_path = ep_dir / "source_merged.mp4"
-
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="source_merged.mp4 not found.")
-
-    file_size = video_path.stat().st_size
-    range_header = request.headers.get("range")
-
-    if range_header:
-        # Parse Range: bytes=start-end
-        range_spec = range_header.replace("bytes=", "")
-        parts = range_spec.split("-")
-        start = int(parts[0]) if parts[0] else 0
-        end = int(parts[1]) if parts[1] else file_size - 1
-        end = min(end, file_size - 1)
-        content_length = end - start + 1
-
-        def iter_file():
-            with open(video_path, "rb") as f:
-                f.seek(start)
-                remaining = content_length
-                while remaining > 0:
-                    chunk_size = min(65536, remaining)
-                    data = f.read(chunk_size)
-                    if not data:
-                        break
-                    remaining -= len(data)
-                    yield data
-
-        return StreamingResponse(
-            iter_file(),
-            status_code=206,
-            media_type="video/mp4",
-            headers={
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(content_length),
-            },
-        )
-
-    # No Range header — return full file
-    return FileResponse(
-        video_path,
-        media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes"},
-    )
-
-
-# ── Audio Mix Endpoints ──────────────────────────────────────────
-
-
-class AudioMixTrack(BaseModel):
-    stem: str
-    volume: float = 1.0
-
-
-class AudioMixRequest(BaseModel):
-    tracks: list[AudioMixTrack]
-    master_volume: float = 1.0
-
-
-@router.post("/{episode_id}/audio-mix")
-async def save_audio_mix(episode_id: str, req: AudioMixRequest) -> dict:
-    """Save audio mix settings and generate pre-mixed audio file.
-
-    The generated work/audio_mix.wav is used by render agents instead of
-    camera audio, applying per-track volume levels from the mix panel.
-    """
-    from lib.audio_mix import generate_audio_mix
-
-    ep = read_episode(episode_id)
-    ep["audio_mix"] = {
-        "tracks": [t.model_dump() for t in req.tracks],
-        "master_volume": req.master_volume,
-    }
-    write_episode(episode_id, ep)
-
-    # Re-read to get full data with audio_tracks merged
-    ep = read_episode(episode_id)
-    ep_dir = EPISODES_DIR / episode_id
-
-    try:
-        mix_path = generate_audio_mix(ep_dir, ep)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Mix generation failed: {e}")
-
-    if mix_path:
-        # Invalidate existing rendered segments so re-render picks up new audio
-        work_dir = ep_dir / "work"
-        for f in work_dir.glob("longform_seg_*.mp4"):
-            f.unlink(missing_ok=True)
-
-        return {
-            "status": "generated",
-            "size_mb": round(mix_path.stat().st_size / 1e6, 1),
-        }
-    else:
-        raise HTTPException(status_code=400, detail="No valid tracks to mix")
-
-
-@router.get("/{episode_id}/audio-mix")
-async def get_audio_mix(episode_id: str) -> dict:
-    """Get current audio mix settings."""
-    ep = read_episode(episode_id)
-    return ep.get("audio_mix", {"tracks": [], "master_volume": 1.0})
-
-
-# ── Speaker Cut Config Endpoint ──────────────────────────────────
-
-
-class SpeakerCutConfigRequest(BaseModel):
-    speech_db_margin: float = 12
-    min_segment_seconds: float = 2.0
-    both_db_range: float = 6.0
-    frame_seconds: float = 0.1
-
-
-@router.post("/{episode_id}/speaker-cut-config")
-async def save_speaker_cut_config(
-    episode_id: str, req: SpeakerCutConfigRequest
-) -> dict:
-    """Save speaker cut sensitivity settings for next re-analysis."""
-    ep = read_episode(episode_id)
-    ep["speaker_cut_config"] = req.model_dump()
-    write_episode(episode_id, ep)
-
-    # Clear cached speaker channel data so re-analysis uses fresh params
-    ep_dir = EPISODES_DIR / episode_id
-    work_dir = ep_dir / "work"
-    for f in work_dir.glob("speaker_*_channel.npy"):
-        f.unlink(missing_ok=True)
-
-    return {"status": "saved", "config": ep["speaker_cut_config"]}
+    return {"status": "saved", "crop_config": ep["crop_config"]}

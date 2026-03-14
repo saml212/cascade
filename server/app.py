@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from server.routes import episodes, clips, publish, analytics, pipeline, chat, trim
+from server.routes import episodes, clips, pipeline, chat, trim
 
 # Project root is the parent of server/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -38,8 +38,6 @@ app.add_middleware(
 # API routes
 app.include_router(episodes.router)
 app.include_router(clips.router)
-app.include_router(publish.router)
-app.include_router(analytics.router)
 app.include_router(pipeline.router)
 app.include_router(chat.router)
 app.include_router(trim.router)

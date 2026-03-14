@@ -2,7 +2,6 @@
 
 import json
 from pathlib import Path
-from typing import List
 
 
 def normalize_clip(clip: dict) -> dict:
@@ -21,7 +20,7 @@ def normalize_clip(clip: dict) -> dict:
     return clip
 
 
-def load_clips(episode_dir: Path) -> List[dict]:
+def load_clips(episode_dir: Path) -> list[dict]:
     """Load clips from clips.json in episode directory.
 
     Returns empty list if file doesn't exist.

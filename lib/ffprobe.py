@@ -3,7 +3,7 @@
 import json
 import subprocess
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 
 def probe(path: Path) -> dict:

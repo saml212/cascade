@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from lib.srt import fmt_timecode, escape_srt_path
+from lib.srt import fmt_timecode, escape_srt_path, generate_srt_from_diarized, parse_srt, parse_srt_time
 
 
 class TestFmtTimecode:
@@ -99,3 +99,97 @@ class TestEscapeSrtPath:
     def test_empty_filename(self):
         result = escape_srt_path(Path("/tmp/"))
         assert isinstance(result, str)
+
+
+class TestGenerateSrtFromDiarized:
+    def _make_diarized(self, words):
+        """Helper: wrap word list into diarized format."""
+        return {"utterances": [{"words": words}]}
+
+    def test_basic_generation(self, tmp_path):
+        words = [
+            {"word": "Hello", "start": 1.0, "end": 1.5},
+            {"word": "world", "start": 1.5, "end": 2.0},
+            {"word": "this", "start": 2.0, "end": 2.5},
+            {"word": "is", "start": 2.5, "end": 3.0},
+            {"word": "a", "start": 3.0, "end": 3.5},
+            {"word": "test", "start": 3.5, "end": 4.0},
+        ]
+        diarized = self._make_diarized(words)
+        srt_path = tmp_path / "test.srt"
+        generate_srt_from_diarized(diarized, 1.0, 4.0, srt_path)
+
+        content = srt_path.read_text()
+        assert "Hello world this is" in content
+        assert "a test" in content
+        assert "00:00:00,000" in content  # First chunk starts at 0
+
+    def test_time_offset_relative_to_start(self, tmp_path):
+        words = [
+            {"word": "word1", "start": 10.0, "end": 10.5},
+            {"word": "word2", "start": 10.5, "end": 11.0},
+        ]
+        diarized = self._make_diarized(words)
+        srt_path = tmp_path / "test.srt"
+        generate_srt_from_diarized(diarized, 10.0, 11.0, srt_path)
+
+        content = srt_path.read_text()
+        assert "00:00:00,000" in content  # 10.0 - 10.0 = 0.0
+        assert "00:00:01,000" in content  # 11.0 - 10.0 = 1.0
+
+    def test_filters_words_outside_range(self, tmp_path):
+        words = [
+            {"word": "before", "start": 0.0, "end": 0.5},
+            {"word": "inside", "start": 1.0, "end": 1.5},
+            {"word": "after", "start": 5.0, "end": 5.5},
+        ]
+        diarized = self._make_diarized(words)
+        srt_path = tmp_path / "test.srt"
+        generate_srt_from_diarized(diarized, 1.0, 2.0, srt_path)
+
+        content = srt_path.read_text()
+        assert "inside" in content
+        assert "before" not in content
+        assert "after" not in content
+
+    def test_empty_range(self, tmp_path):
+        diarized = self._make_diarized([])
+        srt_path = tmp_path / "test.srt"
+        generate_srt_from_diarized(diarized, 0.0, 10.0, srt_path)
+        assert srt_path.read_text() == ""
+
+
+class TestParseSrt:
+    def test_basic_parse(self, tmp_path):
+        srt_path = tmp_path / "test.srt"
+        srt_path.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nHello world\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nGoodbye\n"
+        )
+        entries = parse_srt(srt_path)
+        assert len(entries) == 2
+        assert entries[0]["text"] == "Hello world"
+        assert entries[0]["start"] == 0.0
+        assert entries[0]["end"] == 1.0
+        assert entries[1]["text"] == "Goodbye"
+
+    def test_missing_file(self, tmp_path):
+        entries = parse_srt(tmp_path / "nonexistent.srt")
+        assert entries == []
+
+    def test_empty_file(self, tmp_path):
+        srt_path = tmp_path / "empty.srt"
+        srt_path.write_text("")
+        entries = parse_srt(srt_path)
+        assert entries == []
+
+
+class TestParseSrtTime:
+    def test_basic(self):
+        assert parse_srt_time("00:00:01,000") == 1.0
+
+    def test_with_hours(self):
+        assert parse_srt_time("01:30:00,500") == 5400.5
+
+    def test_invalid_format(self):
+        assert parse_srt_time("invalid") == 0.0

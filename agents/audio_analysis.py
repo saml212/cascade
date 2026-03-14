@@ -81,8 +81,8 @@ class AudioAnalysisAgent(BaseAgent):
             rms_delta_db = 0.0
 
         # Classify
-        max_corr = self.config.get("processing", {}).get("max_channel_correlation", 0.95)
-        max_rms_delta = self.config.get("processing", {}).get("max_channel_rms_ratio_delta", 3.0)
+        max_corr = self.get_config("processing", "max_channel_correlation", default=0.95)
+        max_rms_delta = self.get_config("processing", "max_channel_rms_ratio_delta", default=3.0)
 
         channels_identical = (
             abs(correlation) > max_corr and abs(rms_delta_db) < max_rms_delta
