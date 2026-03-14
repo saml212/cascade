@@ -38,8 +38,8 @@ class TestDagDependencies:
     def test_transcribe_depends_on_stitch(self):
         assert AGENT_DEPS["transcribe"] == {"stitch"}
 
-    def test_clip_miner_depends_on_transcribe(self):
-        assert AGENT_DEPS["clip_miner"] == {"transcribe"}
+    def test_clip_miner_depends_on_transcribe_and_speaker_cut(self):
+        assert AGENT_DEPS["clip_miner"] == {"transcribe", "speaker_cut"}
 
     def test_longform_render_depends_on_speaker_cut_and_transcribe(self):
         assert AGENT_DEPS["longform_render"] == {"speaker_cut", "transcribe"}

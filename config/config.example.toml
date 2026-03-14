@@ -12,8 +12,7 @@ public_media_dir = ""                    # Public URL base for Instagram uploads
 [processing]
 frame_seconds = 0.1                       # Audio analysis frame size
 speech_db_margin = 6                      # dB above noise floor for speech
-min_segment_seconds = 0.8                 # Minimum speaker segment duration
-both_db_range = 6.0                       # If both channels active and within this dB range, classify as BOTH
+min_segment_seconds = 2.0                 # Minimum speaker segment duration
 max_channel_correlation = 0.95            # Above this = channels identical
 max_channel_rms_ratio_delta = 3.0         # dB; below this = channels identical
 clip_min_seconds = 30                     # Minimum clip duration
@@ -34,9 +33,10 @@ lut_interpolation = "tetrahedral"         # LUT interpolation: "tetrahedral" (ac
 provider = "deepgram"                     # Transcription provider
 model = "nova-3"                          # Deepgram model
 language = "en"                           # Language code
-diarize = true                            # Enable speaker diarization
+diarize = true                            # Enable speaker diarization (mono fallback only)
 smart_format = true                       # Deepgram smart formatting
 utterances = true                         # Group into utterances
+keyterms = []                             # Boost recognition of specific words, e.g. ["Todd", "Laura"]
 
 [clip_mining]
 method = "llm"                            # "baseline", "transcript", or "llm"

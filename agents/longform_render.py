@@ -19,6 +19,7 @@ from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
 from lib.audio_mix import generate_audio_mix
+from lib.crop import compute_crop, resolve_speaker
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
@@ -290,48 +291,11 @@ class LongformRenderAgent(BaseAgent):
         timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
-        """Get ffmpeg crop filter for speaker type using crop_config center points.
-
-        Handles both L/R labels (legacy stereo) and speaker_N labels (N-speaker mode).
-        BOTH/NONE: uses wide crop or passthrough.
-        """
-        speakers = crop_config.get("speakers", [])
-
-        if speaker.startswith("speaker_") and speakers:
-            # N-speaker mode: speaker_0 -> speakers[0], etc.
-            idx = int(speaker.split("_")[1])
-            if idx < len(speakers):
-                spk = speakers[idx]
-                cx = spk["center_x"]
-                cy = spk.get("center_y", src_h // 2)
-                zoom = spk.get("zoom", 1.0)
-            else:
-                return "scale=1920:1080"
-        elif speaker == "L":
-            cx = crop_config["speaker_l_center_x"]
-            cy = crop_config["speaker_l_center_y"]
-            zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
-        elif speaker == "R":
-            cx = crop_config["speaker_r_center_x"]
-            cy = crop_config["speaker_r_center_y"]
-            zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
-        else:
-            # BOTH/NONE/wide
-            zoom = crop_config.get("wide_zoom", crop_config.get("zoom", 1.0))
-            if zoom <= 1.0:
-                return "scale=1920:1080"
-            cx = crop_config.get("wide_center_x", src_w // 2)
-            cy = crop_config.get("wide_center_y", src_h // 2)
-
-        # Crop dimensions: base is half the source width, divided by zoom
-        # zoom=1.0: crop_w=960 (half frame), zoom=2.0: crop_w=480 (quarter frame)
-        crop_w = max(64, int(src_w / (2 * zoom)))
-        crop_h = max(36, int(crop_w * 9 / 16))
-
-        # Clamp crop origin to frame bounds
-        x = max(0, min(cx - crop_w // 2, src_w - crop_w))
-        y = max(0, min(cy - crop_h // 2, src_h - crop_h))
-
+        """Get ffmpeg crop+scale filter. Crop math in lib/crop.py."""
+        cx, cy, zoom, mode = resolve_speaker(speaker, src_w, src_h, crop_config)
+        if mode is None:
+            return "scale=1920:1080"
+        x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, mode)
         return f"crop={crop_w}:{crop_h}:{x}:{y},scale=1920:1080"
 
     def _generate_segment_srt(self, diarized, start, end, srt_path):

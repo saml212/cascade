@@ -12,6 +12,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from lib.crop import compute_crop, resolve_speaker
 from lib.encoding import get_video_encoder_args
 from lib.paths import get_episodes_dir
 from lib.srt import escape_srt_path, fmt_timecode
@@ -291,10 +292,27 @@ Each clip can have per-platform metadata. The supported platforms and their fiel
 _MAX_TRANSCRIPT_CHARS = 320_000  # ~80K tokens at ~4 chars/token
 
 
+def _speaker_label(speaker_id, speaker_map: list | None = None) -> str:
+    """Map a speaker integer to a display label.
+
+    Uses speaker_map from diarized_transcript.json when available (multichannel
+    mode gives "Speaker 0", "Speaker 1", etc.).  Falls back to "L"/"R" for
+    legacy 2-speaker episodes without a speaker_map.
+    """
+    if not isinstance(speaker_id, int):
+        return str(speaker_id)
+    if speaker_map:
+        for entry in speaker_map:
+            if entry.get("index") == speaker_id:
+                return entry.get("label", f"Speaker {speaker_id}")
+    # Legacy fallback
+    return "L" if speaker_id == 0 else "R"
+
+
 def _format_transcript_text(diarized: Optional[dict]) -> str:
     """Format the full diarized transcript as compact timestamped text lines.
 
-    Format: [0.0s - 3.5s] Speaker L: Welcome...
+    Format: [0.0s - 3.5s] Speaker 0: Welcome...
     If the transcript exceeds ~80K tokens, truncate from the middle.
     """
     if not diarized:
@@ -304,17 +322,17 @@ def _format_transcript_text(diarized: Optional[dict]) -> str:
     if not utterances:
         return "No transcript available."
 
+    speaker_map = diarized.get("speaker_map")
+
     lines = []
     for utt in utterances:
         start = utt.get("start", 0)
         end = utt.get("end", 0)
-        channel = utt.get("channel", utt.get("speaker", "?"))
-        # Map channel index to L/R if numeric
-        if isinstance(channel, int):
-            channel = "L" if channel == 0 else "R"
+        speaker = utt.get("speaker", utt.get("channel", "?"))
+        label = _speaker_label(speaker, speaker_map)
         text = utt.get("text", "").strip()
         if text:
-            lines.append(f"[{start:.1f}s - {end:.1f}s] Speaker {channel}: {text}")
+            lines.append(f"[{start:.1f}s - {end:.1f}s] {label}: {text}")
 
     full_text = "\n".join(lines)
 
@@ -606,23 +624,13 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
     except (subprocess.CalledProcessError, StopIteration, KeyError, json.JSONDecodeError) as e:
         return {"action": "rerender_short", "status": "error", "detail": f"ffprobe failed: {e}"}
 
-    # Load crop config for speaker positioning
+    # Load crop config for speaker positioning (lib/crop.py is source of truth)
     episode_data = _load_json_safe(ep_dir / "episode.json") or {}
-    crop_config = episode_data.get("crop_config")
+    crop_config = episode_data.get("crop_config") or {}
 
-    # Determine speaker crop
     speaker = clip.get("speaker", "BOTH")
-    crop_w = int(src_h * 9 / 16)
-
-    if crop_config and speaker in ("L", "R"):
-        # Use configured center points
-        if speaker == "L":
-            cx = crop_config["speaker_l_center_x"]
-        else:
-            cx = crop_config["speaker_r_center_x"]
-        x_offset = max(0, min(cx - crop_w // 2, src_w - crop_w))
-    else:
-        x_offset = (src_w - crop_w) // 2
+    cx, cy, zoom, _ = resolve_speaker(speaker, src_w, src_h, crop_config)
+    x_offset, y_offset, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "short")
 
     # Load config for encoder args
     from agents.pipeline import load_config
@@ -635,14 +643,14 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
     if srt_path.exists():
         srt_escaped = escape_srt_path(srt_path)
         vf = (
-            f"crop={crop_w}:{src_h}:{x_offset}:0,"
+            f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset},"
             f"scale=1080:1920,"
             f"subtitles='{srt_escaped}':force_style="
             f"'FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
             f"BorderStyle=3,Outline=1,Shadow=0,MarginV=80'"
         )
     else:
-        vf = f"crop={crop_w}:{src_h}:{x_offset}:0,scale=1080:1920"
+        vf = f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset},scale=1080:1920"
 
     cmd = [
         "ffmpeg", "-y",
@@ -858,17 +866,17 @@ def _action_auto_trim(action: dict, ep_dir: Path) -> dict:
     duration = episode_data.get("duration_seconds", 0)
 
     # Format first 3 min and last 3 min of transcript for analysis
+    speaker_map = diarized.get("speaker_map")
     first_lines, last_lines = [], []
     for utt in utterances:
         start = utt.get("start", 0)
         end = utt.get("end", 0)
-        ch = utt.get("channel", utt.get("speaker", "?"))
-        if isinstance(ch, int):
-            ch = "L" if ch == 0 else "R"
+        speaker = utt.get("speaker", utt.get("channel", "?"))
+        label = _speaker_label(speaker, speaker_map)
         text = utt.get("text", "").strip()
         if not text:
             continue
-        line = f"[{start:.1f}s - {end:.1f}s] Speaker {ch}: {text}"
+        line = f"[{start:.1f}s - {end:.1f}s] {label}: {text}"
         if start < 300:
             first_lines.append(line)
         if end > duration - 300:

@@ -202,17 +202,20 @@ class IngestAgent(BaseAgent):
         }
 
     def _sync_audio(self, video_files: list, audio_result: dict) -> dict:
-        """Cross-correlate camera audio with external recorder to find sync offset."""
-        self.logger.info("Computing audio sync offset...")
+        """Multi-point cross-correlation sync between camera audio and H6E.
+
+        Extracts full audio from both sources once, then slices numpy arrays
+        for each checkpoint. Fits linear regression to drift profile for a
+        single tempo correction factor.
+        """
         self.report_progress(0, 1, "Syncing audio")
 
-        # Use the first (or longest) video file for sync
-        video_path = video_files[0]["dest_path"]
-        if len(video_files) > 1:
-            video_path = max(video_files, key=lambda f: f["duration_seconds"])["dest_path"]
+        # Sync against merged video (handles multi-file gaps correctly)
+        merged_path = self.episode_dir / "source_merged.mp4"
+        video_path = str(merged_path) if merged_path.exists() else video_files[0]["dest_path"]
+        video_duration = sum(f["duration_seconds"] for f in video_files)
 
-        # Pick the best H6E track for correlation:
-        # Prefer stereo_mix (TrLR), fallback to builtin_mic (TrMic), then first input track
+        # Pick best H6E track: stereo_mix > builtin_mic > input
         sync_track = None
         for pref in ["stereo_mix", "builtin_mic", "input"]:
             for t in audio_result["tracks"]:
@@ -221,142 +224,138 @@ class IngestAgent(BaseAgent):
                     break
             if sync_track:
                 break
-
         if not sync_track:
-            self.logger.warning("No suitable audio track found for sync")
             return {"status": "no_sync_track"}
 
-        self.logger.info(f"Syncing camera audio against {sync_track['filename']}")
+        self.logger.info(f"Syncing against {sync_track['filename']}")
+        sr = 16000
 
-        sr = 16000  # Downsample for speed
-        # Only use first 3 minutes for sync — the clap is always near the start,
-        # and full-length FFT on long recordings can exhaust memory
-        max_sync_seconds = 180
+        # Extract FULL audio from both sources once (2 ffmpeg calls total)
+        cam_full = self._extract_audio_pcm(video_path, sr)
+        h6e_full = self._extract_audio_pcm(sync_track["dest_path"], sr)
 
-        # Extract mono audio from camera video
-        cam_audio = self._extract_audio_pcm(video_path, sr, max_duration=max_sync_seconds)
-        # Extract mono audio from H6E track
-        h6e_audio = self._extract_audio_pcm(sync_track["dest_path"], sr, max_duration=max_sync_seconds)
-
-        if len(cam_audio) < sr or len(h6e_audio) < sr:
-            self.logger.warning("Audio too short for reliable sync")
+        if len(cam_full) < sr * 2 or len(h6e_full) < sr * 2:
             return {"status": "too_short"}
 
-        # Normalize (remove DC offset)
-        cam_audio = cam_audio - np.mean(cam_audio)
-        h6e_audio = h6e_audio - np.mean(h6e_audio)
+        # Step 1: Initial offset from first 5 minutes
+        init_samples = min(sr * 300, len(cam_full), len(h6e_full))
+        init_offset, init_confidence = self._correlate(
+            cam_full[:init_samples], h6e_full[:init_samples], sr
+        )
+        self.logger.info(f"Initial offset={init_offset:.4f}s, confidence={init_confidence:.4f}")
 
-        # FFT-based cross-correlation
-        n = len(cam_audio) + len(h6e_audio) - 1
-        fft_size = 2 ** int(np.ceil(np.log2(n)))
+        # Step 2: Multi-point drift measurement by slicing numpy arrays
+        window = 15  # seconds per checkpoint window
+        window_samples = sr * window
+        interval = 10  # seconds between checkpoints
+        interval_samples = sr * interval
+        offset_samples = int(init_offset * sr)
+        checkpoints = []
+
+        num_checkpoints = int((video_duration - window) / interval)
+        for i in range(num_checkpoints):
+            cam_start = i * interval_samples
+            h6e_start = cam_start + offset_samples
+
+            if h6e_start < 0 or cam_start + window_samples > len(cam_full) \
+               or h6e_start + window_samples > len(h6e_full):
+                continue
+
+            local_offset, conf = self._correlate(
+                cam_full[cam_start:cam_start + window_samples],
+                h6e_full[h6e_start:h6e_start + window_samples],
+                sr,
+            )
+            checkpoints.append({
+                "time": round(i * interval, 1),
+                "offset": round(init_offset + local_offset, 6),
+                "confidence": round(conf, 4),
+            })
+
+        self.logger.info(f"Collected {len(checkpoints)} drift checkpoints")
+
+        # Step 3: Linear regression on high-confidence checkpoints
+        good = [c for c in checkpoints if c["confidence"] > 0.10]
+
+        base_result = {
+            "sync_track": sync_track["filename"],
+            "video_file": Path(video_path).name,
+            "video_duration": round(video_duration, 3),
+            "confidence": round(init_confidence, 6),
+            "checkpoints": checkpoints,
+        }
+
+        if len(good) < 3:
+            self.logger.warning(f"Only {len(good)} good checkpoints, skipping drift correction")
+            return {
+                **base_result,
+                "status": "low_confidence" if init_confidence < 0.10 else "ok",
+                "offset_seconds": round(init_offset, 6),
+                "tempo_factor": 1.0,
+                "drift_rate_ppm": 0.0,
+                "drift_total_seconds": 0.0,
+            }
+
+        times = np.array([c["time"] for c in good])
+        offsets = np.array([c["offset"] for c in good])
+
+        # offset(t) = intercept + slope * t
+        mean_t, mean_o = np.mean(times), np.mean(offsets)
+        slope = float(np.sum((times - mean_t) * (offsets - mean_o))
+                       / (np.sum((times - mean_t) ** 2) + 1e-15))
+        intercept = float(mean_o - slope * mean_t)
+
+        tempo_factor = 1.0 + slope
+        drift_ppm = slope * 1e6
+        drift_total = slope * video_duration
+
+        # R-squared for quality assessment
+        ss_res = float(np.sum((offsets - (intercept + slope * times)) ** 2))
+        ss_tot = float(np.sum((offsets - mean_o) ** 2))
+        r_sq = 1.0 - ss_res / (ss_tot + 1e-15) if ss_tot > 1e-15 else 1.0
+
+        status = "ok"
+        if init_confidence < 0.10:
+            status = "low_confidence"
+        elif r_sq < 0.5 and abs(drift_total) > 0.1:
+            status = "low_confidence"
+
+        self.logger.info(
+            f"Drift: {drift_total:.4f}s over {video_duration:.0f}s "
+            f"({drift_ppm:.1f}ppm), tempo={tempo_factor:.8f}, R²={r_sq:.4f}"
+        )
+
+        return {
+            **base_result,
+            "status": status,
+            "offset_seconds": round(intercept, 6),
+            "tempo_factor": tempo_factor,
+            "drift_rate_ppm": round(drift_ppm, 2),
+            "drift_total_seconds": round(drift_total, 6),
+            "r_squared": round(r_sq, 4),
+        }
+
+    @staticmethod
+    def _correlate(a: np.ndarray, b: np.ndarray, sr: int) -> tuple[float, float]:
+        """FFT cross-correlation. Returns (offset_seconds, confidence)."""
+        a = a - np.mean(a)
+        b = b - np.mean(b)
+        fft_size = 2 ** int(np.ceil(np.log2(len(a) + len(b) - 1)))
         cc = np.real(np.fft.ifft(
-            np.fft.fft(cam_audio, fft_size) * np.conj(np.fft.fft(h6e_audio, fft_size))
+            np.fft.fft(a, fft_size) * np.conj(np.fft.fft(b, fft_size))
         ))
-
         max_idx = int(np.argmax(cc))
         if max_idx > fft_size // 2:
             max_idx -= fft_size
+        energy = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2)) + 1e-10
+        return max_idx / sr, float(cc[max_idx % fft_size]) / energy
 
-        offset_seconds = max_idx / sr
-        confidence = float(cc[max_idx % fft_size]) / (
-            np.sqrt(np.sum(cam_audio**2) * np.sum(h6e_audio**2)) + 1e-10
-        )
-
-        self.logger.info(
-            f"Audio sync: offset={offset_seconds:.4f}s "
-            f"(H6E starts {abs(offset_seconds):.2f}s "
-            f"{'after' if offset_seconds < 0 else 'before'} camera), "
-            f"confidence={confidence:.4f}"
-        )
-
-        sync_result = {
-            "status": "synced",
-            "offset_seconds": round(offset_seconds, 4),
-            "offset_samples": max_idx,
-            "sync_sample_rate": sr,
-            "sync_track": sync_track["filename"],
-            "video_file": Path(video_path).name,
-            "confidence": round(confidence, 6),
-            "description": (
-                f"H6E audio starts {abs(offset_seconds):.2f}s "
-                f"{'after' if offset_seconds < 0 else 'before'} camera video. "
-                f"To align: camera_time + offset = h6e_time"
-            ),
-        }
-
-        # ── Measure drift by correlating at the END of the recording ──
-        # Independent clocks drift over time; measure offset at the end
-        # and compute a tempo correction factor for audio_mix.
-        total_dur = None
-        for t in audio_result["tracks"]:
-            if t.get("duration_seconds"):
-                total_dur = t["duration_seconds"]
-                break
-        if not total_dur:
-            total_dur = 3600  # fallback
-
-        if total_dur > 300:
-            # Measure offset at the end (last 60 seconds)
-            end_start = max(0, total_dur - 120)  # start extraction 120s from end
-            cam_end = self._extract_audio_pcm(video_path, sr, seek=end_start, max_duration=60)
-            h6e_end = self._extract_audio_pcm(sync_track["dest_path"], sr, seek=end_start, max_duration=60)
-
-            if len(cam_end) > sr * 5 and len(h6e_end) > sr * 5:
-                cam_end = cam_end - np.mean(cam_end)
-                h6e_end = h6e_end - np.mean(h6e_end)
-                n_end = len(cam_end) + len(h6e_end) - 1
-                fft_end = 2 ** int(np.ceil(np.log2(n_end)))
-                cc_end = np.real(np.fft.ifft(
-                    np.fft.fft(cam_end, fft_end) * np.conj(np.fft.fft(h6e_end, fft_end))
-                ))
-                end_idx = int(np.argmax(cc_end))
-                if end_idx > fft_end // 2:
-                    end_idx -= fft_end
-                end_offset = end_idx / sr
-
-                end_conf = float(cc_end[end_idx % fft_end]) / (
-                    np.sqrt(np.sum(cam_end**2) * np.sum(h6e_end**2)) + 1e-10
-                )
-
-                drift_total = end_offset - offset_seconds
-                drift_rate_ppm = (drift_total / total_dur) * 1e6
-                tempo_factor = 1.0 + drift_total / total_dur
-
-                self.logger.info(
-                    f"Audio drift: {drift_total:.4f}s over {total_dur:.0f}s "
-                    f"({drift_rate_ppm:.1f} ppm), tempo correction: {tempo_factor:.8f}"
-                )
-
-                sync_result["end_offset_seconds"] = round(end_offset, 4)
-                sync_result["end_confidence"] = round(end_conf, 6)
-                sync_result["drift_total_seconds"] = round(drift_total, 6)
-                sync_result["drift_rate_ppm"] = round(drift_rate_ppm, 1)
-                sync_result["tempo_factor"] = tempo_factor
-            else:
-                self.logger.warning(
-                    "End-of-recording audio too short for drift measurement"
-                )
-        else:
-            self.logger.info(
-                f"Recording too short ({total_dur:.0f}s) for drift measurement, skipping"
-            )
-
-        return sync_result
-
-    def _extract_audio_pcm(self, input_path: str, sample_rate: int, seek: float = 0, max_duration: int = None) -> np.ndarray:
-        """Extract mono audio as float32 numpy array."""
-        cmd = ["ffmpeg", "-y"]
-        if seek > 0:
-            cmd += ["-ss", str(seek)]
-        cmd += ["-i", str(input_path)]
-        if max_duration:
-            cmd += ["-t", str(max_duration)]
-        cmd += [
-            "-ar", str(sample_rate),
-            "-ac", "1",
-            "-f", "s16le",
-            "-acodec", "pcm_s16le",
-            "-"
+    def _extract_audio_pcm(self, path: str, sr: int) -> np.ndarray:
+        """Extract full mono audio as float32 numpy array via ffmpeg."""
+        cmd = [
+            "ffmpeg", "-y", "-i", str(path),
+            "-ar", str(sr), "-ac", "1",
+            "-f", "s16le", "-acodec", "pcm_s16le", "-",
         ]
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:

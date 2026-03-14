@@ -21,6 +21,7 @@ from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
 from lib.audio_mix import generate_audio_mix
+from lib.crop import compute_crop, resolve_speaker
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
@@ -411,39 +412,9 @@ class ShortsRenderAgent(BaseAgent):
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
-        """Compute 9:16 crop region (w, h, x, y) centered on speaker, with zoom.
-
-        Zoom controls how tight the crop is. Higher zoom = more zoomed in.
-        BOTH defaults to L speaker position.
-        """
-        speakers = crop_config.get("speakers", [])
-
-        if speaker.startswith("speaker_") and speakers:
-            idx = int(speaker.split("_")[1])
-            if idx < len(speakers):
-                spk = speakers[idx]
-                cx = spk["center_x"]
-                cy = spk.get("center_y", src_h // 2)
-                zoom = spk.get("zoom", 1.0)
-            else:
-                cx = src_w // 2
-                cy = src_h // 2
-                zoom = 1.0
-        elif speaker == "R":
-            cx = crop_config["speaker_r_center_x"]
-            cy = crop_config.get("speaker_r_center_y", src_h // 2)
-            zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
-        else:
-            cx = crop_config.get("speaker_l_center_x", src_w // 2)
-            cy = crop_config.get("speaker_l_center_y", src_h // 2)
-            zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
-
-        # Base crop: 9:16 from full height. Zoom shrinks the crop region.
-        crop_h = max(36, int(src_h / zoom))
-        crop_w = max(64, int(crop_h * 9 / 16))
-
-        x = max(0, min(cx - crop_w // 2, src_w - crop_w))
-        y = max(0, min(cy - crop_h // 2, src_h - crop_h))
+        """Compute 9:16 crop region (w, h, x, y). Crop math in lib/crop.py."""
+        cx, cy, zoom, _ = resolve_speaker(speaker, src_w, src_h, crop_config)
+        x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "short")
         return crop_w, crop_h, x, y
 
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):

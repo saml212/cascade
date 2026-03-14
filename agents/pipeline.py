@@ -23,7 +23,7 @@ AGENT_DEPS = {
     "audio_analysis": {"stitch"},
     "speaker_cut": {"audio_analysis"},
     "transcribe": {"stitch"},
-    "clip_miner": {"transcribe"},
+    "clip_miner": {"transcribe", "speaker_cut"},
     "longform_render": {"speaker_cut", "transcribe"},
     "shorts_render": {"clip_miner", "speaker_cut"},
     "metadata_gen": {"clip_miner"},

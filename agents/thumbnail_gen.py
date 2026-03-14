@@ -144,15 +144,16 @@ Return ONLY the JSON object, no other text."""
         if not utterances:
             return "No transcript available."
 
+        speaker_map = diarized.get("speaker_map")
+
         lines = []
         for utt in utterances:
             start = utt.get("start", 0)
-            channel = utt.get("channel", utt.get("speaker", "?"))
-            if isinstance(channel, int):
-                channel = "L" if channel == 0 else "R"
+            speaker = utt.get("speaker", utt.get("channel", "?"))
+            label = self._speaker_label(speaker, speaker_map)
             text = utt.get("text", "").strip()
             if text:
-                lines.append(f"[{start:.0f}s] {channel}: {text}")
+                lines.append(f"[{start:.0f}s] {label}: {text}")
 
         full_text = "\n".join(lines)
 
@@ -166,6 +167,17 @@ Return ONLY the JSON object, no other text."""
         first = first[:first.rfind("\n")]
         last = last[last.find("\n") + 1:]
         return f"{first}\n\n... [middle of conversation omitted] ...\n\n{last}"
+
+    @staticmethod
+    def _speaker_label(speaker_id, speaker_map: list | None = None) -> str:
+        """Map speaker integer to display label using speaker_map or L/R fallback."""
+        if not isinstance(speaker_id, int):
+            return str(speaker_id)
+        if speaker_map:
+            for entry in speaker_map:
+                if entry.get("index") == speaker_id:
+                    return entry.get("label", f"Speaker {speaker_id}")
+        return "L" if speaker_id == 0 else "R"
 
     def _generate_image_openai(self, api_key: str, prompt: str, dest: Path):
         """Call OpenAI's image generation API and save directly to dest."""

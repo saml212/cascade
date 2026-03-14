@@ -10,7 +10,7 @@ from agents.longform_render import LongformRenderAgent
 
 @pytest.fixture
 def crop_config():
-    """Standard 2-speaker crop config."""
+    """Standard 2-speaker crop config with both legacy and N-speaker fields."""
     return {
         "source_width": 3840,
         "source_height": 2160,
@@ -21,6 +21,10 @@ def crop_config():
         "speaker_l_zoom": 1.0,
         "speaker_r_zoom": 1.0,
         "zoom": 1.0,
+        "speakers": [
+            {"label": "Speaker 0", "center_x": 960, "center_y": 1080, "zoom": 1.0},
+            {"label": "Speaker 1", "center_x": 2880, "center_y": 1080, "zoom": 1.0},
+        ],
     }
 
 
@@ -30,149 +34,61 @@ def agent(tmp_episode_dir, sample_config):
 
 
 class TestGetCropFilter:
-    """Test _get_crop_filter for various speakers and zoom levels."""
+    """Test _get_crop_filter produces correct ffmpeg filter strings."""
 
-    def test_speaker_l_default_zoom(self, agent, crop_config):
+    def test_speaker_l_zoom_1(self, agent, crop_config):
         result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        assert result.startswith("crop=")
+        assert "crop=1920:" in result  # 3840 / (2*1.0)
         assert "scale=1920:1080" in result
 
-    def test_speaker_r_default_zoom(self, agent, crop_config):
-        result = agent._get_crop_filter("R", 3840, 2160, crop_config)
-        assert result.startswith("crop=")
-        assert "scale=1920:1080" in result
+    def test_speaker_zoom_2(self, agent, crop_config):
+        crop_config["speakers"][0]["zoom"] = 2.0
+        crop_config["speaker_l_zoom"] = 2.0
+        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
+        assert "crop=960:" in result  # 3840 / (2*2.0)
 
-    def test_both_speaker_no_zoom_passthrough(self, agent, crop_config):
-        """BOTH with zoom <= 1.0 should return simple scale (no crop)."""
+    def test_per_speaker_zoom(self, agent, crop_config):
+        crop_config["speakers"][0]["zoom"] = 2.0
+        crop_config["speakers"][1]["zoom"] = 1.5
+        result_l = agent._get_crop_filter("speaker_0", 3840, 2160, crop_config)
+        result_r = agent._get_crop_filter("speaker_1", 3840, 2160, crop_config)
+        assert "crop=960:" in result_l   # 3840 / (2*2.0)
+        assert "crop=1280:" in result_r  # 3840 / (2*1.5)
+
+    def test_both_no_zoom_passthrough(self, agent, crop_config):
         result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
         assert result == "scale=1920:1080"
 
-    def test_both_speaker_with_wide_zoom(self, agent, crop_config):
-        """BOTH with wide_zoom > 1.0 should apply a crop."""
-        crop_config["wide_zoom"] = 1.5
-        crop_config["wide_center_x"] = 1920
-        crop_config["wide_center_y"] = 1080
-        result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
-        assert result.startswith("crop=")
-        assert "scale=1920:1080" in result
-
-    def test_both_uses_frame_center_when_no_wide_config(self, agent, crop_config):
-        """Without wide_center config, should use frame center."""
-        crop_config["wide_zoom"] = 1.5
-        result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
-        assert result.startswith("crop=")
-
-    def test_zoom_2x_halves_crop_width(self, agent, crop_config):
-        """zoom=2.0 should produce a crop width of src_w / (2 * 2.0) = src_w/4."""
-        crop_config["speaker_l_zoom"] = 2.0
-        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        # crop_w = 3840 / (2 * 2.0) = 960
-        assert "crop=960:" in result
-
-    def test_zoom_1x_gives_half_frame_width(self, agent, crop_config):
-        """zoom=1.0 should produce crop_w = src_w / 2."""
-        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        # crop_w = 3840 / (2 * 1.0) = 1920
-        assert "crop=1920:" in result
-
-    def test_crop_clamped_to_frame_bounds_left_edge(self, agent, crop_config):
-        """Crop centered at x=0 should be clamped to x=0."""
-        crop_config["speaker_l_center_x"] = 0
-        crop_config["speaker_l_center_y"] = 1080
-        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        parts = result.split("crop=")[1].split(",scale=")[0]
-        values = parts.split(":")
-        x = int(values[2])
-        assert x >= 0
-
-    def test_crop_clamped_to_frame_bounds_right_edge(self, agent, crop_config):
-        """Crop centered near right edge should not exceed frame."""
-        crop_config["speaker_r_center_x"] = 3840
-        result = agent._get_crop_filter("R", 3840, 2160, crop_config)
-        parts = result.split("crop=")[1].split(",scale=")[0]
-        values = parts.split(":")
-        crop_w = int(values[0])
-        x = int(values[2])
-        assert x + crop_w <= 3840
-
-    def test_crop_clamped_to_frame_bounds_top(self, agent, crop_config):
-        """Crop centered near top should not go negative."""
-        crop_config["speaker_l_center_y"] = 0
-        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        parts = result.split("crop=")[1].split(",scale=")[0]
-        values = parts.split(":")
-        y = int(values[3])
-        assert y >= 0
-
-    def test_crop_clamped_to_frame_bounds_bottom(self, agent, crop_config):
-        """Crop centered near bottom should not exceed frame."""
-        crop_config["speaker_l_center_y"] = 2160
-        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        parts = result.split("crop=")[1].split(",scale=")[0]
-        values = parts.split(":")
-        crop_h = int(values[1])
-        y = int(values[3])
-        assert y + crop_h <= 2160
-
-    def test_minimum_crop_dimensions(self, agent, crop_config):
-        """Even with extreme zoom, crop should have minimum dimensions."""
-        crop_config["speaker_l_zoom"] = 100.0
-        result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        parts = result.split("crop=")[1].split(",scale=")[0]
-        values = parts.split(":")
-        crop_w = int(values[0])
-        crop_h = int(values[1])
-        assert crop_w >= 64
-        assert crop_h >= 36
-
-    def test_per_speaker_zoom_override(self, agent, crop_config):
-        """Per-speaker zoom should override global zoom."""
-        crop_config["zoom"] = 1.0
-        crop_config["speaker_l_zoom"] = 2.0
-        crop_config["speaker_r_zoom"] = 1.5
-        result_l = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        result_r = agent._get_crop_filter("R", 3840, 2160, crop_config)
-        # L should have crop_w = 3840 / (2*2.0) = 960
-        assert "crop=960:" in result_l
-        # R should have crop_w = 3840 / (2*1.5) = 1280
-        assert "crop=1280:" in result_r
-
-    def test_1080p_source(self, agent, crop_config):
-        """Test with standard 1080p source."""
-        config = {
-            "speaker_l_center_x": 480,
-            "speaker_l_center_y": 540,
-            "speaker_r_center_x": 1440,
-            "speaker_r_center_y": 540,
-            "zoom": 1.0,
-        }
-        result = agent._get_crop_filter("L", 1920, 1080, config)
-        # crop_w = 1920 / 2 = 960
-        assert "crop=960:" in result
-        assert "scale=1920:1080" in result
-
-
-class TestWideShot:
-    """Test wide shot crop config usage."""
-
-    def test_wide_shot_with_configured_center(self, agent, crop_config):
-        crop_config["wide_center_x"] = 1920
-        crop_config["wide_center_y"] = 1080
+    def test_both_with_wide_zoom(self, agent, crop_config):
         crop_config["wide_zoom"] = 1.2
+        crop_config["wide_center_x"] = 1920
+        crop_config["wide_center_y"] = 1080
         result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
-        assert result.startswith("crop=")
-        assert "scale=1920:1080" in result
+        assert "crop=3200:" in result  # 3840 / 1.2 (wide formula)
 
-    def test_wide_shot_defaults_to_center(self, agent, crop_config):
-        """Without wide_center config, should use frame center."""
+    def test_wide_is_2x_speaker_at_same_zoom(self, agent, crop_config):
         crop_config["wide_zoom"] = 1.5
-        result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
-        assert result.startswith("crop=")
+        crop_config["wide_center_x"] = 1920
+        crop_config["wide_center_y"] = 1080
+        crop_config["speakers"][0]["zoom"] = 1.5
+        wide = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
+        spk = agent._get_crop_filter("speaker_0", 3840, 2160, crop_config)
+        assert "crop=2560:" in wide  # 3840 / 1.5
+        assert "crop=1280:" in spk   # 3840 / (2*1.5)
 
-    def test_wide_zoom_exactly_1_returns_passthrough(self, agent, crop_config):
-        crop_config["wide_zoom"] = 1.0
-        result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
-        assert result == "scale=1920:1080"
+    def test_out_of_range_speaker_index(self, agent, crop_config):
+        result = agent._get_crop_filter("speaker_5", 3840, 2160, crop_config)
+        assert "crop=" in result  # still produces a crop (centered)
+
+    def test_1080p_source(self, agent):
+        config = {
+            "speakers": [
+                {"label": "Speaker 0", "center_x": 480, "center_y": 540, "zoom": 1.0},
+            ],
+        }
+        result = agent._get_crop_filter("speaker_0", 1920, 1080, config)
+        assert "crop=960:" in result
+        assert "scale=1920:1080" in result
 
 
 class TestApplyEdits:

@@ -1,129 +1,123 @@
-"""Tests for the transcribe agent."""
+"""Tests for the transcribe agent — multichannel and mono fallback modes."""
 
 import json
 import pytest
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from agents.transcribe import TranscribeAgent
 
+# -- Fixtures ----------------------------------------------------------------
 
-def _mock_deepgram_response():
-    return {
-        "results": {
-            "channels": [
-                {
-                    "alternatives": [
-                        {
-                            "words": [
-                                {"word": "Hello", "punctuated_word": "Hello", "start": 0.5, "end": 0.8, "confidence": 0.99, "speaker": 0},
-                                {"word": "world", "punctuated_word": "world", "start": 0.9, "end": 1.2, "confidence": 0.98, "speaker": 0},
-                                {"word": "this", "punctuated_word": "this", "start": 1.5, "end": 1.7, "confidence": 0.97, "speaker": 1},
-                                {"word": "is", "punctuated_word": "is", "start": 1.8, "end": 1.9, "confidence": 0.99, "speaker": 1},
-                                {"word": "a", "punctuated_word": "a", "start": 2.0, "end": 2.1, "confidence": 0.99, "speaker": 1},
-                                {"word": "test", "punctuated_word": "test.", "start": 2.2, "end": 2.5, "confidence": 0.96, "speaker": 1},
-                            ]
-                        }
-                    ]
-                }
-            ],
-            "utterances": [
-                {
-                    "speaker": 0, "start": 0.5, "end": 1.2,
-                    "transcript": "Hello world",
-                    "confidence": 0.985,
-                    "words": [
-                        {"word": "Hello", "start": 0.5, "end": 0.8, "confidence": 0.99, "speaker": 0},
-                        {"word": "world", "start": 0.9, "end": 1.2, "confidence": 0.98, "speaker": 0},
-                    ],
-                },
-                {
-                    "speaker": 1, "start": 1.5, "end": 2.5,
-                    "transcript": "this is a test",
-                    "confidence": 0.977,
-                    "words": [
-                        {"word": "this", "start": 1.5, "end": 1.7, "confidence": 0.97, "speaker": 1},
-                        {"word": "is", "start": 1.8, "end": 1.9, "confidence": 0.99, "speaker": 1},
-                        {"word": "a", "start": 2.0, "end": 2.1, "confidence": 0.99, "speaker": 1},
-                        {"word": "test", "start": 2.2, "end": 2.5, "confidence": 0.96, "speaker": 1},
-                    ],
-                },
-            ],
-        },
-    }
+MONO_RESPONSE = {
+    "results": {
+        "channels": [{"alternatives": [{"words": [
+            {"word": "Hello", "punctuated_word": "Hello", "start": 0.5, "end": 0.8, "confidence": 0.99, "speaker": 0},
+            {"word": "world", "punctuated_word": "world", "start": 0.9, "end": 1.2, "confidence": 0.98, "speaker": 0},
+            {"word": "test", "punctuated_word": "test.", "start": 1.5, "end": 1.8, "confidence": 0.97, "speaker": 1},
+        ]}]}],
+        "utterances": [
+            {"speaker": 0, "start": 0.5, "end": 1.2, "transcript": "Hello world", "confidence": 0.985,
+             "words": [{"word": "Hello", "start": 0.5, "end": 0.8, "confidence": 0.99, "speaker": 0},
+                       {"word": "world", "start": 0.9, "end": 1.2, "confidence": 0.98, "speaker": 0}]},
+            {"speaker": 1, "start": 1.5, "end": 1.8, "transcript": "test", "confidence": 0.97,
+             "words": [{"word": "test", "start": 1.5, "end": 1.8, "confidence": 0.97, "speaker": 1}]},
+        ],
+    },
+}
+
+MC_RESPONSE = {
+    "results": {
+        "channels": [
+            {"alternatives": [{"words": [{"word": "Welcome", "punctuated_word": "Welcome", "start": 0.5, "end": 0.8}]}]},
+            {"alternatives": [{"words": [{"word": "Thanks", "punctuated_word": "Thanks", "start": 2.0, "end": 2.3}]}]},
+            {"alternatives": [{"words": [{"word": "Yeah", "punctuated_word": "Yeah,", "start": 3.5, "end": 3.7}]}]},
+        ],
+        "utterances": [
+            {"channel": 0, "start": 0.5, "end": 0.8, "transcript": "Welcome", "confidence": 0.99,
+             "words": [{"word": "Welcome", "start": 0.5, "end": 0.8, "confidence": 0.99}]},
+            {"channel": 1, "start": 2.0, "end": 2.3, "transcript": "Thanks", "confidence": 0.97,
+             "words": [{"word": "Thanks", "start": 2.0, "end": 2.3, "confidence": 0.97}]},
+            {"channel": 2, "start": 3.5, "end": 3.7, "transcript": "Yeah,", "confidence": 0.96,
+             "words": [{"word": "Yeah", "start": 3.5, "end": 3.7, "confidence": 0.96}]},
+        ],
+    },
+}
+
+MC_CHANNEL_MAP = [
+    {"index": 0, "label": "Speaker 0", "track": 1},
+    {"index": 1, "label": "Speaker 1", "track": 2},
+    {"index": 2, "label": "Speaker 2", "track": 4},
+]
+
+# -- Tests -------------------------------------------------------------------
 
 
-class TestTranscribeAgent:
-    def test_build_diarized_transcript(self, tmp_episode_dir, sample_config):
+class TestBuildDiarizedTranscript:
+    def test_mono_mode(self, tmp_episode_dir, sample_config):
         agent = TranscribeAgent(tmp_episode_dir, sample_config)
-        raw = _mock_deepgram_response()
-        result = agent._build_diarized_transcript(raw)
+        result = agent._build_diarized_transcript(MONO_RESPONSE)
 
-        assert "utterances" in result
+        assert result["mode"] == "diarized"
+        assert "speaker_map" not in result
         assert len(result["utterances"]) == 2
         assert result["utterances"][0]["speaker"] == 0
         assert result["utterances"][0]["text"] == "Hello world"
+        assert result["utterances"][0]["words"][0]["start"] == 0.5
+        assert result["utterances"][1]["speaker"] == 1
 
-    def test_diarized_word_timestamps(self, tmp_episode_dir, sample_config):
+    def test_multichannel_mode(self, tmp_episode_dir, sample_config):
         agent = TranscribeAgent(tmp_episode_dir, sample_config)
-        raw = _mock_deepgram_response()
-        result = agent._build_diarized_transcript(raw)
+        result = agent._build_diarized_transcript(MC_RESPONSE, multichannel=True, channel_map=MC_CHANNEL_MAP)
 
-        words = result["utterances"][0]["words"]
-        assert len(words) == 2
-        assert words[0]["start"] == 0.5
-        assert words[0]["end"] == 0.8
+        assert result["mode"] == "multichannel"
+        assert result["speaker_map"] == MC_CHANNEL_MAP
+        assert len(result["utterances"]) == 3
+        assert [u["speaker"] for u in result["utterances"]] == [0, 1, 2]
+        assert result["utterances"][2]["text"] == "Yeah,"
+        # Words inherit utterance speaker
+        assert all(w["speaker"] == 1 for w in result["utterances"][1]["words"])
 
-    def test_generate_srt(self, tmp_episode_dir, sample_config):
+
+@pytest.mark.parametrize("multichannel,raw,expected_words", [
+    (False, MONO_RESPONSE, ["Hello", "world", "test"]),
+    (True, MC_RESPONSE, ["Welcome", "Thanks", "Yeah"]),
+])
+class TestGenerateSrt:
+    def test_srt_content(self, multichannel, raw, expected_words, tmp_episode_dir, sample_config):
         agent = TranscribeAgent(tmp_episode_dir, sample_config)
-        raw = _mock_deepgram_response()
-        agent._generate_srt(raw)
-
-        srt_path = tmp_episode_dir / "subtitles" / "transcript.srt"
-        assert srt_path.exists()
-        content = srt_path.read_text()
-        assert "Hello" in content
+        agent._generate_srt(raw, multichannel=multichannel)
+        content = (tmp_episode_dir / "subtitles" / "transcript.srt").read_text()
         assert "-->" in content
+        for word in expected_words:
+            assert word in content
 
-    def test_srt_empty_words(self, tmp_episode_dir, sample_config):
+
+class TestGenerateSrtEmpty:
+    def test_empty_produces_empty(self, tmp_episode_dir, sample_config):
         agent = TranscribeAgent(tmp_episode_dir, sample_config)
-        raw = {"results": {"channels": [{"alternatives": [{"words": []}]}], "utterances": []}}
-        agent._generate_srt(raw)
+        agent._generate_srt({"results": {"channels": [{"alternatives": [{"words": []}]}]}})
+        assert (tmp_episode_dir / "subtitles" / "transcript.srt").read_text() == ""
 
-        srt_path = tmp_episode_dir / "subtitles" / "transcript.srt"
-        assert srt_path.exists()
-        assert srt_path.read_text() == ""
 
-    def test_format_srt_time(self, tmp_episode_dir, sample_config):
-        """Test the fmt_timecode function used by the transcribe agent."""
-        from lib.srt import fmt_timecode
-        assert fmt_timecode(0) == "00:00:00,000"
-        assert fmt_timecode(61.5) == "00:01:01,500"
-        assert fmt_timecode(3661.123) == "01:01:01,123"
-
+class TestExecute:
     @patch("httpx.post")
-    @patch("subprocess.run")
-    def test_execute_calls_deepgram(self, mock_run, mock_post, tmp_episode_dir, sample_config, monkeypatch):
+    def test_mono_fallback(self, mock_post, tmp_episode_dir, sample_config, monkeypatch):
         monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
-
-        # Create source_merged.mp4
         (tmp_episode_dir / "source_merged.mp4").write_bytes(b"\x00" * 100)
+        (tmp_episode_dir / "work" / "audio.m4a").write_bytes(b"\x00" * 50)
+        with open(tmp_episode_dir / "episode.json", "w") as f:
+            json.dump({"episode_id": "test", "duration_seconds": 60}, f)
 
-        # Create pre-existing audio file to skip extraction
-        work_dir = tmp_episode_dir / "work"
-        audio_path = work_dir / "audio.m4a"
-        audio_path.write_bytes(b"\x00" * 50)
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = MONO_RESPONSE
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
 
-        # Mock Deepgram response
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = _mock_deepgram_response()
-        mock_response.raise_for_status = MagicMock()
-        mock_post.return_value = mock_response
-
-        agent = TranscribeAgent(tmp_episode_dir, sample_config)
-        result = agent.execute()
-
+        result = TranscribeAgent(tmp_episode_dir, sample_config).execute()
+        assert result["mode"] == "diarized"
         assert result["utterance_count"] == 2
-        assert (tmp_episode_dir / "transcript.json").exists()
         assert (tmp_episode_dir / "diarized_transcript.json").exists()
+
+        params = mock_post.call_args.kwargs.get("params") or mock_post.call_args[1].get("params")
+        assert params["diarize"] == "true"
+        assert "multichannel" not in params

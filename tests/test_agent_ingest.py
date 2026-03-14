@@ -388,91 +388,11 @@ class TestAudioSyncOffset:
 
     @patch("shutil.copy2")
     @patch("agents.ingest.ffprobe")
-    def test_sync_prefers_stereo_mix(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
-        """Sync should prefer stereo_mix track over others."""
+    def test_sync_prefers_stereo_mix_and_result_fields(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Sync should prefer stereo_mix and return all required fields."""
         audio_dir = tmp_path / "audio_src"
         audio_dir.mkdir()
         (audio_dir / "260311_143505_Tr1.WAV").write_bytes(b"\x00" * 100)
-        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
-
-        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
-
-        video_file = tmp_path / "test.MP4"
-        video_file.write_bytes(b"\x00" * 100)
-
-        # Mock _extract_audio_pcm to return signals with known offset
-        sr = 16000
-        signal = np.zeros(sr * 10, dtype=np.float32)
-        signal[sr:sr + 100] = 10000  # Impulse at 1s
-
-        agent = IngestAgent(tmp_episode_dir, sample_config)
-        agent.source_path = str(video_file)
-        agent.audio_path = str(audio_dir)
-
-        with patch.object(agent, "_extract_audio_pcm", return_value=signal):
-            result = agent.execute()
-
-        assert result["audio_sync"]["status"] == "synced"
-        assert result["audio_sync"]["sync_track"] == "260311_143505_TrLR.WAV"
-
-    @patch("shutil.copy2")
-    @patch("agents.ingest.ffprobe")
-    def test_sync_fallback_to_builtin_mic(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
-        """If no stereo_mix, sync should fall back to builtin_mic."""
-        audio_dir = tmp_path / "audio_src"
-        audio_dir.mkdir()
-        (audio_dir / "260311_143505_TrMic.WAV").write_bytes(b"\x00" * 100)
-
-        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
-
-        video_file = tmp_path / "test.MP4"
-        video_file.write_bytes(b"\x00" * 100)
-
-        sr = 16000
-        signal = np.zeros(sr * 10, dtype=np.float32)
-        signal[sr:sr + 100] = 10000
-
-        agent = IngestAgent(tmp_episode_dir, sample_config)
-        agent.source_path = str(video_file)
-        agent.audio_path = str(audio_dir)
-
-        with patch.object(agent, "_extract_audio_pcm", return_value=signal):
-            result = agent.execute()
-
-        assert result["audio_sync"]["status"] == "synced"
-        assert result["audio_sync"]["sync_track"] == "260311_143505_TrMic.WAV"
-
-    @patch("shutil.copy2")
-    @patch("agents.ingest.ffprobe")
-    def test_sync_short_audio_returns_too_short(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
-        """Audio shorter than 1 second should return too_short status."""
-        audio_dir = tmp_path / "audio_src"
-        audio_dir.mkdir()
-        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
-
-        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
-
-        video_file = tmp_path / "test.MP4"
-        video_file.write_bytes(b"\x00" * 100)
-
-        sr = 16000
-        short_signal = np.zeros(100, dtype=np.float32)  # Very short
-
-        agent = IngestAgent(tmp_episode_dir, sample_config)
-        agent.source_path = str(video_file)
-        agent.audio_path = str(audio_dir)
-
-        with patch.object(agent, "_extract_audio_pcm", return_value=short_signal):
-            result = agent.execute()
-
-        assert result["audio_sync"]["status"] == "too_short"
-
-    @patch("shutil.copy2")
-    @patch("agents.ingest.ffprobe")
-    def test_sync_result_fields(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
-        """Sync result should contain all expected fields."""
-        audio_dir = tmp_path / "audio_src"
-        audio_dir.mkdir()
         (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
 
         mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
@@ -492,14 +412,57 @@ class TestAudioSyncOffset:
             result = agent.execute()
 
         sync = result["audio_sync"]
-        assert sync["status"] == "synced"
-        assert "offset_seconds" in sync
-        assert "offset_samples" in sync
-        assert "sync_sample_rate" in sync
-        assert "sync_track" in sync
-        assert "video_file" in sync
-        assert "confidence" in sync
-        assert "description" in sync
+        assert sync["status"] in ("ok", "low_confidence")
+        assert sync["sync_track"] == "260311_143505_TrLR.WAV"
+        for field in ("offset_seconds", "tempo_factor", "confidence", "checkpoints",
+                       "video_file", "video_duration"):
+            assert field in sync, f"Missing field: {field}"
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_sync_fallback_to_builtin_mic(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """If no stereo_mix, sync should fall back to builtin_mic."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrMic.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        signal = np.zeros(16000 * 10, dtype=np.float32)
+        signal[16000:16100] = 10000
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with patch.object(agent, "_extract_audio_pcm", return_value=signal):
+            result = agent.execute()
+
+        assert result["audio_sync"]["status"] in ("ok", "low_confidence")
+        assert result["audio_sync"]["sync_track"] == "260311_143505_TrMic.WAV"
+
+    @patch("shutil.copy2")
+    @patch("agents.ingest.ffprobe")
+    def test_sync_short_audio_returns_too_short(self, mock_probe, mock_copy, tmp_episode_dir, sample_config, tmp_path):
+        """Audio shorter than 2 seconds should return too_short status."""
+        audio_dir = tmp_path / "audio_src"
+        audio_dir.mkdir()
+        (audio_dir / "260311_143505_TrLR.WAV").write_bytes(b"\x00" * 100)
+
+        mock_probe.return_value = _mock_ffprobe(duration=60.0, channels=1)
+        video_file = tmp_path / "test.MP4"
+        video_file.write_bytes(b"\x00" * 100)
+
+        agent = IngestAgent(tmp_episode_dir, sample_config)
+        agent.source_path = str(video_file)
+        agent.audio_path = str(audio_dir)
+
+        with patch.object(agent, "_extract_audio_pcm", return_value=np.zeros(100, dtype=np.float32)):
+            result = agent.execute()
+
+        assert result["audio_sync"]["status"] == "too_short"
 
     def test_extract_audio_pcm_failure(self, tmp_episode_dir, sample_config):
         """Failed ffmpeg extraction should raise RuntimeError."""

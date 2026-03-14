@@ -92,8 +92,7 @@ def sample_config():
         "processing": {
             "frame_seconds": 0.1,
             "speech_db_margin": 6,
-            "min_segment_seconds": 0.8,
-            "both_db_range": 6.0,
+            "min_segment_seconds": 2.0,
             "max_channel_correlation": 0.95,
             "max_channel_rms_ratio_delta": 3.0,
             "clip_min_seconds": 30,

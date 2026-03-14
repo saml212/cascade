@@ -1,22 +1,9 @@
-"""Transcribe agent — Deepgram Nova-3 transcription with diarization via REST API.
+"""Transcribe agent — Deepgram Nova-3 via REST API.
 
-Inputs:
-    - source_merged.mp4
-Outputs:
-    - transcript.json (raw Deepgram response)
-    - diarized_transcript.json (speaker-labeled utterances with word timestamps)
-    - subtitles/transcript.srt (full-episode SRT)
-    - work/audio.m4a (compact audio for upload)
-Dependencies:
-    - ffmpeg (audio extraction), httpx (Deepgram REST API)
-Config:
-    - transcription.model, transcription.language, transcription.diarize
-    - transcription.smart_format, transcription.utterances
-Environment:
-    - DEEPGRAM_API_KEY
+Two modes: multichannel (H6E per-speaker tracks, perfect attribution) or
+mono fallback (camera audio with diarize=true).
 """
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -33,26 +20,35 @@ class TranscribeAgent(BaseAgent):
     name = "transcribe"
 
     def execute(self) -> dict:
-        merged_path = self.episode_dir / "source_merged.mp4"
         work_dir = self.episode_dir / "work"
         work_dir.mkdir(exist_ok=True)
 
-        # Extract audio to compact m4a for upload
-        audio_path = work_dir / "audio.m4a"
-        if not audio_path.exists():
-            self.logger.info("Extracting audio to m4a...")
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(merged_path),
-                "-vn", "-c:a", "aac", "-b:a", "128k",
-                str(audio_path),
-            ]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        episode_data = self.load_json_safe("episode.json")
+        channel_map = None
+        multichannel = False
+
+        # Try multichannel (H6E per-speaker tracks)
+        if episode_data.get("audio_tracks") and episode_data.get("crop_config", {}).get("speakers"):
+            audio_path, channel_map = self._prepare_multichannel_audio(episode_data)
+            multichannel = audio_path is not None
+            if not multichannel:
+                self.logger.warning("Multichannel prep failed, falling back to mono")
+
+        # Fallback: extract camera audio
+        if not multichannel:
+            audio_path = work_dir / "audio.m4a"
+            if not audio_path.exists():
+                self.logger.info("Extracting audio to m4a...")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(self.episode_dir / "source_merged.mp4"),
+                     "-vn", "-c:a", "aac", "-b:a", "128k", str(audio_path)],
+                    capture_output=True, text=True, check=True,
+                )
 
         audio_size_mb = audio_path.stat().st_size / 1e6
-        self.logger.info(f"Audio file: {audio_size_mb:.1f} MB")
+        self.logger.info(f"Audio: {audio_size_mb:.1f} MB, mode={'multichannel' if multichannel else 'mono+diarize'}")
 
-        # Call Deepgram REST API directly
+        # Deepgram API call
         api_key = os.getenv("DEEPGRAM_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPGRAM_API_KEY not set in environment")
@@ -61,117 +57,152 @@ class TranscribeAgent(BaseAgent):
         params = {
             "model": tc.get("model", "nova-3"),
             "language": tc.get("language", "en"),
-            "diarize": str(tc.get("diarize", True)).lower(),
-            "utterances": str(tc.get("utterances", True)).lower(),
+            "utterances": "true",
             "smart_format": str(tc.get("smart_format", True)).lower(),
             "punctuate": "true",
         }
+        if multichannel:
+            params["multichannel"] = "true"
+        else:
+            params["diarize"] = "true"
+
+        # Keyterms need repeated query params — build URL manually if present
+        url = DEEPGRAM_URL
+        keyterms = tc.get("keyterms", [])
+        if keyterms:
+            from urllib.parse import urlencode
+            url = f"{DEEPGRAM_URL}?{urlencode(params)}&" + "&".join(f"keyterm={k}" for k in keyterms)
+            params = None
 
         with open(audio_path, "rb") as f:
             audio_data = f.read()
 
-        self.logger.info("Sending to Deepgram Nova-3 (this may take a few minutes)...")
-        response = httpx.post(
-            DEEPGRAM_URL,
-            params=params,
-            headers={
-                "Authorization": f"Token {api_key}",
-                "Content-Type": "audio/mp4",
-            },
-            content=audio_data,
-            timeout=600.0,
+        self.logger.info("Sending to Deepgram Nova-3...")
+        resp = httpx.post(
+            url, params=params,
+            headers={"Authorization": f"Token {api_key}",
+                     "Content-Type": "audio/wav" if multichannel else "audio/mp4"},
+            content=audio_data, timeout=600.0,
         )
-        response.raise_for_status()
-        raw_response = response.json()
+        resp.raise_for_status()
+        raw = resp.json()
 
-        # Save raw transcript
-        self.save_json("transcript.json", raw_response)
-        self.logger.info("Raw transcript saved")
+        self.save_json("transcript.json", raw)
 
-        # Build diarized transcript
-        diarized = self._build_diarized_transcript(raw_response)
+        diarized = self._build_diarized_transcript(raw, multichannel, channel_map)
         self.save_json("diarized_transcript.json", diarized)
 
-        # Generate SRT subtitles
-        self._generate_srt(raw_response)
+        self._generate_srt(raw, multichannel)
 
-        utterance_count = len(diarized.get("utterances", []))
-        word_count = sum(len(u.get("words", [])) for u in diarized.get("utterances", []))
-
+        utts = diarized["utterances"]
         return {
             "transcript_path": str(self.episode_dir / "transcript.json"),
             "diarized_path": str(self.episode_dir / "diarized_transcript.json"),
             "srt_path": str(self.episode_dir / "subtitles" / "transcript.srt"),
-            "utterance_count": utterance_count,
-            "word_count": word_count,
+            "utterance_count": len(utts),
+            "word_count": sum(len(u.get("words", [])) for u in utts),
             "audio_size_mb": round(audio_size_mb, 1),
+            "mode": "multichannel" if multichannel else "diarized",
         }
 
-    def _build_diarized_transcript(self, raw: dict) -> dict:
-        """Extract speaker-labeled utterances with word timestamps."""
-        utterances = []
-        raw_utterances = raw.get("results", {}).get("utterances", [])
+    def _prepare_multichannel_audio(self, episode_data: dict):
+        """Merge H6E per-speaker tracks into N-channel WAV. Returns (path, channel_map) or (None, None)."""
+        speakers = episode_data["crop_config"]["speakers"][:4]
+        sync = episode_data.get("audio_sync", {})
+        offset, tempo = sync.get("offset_seconds", 0), sync.get("tempo_factor", 1.0)
 
-        for utt in raw_utterances:
+        # Map track_number -> dest_path (existing files only)
+        track_paths = {t["track_number"]: Path(t["dest_path"])
+                       for t in episode_data.get("audio_tracks", [])
+                       if t.get("track_number") is not None and Path(t["dest_path"]).exists()}
+
+        channel_map, inputs, filters, labels = [], [], [], []
+        for i, spk in enumerate(speakers):
+            tn = spk.get("track")
+            if not tn or tn not in track_paths:
+                self.logger.warning(f"Speaker {i} track {tn} not found")
+                return None, None
+            channel_map.append({"index": i, "label": f"Speaker {i}", "track": tn})
+            inputs += (["-ss", str(offset)] if offset >= 0 else []) + ["-i", str(track_paths[tn])]
+
+            f = f"[{i}:a]aformat=channel_layouts=mono"
+            if offset < 0:
+                delay_ms = int(abs(offset) * 1000)
+                f += f",adelay={delay_ms}|{delay_ms}"
+            if abs(tempo - 1.0) > 1e-7:
+                f += f",atempo={tempo:.8f}"
+            filters.append(f + f"[s{i}]")
+            labels.append(f"[s{i}]")
+
+        n = len(channel_map)
+        fc = "; ".join(filters) + f"; {''.join(labels)}amerge=inputs={n}[out]"
+        video_dur = sync.get("video_duration") or episode_data.get("duration_seconds")
+        output = self.episode_dir / "work" / "transcript_audio.wav"
+
+        cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", fc,
+               "-map", "[out]", "-c:a", "pcm_s16le", "-ar", "48000"]
+        if video_dur:
+            cmd += ["-t", str(video_dur)]
+        cmd.append(str(output))
+
+        self.logger.info(f"Merging {n} speaker tracks into multichannel WAV...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            self.logger.error(f"Multichannel merge failed: {result.stderr[-500:]}")
+            return None, None
+        return output, channel_map
+
+    def _build_diarized_transcript(self, raw: dict, multichannel=False, channel_map=None) -> dict:
+        """Build speaker-labeled utterances. Same output schema for both modes."""
+        speaker_key = "channel" if multichannel else "speaker"
+        utterances = []
+        for utt in raw.get("results", {}).get("utterances", []):
+            spk = utt.get(speaker_key, 0)
             utterances.append({
-                "speaker": utt.get("speaker", 0),
+                "speaker": spk,
                 "start": utt.get("start", 0),
                 "end": utt.get("end", 0),
                 "text": utt.get("transcript", ""),
                 "confidence": utt.get("confidence", 0),
                 "words": [
-                    {
-                        "word": w.get("word", w.get("punctuated_word", "")),
-                        "start": w.get("start", 0),
-                        "end": w.get("end", 0),
-                        "confidence": w.get("confidence", 0),
-                        "speaker": w.get("speaker", 0),
-                    }
+                    {"word": w.get("word", w.get("punctuated_word", "")),
+                     "start": w.get("start", 0), "end": w.get("end", 0),
+                     "confidence": w.get("confidence", 0), "speaker": spk}
                     for w in utt.get("words", [])
                 ],
             })
 
-        return {"utterances": utterances}
+        result = {"mode": "multichannel" if multichannel else "diarized", "utterances": utterances}
+        if channel_map:
+            result["speaker_map"] = channel_map
+        return result
 
-    def _generate_srt(self, raw: dict):
-        """Generate SRT subtitle file from transcript."""
+    def _generate_srt(self, raw: dict, multichannel=False):
+        """Generate SRT from word-level data across all channels."""
         srt_dir = self.episode_dir / "subtitles"
         srt_dir.mkdir(exist_ok=True)
         srt_path = srt_dir / "transcript.srt"
 
-        # Extract words from channels
         words = []
-        for ch in raw.get("results", {}).get("channels", []):
+        for ch_idx, ch in enumerate(raw.get("results", {}).get("channels", [])):
             for alt in ch.get("alternatives", []):
-                words.extend(alt.get("words", []))
+                for w in alt.get("words", []):
+                    if multichannel:
+                        w = {**w, "speaker": ch_idx}
+                    words.append(w)
 
+        if multichannel:
+            words.sort(key=lambda w: w.get("start", 0))
         if not words:
-            with open(srt_path, "w") as f:
-                f.write("")
+            srt_path.write_text("")
             return
 
-        # Group words into ~5-word subtitle blocks
         srt_lines = []
-        idx = 1
-        i = 0
-        while i < len(words):
-            chunk = words[i : i + 5]
-            start_time = chunk[0].get("start", 0)
-            end_time = chunk[-1].get("end", 0)
-            text = " ".join(
-                w.get("punctuated_word", w.get("word", "")) for w in chunk
-            )
-
+        for idx, i in enumerate(range(0, len(words), 5), 1):
+            chunk = words[i:i + 5]
+            text = " ".join(w.get("punctuated_word", w.get("word", "")) for w in chunk)
             srt_lines.append(
-                f"{idx}\n"
-                f"{fmt_timecode(start_time)} --> {fmt_timecode(end_time)}\n"
-                f"{text}\n"
+                f"{idx}\n{fmt_timecode(chunk[0]['start'])} --> {fmt_timecode(chunk[-1]['end'])}\n{text}\n"
             )
-            idx += 1
-            i += 5
-
-        with open(srt_path, "w") as f:
-            f.write("\n".join(srt_lines))
-
-        self.logger.info(f"SRT generated with {idx - 1} blocks")
-
+        srt_path.write_text("\n".join(srt_lines))
+        self.logger.info(f"SRT: {len(srt_lines)} blocks")

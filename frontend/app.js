@@ -2263,8 +2263,8 @@ async function renderCropSetup(episodeId) {
   } else if (existing && existing.speaker_l_center_x != null) {
     // Legacy L/R format
     cropState.speakers = [
-      { label: 'Speaker 1', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, track: 1 },
-      { label: 'Speaker 2', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, track: 2 },
+      { label: 'Speaker 0', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, track: 1 },
+      { label: 'Speaker 1', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, track: 2 },
     ];
   } else {
     // Defaults: spread speakers evenly across the frame
@@ -2272,7 +2272,7 @@ async function renderCropSetup(episodeId) {
     for (let i = 0; i < speakerCount; i++) {
       const xFrac = (i + 1) / (speakerCount + 1);
       cropState.speakers.push({
-        label: `Speaker ${i + 1}`,
+        label: `Speaker ${i}`,
         x: Math.round(cropState.sourceWidth * xFrac),
         y: Math.round(cropState.sourceHeight / 2),
         zoom: 1.0,
@@ -2438,7 +2438,7 @@ async function renderCropSetup(episodeId) {
             ${cropState.speakers.map((s, i) => {
               const c = SPEAKER_COLORS[i % SPEAKER_COLORS.length];
               const active = i === 0;
-              return `<button id="crop-mode-${i}" onclick="setCropSpeaker(${i})" class="flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors ${active ? c.bg + ' text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}">${i + 1}</button>`;
+              return `<button id="crop-mode-${i}" onclick="setCropSpeaker(${i})" class="flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors ${active ? c.bg + ' text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}">${i}</button>`;
             }).join('')}
             <button id="crop-mode-wide" onclick="setCropSpeaker(-1)" class="flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700">Wide</button>
           </div>
@@ -2620,6 +2620,8 @@ function redrawCropCanvas() {
   ctx.drawImage(cropState.image, 0, 0, canvas.width, canvas.height);
 
   // Draw wide shot crop rect
+  // Crop formulas must match lib/crop.py compute_crop() — that is the single source of truth.
+  // Wide: crop_w = srcW / zoom. Speaker: crop_w = srcW / (2 * zoom). Short: crop_h = srcH / zoom.
   if (cropState.wide && cropState.wide.zoom > 1.0) {
     const wZoom = cropState.wide.zoom;
     const wCx = cropState.wide.x / sf;
@@ -2679,7 +2681,7 @@ function redrawCropCanvas() {
     // Label
     ctx.fillStyle = color;
     ctx.font = 'bold 14px system-ui';
-    ctx.fillText(`${idx + 1} ${zoom.toFixed(1)}x`, cx + crossSize + 4, cy - crossSize + 4);
+    ctx.fillText(`${idx} ${zoom.toFixed(1)}x`, cx + crossSize + 4, cy - crossSize + 4);
 
     // Highlight active speaker
     if (idx === cropState.activeIdx) {
@@ -2760,7 +2762,6 @@ function renderAudioTab(episodeId, ep) {
   const cutCfg = ep.speaker_cut_config || {};
   const speechMargin = cutCfg.speech_db_margin || 12;
   const minSegment = cutCfg.min_segment_seconds || 2.0;
-  const bothRange = cutCfg.both_db_range || 6.0;
   const masterPct = Math.round((mixCfg.master_volume || 1.0) * 100);
   const hasMix = (mixCfg.tracks || []).length > 0;
 
@@ -2810,7 +2811,7 @@ function renderAudioTab(episodeId, ep) {
   // Build the speaker assignment label for each track
   function getAssignmentLabel(t) {
     for (let i = 0; i < cropSpeakers.length; i++) {
-      if (cropSpeakers[i].track === t.trackNumber) return cropSpeakers[i].label || `Speaker ${i + 1}`;
+      if (cropSpeakers[i].track === t.trackNumber) return cropSpeakers[i].label || `Speaker ${i}`;
     }
     for (const amb of ambientTracks) {
       if (amb.track_number === t.trackNumber) return 'Ambient';
@@ -2957,16 +2958,6 @@ function renderAudioTab(episodeId, ep) {
             </div>
             <p class="text-xs text-zinc-600 mt-0.5">Shorter = more cuts</p>
           </div>
-          <div>
-            <label class="text-xs text-zinc-500 block mb-1">Both Range (dB)</label>
-            <div class="flex items-center gap-1">
-              <input type="range" id="cut-both-range" min="1" max="15" step="0.5" value="${bothRange}"
-                oninput="document.getElementById('cut-both-range-val').textContent=parseFloat(this.value).toFixed(1)"
-                class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
-              <span id="cut-both-range-val" class="text-xs text-zinc-400 font-mono w-6">${bothRange}</span>
-            </div>
-            <p class="text-xs text-zinc-600 mt-0.5">How close levels must be to count as "both"</p>
-          </div>
         </div>
         <div class="flex items-center gap-2 mt-3 pt-3 border-t border-zinc-800">
           <button onclick="reanalyzeSpeakers('${episodeId}')" class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors">
@@ -3032,7 +3023,6 @@ function renderAudioMixPanel(episodeId, ep) {
   const cutCfg = ep.speaker_cut_config || {};
   const speechMargin = cutCfg.speech_db_margin || 12;
   const minSegment = cutCfg.min_segment_seconds || 2.0;
-  const bothRange = cutCfg.both_db_range || 6.0;
 
   const rows = audioTracks.map(t => {
     const stem = t.filename.replace(/\.[^.]+$/, '');
@@ -3055,7 +3045,7 @@ function renderAudioMixPanel(episodeId, ep) {
     let assignment = '';
     for (let i = 0; i < cropSpeakers.length; i++) {
       if (cropSpeakers[i].track === t.track_number) {
-        assignment = cropSpeakers[i].label || `Speaker ${i + 1}`;
+        assignment = cropSpeakers[i].label || `Speaker ${i}`;
         break;
       }
     }
@@ -3143,15 +3133,6 @@ function renderAudioMixPanel(episodeId, ep) {
                 <span id="cut-min-segment-val" class="text-xs text-zinc-400 font-mono w-6">${minSegment.toFixed ? minSegment.toFixed(1) : minSegment}</span>
               </div>
             </div>
-            <div>
-              <label class="text-xs text-zinc-500 block mb-1">Both Range (dB)</label>
-              <div class="flex items-center gap-1">
-                <input type="range" id="cut-both-range" min="1" max="15" step="0.5" value="${bothRange}"
-                  oninput="document.getElementById('cut-both-range-val').textContent=parseFloat(this.value).toFixed(1)"
-                  class="flex-1 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
-                <span id="cut-both-range-val" class="text-xs text-zinc-400 font-mono w-6">${bothRange}</span>
-              </div>
-            </div>
           </div>
           <div class="flex items-center gap-2 mt-2">
             <button onclick="reanalyzeSpeakers('${episodeId}')" class="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-medium transition-colors">
@@ -3233,7 +3214,6 @@ async function reanalyzeSpeakers(episodeId) {
   // Save sensitivity config first
   const speechMargin = parseFloat(document.getElementById('cut-speech-margin')?.value || 12);
   const minSegment = parseFloat(document.getElementById('cut-min-segment')?.value || 2.0);
-  const bothRange = parseFloat(document.getElementById('cut-both-range')?.value || 6.0);
 
   try {
     await api(`/episodes/${episodeId}/speaker-cut-config`, {
@@ -3241,7 +3221,6 @@ async function reanalyzeSpeakers(episodeId) {
       body: JSON.stringify({
         speech_db_margin: speechMargin,
         min_segment_seconds: minSegment,
-        both_db_range: bothRange,
       }),
     });
 
