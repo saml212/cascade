@@ -292,11 +292,22 @@ class LongformRenderAgent(BaseAgent):
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
         """Get ffmpeg crop filter for speaker type using crop_config center points.
 
-        Centers a 16:9 crop on the speaker's configured center point, clamped to
-        frame bounds. Zoom controls how tight the crop is (higher = more zoomed in).
-        BOTH: uses zoom to crop from full frame if set, else passthrough at 1920x1080.
+        Handles both L/R labels (legacy stereo) and speaker_N labels (N-speaker mode).
+        BOTH/NONE: uses wide crop or passthrough.
         """
-        if speaker == "L":
+        speakers = crop_config.get("speakers", [])
+
+        if speaker.startswith("speaker_") and speakers:
+            # N-speaker mode: speaker_0 -> speakers[0], etc.
+            idx = int(speaker.split("_")[1])
+            if idx < len(speakers):
+                spk = speakers[idx]
+                cx = spk["center_x"]
+                cy = spk.get("center_y", src_h // 2)
+                zoom = spk.get("zoom", 1.0)
+            else:
+                return "scale=1920:1080"
+        elif speaker == "L":
             cx = crop_config["speaker_l_center_x"]
             cy = crop_config["speaker_l_center_y"]
             zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
@@ -305,10 +316,10 @@ class LongformRenderAgent(BaseAgent):
             cy = crop_config["speaker_r_center_y"]
             zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
+            # BOTH/NONE/wide
             zoom = crop_config.get("wide_zoom", crop_config.get("zoom", 1.0))
             if zoom <= 1.0:
                 return "scale=1920:1080"
-            # BOTH/wide: use configured center or frame center
             cx = crop_config.get("wide_center_x", src_w // 2)
             cy = crop_config.get("wide_center_y", src_h // 2)
 

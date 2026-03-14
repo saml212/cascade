@@ -20,6 +20,8 @@ class TestSpeakerCutAgent:
             }, f)
         with open(episode_dir / "stitch.json", "w") as f:
             json.dump({"duration_seconds": 60.0}, f)
+        with open(episode_dir / "episode.json", "w") as f:
+            json.dump({}, f)
 
     def _setup_stereo(self, episode_dir, sample_rate=48000):
         """Set up audio_analysis.json indicating true stereo."""
@@ -31,6 +33,8 @@ class TestSpeakerCutAgent:
             }, f)
         with open(episode_dir / "stitch.json", "w") as f:
             json.dump({"duration_seconds": 10.0}, f)
+        with open(episode_dir / "episode.json", "w") as f:
+            json.dump({}, f)
 
     def test_identical_channels_single_both_segment(self, tmp_episode_dir, sample_config):
         self._setup_identical_channels(tmp_episode_dir)

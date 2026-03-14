@@ -416,12 +416,25 @@ class ShortsRenderAgent(BaseAgent):
         Zoom controls how tight the crop is. Higher zoom = more zoomed in.
         BOTH defaults to L speaker position.
         """
-        if speaker == "R":
+        speakers = crop_config.get("speakers", [])
+
+        if speaker.startswith("speaker_") and speakers:
+            idx = int(speaker.split("_")[1])
+            if idx < len(speakers):
+                spk = speakers[idx]
+                cx = spk["center_x"]
+                cy = spk.get("center_y", src_h // 2)
+                zoom = spk.get("zoom", 1.0)
+            else:
+                cx = src_w // 2
+                cy = src_h // 2
+                zoom = 1.0
+        elif speaker == "R":
             cx = crop_config["speaker_r_center_x"]
             cy = crop_config.get("speaker_r_center_y", src_h // 2)
             zoom = crop_config.get("speaker_r_zoom", crop_config.get("zoom", 1.0))
         else:
-            cx = crop_config["speaker_l_center_x"]
+            cx = crop_config.get("speaker_l_center_x", src_w // 2)
             cy = crop_config.get("speaker_l_center_y", src_h // 2)
             zoom = crop_config.get("speaker_l_zoom", crop_config.get("zoom", 1.0))
 
