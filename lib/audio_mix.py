@@ -34,7 +34,9 @@ def generate_audio_mix(episode_dir: Path, episode_data: dict) -> Path | None:
 
     audio_sync = episode_data.get("audio_sync", {})
     offset = audio_sync.get("offset_seconds", 0)
-    tempo_factor = audio_sync.get("tempo_factor", 1.0)
+    # Only apply tempo correction if the drift regression was reliable
+    r_sq = audio_sync.get("r_squared", 0)
+    tempo_factor = audio_sync.get("tempo_factor", 1.0) if r_sq > 0.5 else 1.0
 
     mix_cfg = episode_data.get("audio_mix", {})
     mix_tracks = mix_cfg.get("tracks", [])

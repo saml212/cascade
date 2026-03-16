@@ -53,14 +53,12 @@ class LongformRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
-        # Resolve audio source: prefer pre-mixed H6E audio, auto-generate if needed
+        # Resolve audio source: always regenerate audio_mix.wav to ensure
+        # it uses the current sync offset/tempo from episode.json
         audio_mix_path = work_dir / "audio_mix.wav"
         has_h6e_tracks = bool(episode_data.get("audio_tracks"))
-        if audio_mix_path.exists():
-            self.logger.info("Using pre-mixed H6E audio from audio_mix.wav")
-        elif has_h6e_tracks:
-            # H6E tracks exist but audio_mix.wav hasn't been generated yet
-            self.logger.info("H6E audio tracks found but audio_mix.wav missing — generating...")
+        if has_h6e_tracks:
+            self.logger.info("Generating audio_mix.wav from H6E tracks with current sync data...")
             mix_result = generate_audio_mix(self.episode_dir, episode_data)
             if mix_result and mix_result.exists():
                 audio_mix_path = mix_result
