@@ -301,12 +301,17 @@ class LongformRenderAgent(BaseAgent):
     def _generate_segment_srt(self, diarized, start, end, srt_path):
         """Generate an SRT file for a segment, with times offset to segment-relative."""
         words = []
+        last_end = -1.0
         for utt in diarized.get("utterances", []):
             for w in utt.get("words", []):
                 w_start = w.get("start", 0)
                 w_end = w.get("end", 0)
                 if w_start >= start and w_end <= end:
+                    # Skip overlapping words from other channels (multichannel bleed)
+                    if w_start < last_end - 0.05:
+                        continue
                     words.append(w)
+                    last_end = w_end
 
         srt_lines = []
         idx = 1

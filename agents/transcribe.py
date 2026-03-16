@@ -81,7 +81,7 @@ class TranscribeAgent(BaseAgent):
         resp = httpx.post(
             url, params=params,
             headers={"Authorization": f"Token {api_key}",
-                     "Content-Type": "audio/wav" if multichannel else "audio/mp4"},
+                     "Content-Type": "audio/flac" if multichannel else "audio/mp4"},
             content=audio_data, timeout=600.0,
         )
         resp.raise_for_status()
@@ -137,10 +137,11 @@ class TranscribeAgent(BaseAgent):
         n = len(channel_map)
         fc = "; ".join(filters) + f"; {''.join(labels)}amerge=inputs={n}[out]"
         video_dur = sync.get("video_duration") or episode_data.get("duration_seconds")
-        output = self.episode_dir / "work" / "transcript_audio.wav"
+        output = self.episode_dir / "work" / "transcript_audio.flac"
 
+        # 16kHz is standard for speech recognition; FLAC for ~10x smaller upload
         cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", fc,
-               "-map", "[out]", "-c:a", "pcm_s16le", "-ar", "48000"]
+               "-map", "[out]", "-c:a", "flac", "-ar", "16000"]
         if video_dur:
             cmd += ["-t", str(video_dur)]
         cmd.append(str(output))
@@ -178,24 +179,30 @@ class TranscribeAgent(BaseAgent):
         return result
 
     def _generate_srt(self, raw: dict, multichannel=False):
-        """Generate SRT from word-level data across all channels."""
+        """Generate SRT from utterances (avoids multichannel word duplication)."""
         srt_dir = self.episode_dir / "subtitles"
         srt_dir.mkdir(exist_ok=True)
         srt_path = srt_dir / "transcript.srt"
 
-        words = []
-        for ch_idx, ch in enumerate(raw.get("results", {}).get("channels", [])):
-            for alt in ch.get("alternatives", []):
-                for w in alt.get("words", []):
-                    if multichannel:
-                        w = {**w, "speaker": ch_idx}
-                    words.append(w)
-
-        if multichannel:
-            words.sort(key=lambda w: w.get("start", 0))
-        if not words:
+        # Use utterances — they're chronologically sorted and deduplicated across channels.
+        # For multichannel, each utterance belongs to one channel, so no duplicates.
+        # Collect words from utterances, keeping only the first occurrence per time window
+        # to handle cases where multiple channels transcribe the same speech (bleed).
+        utts = raw.get("results", {}).get("utterances", [])
+        if not utts:
             srt_path.write_text("")
             return
+
+        words = []
+        last_end = -1.0
+        for utt in utts:
+            for w in utt.get("words", []):
+                start = w.get("start", 0)
+                # Skip words that overlap with already-added words (cross-channel bleed)
+                if start < last_end - 0.05:
+                    continue
+                words.append(w)
+                last_end = w.get("end", start)
 
         srt_lines = []
         for idx, i in enumerate(range(0, len(words), 5), 1):

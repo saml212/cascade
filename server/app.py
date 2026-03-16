@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from server.routes import episodes, clips, pipeline, chat, trim
+from server.routes import episodes, clips, pipeline, chat, trim, schedule
 
 # Project root is the parent of server/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +41,7 @@ app.include_router(clips.router)
 app.include_router(pipeline.router)
 app.include_router(chat.router)
 app.include_router(trim.router)
+app.include_router(schedule.router)
 
 # Mount output directory for video file serving
 if OUTPUT_DIR.exists():

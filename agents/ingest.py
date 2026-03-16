@@ -140,13 +140,29 @@ class IngestAgent(BaseAgent):
             raise FileNotFoundError(f"Audio path not found: {self.audio_path}")
 
         # Find WAV files (Zoom H6E naming: 260311_143505_Tr1.WAV etc.)
+        # Search top-level first, then subdirectories (H6E stores files in session folders)
         wav_files = sorted(
             f for f in list(source.glob("*.WAV")) + list(source.glob("*.wav"))
             if not f.name.startswith("._")
         )
+        if not wav_files:
+            # Search one level deep (e.g., /Volumes/ZOOM_H6E/260311_162356/*.WAV)
+            # Use the most recent session folder
+            subdirs = sorted(
+                (d for d in source.iterdir() if d.is_dir() and not d.name.startswith((".", "TRASH", "ZOOM"))),
+                key=lambda d: d.name, reverse=True,
+            )
+            for subdir in subdirs:
+                wav_files = sorted(
+                    f for f in list(subdir.glob("*.WAV")) + list(subdir.glob("*.wav"))
+                    if not f.name.startswith("._")
+                )
+                if wav_files:
+                    self.logger.info(f"Found audio in subdirectory: {subdir.name}")
+                    break
 
         if not wav_files:
-            raise FileNotFoundError(f"No WAV files found in {self.audio_path}")
+            raise FileNotFoundError(f"No WAV files found in {self.audio_path} or its subdirectories")
 
         tracks = []
         for f in wav_files:
@@ -215,34 +231,57 @@ class IngestAgent(BaseAgent):
         video_path = str(merged_path) if merged_path.exists() else video_files[0]["dest_path"]
         video_duration = sum(f["duration_seconds"] for f in video_files)
 
-        # Pick best H6E track: stereo_mix > builtin_mic > input
-        sync_track = None
-        for pref in ["stereo_mix", "builtin_mic", "input"]:
-            for t in audio_result["tracks"]:
-                if t["track_type"] == pref:
-                    sync_track = t
-                    break
-            if sync_track:
-                break
-        if not sync_track:
+        # Try ALL input tracks to find offset consensus (dissimilar mics need this)
+        input_tracks = [t for t in audio_result["tracks"] if t["track_type"] == "input"]
+        all_tracks = input_tracks or [t for t in audio_result["tracks"]]
+        if not all_tracks:
             return {"status": "no_sync_track"}
 
-        self.logger.info(f"Syncing against {sync_track['filename']}")
         sr = 16000
-
-        # Extract FULL audio from both sources once (2 ffmpeg calls total)
         cam_full = self._extract_audio_pcm(video_path, sr)
-        h6e_full = self._extract_audio_pcm(sync_track["dest_path"], sr)
-
-        if len(cam_full) < sr * 2 or len(h6e_full) < sr * 2:
+        if len(cam_full) < sr * 2:
             return {"status": "too_short"}
 
-        # Step 1: Initial offset from first 5 minutes
-        init_samples = min(sr * 300, len(cam_full), len(h6e_full))
-        init_offset, init_confidence = self._correlate(
-            cam_full[:init_samples], h6e_full[:init_samples], sr
+        # Correlate against each track — find consensus offset
+        init_samples = min(sr * 300, len(cam_full))
+        track_results = []
+        for t in all_tracks:
+            h6e = self._extract_audio_pcm(t["dest_path"], sr)
+            if len(h6e) < sr * 2:
+                continue
+            samples = min(init_samples, len(h6e))
+            offset, conf = self._correlate(cam_full[:samples], h6e[:samples], sr)
+            track_results.append({"track": t, "offset": offset, "confidence": conf})
+            self.logger.info(f"  {t['filename']}: offset={offset:+.4f}s conf={conf:.4f}")
+
+        if not track_results:
+            return {"status": "no_sync_track"}
+
+        # Find consensus: group offsets within 0.5s tolerance, pick largest group
+        track_results.sort(key=lambda r: r["offset"])
+        best_group, current_group = [], [track_results[0]]
+        for r in track_results[1:]:
+            if abs(r["offset"] - current_group[0]["offset"]) < 0.5:
+                current_group.append(r)
+            else:
+                if len(current_group) > len(best_group):
+                    best_group = current_group
+                current_group = [r]
+        if len(current_group) > len(best_group):
+            best_group = current_group
+
+        # Use the highest-confidence track from the consensus group
+        best = max(best_group, key=lambda r: r["confidence"])
+        sync_track = best["track"]
+        init_offset = best["offset"]
+        init_confidence = best["confidence"]
+
+        self.logger.info(
+            f"Sync consensus: {len(best_group)} tracks agree on {init_offset:+.4f}s "
+            f"(best: {sync_track['filename']}, conf={init_confidence:.4f})"
         )
-        self.logger.info(f"Initial offset={init_offset:.4f}s, confidence={init_confidence:.4f}")
+
+        h6e_full = self._extract_audio_pcm(sync_track["dest_path"], sr)
 
         # Step 2: Multi-point drift measurement by slicing numpy arrays
         window = 15  # seconds per checkpoint window
@@ -282,19 +321,48 @@ class IngestAgent(BaseAgent):
             "video_file": Path(video_path).name,
             "video_duration": round(video_duration, 3),
             "confidence": round(init_confidence, 6),
-            "checkpoints": checkpoints,
         }
 
+        # If per-checkpoint correlation is too noisy, fall back to 3-point measurement
+        # using long windows (300s) at start/middle/end — more robust for dissimilar mics
         if len(good) < 3:
-            self.logger.warning(f"Only {len(good)} good checkpoints, skipping drift correction")
-            return {
-                **base_result,
-                "status": "low_confidence" if init_confidence < 0.10 else "ok",
-                "offset_seconds": round(init_offset, 6),
-                "tempo_factor": 1.0,
-                "drift_rate_ppm": 0.0,
-                "drift_total_seconds": 0.0,
-            }
+            self.logger.info("Per-checkpoint confidence too low, trying 3-point drift measurement")
+            drift_points = []
+            for seek_t in [0, int(video_duration / 2), int(video_duration - 300)]:
+                if seek_t < 0:
+                    continue
+                win = min(300, int(video_duration) - seek_t)
+                s, e = seek_t * sr, (seek_t + win) * sr
+                h_s = (seek_t + int(init_offset)) * sr
+                h_e = h_s + win * sr
+                if e > len(cam_full) or h_e > len(h6e_full):
+                    continue
+                off, conf = self._correlate(cam_full[s:e], h6e_full[h_s:h_e], sr)
+                # Also try other consensus tracks for cross-validation
+                total_off = init_offset + off
+                for r in best_group:
+                    if r["track"]["filename"] != sync_track["filename"]:
+                        h6e_alt = self._extract_audio_pcm(r["track"]["dest_path"], sr)
+                        h_s2 = (seek_t + int(init_offset)) * sr
+                        h_e2 = h_s2 + win * sr
+                        if h_e2 <= len(h6e_alt):
+                            off2, _ = self._correlate(cam_full[s:e], h6e_alt[h_s2:h_e2], sr)
+                            total_off = init_offset + (off + off2) / 2
+                        break
+                drift_points.append({"time": seek_t + win / 2, "offset": total_off})
+
+            if len(drift_points) >= 2:
+                good = [{"time": p["time"], "offset": p["offset"], "confidence": 0.5} for p in drift_points]
+                self.logger.info("3-point offsets: %s", [round(p["offset"], 4) for p in drift_points])
+            else:
+                return {
+                    **base_result, "checkpoints": checkpoints,
+                    "status": "low_confidence" if init_confidence < 0.10 else "ok",
+                    "offset_seconds": round(init_offset, 6),
+                    "tempo_factor": 1.0,
+                    "drift_rate_ppm": 0.0,
+                    "drift_total_seconds": 0.0,
+                }
 
         times = np.array([c["time"] for c in good])
         offsets = np.array([c["offset"] for c in good])

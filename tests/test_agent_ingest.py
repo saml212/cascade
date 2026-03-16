@@ -413,8 +413,9 @@ class TestAudioSyncOffset:
 
         sync = result["audio_sync"]
         assert sync["status"] in ("ok", "low_confidence")
-        assert sync["sync_track"] == "260311_143505_TrLR.WAV"
-        for field in ("offset_seconds", "tempo_factor", "confidence", "checkpoints",
+        # Multi-track consensus picks the best track (could be input or stereo_mix)
+        assert "sync_track" in sync
+        for field in ("offset_seconds", "tempo_factor", "confidence",
                        "video_file", "video_duration"):
             assert field in sync, f"Missing field: {field}"
 

@@ -750,6 +750,12 @@ function updatePipelineBar(status) {
 
   bar.classList.remove('hidden');
 
+  // Clear old error details if not in error state
+  if (status.status !== 'error') {
+    const errDiv = document.getElementById('pipeline-error-details');
+    if (errDiv) errDiv.remove();
+  }
+
   // Show/hide cancel button based on running state
   const cancelBtn = document.getElementById('cancel-pipeline-btn');
   if (cancelBtn) {
@@ -771,6 +777,21 @@ function updatePipelineBar(status) {
   } else if (status.status === 'error') {
     pulse.className = 'inline-block w-2 h-2 rounded-full bg-red-400';
     label.textContent = 'Pipeline error';
+    // Show error details below the pipeline bar
+    const errorEntries = Object.entries(errors);
+    if (errorEntries.length > 0) {
+      let errDiv = document.getElementById('pipeline-error-details');
+      if (!errDiv) {
+        errDiv = document.createElement('div');
+        errDiv.id = 'pipeline-error-details';
+        bar.appendChild(errDiv);
+      }
+      errDiv.innerHTML = errorEntries.map(([agent, msg]) =>
+        `<div class="mt-2 px-3 py-2 bg-red-950/50 border border-red-900/50 rounded text-xs text-red-300">
+          <span class="font-semibold text-red-400">${AGENT_LABELS[agent] || agent}:</span> ${escapeHtml(String(msg))}
+        </div>`
+      ).join('');
+    }
   } else if (status.status === 'ready_for_review') {
     pulse.className = 'inline-block w-2 h-2 rounded-full bg-green-400';
     label.textContent = 'Pipeline complete';

@@ -248,6 +248,81 @@ async def get_crop_frame(episode_id: str):
     return FileResponse(frame_path, media_type="image/jpeg")
 
 
+@router.get("/{episode_id}/video-preview")
+async def get_video_preview(episode_id: str):
+    """Serve source_merged.mp4 for video preview in crop/sync UI."""
+    ep_dir = EPISODES_DIR / episode_id
+    merged = ep_dir / "source_merged.mp4"
+    if not merged.exists():
+        raise HTTPException(status_code=404, detail="source_merged.mp4 not found. Run stitch first.")
+    return FileResponse(merged, media_type="video/mp4")
+
+
+@router.get("/{episode_id}/sync-preview")
+async def get_sync_preview(episode_id: str, duration: float = 120.0):
+    """Return waveform data for camera and H6E audio for visual sync verification."""
+    import subprocess
+    import numpy as np
+
+    ep = read_episode(episode_id)
+    ep_dir = EPISODES_DIR / episode_id
+    sync = ep.get("audio_sync", {})
+    offset = sync.get("offset_seconds", 0)
+
+    merged = ep_dir / "source_merged.mp4"
+    if not merged.exists():
+        raise HTTPException(status_code=404, detail="source_merged.mp4 not found")
+
+    # Find best H6E track for display (prefer stereo_mix or builtin_mic)
+    h6e_path = None
+    for pref in ["stereo_mix", "builtin_mic", "input"]:
+        for t in ep.get("audio_tracks", []):
+            if t.get("track_type") == pref and Path(t["dest_path"]).exists():
+                h6e_path = t["dest_path"]
+                break
+        if h6e_path:
+            break
+    if not h6e_path:
+        raise HTTPException(status_code=404, detail="No H6E audio tracks found")
+
+    sr = 1000  # 1kHz — enough for waveform display
+    pps = 100  # peaks per second for the waveform
+
+    def extract_rms(path, seek=0, dur=120):
+        cmd = ["ffmpeg", "-y", "-ss", str(seek), "-i", str(path), "-t", str(dur),
+               "-ar", str(sr), "-ac", "1", "-f", "s16le", "-acodec", "pcm_s16le", "-"]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0:
+            return []
+        data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)
+        # Compute RMS in windows
+        win = max(1, sr // pps)
+        n = len(data) // win
+        if n == 0:
+            return []
+        frames = data[:n * win].reshape(n, win)
+        rms = np.sqrt(np.mean(frames ** 2, axis=1))
+        # Normalize to 0-1
+        mx = np.max(rms)
+        if mx > 0:
+            rms = rms / mx
+        return [round(float(v), 3) for v in rms]
+
+    cam_waveform = extract_rms(str(merged), seek=0, dur=duration)
+    h6e_waveform = extract_rms(h6e_path, seek=offset, dur=duration)
+
+    return {
+        "camera_waveform": cam_waveform,
+        "h6e_waveform": h6e_waveform,
+        "offset_seconds": offset,
+        "duration": duration,
+        "peaks_per_second": pps,
+        "tempo_factor": sync.get("tempo_factor", 1.0),
+        "confidence": sync.get("confidence", 0),
+        "drift_rate_ppm": sync.get("drift_rate_ppm", 0),
+    }
+
+
 @router.get("/{episode_id}/audio-preview/{track_name}")
 async def get_audio_preview(
     episode_id: str,
