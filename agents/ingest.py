@@ -218,46 +218,66 @@ class IngestAgent(BaseAgent):
         }
 
     def _sync_audio(self, video_files: list, audio_result: dict) -> dict:
-        """Multi-point cross-correlation sync between camera audio and H6E.
+        """Sync H6E audio to camera video using energy envelope correlation.
 
-        Extracts full audio from both sources once, then slices numpy arrays
-        for each checkpoint. Fits linear regression to drift profile for a
-        single tempo correction factor.
+        Strategy: Camera audio is synced to video (same device). H6E ambient
+        mics (TrLR/TrMic) capture room audio similar to camera mic. All H6E
+        tracks share the same clock, so syncing any one H6E track syncs them all.
+
+        Uses energy envelope correlation (RMS peaks over time) rather than raw
+        waveform FFT — robust to mic frequency response differences.
+
+        Verifies sync every 10 seconds and fits linear regression for drift.
         """
         self.report_progress(0, 1, "Syncing audio")
 
-        # Sync against merged video (handles multi-file gaps correctly)
         merged_path = self.episode_dir / "source_merged.mp4"
         video_path = str(merged_path) if merged_path.exists() else video_files[0]["dest_path"]
         video_duration = sum(f["duration_seconds"] for f in video_files)
 
-        # Try ALL input tracks to find offset consensus (dissimilar mics need this)
-        input_tracks = [t for t in audio_result["tracks"] if t["track_type"] == "input"]
-        all_tracks = input_tracks or [t for t in audio_result["tracks"]]
-        if not all_tracks:
+        tracks = audio_result.get("tracks", [])
+        if not tracks:
             return {"status": "no_sync_track"}
 
         sr = 16000
         cam_full = self._extract_audio_pcm(video_path, sr)
-        if len(cam_full) < sr * 2:
+        if len(cam_full) < sr * 10:
             return {"status": "too_short"}
 
-        # Correlate against each track — find consensus offset
-        init_samples = min(sr * 300, len(cam_full))
+        # ── Step 1: Find initial offset using ALL tracks ──
+        # Try each track with both FFT and energy envelope correlation,
+        # then find consensus among results.
+        self.logger.info("Step 1: Finding initial offset across all tracks...")
         track_results = []
-        for t in all_tracks:
+        for t in tracks:
             h6e = self._extract_audio_pcm(t["dest_path"], sr)
-            if len(h6e) < sr * 2:
+            if len(h6e) < sr * 10:
                 continue
-            samples = min(init_samples, len(h6e))
-            offset, conf = self._correlate(cam_full[:samples], h6e[:samples], sr)
-            track_results.append({"track": t, "offset": offset, "confidence": conf})
-            self.logger.info(f"  {t['filename']}: offset={offset:+.4f}s conf={conf:.4f}")
+            samples = min(sr * 300, len(cam_full), len(h6e))
+
+            # FFT correlation
+            fft_off, fft_conf = self._correlate(cam_full[:samples], h6e[:samples], sr)
+            # Energy envelope correlation (robust to mic differences)
+            env_off, env_conf = self._envelope_correlate(cam_full[:samples], h6e[:samples], sr)
+
+            # Pick the method with higher confidence
+            if env_conf > fft_conf:
+                offset, conf, method = env_off, env_conf, "envelope"
+            else:
+                offset, conf, method = fft_off, fft_conf, "fft"
+
+            track_results.append({
+                "track": t, "offset": offset, "confidence": conf, "method": method,
+                "h6e_full": h6e,
+            })
+            self.logger.info(
+                f"  {t['filename']}: offset={offset:+.4f}s conf={conf:.4f} ({method})"
+            )
 
         if not track_results:
             return {"status": "no_sync_track"}
 
-        # Find consensus: group offsets within 0.5s tolerance, pick largest group
+        # Find consensus: group offsets within 0.5s tolerance
         track_results.sort(key=lambda r: r["offset"])
         best_group, current_group = [], [track_results[0]]
         for r in track_results[1:]:
@@ -270,104 +290,74 @@ class IngestAgent(BaseAgent):
         if len(current_group) > len(best_group):
             best_group = current_group
 
-        # Use the highest-confidence track from the consensus group
         best = max(best_group, key=lambda r: r["confidence"])
         sync_track = best["track"]
         init_offset = best["offset"]
         init_confidence = best["confidence"]
+        h6e_full = best["h6e_full"]
 
         self.logger.info(
-            f"Sync consensus: {len(best_group)} tracks agree on {init_offset:+.4f}s "
+            f"Consensus: {len(best_group)} tracks agree on {init_offset:+.4f}s "
             f"(best: {sync_track['filename']}, conf={init_confidence:.4f})"
         )
 
-        h6e_full = self._extract_audio_pcm(sync_track["dest_path"], sr)
-
-        # Step 2: Multi-point drift measurement by slicing numpy arrays
-        window = 15  # seconds per checkpoint window
-        window_samples = sr * window
-        interval = 10  # seconds between checkpoints
-        interval_samples = sr * interval
+        # ── Step 2: Verify sync every 10s using energy envelope ──
+        self.logger.info("Step 2: Drift verification every 10s via energy envelope...")
+        interval = 10
+        window = 15  # seconds per check
+        env_win = int(sr * 0.1)  # 100ms RMS window for envelope
         offset_samples = int(init_offset * sr)
         checkpoints = []
 
-        num_checkpoints = int((video_duration - window) / interval)
-        for i in range(num_checkpoints):
-            cam_start = i * interval_samples
-            h6e_start = cam_start + offset_samples
+        for t in range(0, int(video_duration) - window, interval):
+            cam_s = t * sr
+            cam_e = cam_s + window * sr
+            h6e_s = cam_s + offset_samples
+            h6e_e = h6e_s + window * sr
 
-            if h6e_start < 0 or cam_start + window_samples > len(cam_full) \
-               or h6e_start + window_samples > len(h6e_full):
+            if cam_e > len(cam_full) or h6e_e > len(h6e_full) or h6e_s < 0:
                 continue
 
-            local_offset, conf = self._correlate(
-                cam_full[cam_start:cam_start + window_samples],
-                h6e_full[h6e_start:h6e_start + window_samples],
-                sr,
+            local_off, conf = self._envelope_correlate(
+                cam_full[cam_s:cam_e], h6e_full[h6e_s:h6e_e], sr
             )
             checkpoints.append({
-                "time": round(i * interval, 1),
-                "offset": round(init_offset + local_offset, 6),
+                "time": round(t, 1),
+                "offset": round(init_offset + local_off, 6),
                 "confidence": round(conf, 4),
             })
 
         self.logger.info(f"Collected {len(checkpoints)} drift checkpoints")
 
-        # Step 3: Linear regression on high-confidence checkpoints
-        good = [c for c in checkpoints if c["confidence"] > 0.10]
+        # ── Step 3: Linear regression on good checkpoints ──
+        good = [c for c in checkpoints if c["confidence"] > 0.05]
 
         base_result = {
             "sync_track": sync_track["filename"],
             "video_file": Path(video_path).name,
             "video_duration": round(video_duration, 3),
             "confidence": round(init_confidence, 6),
+            "consensus_tracks": len(best_group),
+            "checkpoint_count": len(checkpoints),
+            "good_checkpoint_count": len(good),
         }
 
-        # If per-checkpoint correlation is too noisy, fall back to 3-point measurement
-        # using long windows (300s) at start/middle/end — more robust for dissimilar mics
         if len(good) < 3:
-            self.logger.info("Per-checkpoint confidence too low, trying 3-point drift measurement")
-            drift_points = []
-            for seek_t in [0, int(video_duration / 2), int(video_duration - 300)]:
-                if seek_t < 0:
-                    continue
-                win = min(300, int(video_duration) - seek_t)
-                s, e = seek_t * sr, (seek_t + win) * sr
-                h_s = (seek_t + int(init_offset)) * sr
-                h_e = h_s + win * sr
-                if e > len(cam_full) or h_e > len(h6e_full):
-                    continue
-                off, conf = self._correlate(cam_full[s:e], h6e_full[h_s:h_e], sr)
-                # Also try other consensus tracks for cross-validation
-                total_off = init_offset + off
-                for r in best_group:
-                    if r["track"]["filename"] != sync_track["filename"]:
-                        h6e_alt = self._extract_audio_pcm(r["track"]["dest_path"], sr)
-                        h_s2 = (seek_t + int(init_offset)) * sr
-                        h_e2 = h_s2 + win * sr
-                        if h_e2 <= len(h6e_alt):
-                            off2, _ = self._correlate(cam_full[s:e], h6e_alt[h_s2:h_e2], sr)
-                            total_off = init_offset + (off + off2) / 2
-                        break
-                drift_points.append({"time": seek_t + win / 2, "offset": total_off})
-
-            if len(drift_points) >= 2:
-                good = [{"time": p["time"], "offset": p["offset"], "confidence": 0.5} for p in drift_points]
-                self.logger.info("3-point offsets: %s", [round(p["offset"], 4) for p in drift_points])
-            else:
-                return {
-                    **base_result, "checkpoints": checkpoints,
-                    "status": "low_confidence" if init_confidence < 0.10 else "ok",
-                    "offset_seconds": round(init_offset, 6),
-                    "tempo_factor": 1.0,
-                    "drift_rate_ppm": 0.0,
-                    "drift_total_seconds": 0.0,
-                }
+            self.logger.warning(f"Only {len(good)} good checkpoints — no drift correction")
+            return {
+                **base_result,
+                "status": "low_confidence" if init_confidence < 0.05 else "ok",
+                "offset_seconds": round(init_offset, 6),
+                "tempo_factor": 1.0,
+                "drift_rate_ppm": 0.0,
+                "drift_total_seconds": 0.0,
+                "r_squared": 0.0,
+                "checkpoints": checkpoints,
+            }
 
         times = np.array([c["time"] for c in good])
         offsets = np.array([c["offset"] for c in good])
 
-        # offset(t) = intercept + slope * t
         mean_t, mean_o = np.mean(times), np.mean(offsets)
         slope = float(np.sum((times - mean_t) * (offsets - mean_o))
                        / (np.sum((times - mean_t) ** 2) + 1e-15))
@@ -377,15 +367,12 @@ class IngestAgent(BaseAgent):
         drift_ppm = slope * 1e6
         drift_total = slope * video_duration
 
-        # R-squared for quality assessment
         ss_res = float(np.sum((offsets - (intercept + slope * times)) ** 2))
         ss_tot = float(np.sum((offsets - mean_o) ** 2))
         r_sq = 1.0 - ss_res / (ss_tot + 1e-15) if ss_tot > 1e-15 else 1.0
 
         status = "ok"
-        if init_confidence < 0.10:
-            status = "low_confidence"
-        elif r_sq < 0.5 and abs(drift_total) > 0.1:
+        if r_sq < 0.5 and abs(drift_total) > 0.1:
             status = "low_confidence"
 
         self.logger.info(
@@ -401,22 +388,56 @@ class IngestAgent(BaseAgent):
             "drift_rate_ppm": round(drift_ppm, 2),
             "drift_total_seconds": round(drift_total, 6),
             "r_squared": round(r_sq, 4),
+            "checkpoints": checkpoints,
         }
 
     @staticmethod
     def _correlate(a: np.ndarray, b: np.ndarray, sr: int) -> tuple[float, float]:
-        """FFT cross-correlation. Returns (offset_seconds, confidence)."""
-        a = a - np.mean(a)
-        b = b - np.mean(b)
+        """FFT cross-correlation on raw waveforms. Returns (offset_seconds, confidence)."""
+        a, b = a - np.mean(a), b - np.mean(b)
         fft_size = 2 ** int(np.ceil(np.log2(len(a) + len(b) - 1)))
-        cc = np.real(np.fft.ifft(
-            np.fft.fft(a, fft_size) * np.conj(np.fft.fft(b, fft_size))
-        ))
+        cc = np.real(np.fft.ifft(np.fft.fft(a, fft_size) * np.conj(np.fft.fft(b, fft_size))))
         max_idx = int(np.argmax(cc))
         if max_idx > fft_size // 2:
             max_idx -= fft_size
         energy = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2)) + 1e-10
         return max_idx / sr, float(cc[max_idx % fft_size]) / energy
+
+    @staticmethod
+    def _envelope_correlate(a: np.ndarray, b: np.ndarray, sr: int,
+                            env_window: float = 0.1) -> tuple[float, float]:
+        """Energy envelope cross-correlation. Compares WHEN sound occurs (RMS peaks)
+        rather than waveform shape — robust to different mic frequency responses.
+
+        Returns (offset_seconds, confidence).
+        """
+        win = max(1, int(sr * env_window))
+
+        def rms_envelope(signal):
+            n = len(signal) // win
+            if n == 0:
+                return np.array([])
+            frames = signal[:n * win].reshape(n, win).astype(np.float64)
+            return np.sqrt(np.mean(frames ** 2, axis=1))
+
+        env_a = rms_envelope(a)
+        env_b = rms_envelope(b)
+        if len(env_a) < 10 or len(env_b) < 10:
+            return 0.0, 0.0
+
+        env_a, env_b = env_a - np.mean(env_a), env_b - np.mean(env_b)
+
+        fft_size = 2 ** int(np.ceil(np.log2(len(env_a) + len(env_b) - 1)))
+        cc = np.real(np.fft.ifft(np.fft.fft(env_a, fft_size) * np.conj(np.fft.fft(env_b, fft_size))))
+        max_idx = int(np.argmax(cc))
+        if max_idx > fft_size // 2:
+            max_idx -= fft_size
+
+        energy = np.sqrt(np.sum(env_a ** 2) * np.sum(env_b ** 2)) + 1e-10
+        confidence = float(cc[max_idx % fft_size]) / energy
+        offset = max_idx * env_window  # convert envelope index to seconds
+
+        return offset, confidence
 
     def _extract_audio_pcm(self, path: str, sr: int) -> np.ndarray:
         """Extract full mono audio as float32 numpy array via ffmpeg."""
