@@ -308,8 +308,14 @@ async def get_sync_preview(episode_id: str, duration: float = 120.0):
             rms = rms / mx
         return [round(float(v), 3) for v in rms]
 
-    cam_waveform = extract_rms(str(merged), seek=0, dur=duration)
-    h6e_waveform = extract_rms(h6e_path, seek=offset, dur=duration)
+    # For negative offset (camera started first), shift the camera waveform forward
+    # instead of seeking H6E to a negative position (which ffmpeg silently ignores)
+    if offset >= 0:
+        cam_waveform = extract_rms(str(merged), seek=0, dur=duration)
+        h6e_waveform = extract_rms(h6e_path, seek=offset, dur=duration)
+    else:
+        cam_waveform = extract_rms(str(merged), seek=abs(offset), dur=duration)
+        h6e_waveform = extract_rms(h6e_path, seek=0, dur=duration)
 
     return {
         "camera_waveform": cam_waveform,
@@ -337,9 +343,10 @@ async def save_sync_offset(episode_id: str, req: SyncOffsetRequest):
     ep["audio_sync"]["manually_adjusted"] = True
     write_episode(episode_id, ep)
 
-    # Delete stale cached files so they get regenerated with the new offset
+    # Delete ALL stale cached files that depend on sync offset
     work = EPISODES_DIR / episode_id / "work"
-    for pattern in ["audio_mix.wav", "speaker_*_channel.npy", "transcript_audio.*"]:
+    for pattern in ["audio_mix.wav", "speaker_*_channel.npy", "speaker_*_rms_db.npy",
+                     "transcript_audio.*", "longform_seg_*.mp4", "audio_preview/*.mp3"]:
         for f in work.glob(pattern):
             f.unlink()
 
@@ -538,10 +545,22 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
                     episode_id,
                     mix_path.stat().st_size / 1e6,
                 )
-                # Invalidate existing rendered segments so re-render picks up new audio
+                # Invalidate ALL cached files that depend on crop/audio config
                 work_dir = ep_dir / "work"
-                for f in work_dir.glob("longform_seg_*.mp4"):
-                    f.unlink(missing_ok=True)
+                for pattern in [
+                    "longform_seg_*.mp4",   # rendered video segments
+                    "speaker_*_channel.npy", # cached speaker audio extractions
+                    "speaker_*_rms_db.npy",  # cached RMS data
+                    "transcript_audio.*",    # multichannel transcript audio
+                    "audio_preview/*.mp3",   # cached audio previews
+                ]:
+                    for f in work_dir.glob(pattern):
+                        f.unlink(missing_ok=True)
+                # Also invalidate rendered shorts
+                shorts_dir = ep_dir / "shorts"
+                if shorts_dir.exists():
+                    for f in shorts_dir.glob("*.mp4"):
+                        f.unlink(missing_ok=True)
         except Exception:
             logger.exception("Failed to generate audio_mix.wav for %s", episode_id)
 

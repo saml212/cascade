@@ -1,9 +1,9 @@
 """Shared crop calculation — single source of truth for all render agents.
 
 Formulas must match frontend/app.js redrawCropCanvas(). See comments there.
-  speaker: crop_w = src_w / (2 * zoom)   — 16:9 half-frame
-  wide:    crop_w = src_w / zoom          — 16:9 full-frame
-  short:   crop_h = src_h / zoom          — 9:16 portrait
+  speaker: crop_w = src_w / zoom   — 16:9 (zoom=1 = full frame, zoom=2 = half)
+  wide:    crop_w = src_w / zoom   — 16:9 full-frame
+  short:   crop_h = src_h / zoom   — 9:16 portrait
 """
 
 

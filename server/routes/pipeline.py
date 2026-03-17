@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from lib.atomic_write import atomic_write_json
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -156,8 +158,7 @@ async def cancel_pipeline(episode_id: str) -> dict:
             if episode.get("status") == "processing":
                 episode["status"] = "cancelled"
                 episode["pipeline"].pop("current_agent", None)
-                with open(episode_file, "w") as f:
-                    json.dump(episode, f, indent=2)
+                atomic_write_json(episode_file, episode)
         return {"status": "not_running", "episode_id": episode_id}
 
     # Update episode status immediately
@@ -167,8 +168,7 @@ async def cancel_pipeline(episode_id: str) -> dict:
             episode = json.load(f)
         episode["status"] = "cancelled"
         episode["pipeline"].pop("current_agent", None)
-        with open(episode_file, "w") as f:
-            json.dump(episode, f, indent=2)
+        atomic_write_json(episode_file, episode)
 
     logger.info("Pipeline cancellation requested for %s", episode_id)
     return {"status": "cancel_requested", "episode_id": episode_id}
@@ -233,8 +233,7 @@ async def auto_approve(episode_id: str) -> dict:
     episode["status"] = "approved"
     episode["approved_at"] = datetime.now(timezone.utc).isoformat()
 
-    with open(episode_file, "w") as f:
-        json.dump(episode, f, indent=2)
+    atomic_write_json(episode_file, episode)
 
     # Also approve in clips.json
     clips_file = OUTPUT_DIR / episode_id / "clips.json"
@@ -244,8 +243,7 @@ async def auto_approve(episode_id: str) -> dict:
         for clip in clips_data.get("clips", []):
             if clip.get("status", "pending") == "pending":
                 clip["status"] = "approved"
-        with open(clips_file, "w") as f:
-            json.dump(clips_data, f, indent=2)
+        atomic_write_json(clips_file, clips_data)
 
     return {"status": "approved", "episode_id": episode_id}
 
@@ -269,8 +267,7 @@ async def approve_backup(episode_id: str) -> dict:
         episode["backup_approved_at"] = datetime.now(timezone.utc).isoformat()
         episode["status"] = "processing"
 
-        with open(episode_file, "w") as f:
-            json.dump(episode, f, indent=2)
+        atomic_write_json(episode_file, episode)
 
         # Resume pipeline with just backup
         source_path = episode.get("source_path", "")

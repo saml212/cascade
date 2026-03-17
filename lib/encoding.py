@@ -28,7 +28,7 @@ def get_video_encoder_args(config: dict, crf_key: str = "video_crf") -> list:
     default (10-20x faster, dedicated Media Engine). Set use_hardware_accel=false
     in config to force software encoding.
 
-    VideoToolbox path: ["-c:v", "h264_videotoolbox", "-q:v", "75"]
+    VideoToolbox path: ["-c:v", "hevc_videotoolbox", "-q:v", "55", "-tag:v", "hvc1"]
     Software fallback: ["-c:v", "libx264", "-crf", "<value>", "-preset", "medium"]
     """
     use_hw = config.get("processing", {}).get("use_hardware_accel", True)
