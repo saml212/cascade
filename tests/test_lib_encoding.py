@@ -27,7 +27,7 @@ class TestHasVideoToolbox:
         with patch("lib.encoding.sys") as mock_sys, \
              patch("lib.encoding.subprocess.run") as mock_run:
             mock_sys.platform = "darwin"
-            mock_run.return_value = MagicMock(stdout="... h264_videotoolbox ...")
+            mock_run.return_value = MagicMock(stdout="... hevc_videotoolbox ...")
             assert has_videotoolbox() is True
 
     def test_returns_false_when_not_available_on_macos(self):
@@ -41,7 +41,7 @@ class TestHasVideoToolbox:
         with patch("lib.encoding.sys") as mock_sys, \
              patch("lib.encoding.subprocess.run") as mock_run:
             mock_sys.platform = "darwin"
-            mock_run.return_value = MagicMock(stdout="h264_videotoolbox")
+            mock_run.return_value = MagicMock(stdout="hevc_videotoolbox")
             has_videotoolbox()
             has_videotoolbox()
             assert mock_run.call_count == 1
@@ -100,16 +100,16 @@ class TestGetVideoEncoderArgs:
         config = {"processing": {"use_hardware_accel": True}}
         with patch("lib.encoding.has_videotoolbox", return_value=True):
             args = get_video_encoder_args(config)
-            assert args[0:2] == ["-c:v", "h264_videotoolbox"]
+            assert args[0:2] == ["-c:v", "hevc_videotoolbox"]
             assert "-q:v" in args
-            assert "75" in args
+            assert "55" in args
 
     def test_videotoolbox_custom_quality(self):
         """VideoToolbox quality should be configurable."""
         config = {"processing": {"use_hardware_accel": True, "videotoolbox_quality": 90}}
         with patch("lib.encoding.has_videotoolbox", return_value=True):
             args = get_video_encoder_args(config)
-            assert args[0:2] == ["-c:v", "h264_videotoolbox"]
+            assert args[0:2] == ["-c:v", "hevc_videotoolbox"]
             assert "90" in args
 
     def test_software_when_hw_accel_disabled(self):
@@ -130,7 +130,7 @@ class TestGetVideoEncoderArgs:
         config = {}
         with patch("lib.encoding.has_videotoolbox", return_value=True):
             args = get_video_encoder_args(config)
-            assert args[0:2] == ["-c:v", "h264_videotoolbox"]
+            assert args[0:2] == ["-c:v", "hevc_videotoolbox"]
 
     def test_empty_config_no_hw(self):
         """Empty config without VideoToolbox should use software defaults."""

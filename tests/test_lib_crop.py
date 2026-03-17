@@ -7,10 +7,10 @@ from lib.crop import compute_crop, resolve_speaker
 # -- compute_crop ----------------------------------------------------------
 
 @pytest.mark.parametrize("mode,src_w,src_h,zoom,exp_w,exp_h", [
-    # Speaker: crop_w = src_w / (2 * zoom)
-    ("speaker", 3840, 2160, 1.0, 1920, 1080),
-    ("speaker", 3840, 2160, 2.0, 960,  540),
-    ("speaker", 1920, 1080, 1.0, 960,  540),
+    # Speaker: crop_w = src_w / zoom (same as wide — zoom=1.0 = full frame)
+    ("speaker", 3840, 2160, 1.0, 3840, 2160),
+    ("speaker", 3840, 2160, 2.0, 1920, 1080),
+    ("speaker", 1920, 1080, 1.0, 1920, 1080),
     # Wide: crop_w = src_w / zoom
     ("wide", 3840, 2160, 1.0, 3840, 2160),
     ("wide", 3840, 2160, 1.2, 3200, 1800),
@@ -24,10 +24,10 @@ def test_crop_dimensions(mode, src_w, src_h, zoom, exp_w, exp_h):
     assert (w, h) == (exp_w, exp_h)
 
 
-def test_wide_is_2x_speaker_at_same_zoom():
+def test_speaker_and_wide_same_at_same_zoom():
     _, _, w_wide, _ = compute_crop(3840, 2160, 1920, 1080, 1.5, "wide")
     _, _, w_spk, _ = compute_crop(3840, 2160, 1920, 1080, 1.5, "speaker")
-    assert w_wide == 2 * w_spk
+    assert w_wide == w_spk
 
 
 @pytest.mark.parametrize("cx,cy", [(0, 1080), (3840, 1080), (1920, 0), (1920, 2160)])
@@ -55,7 +55,7 @@ def test_invalid_mode_raises():
 class TestUIMatch:
     def test_speaker(self, src_w, src_h, zoom):
         _, _, w, h = compute_crop(src_w, src_h, src_w // 2, src_h // 2, zoom, "speaker")
-        assert w == max(64, int(src_w / (2 * zoom)))
+        assert w == min(src_w, max(64, int(src_w / zoom)))
         assert h == max(36, int(w * 9 / 16))
 
     def test_wide(self, src_w, src_h, zoom):

@@ -38,22 +38,22 @@ class TestGetCropFilter:
 
     def test_speaker_l_zoom_1(self, agent, crop_config):
         result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        assert "crop=1920:" in result  # 3840 / (2*1.0)
+        assert "crop=3840:" in result  # 3840 / 1.0 = full frame
         assert "scale=1920:1080" in result
 
     def test_speaker_zoom_2(self, agent, crop_config):
         crop_config["speakers"][0]["zoom"] = 2.0
         crop_config["speaker_l_zoom"] = 2.0
         result = agent._get_crop_filter("L", 3840, 2160, crop_config)
-        assert "crop=960:" in result  # 3840 / (2*2.0)
+        assert "crop=1920:" in result  # 3840 / 2.0
 
     def test_per_speaker_zoom(self, agent, crop_config):
         crop_config["speakers"][0]["zoom"] = 2.0
         crop_config["speakers"][1]["zoom"] = 1.5
         result_l = agent._get_crop_filter("speaker_0", 3840, 2160, crop_config)
         result_r = agent._get_crop_filter("speaker_1", 3840, 2160, crop_config)
-        assert "crop=960:" in result_l   # 3840 / (2*2.0)
-        assert "crop=1280:" in result_r  # 3840 / (2*1.5)
+        assert "crop=1920:" in result_l   # 3840 / 2.0
+        assert "crop=2560:" in result_r   # 3840 / 1.5
 
     def test_both_no_zoom_passthrough(self, agent, crop_config):
         result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
@@ -74,7 +74,7 @@ class TestGetCropFilter:
         wide = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
         spk = agent._get_crop_filter("speaker_0", 3840, 2160, crop_config)
         assert "crop=2560:" in wide  # 3840 / 1.5
-        assert "crop=1280:" in spk   # 3840 / (2*1.5)
+        assert "crop=2560:" in spk   # 3840 / 1.5 (speaker and wide now same formula)
 
     def test_out_of_range_speaker_index(self, agent, crop_config):
         result = agent._get_crop_filter("speaker_5", 3840, 2160, crop_config)
@@ -87,7 +87,7 @@ class TestGetCropFilter:
             ],
         }
         result = agent._get_crop_filter("speaker_0", 1920, 1080, config)
-        assert "crop=960:" in result
+        assert "crop=1920:" in result  # 1920 / 1.0 = full frame
         assert "scale=1920:1080" in result
 
 

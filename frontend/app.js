@@ -2646,7 +2646,7 @@ function redrawCropCanvas() {
 
   // Draw wide shot crop rect
   // Crop formulas must match lib/crop.py compute_crop() — that is the single source of truth.
-  // Wide: crop_w = srcW / zoom. Speaker: crop_w = srcW / (2 * zoom). Short: crop_h = srcH / zoom.
+  // Wide: crop_w = srcW / zoom. Speaker: crop_w = srcW / zoom. Short: crop_h = srcH / zoom.
   if (cropState.wide && cropState.wide.zoom > 1.0) {
     const wZoom = cropState.wide.zoom;
     const wCx = cropState.wide.x / sf;
@@ -2684,7 +2684,7 @@ function redrawCropCanvas() {
     ctx.strokeRect(shortsX, shortsY, shortsCropW, shortsCropH);
 
     // 16:9 longform crop rect
-    const lfCropW = Math.round((srcW / (2 * zoom)) / sf);
+    const lfCropW = Math.round((srcW / zoom) / sf);
     const lfCropH = Math.round(lfCropW * 9 / 16);
     const lfX = Math.max(0, Math.min(cx - lfCropW / 2, canvas.width - lfCropW));
     const lfY = Math.max(0, Math.min(cy - lfCropH / 2, canvas.height - lfCropH));

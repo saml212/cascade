@@ -337,10 +337,11 @@ async def save_sync_offset(episode_id: str, req: SyncOffsetRequest):
     ep["audio_sync"]["manually_adjusted"] = True
     write_episode(episode_id, ep)
 
-    # Delete stale audio_mix.wav so it gets regenerated with the new offset
-    mix_path = EPISODES_DIR / episode_id / "work" / "audio_mix.wav"
-    if mix_path.exists():
-        mix_path.unlink()
+    # Delete stale cached files so they get regenerated with the new offset
+    work = EPISODES_DIR / episode_id / "work"
+    for pattern in ["audio_mix.wav", "speaker_*_channel.npy", "transcript_audio.*"]:
+        for f in work.glob(pattern):
+            f.unlink()
 
     return {"status": "saved", "offset_seconds": req.offset_seconds}
 

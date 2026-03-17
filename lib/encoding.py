@@ -16,7 +16,7 @@ def has_videotoolbox() -> bool:
             ["ffmpeg", "-encoders"],
             capture_output=True, text=True, timeout=10,
         )
-        return "h264_videotoolbox" in result.stdout
+        return "hevc_videotoolbox" in result.stdout
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
@@ -34,9 +34,9 @@ def get_video_encoder_args(config: dict, crf_key: str = "video_crf") -> list:
     use_hw = config.get("processing", {}).get("use_hardware_accel", True)
 
     if use_hw and has_videotoolbox():
-        # Apple Silicon Media Engine — fast and high quality for podcast content
-        vt_quality = config.get("processing", {}).get("videotoolbox_quality", 75)
-        return ["-c:v", "h264_videotoolbox", "-q:v", str(vt_quality)]
+        # Apple Silicon Media Engine — HEVC preserves 10-bit from DJI source
+        vt_quality = config.get("processing", {}).get("videotoolbox_quality", 55)
+        return ["-c:v", "hevc_videotoolbox", "-q:v", str(vt_quality), "-tag:v", "hvc1"]
 
     crf = config.get("processing", {}).get(crf_key, 22)
     preset = config.get("processing", {}).get("encode_preset", "medium")

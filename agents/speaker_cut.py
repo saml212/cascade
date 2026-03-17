@@ -148,14 +148,21 @@ class SpeakerCutAgent(BaseAgent):
         return [np.load(str(work / f"{n}_channel.npy")) for n in ("left", "right")], "lr"
 
     def _extract_track(self, path: Path, offset: float) -> np.ndarray:
+        sr = 16000
         cmd = ["ffmpeg", "-y"]
         if offset >= 0:
             cmd += ["-ss", str(offset)]
-        cmd += ["-i", str(path), "-ar", "16000", "-ac", "1", "-f", "s16le", "-acodec", "pcm_s16le", "-"]
+        cmd += ["-i", str(path), "-ar", str(sr), "-ac", "1", "-f", "s16le", "-acodec", "pcm_s16le", "-"]
         r = subprocess.run(cmd, capture_output=True)
         if r.returncode != 0:
             raise RuntimeError(f"Track extraction failed: {r.stderr.decode()[:300]}")
-        return np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)
+        data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)
+        # For negative offset (camera started first), prepend silence so
+        # timestamps align to video time, not H6E time
+        if offset < 0:
+            pad = np.zeros(int(abs(offset) * sr), dtype=np.float32)
+            data = np.concatenate([pad, data])
+        return data
 
     @staticmethod
     def _load_wav(path: Path) -> np.ndarray:

@@ -8,9 +8,13 @@ Formulas must match frontend/app.js redrawCropCanvas(). See comments there.
 
 
 def compute_crop(src_w, src_h, cx, cy, zoom, mode):
-    """Return (x, y, crop_w, crop_h) clamped to frame bounds."""
+    """Return (x, y, crop_w, crop_h) clamped to frame bounds.
+
+    For "speaker" mode: zoom=1.0 gives full frame, zoom=2.0 gives half-frame.
+    This avoids the crop-then-upscale quality loss at low zoom values.
+    """
     if mode == "speaker":
-        crop_w = max(64, int(src_w / (2 * zoom)))
+        crop_w = max(64, int(src_w / zoom))
         crop_h = max(36, int(crop_w * 9 / 16))
     elif mode == "wide":
         crop_w = max(64, int(src_w / zoom))
