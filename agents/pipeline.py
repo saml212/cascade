@@ -174,7 +174,12 @@ def run_pipeline(
             if "clips" in result:
                 episode["clips"] = result["clips"]
             # Merge audio sync/track data from ingest
+            # Preserve manually adjusted offset — don't overwrite with auto-detected
             if "audio_sync" in result:
+                existing_sync = episode.get("audio_sync", {})
+                if existing_sync.get("manually_adjusted"):
+                    result["audio_sync"]["offset_seconds"] = existing_sync["offset_seconds"]
+                    result["audio_sync"]["manually_adjusted"] = True
                 episode["audio_sync"] = result["audio_sync"]
             if "audio" in result:
                 episode["audio_tracks"] = result["audio"].get("tracks", [])

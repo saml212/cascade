@@ -136,8 +136,11 @@ def _build_from_crop_config(episode_dir: Path, episode_data: dict) -> list[dict]
 
     for amb in crop.get("ambient_tracks", []):
         tn = amb.get("track_number")
+        stem = amb.get("stem")
         if tn and tn in num_to_stem:
             result.append({"stem": num_to_stem[tn], "volume": amb.get("volume", 0.2)})
+        elif stem:
+            result.append({"stem": stem, "volume": amb.get("volume", 0.2)})
 
     return result
 

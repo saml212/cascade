@@ -2724,11 +2724,14 @@ async function saveCropConfig(episodeId) {
   const btn = document.getElementById('crop-save-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
 
-  // Collect ambient tracks from mixer
+  // Collect ambient tracks from mixer (some tracks like Mix/Mic have no trackNumber)
   const ambientTracks = [];
   for (const t of mixerState.tracks) {
-    if (t.assignment === 'ambient' && t.trackNumber) {
-      ambientTracks.push({ track_number: t.trackNumber, volume: t.volume });
+    if (t.assignment === 'ambient') {
+      const entry = { volume: t.volume };
+      if (t.trackNumber) entry.track_number = t.trackNumber;
+      if (t.stem) entry.stem = t.stem;
+      ambientTracks.push(entry);
     }
   }
 
@@ -3543,8 +3546,8 @@ function initSyncAudio(episodeId, audioTracks) {
   const video = document.getElementById('sync-video');
   if (!h6eAudio || !video) return;
 
-  // Load H6E audio preview (first 3 minutes)
-  h6eAudio.src = `${API}/episodes/${episodeId}/audio-preview/${stem}?start=0&duration=180`;
+  // Load H6E audio preview (first 30 minutes — enough to verify drift)
+  h6eAudio.src = `${API}/episodes/${episodeId}/audio-preview/${stem}?start=0&duration=1800`;
 
   // Sync H6E playback with video
   video.addEventListener('play', () => {

@@ -411,7 +411,8 @@ class SpeakerCropConfig(BaseModel):
 
 
 class AmbientTrackConfig(BaseModel):
-    track_number: int
+    track_number: Optional[int] = None
+    stem: Optional[str] = None  # filename stem for tracks without a number (Mix, Mic)
     volume: float = 0.2
 
 
