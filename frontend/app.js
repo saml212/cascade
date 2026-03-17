@@ -2375,43 +2375,45 @@ async function renderCropSetup(episodeId) {
     ${(ep.audio_sync && ep.audio_sync.offset_seconds != null) ? `
     <div id="sync-verify" class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="text-sm font-semibold text-zinc-300">Audio Sync Verification</h3>
-        <div class="flex items-center gap-2">
-          <span class="text-xs text-zinc-500">Auto-detected: ${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
-          <span id="sync-status" class="text-xs text-zinc-600">Loading waveforms...</span>
-        </div>
+        <h3 class="text-sm font-semibold text-zinc-300">Audio Sync</h3>
+        <span id="sync-status" class="text-xs text-zinc-600">Loading waveforms...</span>
       </div>
 
-      <div class="mb-3">
-        <video id="sync-video" width="480" class="rounded-lg bg-black mb-3" preload="metadata" controls>
+      <div class="mb-3 flex gap-4 items-start">
+        <video id="sync-video" width="480" class="rounded-lg bg-black" preload="metadata" controls>
           <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
         </video>
+        <div class="flex flex-col gap-2 min-w-[160px]">
+          <div class="flex items-center gap-2">
+            <button onclick="toggleSyncMute('camera')" id="sync-mute-cam" class="px-2 py-1 text-xs rounded font-medium bg-orange-800 text-orange-200">Camera ON</button>
+            <span class="text-xs text-zinc-500">Video mic</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="toggleSyncMute('h6e')" id="sync-mute-h6e" class="px-2 py-1 text-xs rounded font-medium bg-blue-800 text-blue-200">H6E ON</button>
+            <span class="text-xs text-zinc-500">External mic</span>
+          </div>
+          <audio id="sync-h6e-audio" preload="auto"></audio>
+          <div class="mt-2">
+            <label class="text-xs text-zinc-500">Offset (scroll or type):</label>
+            <input type="number" id="sync-offset-input" step="0.1"
+              value="${ep.audio_sync.offset_seconds.toFixed(2)}"
+              class="w-full mt-1 px-2 py-1 text-sm font-mono bg-zinc-800 border border-zinc-700 rounded text-white text-center"
+              onchange="setSyncOffset(parseFloat(this.value)||0)"
+            >
+          </div>
+          <button onclick="saveSyncOffset('${episodeId}')" id="sync-save-btn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Save Offset</button>
+        </div>
       </div>
 
       <div class="mb-1 flex items-center gap-4">
         <div class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm" style="background:rgba(251,146,60,0.8);"></span><span class="text-xs text-zinc-400">Camera</span></div>
         <div class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm" style="background:rgba(96,165,250,0.8);"></span><span class="text-xs text-zinc-400">H6E (shifted by offset)</span></div>
-        <span class="text-xs text-zinc-600 ml-auto">Scroll to zoom, drag to pan, click to seek</span>
+        <span class="text-xs text-zinc-600 ml-auto">Scroll to zoom, drag to pan</span>
       </div>
       <canvas id="sync-waveform" class="w-full rounded cursor-crosshair" style="height:180px;background:#0a0a0a;"></canvas>
-      <div class="flex items-center justify-between mt-1 mb-3">
+      <div class="flex items-center justify-between mt-1">
         <span id="sync-view-range" class="text-xs text-zinc-600 font-mono"></span>
         <button onclick="syncZoomToFit()" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">Zoom to fit</button>
-      </div>
-
-      <div class="flex items-center gap-3 flex-wrap">
-        <span class="text-xs text-zinc-500">Offset:</span>
-        <button onclick="adjustSyncOffset(-10)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-10</button>
-        <button onclick="adjustSyncOffset(-5)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-5</button>
-        <button onclick="adjustSyncOffset(-1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1</button>
-        <button onclick="adjustSyncOffset(-0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.1</button>
-        <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[100px] text-center">${ep.audio_sync.offset_seconds.toFixed(2)}s</span>
-        <button onclick="adjustSyncOffset(0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.1</button>
-        <button onclick="adjustSyncOffset(1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1</button>
-        <button onclick="adjustSyncOffset(5)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+5</button>
-        <button onclick="adjustSyncOffset(10)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+10</button>
-        <button onclick="saveSyncOffset('${episodeId}')" id="sync-save-btn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Save Offset</button>
-        <button onclick="resetSyncOffset()" id="sync-reset-btn" class="px-3 py-1.5 text-xs bg-zinc-700 hover:bg-zinc-600 rounded font-medium transition-colors text-zinc-300">Reset</button>
       </div>
     </div>` : ''}
 
@@ -3286,9 +3288,19 @@ async function loadSyncPreview(episodeId, currentOffset) {
 
     if (statusEl) statusEl.textContent = 'Loaded. Scroll to zoom, drag to pan.';
 
+    // Update the offset input with the loaded value
+    const input = document.getElementById('sync-offset-input');
+    if (input) input.value = syncState.offset.toFixed(2);
+
     initSyncCanvas();
     drawSyncWaveform();
     initSyncPlayhead();
+
+    // Init H6E audio playback for sync verification
+    const ep = state.currentEpisode;
+    if (ep && ep.audio_tracks) {
+      initSyncAudio(episodeId, ep.audio_tracks);
+    }
   } catch (err) {
     if (statusEl) statusEl.textContent = 'Failed to load: ' + err.message;
   }
@@ -3463,12 +3475,15 @@ function initSyncPlayhead() {
 }
 
 function adjustSyncOffset(delta) {
-  syncState.offset = Math.round((syncState.offset + delta) * 10000) / 10000;
+  setSyncOffset(syncState.offset + delta);
+}
 
-  const display = document.getElementById('sync-offset-display');
-  if (display) display.textContent = syncState.offset.toFixed(4) + 's';
-
+function setSyncOffset(value) {
+  syncState.offset = Math.round(value * 100) / 100;
+  const input = document.getElementById('sync-offset-input');
+  if (input) input.value = syncState.offset.toFixed(2);
   if (syncState.loaded) drawSyncWaveform();
+  syncH6EPlayback();
 }
 
 async function saveSyncOffset(episodeId) {
@@ -3480,12 +3495,81 @@ async function saveSyncOffset(episodeId) {
       method: 'POST',
       body: JSON.stringify({ offset_seconds: syncState.offset }),
     });
-    showToast(`Sync offset saved: ${syncState.offset.toFixed(4)}s`, 'success');
+    showToast(`Offset saved: ${syncState.offset.toFixed(2)}s`, 'success');
   } catch (err) {
-    showToast('Failed to save offset: ' + err.message, 'error');
+    showToast('Failed to save: ' + err.message, 'error');
   }
 
   if (btn) { btn.disabled = false; btn.textContent = 'Save Offset'; }
+}
+
+function toggleSyncMute(which) {
+  const video = document.getElementById('sync-video');
+  const h6eAudio = document.getElementById('sync-h6e-audio');
+  if (which === 'camera' && video) {
+    video.muted = !video.muted;
+    const btn = document.getElementById('sync-mute-cam');
+    if (btn) {
+      btn.textContent = video.muted ? 'Camera OFF' : 'Camera ON';
+      btn.className = `px-2 py-1 text-xs rounded font-medium ${video.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-orange-800 text-orange-200'}`;
+    }
+  }
+  if (which === 'h6e' && h6eAudio) {
+    h6eAudio.muted = !h6eAudio.muted;
+    const btn = document.getElementById('sync-mute-h6e');
+    if (btn) {
+      btn.textContent = h6eAudio.muted ? 'H6E OFF' : 'H6E ON';
+      btn.className = `px-2 py-1 text-xs rounded font-medium ${h6eAudio.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-blue-800 text-blue-200'}`;
+    }
+  }
+}
+
+function syncH6EPlayback() {
+  const video = document.getElementById('sync-video');
+  const h6eAudio = document.getElementById('sync-h6e-audio');
+  if (!video || !h6eAudio || !h6eAudio.src) return;
+  h6eAudio.currentTime = video.currentTime + syncState.offset;
+}
+
+function initSyncAudio(episodeId, audioTracks) {
+  // Find the stereo mix or builtin mic track for sync preview
+  let syncTrack = audioTracks.find(t => t.track_type === 'stereo_mix')
+    || audioTracks.find(t => t.track_type === 'builtin_mic')
+    || audioTracks.find(t => t.track_type === 'input');
+  if (!syncTrack) return;
+
+  const stem = syncTrack.filename.replace(/\.(WAV|wav)$/, '');
+  const h6eAudio = document.getElementById('sync-h6e-audio');
+  const video = document.getElementById('sync-video');
+  if (!h6eAudio || !video) return;
+
+  // Load H6E audio preview (first 3 minutes)
+  h6eAudio.src = `${API}/episodes/${episodeId}/audio-preview/${stem}?start=0&duration=180`;
+
+  // Sync H6E playback with video
+  video.addEventListener('play', () => {
+    syncH6EPlayback();
+    h6eAudio.play().catch(() => {});
+  });
+  video.addEventListener('pause', () => h6eAudio.pause());
+  video.addEventListener('seeked', () => syncH6EPlayback());
+  video.addEventListener('timeupdate', () => {
+    // Correct drift every second
+    const expected = video.currentTime + syncState.offset;
+    if (Math.abs(h6eAudio.currentTime - expected) > 0.3) {
+      h6eAudio.currentTime = expected;
+    }
+  });
+
+  // Scroll on offset input to adjust
+  const input = document.getElementById('sync-offset-input');
+  if (input) {
+    input.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const step = e.shiftKey ? 1.0 : 0.1;
+      setSyncOffset(syncState.offset + (e.deltaY > 0 ? -step : step));
+    }, { passive: false });
+  }
 }
 
 function resetSyncOffset() {
