@@ -185,15 +185,23 @@ class SpeakerCutAgent(BaseAgent):
                 cur, start = labels[i], i
         segs.append({"start": round(start * frame_sec, 3),
                      "end": round(n_frames * frame_sec, 3), "speaker": cur})
-        # Absorb short segments into predecessor, re-merge consecutive same-speaker
+        # Absorb short segments into neighbors, re-merge consecutive same-speaker
         changed = True
         while changed:
             changed = False
             new = []
-            for seg in segs:
-                if seg["end"] - seg["start"] < min_dur and new:
-                    new[-1]["end"] = seg["end"]; changed = True
-                elif seg["end"] - seg["start"] >= min_dur:
+            for i, seg in enumerate(segs):
+                if seg["end"] - seg["start"] < min_dur:
+                    if new:
+                        # Merge into predecessor
+                        new[-1]["end"] = seg["end"]; changed = True
+                    elif i + 1 < len(segs):
+                        # First segment is short — merge into next by extending next's start
+                        segs[i + 1]["start"] = seg["start"]; changed = True
+                    else:
+                        # Only segment — keep it regardless of duration
+                        new.append(seg)
+                else:
                     new.append(seg)
             segs = new
         merged = [segs[0]] if segs else []

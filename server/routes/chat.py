@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from lib.crop import compute_crop, resolve_speaker
-from lib.encoding import get_video_encoder_args
+from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.paths import get_episodes_dir
 from lib.srt import escape_srt_path, fmt_timecode
 
@@ -582,7 +582,7 @@ def _action_reject_clip(action: dict, ep_dir: Path) -> dict:
 
 
 def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
-    """Re-render a single short clip using ffmpeg, matching shorts_render agent logic."""
+    """Re-render a single short clip using the shorts_render agent for full parity."""
     clip_id = action.get("clip_id")
     if not clip_id:
         return {"action": "rerender_short", "status": "error", "detail": "Missing clip_id"}
@@ -600,80 +600,62 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
     if not merged_path.exists():
         return {"action": "rerender_short", "status": "error", "detail": "source_merged.mp4 not found"}
 
-    start = clip.get("start_seconds", clip.get("start", 0))
-    end = clip.get("end_seconds", clip.get("end", 0))
-    duration = end - start
+    # Delegate to ShortsRenderAgent so LUT, 10-bit, audio_mix, and per-segment
+    # crops are all handled identically to the pipeline render.
+    from agents.pipeline import load_config
+    from agents.shorts_render import ShortsRenderAgent
 
-    shorts_dir = ep_dir / "shorts"
-    shorts_dir.mkdir(exist_ok=True)
-    output_path = shorts_dir / f"{clip_id}.mp4"
+    config = load_config()
+    agent = ShortsRenderAgent(ep_dir, config)
 
-    # Probe source dimensions
     try:
-        probe_cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            str(merged_path),
-        ]
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        probe_data = json.loads(probe_result.stdout)
-        video_stream = next(s for s in probe_data["streams"] if s["codec_type"] == "video")
+        # Load the same data the agent uses
+        segments_data = agent.load_json("segments.json")
+        diarized = agent.load_json("diarized_transcript.json")
+        episode_data = agent.load_json("episode.json")
+        crop_config = episode_data.get("crop_config")
+        if not crop_config:
+            return {"action": "rerender_short", "status": "error", "detail": "crop_config not set"}
+
+        # Audio source — use H6E audio_mix.wav when available
+        audio_mix_path = ep_dir / "work" / "audio_mix.wav"
+        if not audio_mix_path.exists():
+            audio_mix_path = None
+
+        segments = segments_data.get("segments", [])
+        start = clip.get("start_seconds", clip.get("start", 0))
+        end = clip.get("end_seconds", clip.get("end", 0))
+
+        # Probe source dimensions
+        from lib.ffprobe import probe as ffprobe
+        probe = ffprobe(merged_path)
+        video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
-    except (subprocess.CalledProcessError, StopIteration, KeyError, json.JSONDecodeError) as e:
-        return {"action": "rerender_short", "status": "error", "detail": f"ffprobe failed: {e}"}
 
-    # Load crop config for speaker positioning (lib/crop.py is source of truth)
-    episode_data = _load_json_safe(ep_dir / "episode.json") or {}
-    crop_config = episode_data.get("crop_config") or {}
+        shorts_dir = ep_dir / "shorts"
+        shorts_dir.mkdir(exist_ok=True)
+        subtitles_dir = ep_dir / "subtitles"
+        subtitles_dir.mkdir(exist_ok=True)
 
-    speaker = clip.get("speaker", "BOTH")
-    cx, cy, zoom, _ = resolve_speaker(speaker, src_w, src_h, crop_config)
-    x_offset, y_offset, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "short")
+        audio_bitrate = config.get("processing", {}).get("shorts_audio_bitrate", "128k")
+        encoder_args = get_video_encoder_args(config, crf_key="shorts_crf")
+        lut_filter = get_lut_filter(config)
 
-    # Load config for encoder args
-    from agents.pipeline import load_config
-    config = load_config()
-    encoder_args = get_video_encoder_args(config, crf_key="shorts_crf")
-    audio_bitrate = config.get("processing", {}).get("shorts_audio_bitrate", "128k")
+        # Regenerate per-clip SRT
+        srt_path = subtitles_dir / f"{clip_id}.srt"
+        agent._generate_clip_srt(diarized, start, end, srt_path)
 
-    # Build subtitle filter if SRT exists
-    srt_path = ep_dir / "subtitles" / f"{clip_id}.srt"
-    if srt_path.exists():
-        srt_escaped = escape_srt_path(srt_path)
-        vf = (
-            f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset},"
-            f"scale=1080:1920,"
-            f"subtitles='{srt_escaped}':force_style="
-            f"'FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            f"BorderStyle=3,Outline=1,Shadow=0,MarginV=80'"
+        output_path = shorts_dir / f"{clip_id}.mp4"
+        agent._render_short(
+            merged_path, output_path, srt_path,
+            start, end, segments,
+            src_w, src_h, audio_bitrate,
+            crop_config, encoder_args, lut_filter,
+            audio_mix_path,
         )
-    else:
-        vf = f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset},scale=1080:1920"
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start),
-        "-i", str(merged_path),
-        "-t", str(duration),
-        "-vf", vf,
-        "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
-        *encoder_args,
-        "-r", "30", "-g", "30", "-bf", "0",
-        "-vsync", "cfr",
-        "-pix_fmt", "yuv420p",
-        "-video_track_timescale", "30000",
-        "-c:a", "aac", "-b:a", audio_bitrate,
-        "-use_editlist", "0",
-        "-movflags", "+faststart",
-        str(output_path),
-    ]
-
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as e:
-        return {"action": "rerender_short", "status": "error", "detail": f"ffmpeg failed: {e.stderr[:500]}"}
+    except Exception as e:
+        return {"action": "rerender_short", "status": "error", "detail": str(e)[:500]}
 
     return {"action": "rerender_short", "status": "ok", "clip_id": clip_id, "output": str(output_path)}
 

@@ -149,18 +149,19 @@ class ShortsRenderAgent(BaseAgent):
 
         # Merge very short segments (< 0.5s) into neighbors to avoid ffmpeg failures
         merged = []
-        for seg in clip_segs:
-            if merged and (seg["end"] - seg["start"]) < 0.5:
-                # Absorb into previous segment
-                merged[-1]["end"] = seg["end"]
-            elif not merged and (seg["end"] - seg["start"]) < 0.5 and len(clip_segs) > 1:
-                # Skip — will be absorbed by the next segment's start
-                continue
+        for i, seg in enumerate(clip_segs):
+            if (seg["end"] - seg["start"]) < 0.5:
+                if merged:
+                    # Absorb into previous segment
+                    merged[-1]["end"] = seg["end"]
+                elif i + 1 < len(clip_segs):
+                    # First segment is short — extend next segment's start to absorb it
+                    clip_segs[i + 1]["start"] = seg["start"]
+                else:
+                    # Only segment — keep it regardless of duration
+                    merged.append(seg)
             else:
                 merged.append(seg)
-        # Fix gaps from skipped leading segments
-        if merged and merged[0]["start"] > clip_start:
-            merged[0]["start"] = clip_start
         return merged if merged else clip_segs
 
     def _render_short(

@@ -1,24 +1,25 @@
 # Cascade
 
-Podcast automation pipeline that turns raw Canon MP4 recordings into publish-ready shorts, longform video, and an RSS podcast feed.
+Podcast automation pipeline that turns raw recordings into publish-ready shorts, longform video, and an RSS podcast feed. Supports single-camera or multi-camera setups with external multi-track audio (Zoom H6E or similar).
 
 ## What It Does
 
-Cascade runs a 13-agent pipeline:
+Cascade runs a 14-agent pipeline:
 
-1. **Ingest** — Copy MP4s from SD card to SSD, validate with ffprobe
+1. **Ingest** — Copy media from SD card(s) to SSD, validate with ffprobe, sync external audio
 2. **Stitch** — Concatenate clips via ffmpeg stream-copy
 3. **Audio Analysis** — Detect true stereo vs identical/mono channels
-4. **Speaker Cut** — Segment into L/R/BOTH based on per-channel RMS energy
+4. **Speaker Cut** — Segment speakers via per-channel RMS energy (supports N-speaker multi-track)
 5. **Transcribe** — Deepgram Nova-3 with diarization + SRT generation
 6. **Clip Miner** — Claude identifies top 10 short-form candidates
 7. **Longform Render** — 16:9 speaker-cropped video with hardware encoding
 8. **Shorts Render** — 9:16 shorts with burned-in subtitles
 9. **Metadata Gen** — Per-platform titles, descriptions, hashtags, schedule
-10. **QA** — Validate all outputs (durations, file sizes, formats)
-11. **Podcast Feed** — Extract audio, generate RSS, upload to Cloudflare R2
-12. **Publish** — Distribute to YouTube, TikTok, Instagram
-13. **Backup** — rsync episode to external HDD
+10. **Thumbnail Gen** — AI-generated caricature artwork via OpenAI
+11. **QA** — Validate all outputs (durations, file sizes, formats)
+12. **Podcast Feed** — Extract audio, generate RSS, upload to Cloudflare R2
+13. **Publish** — Distribute to YouTube, TikTok, Instagram, and more
+14. **Backup** — rsync episode to external HDD
 
 Agents run in parallel where possible (transcribe runs alongside audio analysis + speaker cut).
 
@@ -26,8 +27,8 @@ Agents run in parallel where possible (transcribe runs alongside audio analysis 
 
 ### Prerequisites
 
-- **Python 3.10+**
-- **ffmpeg** — `brew install ffmpeg`
+- **Python 3.11+**
+- **ffmpeg** with libass (for subtitle burning) — `brew install ffmpeg` or `brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass`
 - **uv** (recommended) — `brew install uv`
 
 ### Setup
@@ -54,6 +55,7 @@ cp .env.example .env                               # Fill in API keys
 |-----|----------|---------|
 | `ANTHROPIC_API_KEY` | Yes | Claude — clip mining, metadata generation, chat |
 | `DEEPGRAM_API_KEY` | Yes | Nova-3 transcription + speaker diarization |
+| `OPENAI_API_KEY` | No | Thumbnail generation (caricature artwork) |
 | `YOUTUBE_CLIENT_ID` | No | YouTube publishing |
 | `YOUTUBE_CLIENT_SECRET` | No | YouTube publishing |
 | `TIKTOK_CLIENT_KEY` | No | TikTok publishing |
@@ -93,25 +95,26 @@ The web UI lets you review clips, approve/reject them, trim boundaries, chat wit
 
 ```
 cascade/
-├── agents/          # 13 pipeline agents (DAG-parallel execution)
-│   ├── base.py      # BaseAgent ABC (timing, logging, JSON I/O)
+├── agents/          # 14 pipeline agents (DAG-parallel execution)
+│   ├── base.py      # BaseAgent ABC (timing, logging, JSON I/O, config helpers)
 │   ├── pipeline.py  # DAG orchestrator with dependency-aware parallelism
 │   ├── ingest.py → stitch.py → audio_analysis.py → speaker_cut.py
 │   ├── transcribe.py (runs parallel to audio_analysis + speaker_cut)
 │   ├── clip_miner.py → shorts_render.py + metadata_gen.py (parallel)
 │   ├── longform_render.py (starts when speaker_cut + transcribe finish)
-│   ├── qa.py → podcast_feed.py → publish.py → backup.py
+│   ├── thumbnail_gen.py → qa.py → podcast_feed.py → publish.py → backup.py
 │   └── ...
 ├── lib/             # Shared utilities
-│   ├── encoding.py  # VideoToolbox / libx264 encoder selection
+│   ├── encoding.py  # VideoToolbox / libx264 encoder selection + LUT support
 │   ├── ffprobe.py   # ffprobe wrapper
-│   ├── paths.py     # Path resolution
+│   ├── audio_mix.py # Multi-track audio mixing with per-track volume control
+│   ├── paths.py     # Path resolution (external drive fallback)
 │   ├── clips.py     # Clip normalization
-│   └── srt.py       # SRT formatting
+│   └── srt.py       # SRT generation, parsing, and ffmpeg escaping
 ├── server/          # FastAPI app (port 8420)
 │   ├── app.py       # Entry point + static files
-│   └── routes/      # API endpoints (episodes, clips, pipeline, chat, etc.)
-├── frontend/        # Vanilla JS SPA for clip review + chat
+│   └── routes/      # API endpoints (episodes, clips, pipeline, chat, trim, etc.)
+├── frontend/        # Vanilla JS SPA for clip review + chat + audio mix panel
 ├── config/          # config.toml — all settings
 ├── tests/           # pytest + Jest test suites
 └── start.sh         # One-command setup + launch

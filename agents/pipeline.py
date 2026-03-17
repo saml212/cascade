@@ -57,7 +57,8 @@ def run_pipeline(
     Args:
         source_path: Path(s) to source media (directory, file, or list of files).
         audio_path: Optional path to external audio recorder directory (e.g., Zoom H6E).
-        speaker_count: Optional number of speakers for multi-track audio.
+        speaker_count: Optional number of speakers — stored as metadata in episode.json
+            for the frontend crop setup UI. Not used by pipeline agents directly.
         episode_id: Optional episode ID. If None, one is generated.
         agents: Optional list of agent names to run. If None, runs all.
 

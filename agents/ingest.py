@@ -244,9 +244,10 @@ class IngestAgent(BaseAgent):
         if len(cam_full) < sr * 10:
             return {"status": "too_short"}
 
-        # ── Step 1: Find initial offset using ALL tracks ──
-        # Try each track with both FFT and energy envelope correlation,
-        # then find consensus among results.
+        # ── Step 1: Find initial offset ──
+        # Use _smart_correlate (bandpass + envelope + normalization) on each track.
+        # This handles dissimilar mics (camera vs lavalier) by filtering to speech
+        # frequencies and comparing energy patterns, not waveform shape.
         self.logger.info("Step 1: Finding initial offset across all tracks...")
         track_results = []
         for t in tracks:
@@ -254,25 +255,12 @@ class IngestAgent(BaseAgent):
             if len(h6e) < sr * 10:
                 continue
             samples = min(sr * 300, len(cam_full), len(h6e))
-
-            # FFT correlation
-            fft_off, fft_conf = self._correlate(cam_full[:samples], h6e[:samples], sr)
-            # Energy envelope correlation (robust to mic differences)
-            env_off, env_conf = self._envelope_correlate(cam_full[:samples], h6e[:samples], sr)
-
-            # Pick the method with higher confidence
-            if env_conf > fft_conf:
-                offset, conf, method = env_off, env_conf, "envelope"
-            else:
-                offset, conf, method = fft_off, fft_conf, "fft"
-
+            offset, conf = self._smart_correlate(cam_full[:samples], h6e[:samples], sr)
             track_results.append({
-                "track": t, "offset": offset, "confidence": conf, "method": method,
+                "track": t, "offset": offset, "confidence": conf,
                 "h6e_full": h6e,
             })
-            self.logger.info(
-                f"  {t['filename']}: offset={offset:+.4f}s conf={conf:.4f} ({method})"
-            )
+            self.logger.info(f"  {t['filename']}: offset={offset:+.4f}s conf={conf:.4f}")
 
         if not track_results:
             return {"status": "no_sync_track"}
@@ -318,7 +306,7 @@ class IngestAgent(BaseAgent):
             if cam_e > len(cam_full) or h6e_e > len(h6e_full) or h6e_s < 0:
                 continue
 
-            local_off, conf = self._envelope_correlate(
+            local_off, conf = self._smart_correlate(
                 cam_full[cam_s:cam_e], h6e_full[h6e_s:h6e_e], sr
             )
             checkpoints.append({
@@ -404,38 +392,64 @@ class IngestAgent(BaseAgent):
         return max_idx / sr, float(cc[max_idx % fft_size]) / energy
 
     @staticmethod
-    def _envelope_correlate(a: np.ndarray, b: np.ndarray, sr: int,
-                            env_window: float = 0.1) -> tuple[float, float]:
-        """Energy envelope cross-correlation. Compares WHEN sound occurs (RMS peaks)
-        rather than waveform shape — robust to different mic frequency responses.
+    def _smart_correlate(a: np.ndarray, b: np.ndarray, sr: int) -> tuple[float, float]:
+        """Robust audio sync correlation that works with dissimilar mics.
+
+        1. Bandpass filter to speech frequencies (200-4000Hz)
+        2. Compute energy envelope in 50ms windows
+        3. Normalize to unit variance
+        4. Cross-correlate envelopes
 
         Returns (offset_seconds, confidence).
         """
-        win = max(1, int(sr * env_window))
+        from numpy.fft import rfft, irfft
 
-        def rms_envelope(signal):
+        # Bandpass filter 200-4000Hz via FFT
+        def bandpass(signal, sr, lo=200, hi=4000):
+            n = len(signal)
+            spec = rfft(signal.astype(np.float64))
+            freqs = np.fft.rfftfreq(n, 1.0 / sr)
+            spec[(freqs < lo) | (freqs > hi)] = 0
+            return irfft(spec, n).astype(np.float32)
+
+        a_filt = bandpass(a, sr)
+        b_filt = bandpass(b, sr)
+
+        # Energy envelope in 50ms windows
+        win = max(1, int(sr * 0.05))
+        def envelope(signal):
             n = len(signal) // win
             if n == 0:
                 return np.array([])
             frames = signal[:n * win].reshape(n, win).astype(np.float64)
-            return np.sqrt(np.mean(frames ** 2, axis=1))
+            env = np.sqrt(np.mean(frames ** 2, axis=1))
+            # Normalize to unit variance
+            env = env - np.mean(env)
+            std = np.std(env)
+            if std > 0:
+                env = env / std
+            return env
 
-        env_a = rms_envelope(a)
-        env_b = rms_envelope(b)
-        if len(env_a) < 10 or len(env_b) < 10:
+        env_a = envelope(a_filt)
+        env_b = envelope(b_filt)
+        if len(env_a) < 20 or len(env_b) < 20:
             return 0.0, 0.0
 
-        env_a, env_b = env_a - np.mean(env_a), env_b - np.mean(env_b)
-
+        # Cross-correlate
         fft_size = 2 ** int(np.ceil(np.log2(len(env_a) + len(env_b) - 1)))
-        cc = np.real(np.fft.ifft(np.fft.fft(env_a, fft_size) * np.conj(np.fft.fft(env_b, fft_size))))
-        max_idx = int(np.argmax(cc))
+        cc = np.real(np.fft.ifft(
+            np.fft.fft(env_a, fft_size) * np.conj(np.fft.fft(env_b, fft_size))
+        ))
+        # Normalize by geometric mean of energies
+        energy = np.sqrt(np.sum(env_a ** 2) * np.sum(env_b ** 2)) + 1e-10
+        cc_norm = cc / energy
+
+        max_idx = int(np.argmax(cc_norm))
         if max_idx > fft_size // 2:
             max_idx -= fft_size
 
-        energy = np.sqrt(np.sum(env_a ** 2) * np.sum(env_b ** 2)) + 1e-10
-        confidence = float(cc[max_idx % fft_size]) / energy
-        offset = max_idx * env_window  # convert envelope index to seconds
+        confidence = float(cc_norm[max_idx % fft_size])
+        offset = max_idx * 0.05  # envelope frame = 50ms
 
         return offset, confidence
 
