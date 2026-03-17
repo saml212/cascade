@@ -413,9 +413,10 @@ class SpeakerCropConfig(BaseModel):
     label: str
     center_x: int
     center_y: int
-    zoom: float = 1.0
+    zoom: float = 1.0            # Shorts zoom (9:16 portrait crop)
+    longform_zoom: float = 0.75  # Longform zoom (16:9) — lower = wider. Default shows ~2/3 frame.
     track: Optional[int] = None  # H6E track number (1-based) mapped to this speaker
-    volume: float = 1.0  # Audio volume for this speaker's track (0.0-2.0)
+    volume: float = 1.0          # Audio volume for this speaker's track (0.0-2.0)
 
 
 class AmbientTrackConfig(BaseModel):

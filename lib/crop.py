@@ -32,11 +32,15 @@ def compute_crop(src_w, src_h, cx, cy, zoom, mode):
     return x, y, crop_w, crop_h
 
 
-def resolve_speaker(speaker, src_w, src_h, crop_config):
+def resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=False):
     """Resolve a speaker label to (cx, cy, zoom, mode).
 
     Returns (cx, cy, zoom, mode) where mode is "speaker", "wide", or None.
     None means BOTH/NONE with zoom <= 1.0 (passthrough, no crop needed).
+
+    Each speaker can have separate zoom values:
+      zoom          — used for shorts (9:16 portrait)
+      longform_zoom — used for longform (16:9). Falls back to zoom if not set.
     """
     speakers = crop_config.get("speakers", [])
 
@@ -50,7 +54,11 @@ def resolve_speaker(speaker, src_w, src_h, crop_config):
         # Use speakers[] array if available
         if speakers and idx < len(speakers):
             spk = speakers[idx]
-            return spk["center_x"], spk.get("center_y", src_h // 2), spk.get("zoom", 1.0), "speaker"
+            if for_shorts:
+                zoom = spk.get("zoom", 1.0)
+            else:
+                zoom = spk.get("longform_zoom", spk.get("zoom", 1.0))
+            return spk["center_x"], spk.get("center_y", src_h // 2), zoom, "speaker"
 
         # Fallback: legacy speaker_l/speaker_r fields for 2-speaker setups
         if idx <= 1:

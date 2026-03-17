@@ -412,7 +412,7 @@ class ShortsRenderAgent(BaseAgent):
 
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
         """Compute 9:16 crop region (w, h, x, y). Crop math in lib/crop.py."""
-        cx, cy, zoom, _ = resolve_speaker(speaker, src_w, src_h, crop_config)
+        cx, cy, zoom, _ = resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=True)
         x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "short")
         return crop_w, crop_h, x, y
 

@@ -2279,7 +2279,8 @@ async function renderCropSetup(episodeId) {
 
   if (existing && existing.speakers && existing.speakers.length) {
     cropState.speakers = existing.speakers.map(s => ({
-      label: s.label, x: s.center_x, y: s.center_y, zoom: s.zoom || 1.0, track: s.track || null,
+      label: s.label, x: s.center_x, y: s.center_y, zoom: s.zoom || 1.0,
+      longform_zoom: s.longform_zoom || 0.75, track: s.track || null,
     }));
   } else if (existing && existing.speaker_l_center_x != null) {
     // Legacy L/R format
@@ -2297,6 +2298,7 @@ async function renderCropSetup(episodeId) {
         x: Math.round(cropState.sourceWidth * xFrac),
         y: Math.round(cropState.sourceHeight / 2),
         zoom: 1.0,
+        longform_zoom: 0.75,
         track: i + 1,
       });
     }
@@ -2683,8 +2685,9 @@ function redrawCropCanvas() {
     ctx.setLineDash([8, 4]);
     ctx.strokeRect(shortsX, shortsY, shortsCropW, shortsCropH);
 
-    // 16:9 longform crop rect
-    const lfCropW = Math.round((srcW / (2 * zoom)) / sf);
+    // 16:9 longform crop rect (uses longform_zoom, independent of shorts zoom)
+    const lfZoom = s.longform_zoom || 0.75;
+    const lfCropW = Math.round((srcW / (2 * lfZoom)) / sf);
     const lfCropH = Math.round(lfCropW * 9 / 16);
     const lfX = Math.max(0, Math.min(cx - lfCropW / 2, canvas.width - lfCropW));
     const lfY = Math.max(0, Math.min(cy - lfCropH / 2, canvas.height - lfCropH));
@@ -2750,6 +2753,7 @@ async function saveCropConfig(episodeId) {
             center_x: s.x,
             center_y: s.y,
             zoom: s.zoom,
+            longform_zoom: s.longform_zoom || 0.75,
             track: s.track,
             volume: volume,
           };
