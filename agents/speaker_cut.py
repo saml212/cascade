@@ -5,7 +5,6 @@ if one speaker is significantly louder, they win even if others cross threshold.
 """
 
 import subprocess
-import wave
 from pathlib import Path
 
 import numpy as np
@@ -166,8 +165,7 @@ class SpeakerCutAgent(BaseAgent):
 
     @staticmethod
     def _load_wav(path: Path) -> np.ndarray:
-        with wave.open(str(path), "rb") as wf:
-            return np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
+        return np.frombuffer(path.read_bytes(), dtype=np.int16).astype(np.float32)
 
     # -- Segment helpers ---------------------------------------------------------
 

@@ -109,20 +109,18 @@ class AudioAnalysisAgent(BaseAgent):
         }
 
     def _extract_channels(self, input_path: Path, left_out: Path, right_out: Path):
-        """Extract L and R channels as WAV files, downsampled to 16kHz."""
+        """Extract L and R channels as raw s16le PCM, downsampled to 16kHz."""
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-filter_complex", "channelsplit=channel_layout=stereo[L][R]",
-            "-map", "[L]", "-ar", "16000", "-f", "wav", "-acodec", "pcm_s16le", str(left_out),
-            "-map", "[R]", "-ar", "16000", "-f", "wav", "-acodec", "pcm_s16le", str(right_out),
+            "-map", "[L]", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", str(left_out),
+            "-map", "[R]", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", str(right_out),
         ]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-    def _load_wav(self, path: Path) -> np.ndarray:
-        """Load WAV file data as float32 array."""
-        import wave
-        with wave.open(str(path), "rb") as wf:
-            data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-        return data.astype(np.float32)
+    @staticmethod
+    def _load_wav(path: Path) -> np.ndarray:
+        """Load raw PCM s16le data as float32 array."""
+        return np.frombuffer(path.read_bytes(), dtype=np.int16).astype(np.float32)
 
