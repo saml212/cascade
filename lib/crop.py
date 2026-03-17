@@ -1,7 +1,7 @@
 """Shared crop calculation — single source of truth for all render agents.
 
 Formulas must match frontend/app.js redrawCropCanvas(). See comments there.
-  speaker: crop_w = src_w / zoom   — 16:9 (zoom=1 = full frame, zoom=2 = half)
+  speaker: crop_w = src_w / (2 * zoom)   — 16:9 half-frame per speaker
   wide:    crop_w = src_w / zoom   — 16:9 full-frame
   short:   crop_h = src_h / zoom   — 9:16 portrait
 """
@@ -14,7 +14,7 @@ def compute_crop(src_w, src_h, cx, cy, zoom, mode):
     This avoids the crop-then-upscale quality loss at low zoom values.
     """
     if mode == "speaker":
-        crop_w = max(64, int(src_w / zoom))
+        crop_w = max(64, int(src_w / (2 * zoom)))
         crop_h = max(36, int(crop_w * 9 / 16))
     elif mode == "wide":
         crop_w = max(64, int(src_w / zoom))
