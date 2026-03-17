@@ -323,6 +323,28 @@ async def get_sync_preview(episode_id: str, duration: float = 120.0):
     }
 
 
+class SyncOffsetRequest(BaseModel):
+    offset_seconds: float
+
+
+@router.post("/{episode_id}/sync-offset")
+async def save_sync_offset(episode_id: str, req: SyncOffsetRequest):
+    """Save a manually adjusted sync offset."""
+    ep = read_episode(episode_id)
+    if "audio_sync" not in ep:
+        ep["audio_sync"] = {}
+    ep["audio_sync"]["offset_seconds"] = req.offset_seconds
+    ep["audio_sync"]["manually_adjusted"] = True
+    write_episode(episode_id, ep)
+
+    # Delete stale audio_mix.wav so it gets regenerated with the new offset
+    mix_path = EPISODES_DIR / episode_id / "work" / "audio_mix.wav"
+    if mix_path.exists():
+        mix_path.unlink()
+
+    return {"status": "saved", "offset_seconds": req.offset_seconds}
+
+
 @router.get("/{episode_id}/audio-preview/{track_name}")
 async def get_audio_preview(
     episode_id: str,

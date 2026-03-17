@@ -2401,13 +2401,15 @@ async function renderCropSetup(episodeId) {
 
       <div class="flex items-center gap-3 flex-wrap">
         <span class="text-xs text-zinc-500">Offset:</span>
-        <button onclick="adjustSyncOffset(-1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1.0</button>
+        <button onclick="adjustSyncOffset(-10)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-10</button>
+        <button onclick="adjustSyncOffset(-5)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-5</button>
+        <button onclick="adjustSyncOffset(-1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1</button>
         <button onclick="adjustSyncOffset(-0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.1</button>
-        <button onclick="adjustSyncOffset(-0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.01</button>
-        <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[80px] text-center">${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
-        <button onclick="adjustSyncOffset(0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.01</button>
+        <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[100px] text-center">${ep.audio_sync.offset_seconds.toFixed(2)}s</span>
         <button onclick="adjustSyncOffset(0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.1</button>
-        <button onclick="adjustSyncOffset(1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1.0</button>
+        <button onclick="adjustSyncOffset(1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1</button>
+        <button onclick="adjustSyncOffset(5)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+5</button>
+        <button onclick="adjustSyncOffset(10)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+10</button>
         <button onclick="saveSyncOffset('${episodeId}')" id="sync-save-btn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Save Offset</button>
         <button onclick="resetSyncOffset()" id="sync-reset-btn" class="px-3 py-1.5 text-xs bg-zinc-700 hover:bg-zinc-600 rounded font-medium transition-colors text-zinc-300">Reset</button>
       </div>
@@ -2883,13 +2885,15 @@ function renderAudioTab(episodeId, ep) {
 
         <div class="flex items-center gap-2 flex-wrap">
           <span class="text-xs text-zinc-500">Offset:</span>
-          <button onclick="adjustSyncOffset(-1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1.0</button>
+          <button onclick="adjustSyncOffset(-10)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-10</button>
+          <button onclick="adjustSyncOffset(-5)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-5</button>
+          <button onclick="adjustSyncOffset(-1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-1</button>
           <button onclick="adjustSyncOffset(-0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.1</button>
-          <button onclick="adjustSyncOffset(-0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">-0.01</button>
-          <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[80px] text-center">${ep.audio_sync.offset_seconds.toFixed(4)}s</span>
-          <button onclick="adjustSyncOffset(0.01)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.01</button>
+          <span id="sync-offset-display" class="text-sm font-mono text-white px-2 py-1 bg-zinc-800 rounded min-w-[100px] text-center">${ep.audio_sync.offset_seconds.toFixed(2)}s</span>
           <button onclick="adjustSyncOffset(0.1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+0.1</button>
-          <button onclick="adjustSyncOffset(1.0)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1.0</button>
+          <button onclick="adjustSyncOffset(1)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+1</button>
+          <button onclick="adjustSyncOffset(5)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+5</button>
+          <button onclick="adjustSyncOffset(10)" class="px-2 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 rounded transition-colors font-mono">+10</button>
           <button onclick="saveSyncOffset('${episodeId}')" id="sync-save-btn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded font-medium transition-colors">Save Offset</button>
           <button onclick="resetSyncOffset()" class="px-3 py-1.5 text-xs bg-zinc-700 hover:bg-zinc-600 rounded font-medium transition-colors text-zinc-300">Reset</button>
         </div>
