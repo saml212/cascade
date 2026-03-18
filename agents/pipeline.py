@@ -242,6 +242,11 @@ def run_pipeline(
     # Agents that require crop_config to produce correct results
     crop_dependent_agents = {"speaker_cut", "longform_render", "shorts_render"}
     stitch_pause_needed = (bool(requested_set & crop_dependent_agents) and "crop_config" not in episode)
+    # Pause after longform_render for user approval before spending API tokens
+    # on clip mining, metadata, shorts, etc.
+    longform_approval_agents = {"clip_miner", "shorts_render", "metadata_gen"}
+    longform_pause_needed = (bool(requested_set & longform_approval_agents)
+                             and not episode.get("longform_approved"))
     # Special handling: backup must pause for user approval (destructive SD cleanup)
     backup_pause_needed = ("backup" in requested_set and not episode.get("backup_approved"))
 
@@ -283,6 +288,23 @@ def run_pipeline(
                         else:
                             episode.update(ep_check)
                             stitch_pause_needed = False
+
+                # Pause before clip_miner/shorts/metadata until longform is approved
+                if longform_pause_needed and name in longform_approval_agents:
+                    with episode_lock:
+                        with open(mutable["episode_file"]) as f:
+                            ep_check = json.load(f)
+                        if not ep_check.get("longform_approved"):
+                            episode["status"] = "awaiting_longform_approval"
+                            episode["pipeline"].pop("current_agent", None)
+                            _save_episode(mutable["episode_file"], episode)
+                            logger.info(f"Pipeline paused for {mutable['episode_id']}: awaiting longform approval")
+                            for fut in pending_futures:
+                                fut.cancel()
+                            return episode
+                        else:
+                            episode.update(ep_check)
+                            longform_pause_needed = False
 
                 # If backup is ready but not approved, pause for user confirmation
                 if backup_pause_needed and name == "backup":

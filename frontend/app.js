@@ -264,7 +264,7 @@ function startPipelinePoller(episodeId, onUpdate) {
         clearInterval(state.pipelinePollers[key]);
         delete state.pipelinePollers[key];
         // Pipeline finished or paused — refresh the page to show banners/media
-        if (['ready_for_review', 'error', 'awaiting_crop_setup', 'awaiting_backup_approval'].includes(status.status)) {
+        if (['ready_for_review', 'error', 'awaiting_crop_setup', 'awaiting_longform_approval', 'awaiting_backup_approval'].includes(status.status)) {
           setTimeout(() => navigate(), 1000);
         }
       }
@@ -587,6 +587,21 @@ async function renderEpisodeDetail(episodeId, tab) {
       <a href="#/episodes/${episodeId}/crop-setup" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium transition-colors text-white">
         Set Up Crops
       </a>
+    </div>
+    ` : ''}
+
+    ${ep.status === 'awaiting_longform_approval' ? `
+    <div class="mb-6 bg-green-900/30 border border-green-700/50 rounded-lg p-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+        <div>
+          <p class="text-sm font-medium text-green-200">Longform render complete — review before continuing</p>
+          <p class="text-xs text-green-400/70">Watch the longform video above. If it looks good, approve to continue with clip mining, shorts, and metadata (uses API tokens).</p>
+        </div>
+      </div>
+      <button onclick="approveLongform('${episodeId}')" class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition-colors text-white">
+        Approve &amp; Continue
+      </button>
     </div>
     ` : ''}
 
@@ -1085,6 +1100,16 @@ async function approveAll(episodeId) {
   try {
     await api(`/episodes/${episodeId}/auto-approve`, { method: 'POST' });
     showToast('All clips approved.', 'success');
+    await renderEpisodeDetail(episodeId);
+  } catch (err) {
+    showToast('Failed: ' + err.message, 'error');
+  }
+}
+
+async function approveLongform(episodeId) {
+  try {
+    await api(`/episodes/${episodeId}/approve-longform`, { method: 'POST' });
+    showToast('Longform approved — continuing with clip mining and shorts.', 'success');
     await renderEpisodeDetail(episodeId);
   } catch (err) {
     showToast('Failed: ' + err.message, 'error');

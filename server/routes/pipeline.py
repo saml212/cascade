@@ -286,3 +286,40 @@ async def approve_backup(episode_id: str) -> dict:
 
     logger.info("Backup approved and started for %s", episode_id)
     return {"status": "backup_started", "episode_id": episode_id}
+
+
+@router.post("/episodes/{episode_id}/approve-longform")
+async def approve_longform(episode_id: str):
+    """Approve the longform render and resume pipeline for clip mining, shorts, metadata."""
+    async with _pipeline_lock:
+        if episode_id in _running and _running[episode_id].is_alive():
+            raise HTTPException(status_code=409, detail="Pipeline already running")
+
+        episode_file = OUTPUT_DIR / episode_id / "episode.json"
+        if not episode_file.exists():
+            raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+
+        with open(episode_file) as f:
+            episode = json.load(f)
+
+        episode["longform_approved"] = True
+        episode["longform_approved_at"] = datetime.now(timezone.utc).isoformat()
+        episode["status"] = "processing"
+        atomic_write_json(episode_file, episode)
+
+        source_path = episode.get("source_path", "")
+
+        def _run():
+            from agents.pipeline import run_pipeline
+            run_pipeline(
+                source_path=source_path,
+                episode_id=episode_id,
+                agents=["clip_miner", "shorts_render", "metadata_gen", "thumbnail_gen", "qa"],
+            )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        _running[episode_id] = thread
+
+    logger.info("Longform approved, resuming pipeline for %s", episode_id)
+    return {"status": "resumed", "episode_id": episode_id}
