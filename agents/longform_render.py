@@ -152,40 +152,16 @@ class LongformRenderAgent(BaseAgent):
         ]
         timed_ffmpeg(concat_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
-        # Step 2: Get exact video track duration
-        raw_probe = ffprobe(raw_concat)
-        video_dur = None
-        for s in raw_probe["streams"]:
-            if s["codec_type"] == "video" and "duration" in s:
-                video_dur = float(s["duration"])
-                break
-
-        # Step 3: Fix audio nb_frames via WAV extraction + re-encode.
-        # Concatenating N segments accumulates ~3 extra AAC priming/padding
-        # frames per segment, inflating nb_frames in the sample table.
-        # Platforms like Spotify compute audio duration from nb_frames
-        # (nb_frames × 1024 / sample_rate) rather than the container
-        # duration, so the inflated count causes rejection.
-        # Extracting audio as WAV with -t gives exact sample count,
-        # then re-encoding from WAV produces correct nb_frames.
-        clean_wav = work_dir / "audio_clean.wav"
-        wav_cmd = [
-            "ffmpeg", "-y",
-            "-i", str(raw_concat),
-        ]
-        if video_dur:
-            wav_cmd += ["-t", str(video_dur)]
-        wav_cmd += [
-            "-vn",
-            "-c:a", "pcm_s16le", "-ar", "48000",
-            str(clean_wav),
-        ]
-        timed_ffmpeg(wav_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
-
+        # Step 2: Mux video with audio_mix.wav directly.
+        # Per-segment audio encoding is skipped entirely — each AAC segment
+        # adds ~21ms of padding (1024 samples at 48kHz) which accumulates
+        # to seconds of drift over hundreds of segments. Using audio_mix.wav
+        # as a single audio source eliminates this completely.
+        audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else merged_path
         mux_cmd = [
             "ffmpeg", "-y",
             "-i", str(raw_concat),
-            "-i", str(clean_wav),
+            "-i", str(audio_source),
             "-map", "0:v", "-map", "1:a",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", audio_bitrate,
@@ -196,7 +172,6 @@ class LongformRenderAgent(BaseAgent):
         ]
         timed_ffmpeg(mux_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
         raw_concat.unlink(missing_ok=True)
-        clean_wav.unlink(missing_ok=True)
 
         # Validate
         probe = ffprobe(output_path)
@@ -247,45 +222,24 @@ class LongformRenderAgent(BaseAgent):
                 f"Alignment=2'"
             )
 
-        if audio_mix_path and audio_mix_path.exists():
-            # Use pre-mixed H6E audio — offset is already baked into audio_mix.wav,
-            # so we only seek to the segment start time (no additional offset)
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start), "-i", str(source),
-                "-ss", str(start), "-i", str(audio_mix_path),
-                "-t", str(duration),
-                "-map", "0:v", "-map", "1:a",
-                "-vf", vf,
-                *encoder_args,
-                "-r", "30", "-g", "30", "-bf", "0",
-                "-vsync", "cfr",
-                "-pix_fmt", "p010le",
-                "-video_track_timescale", "30000",
-                "-c:a", "aac", "-b:a", audio_bitrate,
-                "-use_editlist", "0",
-                "-movflags", "+faststart",
-                str(output),
-            ]
-        else:
-            # Fallback: camera stereo audio merged to mono
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-i", str(source),
-                "-t", str(duration),
-                "-vf", vf,
-                "-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
-                *encoder_args,
-                "-r", "30", "-g", "30", "-bf", "0",
-                "-vsync", "cfr",
-                "-pix_fmt", "p010le",
-                "-video_track_timescale", "30000",
-                "-c:a", "aac", "-b:a", audio_bitrate,
-                "-use_editlist", "0",
-                "-movflags", "+faststart",
-                str(output),
-            ]
+        # Render VIDEO ONLY — no per-segment audio encoding.
+        # Audio is muxed once at the end from audio_mix.wav to avoid
+        # AAC frame padding accumulation (21ms per segment = seconds of drift).
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-i", str(source),
+            "-t", str(duration),
+            "-an",  # no audio
+            "-vf", vf,
+            *encoder_args,
+            "-r", "30", "-g", "30", "-bf", "0",
+            "-vsync", "cfr",
+            "-pix_fmt", "p010le",
+            "-video_track_timescale", "30000",
+            "-use_editlist", "0",
+            "-movflags", "+faststart",
+            str(output),
+        ]
         timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
     def _get_crop_filter(self, speaker, src_w, src_h, crop_config):

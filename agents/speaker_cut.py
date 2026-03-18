@@ -98,6 +98,19 @@ class SpeakerCutAgent(BaseAgent):
 
         segments = self._finalize_segments(labels, frame_sec, n_frames, min_seg)
 
+        # Anticipate cuts: shift each segment start 0.3s earlier so the camera
+        # switches just before the speaker begins talking, not after.
+        # Since this is pre-rendered (not live), we can look ahead.
+        anticipate = 0.3
+        for i in range(1, len(segments)):
+            prev_end = segments[i - 1]["end"]
+            new_start = max(prev_end, segments[i]["start"] - anticipate)
+            # Extend previous segment to fill the gap
+            segments[i - 1]["end"] = new_start
+            segments[i]["start"] = new_start
+        for seg in segments:
+            seg["duration"] = round(seg["end"] - seg["start"], 3)
+
         self.logger.info(f"{mode} cut: {len(segments)} segments, {n_frames} frames, {n_spk} speakers")
         work = self.episode_dir / "work"
         for i, s in enumerate(smoothed):
