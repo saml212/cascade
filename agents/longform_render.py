@@ -114,9 +114,8 @@ class LongformRenderAgent(BaseAgent):
                 srt_path = srt_dir / f"seg_{i:04d}.srt"
                 future = executor.submit(
                     self._render_segment,
-                    merged_path, seg_path, seg, src_w, src_h, audio_bitrate,
+                    merged_path, seg_path, seg, src_w, src_h,
                     crop_config, srt_path, encoder_args, lut_filter,
-                    audio_mix_path,
                 )
                 futures[future] = (i, seg_path)
 
@@ -173,6 +172,14 @@ class LongformRenderAgent(BaseAgent):
         timed_ffmpeg(mux_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
         raw_concat.unlink(missing_ok=True)
 
+        # Clean up intermediate segment files (~400+ files, gigabytes)
+        for f in work_dir.glob("longform_seg_*.mp4"):
+            f.unlink(missing_ok=True)
+        for f in srt_dir.glob("seg_*.srt"):
+            f.unlink(missing_ok=True)
+        concat_list.unlink(missing_ok=True)
+        self.logger.info("Cleaned up intermediate segment files")
+
         # Validate
         probe = ffprobe(output_path)
         output_duration = float(probe["format"]["duration"])
@@ -191,14 +198,12 @@ class LongformRenderAgent(BaseAgent):
         segment: dict,
         src_w: int,
         src_h: int,
-        audio_bitrate: str,
         crop_config: dict,
         srt_path: Path = None,
         encoder_args: list = None,
         lut_filter: str = "",
-        audio_mix_path: Path = None,
     ):
-        """Render a single segment with speaker-appropriate crop and subtitles."""
+        """Render a single video-only segment with speaker-appropriate crop and subtitles."""
         start = segment["start"]
         duration = segment["end"] - segment["start"]
         speaker = segment["speaker"]
