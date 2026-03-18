@@ -244,8 +244,10 @@ def run_pipeline(
     stitch_pause_needed = (bool(requested_set & crop_dependent_agents) and "crop_config" not in episode)
     # Pause after longform_render for user approval before spending API tokens
     # on clip mining, metadata, shorts, etc.
+    # Only pause if longform_render is in the requested set AND has completed.
     longform_approval_agents = {"clip_miner", "shorts_render", "metadata_gen"}
     longform_pause_needed = (bool(requested_set & longform_approval_agents)
+                             and "longform_render" in requested_set
                              and not episode.get("longform_approved"))
     # Special handling: backup must pause for user approval (destructive SD cleanup)
     backup_pause_needed = ("backup" in requested_set and not episode.get("backup_approved"))
@@ -290,7 +292,9 @@ def run_pipeline(
                             stitch_pause_needed = False
 
                 # Pause before clip_miner/shorts/metadata until longform is approved
-                if longform_pause_needed and name in longform_approval_agents:
+                # Only pause if longform_render has actually completed
+                if longform_pause_needed and name in longform_approval_agents \
+                        and "longform_render" in completed:
                     with episode_lock:
                         with open(mutable["episode_file"]) as f:
                             ep_check = json.load(f)
