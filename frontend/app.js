@@ -2686,7 +2686,7 @@ function redrawCropCanvas() {
     ctx.strokeRect(shortsX, shortsY, shortsCropW, shortsCropH);
 
     // 16:9 longform crop rect (uses longform_zoom, independent of shorts zoom)
-    const lfZoom = s.longform_zoom || 0.75;
+    const lfZoom = spk.longform_zoom || 0.75;
     const lfCropW = Math.round((srcW / (2 * lfZoom)) / sf);
     const lfCropH = Math.round(lfCropW * 9 / 16);
     const lfX = Math.max(0, Math.min(cx - lfCropW / 2, canvas.width - lfCropW));
