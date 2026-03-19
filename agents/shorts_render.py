@@ -229,9 +229,13 @@ class ShortsRenderAgent(BaseAgent):
             "-pix_fmt", "p010le",
             "-video_track_timescale", "30000",
             "-use_editlist", "0",
+            "-movflags", "+faststart",
             str(temp_video),
         ]
         timed_ffmpeg(cmd_video, agent_logger=self.logger, capture_output=True, text=True, check=True)
+
+        if not temp_video.exists() or temp_video.stat().st_size == 0:
+            raise RuntimeError(f"Video render produced empty file: {temp_video}")
 
         # Step 2: mux with audio from audio_mix.wav (precise WAV seek)
         audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
