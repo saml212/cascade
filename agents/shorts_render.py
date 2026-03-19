@@ -250,22 +250,20 @@ class ShortsRenderAgent(BaseAgent):
                 if lut_filter:
                     vf = lut_filter + "," + vf
 
-                extra_inputs, map_args, af_args = _audio_args(seg_start)
+                # Render VIDEO ONLY — audio muxed once at the end to avoid
+                # AAC frame padding accumulation (21ms per segment)
                 cmd = [
                     "ffmpeg", "-y",
                     "-ss", str(seg_start),
                     "-i", str(source),
-                    *extra_inputs,
                     "-t", str(seg_duration),
-                    *map_args,
+                    "-an",
                     "-vf", vf,
-                    *af_args,
                     *encoder_args,
                     "-r", "30", "-g", "30", "-bf", "0",
                     "-vsync", "cfr",
                     "-pix_fmt", "p010le",
                     "-video_track_timescale", "30000",
-                    "-c:a", "aac", "-b:a", audio_bitrate,
                     "-use_editlist", "0",
                     str(seg_output),
                 ]
@@ -283,9 +281,7 @@ class ShortsRenderAgent(BaseAgent):
                 for sf in seg_files:
                     f.write(f"file '{sf}'\n")
 
-            # Concat segments, then re-mux with -t to match video duration.
-            # Segment concat can create timing gaps that make audio longer
-            # than video — platforms like Spotify reject this.
+            # Concat video-only segments
             raw_concat = work_dir / "concat_raw.mp4"
             concat_cmd = [
                 "ffmpeg", "-y",
@@ -296,32 +292,14 @@ class ShortsRenderAgent(BaseAgent):
             ]
             subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
 
-            # Probe video duration and hard-stop both tracks there
-            probe_cmd = [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_streams", str(raw_concat),
-            ]
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-            streams = json.loads(probe_result.stdout).get("streams", [])
-            video_dur = None
-            for s in streams:
-                if s.get("codec_type") == "video" and "duration" in s:
-                    video_dur = float(s["duration"])
-                    break
-
-            # Extract audio as WAV to fix nb_frames inflation from
-            # accumulated AAC priming/padding across concat segments.
-            clean_wav = work_dir / "audio_clean.wav"
-            wav_cmd = ["ffmpeg", "-y", "-i", str(raw_concat)]
-            if video_dur:
-                wav_cmd += ["-t", str(video_dur)]
-            wav_cmd += ["-vn", "-c:a", "pcm_s16le", "-ar", "48000", str(clean_wav)]
-            subprocess.run(wav_cmd, capture_output=True, text=True, check=True)
-
+            # Mux with audio_mix.wav directly (same fix as longform) —
+            # avoids AAC frame padding accumulation from per-segment encoding
+            audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
             mux_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(raw_concat),
-                "-i", str(clean_wav),
+                "-ss", str(start), "-i", str(audio_source),
+                "-t", str(end - start),
                 "-map", "0:v", "-map", "1:a",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", audio_bitrate,
@@ -334,7 +312,6 @@ class ShortsRenderAgent(BaseAgent):
             if not output.exists() or output.stat().st_size == 0:
                 raise RuntimeError(f"Mux produced empty output: {output}")
             raw_concat.unlink(missing_ok=True)
-            clean_wav.unlink(missing_ok=True)
         finally:
             # Clean up work files
             for f in work_dir.glob("*"):
