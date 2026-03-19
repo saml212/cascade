@@ -192,137 +192,40 @@ class ShortsRenderAgent(BaseAgent):
 
         # If only one segment (or all same speaker), render directly
         speakers = set(s["speaker"] for s in clip_segs)
-        if len(clip_segs) == 1 or len(speakers) == 1:
-            speaker = clip_segs[0]["speaker"]
-            duration = end - start
-            vf = self._get_short_crop_filter(speaker, src_w, src_h, srt_path, crop_config)
-            if lut_filter:
-                vf = lut_filter + "," + vf
-            extra_inputs, map_args, af_args = _audio_args(start)
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-i", str(source),
-                *extra_inputs,
-                "-t", str(duration),
-                *map_args,
-                "-vf", vf,
-                *af_args,
-                *encoder_args,
-                "-r", "30", "-g", "30", "-bf", "0",
-                "-vsync", "cfr",
-                "-pix_fmt", "p010le",
-                "-video_track_timescale", "30000",
-                "-c:a", "aac", "-b:a", audio_bitrate,
-                "-use_editlist", "0",
-                "-movflags", "+faststart",
-                str(output),
-            ]
-            timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
-            return
+        # Find the dominant speaker for this clip (most time in the clip)
+        speaker_time = {}
+        for seg in clip_segs:
+            spk = seg["speaker"]
+            speaker_time[spk] = speaker_time.get(spk, 0) + (seg["end"] - seg["start"])
+        speaker = max(speaker_time, key=speaker_time.get)
 
-        # Multiple segments with different speakers — render each, then concat
-        # Use episode work dir (not system temp) so ffmpeg/libass can reliably access SRT files
-        clip_name = output.stem
-        work_dir = output.parent.parent / "work" / f"shorts_{clip_name}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        seg_files = []
-
-        try:
-            for idx, seg in enumerate(clip_segs):
-                seg_start = seg["start"]
-                seg_end = seg["end"]
-                seg_duration = seg_end - seg_start
-                speaker = seg["speaker"]
-
-                # Generate per-segment SRT (time-offset to segment-relative)
-                seg_srt_path = work_dir / f"seg_{idx}.srt"
-                self._generate_segment_srt(srt_path, seg_start - start, seg_end - start, seg_srt_path)
-
-                seg_output = work_dir / f"seg_{idx}.mp4"
-
-                # Use crop filter with or without subtitles depending on SRT content
-                has_subs = seg_srt_path.stat().st_size > 0
-                if has_subs:
-                    vf = self._get_short_crop_filter(speaker, src_w, src_h, seg_srt_path, crop_config)
-                else:
-                    vf = self._get_short_crop_filter_no_subs(speaker, src_w, src_h, crop_config)
-                if lut_filter:
-                    vf = lut_filter + "," + vf
-
-                # Render VIDEO ONLY — audio muxed once at the end to avoid
-                # AAC frame padding accumulation (21ms per segment)
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(seg_start),
-                    "-i", str(source),
-                    "-t", str(seg_duration),
-                    "-an",
-                    "-vf", vf,
-                    *encoder_args,
-                    "-r", "30", "-g", "30", "-bf", "0",
-                    "-vsync", "cfr",
-                    "-pix_fmt", "p010le",
-                    "-video_track_timescale", "30000",
-                    "-use_editlist", "0",
-                    str(seg_output),
-                ]
-                result = timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"ffmpeg failed (exit {result.returncode}) for segment {idx} "
-                        f"(speaker={speaker}, dur={seg_duration:.2f}s):\n{result.stderr[-1000:]}"
-                    )
-                seg_files.append(seg_output)
-
-            # Concat all segments
-            concat_list = work_dir / "concat.txt"
-            with open(concat_list, "w") as f:
-                for sf in seg_files:
-                    f.write(f"file '{sf}'\n")
-
-            # Concat video-only segments
-            raw_concat = work_dir / "concat_raw.mp4"
-            concat_cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_list),
-                "-c", "copy",
-                str(raw_concat),
-            ]
-            subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
-
-            # Mux with audio_mix.wav directly (same fix as longform) —
-            # avoids AAC frame padding accumulation from per-segment encoding
-            audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
-            mux_cmd = [
-                "ffmpeg", "-y",
-                "-i", str(raw_concat),
-                "-ss", str(start), "-i", str(audio_source),
-                "-t", str(end - start),
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", audio_bitrate,
-                "-shortest",
-                "-use_editlist", "0",
-                "-movflags", "+faststart",
-                str(output),
-            ]
-            subprocess.run(mux_cmd, capture_output=True, text=True, check=True)
-            if not output.exists() or output.stat().st_size == 0:
-                raise RuntimeError(f"Mux produced empty output: {output}")
-            raw_concat.unlink(missing_ok=True)
-        finally:
-            # Clean up work files
-            for f in work_dir.glob("*"):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-            try:
-                os.rmdir(work_dir)
-            except OSError:
-                pass
+        # Single-pass render with dominant speaker's crop + audio_mix.wav.
+        # No per-segment splitting/concat — avoids AAC padding accumulation.
+        duration = end - start
+        vf = self._get_short_crop_filter(speaker, src_w, src_h, srt_path, crop_config)
+        if lut_filter:
+            vf = lut_filter + "," + vf
+        extra_inputs, map_args, af_args = _audio_args(start)
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", str(source),
+            *extra_inputs,
+            "-t", str(duration),
+            *map_args,
+            "-vf", vf,
+            *af_args,
+            *encoder_args,
+            "-r", "30", "-g", "30", "-bf", "0",
+            "-vsync", "cfr",
+            "-pix_fmt", "p010le",
+            "-video_track_timescale", "30000",
+            "-c:a", "aac", "-b:a", audio_bitrate,
+            "-use_editlist", "0",
+            "-movflags", "+faststart",
+            str(output),
+        ]
+        timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
     def _generate_segment_srt(self, clip_srt_path, seg_start_rel, seg_end_rel, out_path):
         """Extract subtitle entries from the clip SRT that fall within segment bounds.
