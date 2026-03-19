@@ -199,33 +199,56 @@ class ShortsRenderAgent(BaseAgent):
             speaker_time[spk] = speaker_time.get(spk, 0) + (seg["end"] - seg["start"])
         speaker = max(speaker_time, key=speaker_time.get)
 
-        # Single-pass render with dominant speaker's crop + audio_mix.wav.
-        # No per-segment splitting/concat — avoids AAC padding accumulation.
+        # Two-step render: video-only first, then mux audio separately.
+        # -ss before -i on HEVC seeks to nearest keyframe (imprecise).
+        # WAV seek is sample-accurate. Rendering them together creates
+        # a mismatch. Separating them and using trim/atrim filters for
+        # precise frame-accurate sync eliminates this.
         duration = end - start
         vf = self._get_short_crop_filter(speaker, src_w, src_h, srt_path, crop_config)
         if lut_filter:
             vf = lut_filter + "," + vf
-        extra_inputs, map_args, af_args = _audio_args(start)
-        cmd = [
+
+        # Coarse seek to 5s before target for speed, then precise trim
+        coarse_seek = max(0, start - 5)
+        trim_start = start - coarse_seek
+        trim_end = trim_start + duration
+
+        work_dir = output.parent.parent / "work"
+        temp_video = work_dir / f"short_temp_{output.stem}.mp4"
+
+        # Step 1: video-only with precise trim filter
+        cmd_video = [
             "ffmpeg", "-y",
-            "-ss", str(start),
-            "-i", str(source),
-            *extra_inputs,
-            "-t", str(duration),
-            *map_args,
-            "-vf", vf,
-            *af_args,
+            "-ss", str(coarse_seek), "-i", str(source),
+            "-an",
+            "-vf", f"trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS," + vf,
             *encoder_args,
             "-r", "30", "-g", "30", "-bf", "0",
             "-vsync", "cfr",
             "-pix_fmt", "p010le",
             "-video_track_timescale", "30000",
+            "-use_editlist", "0",
+            str(temp_video),
+        ]
+        timed_ffmpeg(cmd_video, agent_logger=self.logger, capture_output=True, text=True, check=True)
+
+        # Step 2: mux with audio from audio_mix.wav (precise WAV seek)
+        audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
+        cmd_mux = [
+            "ffmpeg", "-y",
+            "-i", str(temp_video),
+            "-ss", str(start), "-i", str(audio_source),
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy",
             "-c:a", "aac", "-b:a", audio_bitrate,
+            "-shortest",
             "-use_editlist", "0",
             "-movflags", "+faststart",
             str(output),
         ]
-        timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        timed_ffmpeg(cmd_mux, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        temp_video.unlink(missing_ok=True)
 
     def _generate_segment_srt(self, clip_srt_path, seg_start_rel, seg_end_rel, out_path):
         """Extract subtitle entries from the clip SRT that fall within segment bounds.
