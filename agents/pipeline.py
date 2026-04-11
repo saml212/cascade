@@ -184,6 +184,8 @@ def run_pipeline(
                 episode["audio_sync"] = result["audio_sync"]
             if "audio" in result:
                 episode["audio_tracks"] = result["audio"].get("tracks", [])
+            if "source_properties" in result and result["source_properties"]:
+                episode["source_properties"] = result["source_properties"]
             _save_episode(mutable["episode_file"], episode)
 
         # After stitch, remove source/ directory to reclaim ~20GB

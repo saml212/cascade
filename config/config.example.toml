@@ -18,16 +18,38 @@ max_channel_rms_ratio_delta = 3.0         # dB; below this = channels identical
 clip_min_seconds = 30                     # Minimum clip duration
 clip_max_seconds = 90                     # Maximum clip duration
 clip_count = 10                           # Number of clips to generate
-output_resolution = "1920x1080"           # Longform output resolution
-shorts_resolution = "1080x1920"           # Shorts output resolution
+preserve_source_resolution = true         # Use source resolution for longform (4K stays 4K, 1080p stays 1080p)
+output_resolution = "1920x1080"           # Fallback when preserve_source_resolution=false
+shorts_resolution = "1080x1920"           # Shorts output resolution (always portrait)
 video_crf = 22                            # CRF for longform
 shorts_crf = 20                           # CRF for shorts
 audio_bitrate = "192k"                    # Audio bitrate for longform
-shorts_audio_bitrate = "128k"             # Audio bitrate for shorts
+shorts_audio_bitrate = "192k"             # Audio bitrate for shorts
 use_hardware_accel = true                 # Use VideoToolbox (macOS) or VAAPI (Linux)
-videotoolbox_quality = 80                 # VideoToolbox quality (lower = higher quality, 60-85 typical)
+videotoolbox_quality = 65                 # VideoToolbox H.264 quality (0-100, higher=better; 60-70 sweet spot)
 lut_path = ""                             # Path to .cube LUT file for color grading (optional)
 lut_interpolation = "tetrahedral"         # LUT interpolation: "tetrahedral" (accurate) or "trilinear" (fast)
+
+# Video polish (post-LUT enhancement chain)
+video_denoise = true                      # hqdn3d gentle denoise (removes HEVC mosquito noise)
+video_sharpen = true                      # CAS contrast-adaptive sharpening
+video_sharpen_strength = 0.3              # CAS strength 0.0-1.0 (0.3 gentle, 0.5+ aggressive)
+video_polish = true                       # eq filter tonal polish
+video_contrast = 1.0                      # eq contrast (1.0 = no change; LUT handles contrast)
+video_saturation = 1.04                   # eq saturation (subtle lift only)
+video_gamma = 1.01                        # eq gamma (very subtle brightness lift)
+
+# Audio enhancement (Spotify/Apple/YouTube compliant — single master)
+audio_enhance = true                     # Enable audio enhancement pipeline
+audio_target_lufs = -16                  # Target loudness LUFS (-16 = Apple ±1 gate; Spotify/YT normalize down)
+audio_target_lra = 7                     # Target loudness range (6-8 = tight spoken dialogue)
+audio_target_tp = -1.0                   # True peak ceiling dBTP (-1.0 safe for AAC/Vorbis transcode)
+audio_highpass_hz = 80                   # Highpass cutoff Hz (4-pole Butterworth)
+audio_lowpass_hz = 16000                 # Lowpass cutoff Hz (16k preserves "air" for headphones)
+audio_afftdn = true                      # FFT-based stationary noise removal (light when DFN3 active)
+audio_declick = true                     # Autoregressive declicking (mouth clicks, chair squeaks)
+audio_deesser = true                     # Sibilance control at 5-8 kHz
+audio_denoise_model = "deepfilternet"    # ML denoise: "deepfilternet" (default), "none", or "MossFormer2_SE_48K"
 
 [transcription]
 provider = "deepgram"                     # Transcription provider

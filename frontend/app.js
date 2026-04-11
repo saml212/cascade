@@ -253,20 +253,46 @@ function clearAllPollers() {
   });
 }
 
+// Terminal statuses — once an episode reaches one of these, the poller
+// permanently stops. Any other status (processing, awaiting_*, error) is
+// considered transient and will keep polling.
+const TERMINAL_STATUSES = ['approved', 'cancelled', 'published'];
+
 function startPipelinePoller(episodeId, onUpdate) {
   const key = `pipeline-${episodeId}`;
   if (state.pipelinePollers[key]) clearInterval(state.pipelinePollers[key]);
+
+  let lastStatus = null;
+  let lastRunning = null;
+
   state.pipelinePollers[key] = setInterval(async () => {
     try {
       const status = await api(`/episodes/${episodeId}/pipeline-status`);
       onUpdate(status);
-      if (!status.is_running) {
+
+      const statusChanged = lastStatus !== status.status || lastRunning !== status.is_running;
+      lastStatus = status.status;
+      lastRunning = status.is_running;
+
+      // Stop polling only when the episode is definitively done
+      if (TERMINAL_STATUSES.includes(status.status)) {
         clearInterval(state.pipelinePollers[key]);
         delete state.pipelinePollers[key];
-        // Pipeline finished or paused — refresh the page to show banners/media
-        if (['ready_for_review', 'error', 'awaiting_crop_setup', 'awaiting_longform_approval', 'awaiting_backup_approval'].includes(status.status)) {
-          setTimeout(() => navigate(), 1000);
-        }
+        return;
+      }
+
+      // If the pipeline just transitioned from running → not running AND the
+      // user is viewing the episode-detail page for this episode, refresh the
+      // page to show new banners/media. This does NOT yank them out of
+      // crop-setup, clip-detail, or another episode.
+      if (!status.is_running && statusChanged &&
+          ['ready_for_review', 'error', 'awaiting_crop_setup', 'awaiting_longform_approval', 'awaiting_backup_approval'].includes(status.status)) {
+        setTimeout(() => {
+          const route = getRoute();
+          if (route.view === 'episode-detail' && route.episodeId === episodeId) {
+            navigate();
+          }
+        }, 1000);
       }
     } catch {
       // Silently ignore polling errors
@@ -337,22 +363,23 @@ async function renderDashboard() {
 
   loadScheduleSidebar();
 
-  // Check pipeline status for episodes that might be running
-  // (status could be 'processing', 'awaiting_crop_setup', 'awaiting_backup_approval', etc.)
-  episodes.forEach(async (ep) => {
+  // Start a poller for EVERY episode so status changes are reflected live
+  // regardless of the initial state (processing, awaiting_*, error, etc.).
+  // The poller self-terminates when the pipeline is fully idle AND in a
+  // terminal state (ready_for_review, approved, cancelled, published).
+  episodes.forEach((ep) => {
     const id = ep.episode_id || ep.id;
-    if (ep.status === 'processing') {
-      startPipelinePoller(id, (status) => updateEpisodeCardStatus(id, status));
-    } else if (!['ready_for_review', 'error', 'cancelled', 'approved'].includes(ep.status)) {
-      // Check if pipeline is actually running despite non-processing status
-      try {
-        const status = await api(`/episodes/${id}/pipeline-status`);
-        if (status.is_running) {
-          updateEpisodeCardStatus(id, status);
-          startPipelinePoller(id, (status) => updateEpisodeCardStatus(id, status));
+    startPipelinePoller(id, (status) => {
+      updateEpisodeCardStatus(id, status);
+      // Also refresh the card's status badge if it changed
+      if (status.status && status.status !== ep.status) {
+        ep.status = status.status;
+        const badgeEl = document.querySelector(`#episode-card-${id} .status-badge`);
+        if (badgeEl && badgeEl.outerHTML) {
+          badgeEl.outerHTML = statusBadge(status.status);
         }
-      } catch {}
-    }
+      }
+    });
   });
 }
 
@@ -376,6 +403,9 @@ function episodeCard(ep) {
           <p class="text-xs text-zinc-600 mt-1">${ep.episode_name ? escapeHtml(id) + ' &middot; ' : ''}${ep.created_at ? new Date(ep.created_at).toLocaleDateString() : ''}</p>
         </div>
         <div class="flex items-center gap-1 flex-shrink-0 mt-1">
+          <a href="#/episodes/${id}/crop-setup" onclick="event.stopPropagation()" class="p-1.5 text-zinc-500 hover:text-amber-400 hover:bg-amber-900/30 transition-colors rounded" title="Edit crop">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
+          </a>
           <button onclick="event.preventDefault(); event.stopPropagation(); deleteEpisodeFromDashboard('${id}')" class="p-1.5 text-zinc-500 hover:text-red-400 hover:bg-red-900/30 transition-colors rounded" title="Delete episode">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
           </button>
@@ -392,6 +422,19 @@ function episodeCard(ep) {
 }
 
 function updateEpisodeCardStatus(episodeId, status) {
+  // Update the status badge inline on the dashboard card so stale statuses
+  // don't persist after the pipeline transitions.
+  const card = document.getElementById(`episode-card-${episodeId}`);
+  if (card && status.status) {
+    const oldBadge = card.querySelector('[class*="status-"]');
+    if (oldBadge) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = statusBadge(status.status);
+      const newBadge = wrapper.firstElementChild;
+      if (newBadge) oldBadge.replaceWith(newBadge);
+    }
+  }
+
   const mini = document.getElementById(`pipeline-mini-${episodeId}`);
   if (!mini) return;
   mini.classList.remove('hidden');
@@ -403,12 +446,27 @@ function updateEpisodeCardStatus(episodeId, status) {
         <span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
         <span>${escapeHtml(status.current_agent || 'Running')}${pctText}...</span>
       </div>`;
-  } else {
+  } else if (['ready_for_review', 'approved', 'published'].includes(status.status)) {
     mini.innerHTML = `
       <div class="flex items-center gap-2 text-xs text-green-400">
         <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
         <span>Pipeline complete</span>
       </div>`;
+  } else if (status.status === 'error') {
+    mini.innerHTML = `
+      <div class="flex items-center gap-2 text-xs text-red-400">
+        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        <span>Error — needs attention</span>
+      </div>`;
+  } else if (status.status && status.status.startsWith('awaiting_')) {
+    const label = status.status.replace('awaiting_', '').replace(/_/g, ' ');
+    mini.innerHTML = `
+      <div class="flex items-center gap-2 text-xs text-amber-400">
+        <span class="inline-block w-2 h-2 rounded-full bg-amber-400"></span>
+        <span>Waiting: ${escapeHtml(label)}</span>
+      </div>`;
+  } else {
+    mini.classList.add('hidden');
   }
 }
 
@@ -557,6 +615,10 @@ async function renderEpisodeDetail(episodeId, tab) {
         <p class="text-xs text-zinc-600 mt-1">${escapeHtml(episodeId)}</p>
       </div>
       <div class="flex items-center gap-2">
+        <a href="#/episodes/${episodeId}/crop-setup" class="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 border border-amber-600 rounded-lg text-xs font-medium transition-colors text-white flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
+          Edit Crop
+        </a>
         <button onclick="rerunPipeline('${episodeId}')" class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5">
           <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
           Re-run Pipeline
@@ -586,6 +648,17 @@ async function renderEpisodeDetail(episodeId, tab) {
       </div>
       <a href="#/episodes/${episodeId}/crop-setup" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium transition-colors text-white">
         Set Up Crops
+      </a>
+    </div>
+    ` : ep.crop_config ? `
+    <!-- Persistent "Edit Crop" link for episodes that already have a crop config -->
+    <div class="mb-6 bg-zinc-900 border border-zinc-800 rounded-lg p-3 flex items-center justify-between text-xs">
+      <span class="text-zinc-500">
+        Crop config: ${(ep.crop_config.speakers || []).length} speakers
+        ${ep.crop_config.source_width ? `· source ${ep.crop_config.source_width}×${ep.crop_config.source_height}` : ''}
+      </span>
+      <a href="#/episodes/${episodeId}/crop-setup" class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-300 hover:text-white font-medium transition-colors">
+        Edit Crop
       </a>
     </div>
     ` : ''}
@@ -2302,29 +2375,41 @@ async function renderCropSetup(episodeId) {
   cropState.sourceWidth = (existing && existing.source_width) || 1920;
   cropState.sourceHeight = (existing && existing.source_height) || 1080;
 
+  // Determine if this is a camera-audio episode (no H6E tracks).
+  // For these, we should NOT assign H6E track numbers — speaker_cut will
+  // fall back to L/R camera audio mode where speaker_0 = left channel,
+  // speaker_1 = right channel.
+  const hasH6ETracks = (ep.audio_tracks || []).filter(t => t.track_type === 'input').length > 0;
+
   if (existing && existing.speakers && existing.speakers.length) {
     cropState.speakers = existing.speakers.map(s => ({
       label: s.label, x: s.center_x, y: s.center_y, zoom: s.zoom || 1.0,
-      longform_zoom: s.longform_zoom || 0.75, track: s.track || null,
+      longform_zoom: s.longform_zoom || 0.75,
+      track: hasH6ETracks ? (s.track || null) : null,
     }));
   } else if (existing && existing.speaker_l_center_x != null) {
     // Legacy L/R format
     cropState.speakers = [
-      { label: 'Speaker 0', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, track: 1 },
-      { label: 'Speaker 1', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, track: 2 },
+      { label: hasH6ETracks ? 'Speaker 0' : 'Speaker 0 (Left)', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, track: hasH6ETracks ? 1 : null },
+      { label: hasH6ETracks ? 'Speaker 1' : 'Speaker 1 (Right)', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, track: hasH6ETracks ? 2 : null },
     ];
   } else {
     // Defaults: spread speakers evenly across the frame
     cropState.speakers = [];
     for (let i = 0; i < speakerCount; i++) {
       const xFrac = (i + 1) / (speakerCount + 1);
+      // Camera-audio mode: label clearly with L/R channel hint (only valid for 2-speaker mode)
+      let label = `Speaker ${i}`;
+      if (!hasH6ETracks && speakerCount === 2) {
+        label = i === 0 ? 'Speaker 0 (Left)' : 'Speaker 1 (Right)';
+      }
       cropState.speakers.push({
-        label: `Speaker ${i}`,
+        label,
         x: Math.round(cropState.sourceWidth * xFrac),
         y: Math.round(cropState.sourceHeight / 2),
         zoom: 1.0,
         longform_zoom: 0.75,
-        track: i + 1,
+        track: hasH6ETracks ? (i + 1) : null,
       });
     }
   }
@@ -2443,6 +2528,33 @@ async function renderCropSetup(episodeId) {
         <button onclick="syncZoomToFit()" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">Zoom to fit</button>
       </div>
     </div>` : ''}
+
+    ${!hasH6ETracks ? `
+    <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-semibold text-zinc-300">Identify Speakers (Camera Audio L/R)</h3>
+        <span class="text-xs text-zinc-500">No H6E tracks — using camera stereo audio</span>
+      </div>
+      <p class="text-xs text-zinc-500 mb-3">
+        Each channel of the camera audio carries one speaker. Listen to each side to figure out
+        who's where, then label the speakers below accordingly.
+      </p>
+      <div class="grid grid-cols-2 gap-3">
+        <div class="flex items-center gap-2 bg-zinc-950 border border-zinc-800 rounded p-3">
+          <span class="text-sm font-semibold text-zinc-300 w-20">⬅ Left =<br><span class="text-xs text-zinc-500">Speaker 0</span></span>
+          <audio id="ch-preview-left" controls preload="none" class="flex-1 h-8" style="filter: invert(0.85);">
+            <source src="/api/episodes/${episodeId}/channel-preview/left?start=60&amp;duration=60" type="audio/mpeg">
+          </audio>
+        </div>
+        <div class="flex items-center gap-2 bg-zinc-950 border border-zinc-800 rounded p-3">
+          <span class="text-sm font-semibold text-zinc-300 w-20">Right ➡<br><span class="text-xs text-zinc-500">Speaker 1</span></span>
+          <audio id="ch-preview-right" controls preload="none" class="flex-1 h-8" style="filter: invert(0.85);">
+            <source src="/api/episodes/${episodeId}/channel-preview/right?start=60&amp;duration=60" type="audio/mpeg">
+          </audio>
+        </div>
+      </div>
+    </div>
+    ` : ''}
 
     ${allAudioTracks.length > 0 ? `
     <div id="audio-mixer" class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">

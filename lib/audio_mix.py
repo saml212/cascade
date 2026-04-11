@@ -9,28 +9,72 @@ audio when available.
 import json
 import logging
 import subprocess
+import threading
 from pathlib import Path
 
 logger = logging.getLogger("cascade")
 
+# Serialize audio mix generation across threads — both render agents call
+# generate_audio_mix() and would otherwise race on the same output files.
+_audio_mix_lock = threading.Lock()
 
-def generate_audio_mix(episode_dir: Path, episode_data: dict) -> Path | None:
-    """Generate work/audio_mix.wav from H6E tracks with per-track volumes.
 
-    Reads mix settings from episode_data["audio_mix"]["tracks"] — a list of
-    {stem, volume} entries.  Falls back to crop_config speaker/ambient volumes
-    if no explicit audio_mix config exists.
+def generate_audio_mix(episode_dir: Path, episode_data: dict, config: dict = None) -> Path | None:
+    """Generate work/audio_mix.wav, the canonical audio source for renders.
 
-    Audio sync offset + tempo correction from audio_sync is applied so the
-    output aligns with the video timeline. Output is trimmed to match video
-    duration. Only H6E audio is included — no camera audio.
+    Two modes:
+    1. **H6E multi-track mode**: When `episode_data["audio_tracks"]` contains
+       Zoom H6E tracks, mixes them according to `audio_mix.tracks` (or
+       `crop_config` speaker/ambient volumes), applies sync offset + tempo
+       correction, and saves to work/audio_mix.wav.
+    2. **Camera-audio mode** (no H6E): Extracts the embedded audio from
+       source_merged.mp4 directly. Used for episodes recorded with wireless
+       DJI mics where audio is baked into the camera file.
+
+    In both cases, if config is provided and audio_enhance is enabled, the
+    resulting WAV is run through the audio enhancement pipeline (DeepFilterNet
+    denoise + ffmpeg EQ/compression/loudness normalization).
 
     Returns:
-        Path to generated WAV, or None if no tracks available.
+        Path to generated WAV, or None if no audio source available.
     """
     work_dir = episode_dir / "work"
     work_dir.mkdir(exist_ok=True)
     output_path = work_dir / "audio_mix.wav"
+
+    # Acquire lock to prevent concurrent generation by parallel render agents.
+    # The second caller will block here, then check if the file is recent enough
+    # to skip regeneration entirely.
+    _audio_mix_lock.acquire()
+    try:
+        return _generate_audio_mix_locked(
+            episode_dir, episode_data, config, work_dir, output_path
+        )
+    finally:
+        _audio_mix_lock.release()
+
+
+def _generate_audio_mix_locked(
+    episode_dir: Path,
+    episode_data: dict,
+    config: dict,
+    work_dir: Path,
+    output_path: Path,
+) -> Path | None:
+    """Internal implementation, called under _audio_mix_lock."""
+    import time
+
+    # If audio_mix.wav was generated less than 5 minutes ago by another thread
+    # in the same pipeline run, skip regeneration. The render agent calling
+    # this is just about to start rendering with the same audio config.
+    if output_path.exists():
+        age_seconds = time.time() - output_path.stat().st_mtime
+        if age_seconds < 300:
+            logger.info(
+                "audio_mix.wav generated %.0fs ago — skipping regeneration",
+                age_seconds,
+            )
+            return output_path
 
     audio_sync = episode_data.get("audio_sync", {})
     offset = audio_sync.get("offset_seconds", 0)
@@ -44,8 +88,14 @@ def generate_audio_mix(episode_dir: Path, episode_data: dict) -> Path | None:
 
     if not mix_tracks:
         mix_tracks = _build_from_crop_config(episode_dir, episode_data)
+
+    # Camera-audio mode: no H6E tracks available, extract from source_merged.mp4
     if not mix_tracks:
-        return None
+        merged_path = episode_dir / "source_merged.mp4"
+        if not merged_path.exists():
+            logger.warning("No H6E tracks and no source_merged.mp4 — cannot generate audio mix")
+            return None
+        return _generate_camera_audio_mix(merged_path, output_path, config)
 
     stem_to_path = _map_track_stems(episode_dir, episode_data)
     entries = [
@@ -114,6 +164,56 @@ def generate_audio_mix(episode_dir: Path, episode_data: dict) -> Path | None:
 
     size_mb = output_path.stat().st_size / 1e6
     logger.info(f"Audio mix: {output_path.name} ({size_mb:.1f} MB)")
+
+    # Apply audio enhancement (EQ, compression, loudness normalization)
+    if config:
+        from lib.audio_enhance import enhance_audio
+        enhanced_path = work_dir / "audio_mix_enhanced.wav"
+        result_path = enhance_audio(output_path, enhanced_path, config)
+        if result_path != output_path and result_path.exists():
+            # Replace raw mix with enhanced version
+            result_path.rename(output_path)
+
+    return output_path
+
+
+def _generate_camera_audio_mix(
+    merged_path: Path,
+    output_path: Path,
+    config: dict,
+) -> Path | None:
+    """Extract camera audio from source_merged.mp4 to PCM WAV, then enhance.
+
+    Used for episodes recorded with wireless mics where audio is embedded in
+    the camera file (no separate H6E recording). The L/R channels typically
+    correspond to two speakers via DJI mics — we preserve them as-is so
+    speaker_cut can use them for L/R speaker detection.
+    """
+    logger.info("Extracting camera audio to %s...", output_path.name)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(merged_path),
+        "-vn",  # video not needed
+        "-c:a", "pcm_s16le",
+        "-ar", "48000",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error("Camera audio extraction failed: %s", result.stderr[-500:])
+        return None
+
+    size_mb = output_path.stat().st_size / 1e6
+    logger.info("Camera audio extracted: %s (%.1f MB)", output_path.name, size_mb)
+
+    # Apply enhancement (DeepFilterNet + ffmpeg chain) — same as H6E path
+    if config:
+        from lib.audio_enhance import enhance_audio
+        enhanced_path = output_path.parent / "audio_mix_enhanced.wav"
+        result_path = enhance_audio(output_path, enhanced_path, config)
+        if result_path != output_path and result_path.exists():
+            result_path.rename(output_path)
+
     return output_path
 
 

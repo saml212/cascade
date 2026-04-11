@@ -22,7 +22,13 @@ from pathlib import Path
 from agents.base import BaseAgent, timed_ffmpeg
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
-from lib.encoding import get_video_encoder_args, get_lut_filter
+from lib.encoding import (
+    get_video_encoder_args,
+    get_color_metadata_args,
+    get_lut_filter,
+    get_scale_filter,
+    get_video_polish_filters,
+)
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
 
@@ -45,20 +51,17 @@ class ShortsRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
-        # Always regenerate audio_mix.wav to use current sync data
-        audio_mix_path = self.episode_dir / "work" / "audio_mix.wav"
-        has_h6e_tracks = bool(episode_data.get("audio_tracks"))
-        if has_h6e_tracks:
-            self.logger.info("Generating audio_mix.wav from H6E tracks with current sync data...")
-            mix_result = generate_audio_mix(self.episode_dir, episode_data)
-            if mix_result and mix_result.exists():
-                audio_mix_path = mix_result
-                self.logger.info("Generated audio_mix.wav from H6E tracks")
-            else:
-                self.logger.warning("Failed to generate audio_mix.wav, falling back to camera audio")
-                audio_mix_path = None
+        # Always (re)generate enhanced audio_mix.wav. Works for both H6E
+        # multi-track and camera-audio modes (see lib/audio_mix.py).
+        self.logger.info("Generating enhanced audio_mix.wav...")
+        mix_result = generate_audio_mix(self.episode_dir, episode_data, self.config)
+        if mix_result and mix_result.exists():
+            audio_mix_path = mix_result
+            self.logger.info("audio_mix.wav ready: %s", mix_result)
         else:
-            self.logger.info("No H6E audio tracks — using camera audio from source_merged.mp4")
+            self.logger.warning(
+                "audio_mix.wav generation failed — falling back to raw camera audio"
+            )
             audio_mix_path = None
 
         clips = clips_data.get("clips", [])
@@ -72,12 +75,24 @@ class ShortsRenderAgent(BaseAgent):
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
 
+        # Source fps from ingest properties, or detect from video stream
+        source_props = episode_data.get("source_properties", {})
+        source_fps = source_props.get("fps")
+        if not source_fps:
+            r_rate = video_stream.get("r_frame_rate", "30/1")
+            try:
+                num, den = r_rate.split("/")
+                source_fps = round(int(num) / int(den), 3)
+            except (ValueError, ZeroDivisionError):
+                source_fps = 30.0
+        source_fps_int = int(round(source_fps))
+
         shorts_dir = self.episode_dir / "shorts"
         shorts_dir.mkdir(exist_ok=True)
         subtitles_dir = self.episode_dir / "subtitles"
         subtitles_dir.mkdir(exist_ok=True)
 
-        audio_bitrate = self.config.get("processing", {}).get("shorts_audio_bitrate", "128k")
+        audio_bitrate = self.config.get("processing", {}).get("shorts_audio_bitrate", "192k")
         encoder_args = get_video_encoder_args(self.config, crf_key="shorts_crf")
         lut_filter = get_lut_filter(self.config)
         if lut_filter:
@@ -105,7 +120,7 @@ class ShortsRenderAgent(BaseAgent):
                     start, end, segments,
                     src_w, src_h, audio_bitrate,
                     crop_config, encoder_args, lut_filter,
-                    audio_mix_path,
+                    audio_mix_path, source_fps_int,
                 )
                 futures[future] = clip_id
 
@@ -170,7 +185,7 @@ class ShortsRenderAgent(BaseAgent):
         start, end, segments,
         src_w, src_h, audio_bitrate,
         crop_config, encoder_args, lut_filter="",
-        audio_mix_path=None,
+        audio_mix_path=None, fps=30,
     ):
         """Render a 9:16 short with per-segment dynamic speaker crops."""
         clip_segs = self._get_clip_segments(segments, start, end)
@@ -224,10 +239,10 @@ class ShortsRenderAgent(BaseAgent):
             "-an",
             "-vf", f"trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS," + vf,
             *encoder_args,
-            "-r", "30", "-g", "30", "-bf", "0",
+            *get_color_metadata_args(),
+            "-r", str(fps), "-g", str(fps), "-bf", "0",
             "-vsync", "cfr",
-            "-pix_fmt", "p010le",
-            "-video_track_timescale", "30000",
+            "-video_track_timescale", str(fps * 1000),
             "-use_editlist", "0",
             "-movflags", "+faststart",
             str(temp_video),
@@ -326,29 +341,40 @@ class ShortsRenderAgent(BaseAgent):
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
         """Build 9:16 crop filter without subtitle burn-in."""
         crop_w, crop_h, x, y = self._get_short_crop_region(speaker, src_w, src_h, crop_config)
-        return f"crop={crop_w}:{crop_h}:{x}:{y},scale=1080:1920"
+        scale = get_scale_filter(1080, 1920)
+        polish = get_video_polish_filters(self.config)
+        chain = f"crop={crop_w}:{crop_h}:{x}:{y},{scale},format=yuv420p"
+        if polish:
+            chain += f",{polish}"
+        return chain
 
     def _get_short_crop_filter(
         self, speaker, src_w, src_h, srt_path, crop_config
     ):
         """Build 9:16 crop filter chain with subtitle burn-in.
 
-        Centers a 9:16 crop on the speaker's configured center point with zoom,
-        clamped to frame bounds.
+        Filter order: crop → scale (lanczos+dither) → format=yuv420p →
+        hqdn3d → cas → eq → subtitles.
+
+        LUT runs at 10-bit (added by caller as separate prefix), then dither
+        during scale to 8-bit, then polish, then burn subtitles last.
         """
         crop_w, crop_h, x, y = self._get_short_crop_region(speaker, src_w, src_h, crop_config)
+        scale = get_scale_filter(1080, 1920)
+        polish = get_video_polish_filters(self.config)
 
         # Escape the SRT path for ffmpeg filter (colons and backslashes)
         srt_escaped = escape_srt_path(srt_path)
 
-        # Crop -> scale -> burn subtitles
-        return (
-            f"crop={crop_w}:{crop_h}:{x}:{y},"
-            f"scale=1080:1920,"
-            f"subtitles='{srt_escaped}':force_style="
+        chain = f"crop={crop_w}:{crop_h}:{x}:{y},{scale},format=yuv420p"
+        if polish:
+            chain += f",{polish}"
+        chain += (
+            f",subtitles='{srt_escaped}':force_style="
             f"'FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
             f"BorderStyle=3,Outline=1,Shadow=0,MarginV=80'"
         )
+        return chain
 
     def _generate_clip_srt(
         self, diarized, start, end, srt_path

@@ -409,6 +409,56 @@ async def get_audio_preview(
     return FileResponse(cache_file, media_type="audio/mpeg")
 
 
+@router.get("/{episode_id}/channel-preview/{channel}")
+async def get_channel_preview(
+    episode_id: str,
+    channel: str,
+    start: float = 30.0,
+    duration: float = 60.0,
+):
+    """Serve an MP3 preview of one channel of source_merged.mp4 audio.
+
+    For camera-audio episodes (no separate H6E recording), the camera's
+    embedded stereo audio carries one speaker per channel. This endpoint
+    extracts and previews just the left or right channel so the user can
+    identify which speaker is on which side when setting up crop config.
+
+    channel: "left" or "right"
+    """
+    import subprocess
+
+    if channel not in ("left", "right"):
+        raise HTTPException(status_code=400, detail="channel must be 'left' or 'right'")
+
+    ep_dir = EPISODES_DIR / episode_id
+    source = ep_dir / "source_merged.mp4"
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="source_merged.mp4 not found")
+
+    cache_dir = ep_dir / "work" / "audio_preview"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"channel_{channel}_{int(start)}_{int(duration)}.mp3"
+
+    if not cache_file.exists():
+        # Use channelsplit to extract just the requested channel
+        ch_idx = "FL" if channel == "left" else "FR"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", str(source),
+            "-t", str(duration),
+            "-vn",
+            "-af", f"pan=mono|c0={ch_idx}",
+            "-ar", "44100", "-b:a", "128k",
+            str(cache_file),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}")
+
+    return FileResponse(cache_file, media_type="audio/mpeg")
+
+
 class SpeakerCropConfig(BaseModel):
     label: str
     center_x: int
@@ -523,8 +573,90 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
             ],
         }
 
-    # Transition from awaiting_crop_setup to processing
-    if ep.get("status") == "awaiting_crop_setup":
+    # When crop_config changes on an already-processed episode, we need to
+    # invalidate the downstream agents that depend on crop but PRESERVE the
+    # expensive work (transcription, clip mining, metadata) which only
+    # depends on the audio/transcript, not the crop.
+    #
+    # Crop-dependent agents that must re-run:
+    #   speaker_cut      (speaker labels come from crop)
+    #   longform_render  (uses crop rectangle for video)
+    #   shorts_render    (uses crop rectangle for video)
+    #   qa               (validates renders)
+    #   podcast_feed     (depends on final artifacts)
+    #   publish          (depends on final artifacts)
+    #   backup           (depends on final artifacts)
+    #
+    # Crop-INDEPENDENT agents we keep (save money + time):
+    #   ingest, stitch, audio_analysis  (always kept)
+    #   transcribe                       (Deepgram, ~$0.50 — big savings)
+    #   clip_miner                       (Claude LLM, ~$0.20)
+    #   metadata_gen                     (Claude LLM, ~$0.10-0.20)
+    #   thumbnail_gen                    (OpenAI caricature, ~$0.10)
+    CROP_DEPENDENT_AGENTS = {
+        "speaker_cut", "longform_render", "shorts_render",
+        "qa", "podcast_feed", "publish", "backup",
+    }
+
+    pipeline_state = ep.setdefault("pipeline", {})
+    completed = pipeline_state.get("agents_completed", [])
+    had_crop_dependent_work = any(a in completed for a in CROP_DEPENDENT_AGENTS)
+
+    # Remove crop-dependent agents from completed list so resume_pipeline will re-run them
+    pipeline_state["agents_completed"] = [a for a in completed if a not in CROP_DEPENDENT_AGENTS]
+
+    # Clear any errors from those agents so the pipeline doesn't refuse to continue
+    errors = pipeline_state.get("errors", {})
+    pipeline_state["errors"] = {
+        name: msg for name, msg in errors.items()
+        if name not in CROP_DEPENDENT_AGENTS
+    }
+
+    # If we actually invalidated downstream work, nuke the artifacts so they
+    # get regenerated. Only do this when there was prior work — initial crop
+    # setup shouldn't delete anything (nothing exists yet).
+    if had_crop_dependent_work:
+        ep_dir = EPISODES_DIR / episode_id
+        work_dir = ep_dir / "work"
+        # Files that must be regenerated because crop changed
+        artifacts_to_remove = [
+            ep_dir / "longform.mp4",
+            ep_dir / "segments.json",
+            ep_dir / "speaker_cut.json",
+            ep_dir / "longform_render.json",
+            ep_dir / "shorts_render.json",
+            ep_dir / "qa.json",
+            ep_dir / "publish.json",
+        ]
+        for f in artifacts_to_remove:
+            if f.exists():
+                f.unlink()
+        # Shorts: delete all rendered clips
+        shorts_dir = ep_dir / "shorts"
+        if shorts_dir.exists():
+            for f in shorts_dir.glob("*.mp4"):
+                f.unlink(missing_ok=True)
+        # Work dir: segment caches, speaker channel caches, concat lists
+        if work_dir.exists():
+            for pattern in [
+                "longform_seg_*.mp4",
+                "longform_raw.mp4",
+                "longform_concat.txt",
+                "short_temp_*.mp4",
+                "speaker_*_channel.npy",
+                "speaker_*_rms_db.npy",
+                "rms_meta.json",
+                "audio_mix.wav",              # forces re-mix with new audio chain too
+                "audio_mix_enhanced.wav",
+                "audio_mix_denoised.wav",
+            ]:
+                for f in work_dir.glob(pattern):
+                    f.unlink(missing_ok=True)
+
+    # Transition from awaiting_crop_setup or error back to processing so the
+    # pipeline can run again.
+    if ep.get("status") in ("awaiting_crop_setup", "error", "ready_for_review",
+                             "awaiting_backup_approval", "awaiting_longform_approval"):
         ep["status"] = "processing"
 
     write_episode(episode_id, ep)

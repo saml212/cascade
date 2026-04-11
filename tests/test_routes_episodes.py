@@ -331,8 +331,9 @@ class TestCropConfig:
         resp = client.get("/api/episodes/ep_001")
         assert resp.json()["status"] == "processing"
 
-    def test_crop_config_no_status_change_if_not_awaiting(self, test_client):
-        """If status is not awaiting_crop_setup, it should not change."""
+    def test_crop_config_reopens_completed_episode(self, test_client):
+        """Editing crop on a completed episode should transition back to processing
+        so the downstream agents (speaker_cut, renders) can re-run."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "ready_for_review"})
         client.post("/api/episodes/ep_001/crop-config", json={
@@ -342,7 +343,7 @@ class TestCropConfig:
             "speaker_r_center_y": 540,
         })
         resp = client.get("/api/episodes/ep_001")
-        assert resp.json()["status"] == "ready_for_review"
+        assert resp.json()["status"] == "processing"
 
     def test_legacy_format_generates_speakers_array(self, test_client):
         """Legacy format should also store a speakers array."""

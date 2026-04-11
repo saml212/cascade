@@ -127,10 +127,19 @@ class SpeakerCutAgent(BaseAgent):
 
     def _load_tracks(self, episode_data: dict, audio_data: dict) -> tuple[list[np.ndarray], str]:
         speakers = episode_data.get("crop_config", {}).get("speakers", [])
-        if len(speakers) >= 2 and all(s.get("track") for s in speakers):
+        audio_tracks = episode_data.get("audio_tracks", [])
+
+        # N-speaker mode requires BOTH crop_config tracks AND actual audio_tracks.
+        # If either is missing, fall back to L/R mode (camera audio stereo split).
+        # The crop UI sometimes assigns track numbers even for camera-audio episodes,
+        # so we check audio_tracks too, not just the crop_config field.
+        has_track_assignments = len(speakers) >= 2 and all(s.get("track") for s in speakers)
+        has_h6e_tracks = len(audio_tracks) > 0
+
+        if has_track_assignments and has_h6e_tracks:
             offset = episode_data.get("audio_sync", {}).get("offset_seconds", 0)
             path_map = {}
-            for t in episode_data.get("audio_tracks", []):
+            for t in audio_tracks:
                 tn = t.get("track_number")
                 if tn is not None:
                     p = Path(t["dest_path"])
@@ -141,7 +150,14 @@ class SpeakerCutAgent(BaseAgent):
             for i, spk in enumerate(speakers):
                 path = path_map.get(spk["track"])
                 if not path:
-                    raise RuntimeError(f"Track {spk['track']} for speaker {i} not found")
+                    # H6E track config exists but the file is missing — fall through
+                    # to L/R mode rather than crashing.
+                    self.logger.warning(
+                        "Track %s for speaker %s not found — falling back to L/R camera audio",
+                        spk["track"], i,
+                    )
+                    arrays = None
+                    break
                 npy = work / f"speaker_{i}_channel.npy"
                 if npy.exists():
                     arrays.append(np.load(str(npy)))
@@ -149,8 +165,14 @@ class SpeakerCutAgent(BaseAgent):
                     data = self._extract_track(path, offset)
                     np.save(str(npy), data)
                     arrays.append(data)
-            return arrays, "n_speaker"
+            if arrays is not None:
+                return arrays, "n_speaker"
 
+        # L/R camera-audio fallback. Used when there's no H6E recording or when
+        # H6E track files are missing. The video's stereo audio is split: left =
+        # speaker_0, right = speaker_1. For 2-speaker camera audio this works
+        # great because each speaker has their own mic via the wireless DJI mics.
+        self.logger.info("Using L/R camera audio mode (no H6E tracks)")
         work = self.episode_dir / "work"
         for name in ("left", "right"):
             npy = work / f"{name}_channel.npy"

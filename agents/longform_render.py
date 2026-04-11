@@ -20,7 +20,13 @@ from pathlib import Path
 from agents.base import BaseAgent, timed_ffmpeg
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
-from lib.encoding import get_video_encoder_args, get_lut_filter
+from lib.encoding import (
+    get_video_encoder_args,
+    get_color_metadata_args,
+    get_lut_filter,
+    get_scale_filter,
+    get_video_polish_filters,
+)
 from lib.ffprobe import probe as ffprobe
 from lib.srt import fmt_timecode, escape_srt_path
 
@@ -53,21 +59,19 @@ class LongformRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
-        # Resolve audio source: always regenerate audio_mix.wav to ensure
-        # it uses the current sync offset/tempo from episode.json
-        audio_mix_path = work_dir / "audio_mix.wav"
-        has_h6e_tracks = bool(episode_data.get("audio_tracks"))
-        if has_h6e_tracks:
-            self.logger.info("Generating audio_mix.wav from H6E tracks with current sync data...")
-            mix_result = generate_audio_mix(self.episode_dir, episode_data)
-            if mix_result and mix_result.exists():
-                audio_mix_path = mix_result
-                self.logger.info("Generated audio_mix.wav from H6E tracks")
-            else:
-                self.logger.warning("Failed to generate audio_mix.wav, falling back to camera audio")
-                audio_mix_path = None
+        # Resolve audio source: always (re)generate audio_mix.wav. With H6E
+        # tracks, this mixes the multi-track recording. Without H6E, it
+        # extracts the camera's embedded audio. Either way, the same
+        # enhancement chain (DeepFilterNet + ffmpeg) is applied.
+        self.logger.info("Generating enhanced audio_mix.wav...")
+        mix_result = generate_audio_mix(self.episode_dir, episode_data, self.config)
+        if mix_result and mix_result.exists():
+            audio_mix_path = mix_result
+            self.logger.info("audio_mix.wav ready: %s", mix_result)
         else:
-            self.logger.info("No H6E audio tracks — using camera audio from source_merged.mp4")
+            self.logger.warning(
+                "audio_mix.wav generation failed — falling back to raw camera audio"
+            )
             audio_mix_path = None
 
         # Get source video dimensions
@@ -77,6 +81,31 @@ class LongformRenderAgent(BaseAgent):
         )
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
+
+        # Source fps from ingest properties, or detect from video stream
+        source_props = episode_data.get("source_properties", {})
+        source_fps = source_props.get("fps")
+        if not source_fps:
+            r_rate = video_stream.get("r_frame_rate", "30/1")
+            try:
+                num, den = r_rate.split("/")
+                source_fps = round(int(num) / int(den), 3)
+            except (ValueError, ZeroDivisionError):
+                source_fps = 30.0
+        source_fps_int = int(round(source_fps))
+        self.logger.info(f"Source: {src_w}x{src_h} @ {source_fps} fps")
+
+        # Determine output resolution. Default: preserve source resolution
+        # (no quality loss). Can be overridden via config.processing.preserve_source_resolution=false
+        # in which case it falls back to processing.output_resolution.
+        proc = self.config.get("processing", {})
+        if proc.get("preserve_source_resolution", True):
+            out_w, out_h = src_w, src_h
+            self.logger.info(f"Output: {out_w}x{out_h} (preserving source resolution)")
+        else:
+            out_res = proc.get("output_resolution", "1920x1080")
+            out_w, out_h = (int(x) for x in out_res.split("x"))
+            self.logger.info(f"Output: {out_w}x{out_h} (from config)")
 
         audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
         encoder_args = get_video_encoder_args(self.config)
@@ -116,6 +145,7 @@ class LongformRenderAgent(BaseAgent):
                     self._render_segment,
                     merged_path, seg_path, seg, src_w, src_h,
                     crop_config, srt_path, encoder_args, lut_filter,
+                    source_fps_int, out_w, out_h,
                 )
                 futures[future] = (i, seg_path)
 
@@ -202,17 +232,30 @@ class LongformRenderAgent(BaseAgent):
         srt_path: Path = None,
         encoder_args: list = None,
         lut_filter: str = "",
+        fps: int = 30,
+        out_w: int = 1920,
+        out_h: int = 1080,
     ):
         """Render a single video-only segment with speaker-appropriate crop and subtitles."""
         start = segment["start"]
         duration = segment["end"] - segment["start"]
         speaker = segment["speaker"]
 
-        # Build video filter: LUT (color grade) → crop → scale
+        # Build video filter:
+        # LUT (10-bit) → crop → scale (lanczos+dither) → format=yuv420p →
+        # hqdn3d (denoise) → cas (sharpen) → eq (polish) → subtitles
+        #
+        # LUT runs at source bit depth for accurate color math, then dither to
+        # 8-bit during scale, then polish, then burn subtitles last so they
+        # aren't affected by sharpening/grading.
         vf_parts = []
         if lut_filter:
             vf_parts.append(lut_filter)
-        vf_parts.append(self._get_crop_filter(speaker, src_w, src_h, crop_config))
+        vf_parts.append(self._get_crop_filter(speaker, src_w, src_h, crop_config, out_w, out_h))
+        vf_parts.append("format=yuv420p")
+        polish = get_video_polish_filters(self.config)
+        if polish:
+            vf_parts.append(polish)
         vf = ",".join(vf_parts)
 
         # Append subtitle burn-in if SRT has content
@@ -237,23 +280,26 @@ class LongformRenderAgent(BaseAgent):
             "-an",  # no audio
             "-vf", vf,
             *encoder_args,
-            "-r", "30", "-g", "30", "-bf", "0",
+            *get_color_metadata_args(),
+            "-r", str(fps), "-g", str(fps), "-bf", "0",
             "-vsync", "cfr",
-            "-pix_fmt", "p010le",
-            "-video_track_timescale", "30000",
+            "-video_track_timescale", str(fps * 1000),
             "-use_editlist", "0",
             "-movflags", "+faststart",
             str(output),
         ]
         timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
 
-    def _get_crop_filter(self, speaker, src_w, src_h, crop_config):
-        """Get ffmpeg crop+scale filter. Crop math in lib/crop.py."""
+    def _get_crop_filter(self, speaker, src_w, src_h, crop_config, out_w=1920, out_h=1080):
+        """Get ffmpeg crop+scale filter with high-quality lanczos+dither.
+        Crop math in lib/crop.py. out_w/out_h is the target output resolution
+        (typically the source resolution for full-quality preservation)."""
+        scale = get_scale_filter(out_w, out_h)
         cx, cy, zoom, mode = resolve_speaker(speaker, src_w, src_h, crop_config)
         if mode is None:
-            return "scale=1920:1080"
+            return scale
         x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, mode)
-        return f"crop={crop_w}:{crop_h}:{x}:{y},scale=1920:1080"
+        return f"crop={crop_w}:{crop_h}:{x}:{y},{scale}"
 
     def _generate_segment_srt(self, diarized, start, end, srt_path):
         """Generate an SRT file for a segment, with times offset to segment-relative."""

@@ -57,7 +57,8 @@ class TestGetCropFilter:
 
     def test_both_no_zoom_passthrough(self, agent, crop_config):
         result = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
-        assert result == "scale=1920:1080"
+        assert result.startswith("scale=1920:1080")
+        assert "lanczos" in result
 
     def test_both_with_wide_zoom(self, agent, crop_config):
         crop_config["wide_zoom"] = 1.2
