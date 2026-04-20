@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/pre_bash_guard.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/pre_bash_ruff.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/post_edit_py_reminder.py"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/post_edit_py_reminder.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/stop_summary.py"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(.venv/bin/ruff:*)",
+      "Bash(ffmpeg:*)",
+      "Bash(ffprobe:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(echo:*)",
+      "Bash(curl:*)",
+      "Bash(uv:*)",
+      "Bash(du -sh:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)"
+    ]
+  },
+  "disabledPlugins": [
+    "rust-analyzer-lsp@claude-plugins-official",
+    "property-based-testing@trailofbits",
+    "mutation-testing@trailofbits",
+    "testing-handbook-skills@trailofbits",
+    "supply-chain-risk-auditor@trailofbits",
+    "insecure-defaults@trailofbits",
+    "fp-check@trailofbits"
+  ]
+}

@@ -18,6 +18,9 @@ data/
 .DS_Store
 Thumbs.db
 
+# Claude Code (local overrides — not for sharing)
+.claude/settings.local.json
+
 # IDE
 .vscode/
 .idea/
@@ -37,3 +40,7 @@ node_modules/
 
 # Generated files
 links/index.html
+
+# Render verification scratch
+tmp_render_check/
+tmp_debug/

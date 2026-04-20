@@ -86,11 +86,12 @@ curl -X POST http://localhost:8420/api/episodes/ep_001/auto-approve
 - Dependencies in `requirements.txt`, installed via `uv pip install`
 
 ## Key Constraints
-- Python 3.11+ required; `.venv` is 3.11+, `start.sh` uses 3.12 via `uv`
-- Uses `tomllib` (stdlib); `tomli` no longer needed
-- macOS resource fork files (`._*.MP4`) appear on SD cards — must filter in globs
-- Deepgram SDK v5 has a different API from v3 — use httpx REST API directly instead
+- macOS resource fork files (`._*.MP4`) appear on SD cards — always filter: `if not f.name.startswith("._"):`
+- Deepgram SDK v5 has a completely different API from v3 — use httpx REST API directly
 - After modifying Python files, clear `__pycache__` or restart uvicorn (stale bytecode with `--reload`)
+- `tomllib` (stdlib 3.11+) for TOML config — `tomli` has been removed
+- ffmpeg 8.x: use `-shortest` not `-fflags +shortest`; use `-use_editlist 0` for platform compliance
+- Never hardcode `/Volumes/1TB_SSD/` paths — use `lib/paths.resolve_path()`
 
 ## Error Handling
 - If a pipeline fails mid-run, fix the issue and re-run with `--agents <remaining_agents>`
@@ -98,6 +99,15 @@ curl -X POST http://localhost:8420/api/episodes/ep_001/auto-approve
 - Check `episode.json` → `pipeline.agents_completed` to see what's already done
 
 ## API Costs per Episode
-- Deepgram transcription: ~$0.50
-- Claude clip mining: ~$0.10-0.30
-- Claude metadata: ~$0.10-0.20
+- Deepgram transcription: ~$0.50 (stays on API — best-in-class STT)
+- Claude clip mining: ~$0.10-0.30 (pending migration to `claude` CLI / Max subscription)
+- Claude metadata: ~$0.10-0.20 (pending migration)
+
+## Dev Harness
+Task backlog: `wishlist.md`. Subagents in `.claude/agents/`:
+- **`dev`** — feature work, bug fixes (`agents/`, `lib/`, `server/`, `frontend/`)
+- **`clean`** — ruff F401/F811/F841 + dead code, no logic changes
+- **`api-migrator`** — replace Anthropic SDK with `claude` CLI subprocess
+- **`test-runner`** — run pytest, fix failures, no new tests
+
+Hooks in `.claude/hooks/`: episode-data guard, force-push block, ruff pre-commit gate, Python cache reminder, stop summary.
