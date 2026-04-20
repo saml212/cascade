@@ -1,0 +1,61 @@
+{
+  "$comment": "Single-repo profile (harness-v2 §23). Cascade is Python-primary with a vanilla JS frontend. Consumed by .claude/hooks/route-format.sh and .claude/skills/clean/.",
+  "languages": {
+    "python": {
+      "extensions": [".py"],
+      "paths": ["agents/", "lib/", "server/", "tests/", "scripts/"],
+      "format_command": "ruff format {file}",
+      "lint_fix_command": "ruff check --select F401,F811,F841 --fix {file}",
+      "dead_code_command": "vulture --min-confidence 80 {file}",
+      "complexity": {
+        "max_function_lines": 80,
+        "max_cyclomatic": 8
+      }
+    },
+    "javascript": {
+      "extensions": [".js", ".mjs"],
+      "paths": ["frontend/"],
+      "format_command": null,
+      "lint_fix_command": null,
+      "dead_code_command": "npx knip --no-gitignore",
+      "complexity": {
+        "max_function_lines": 50,
+        "max_cyclomatic": 8
+      }
+    }
+  },
+  "verify": [
+    ".venv/bin/pytest tests/ -v --tb=short",
+    ".venv/bin/ruff check agents/ lib/ server/"
+  ],
+  "anti_slop": {
+    "static": {
+      "python": "ruff check --select F401,F811,F841,C901 --fix",
+      "cross_file_python": "vulture --min-confidence 80 agents/ lib/ server/",
+      "javascript": "npx knip --no-gitignore"
+    },
+    "simplifier": {
+      "plugin": "code-simplifier",
+      "required": false,
+      "note": "install with: claude plugin install code-simplifier — skill will skip if not present"
+    },
+    "audit": {
+      "comment_check": true,
+      "single_use_helpers": true,
+      "unnecessary_error_handling": true,
+      "debug_artifacts": ["print(", "console.log(", "console.debug(", "fmt.Println"],
+      "bloated_docstrings": true
+    },
+    "scope": "branch_changed_files_only",
+    "enforce_before_commit": true
+  },
+  "safety": {
+    "format_allowlist": ["ruff", "black", "isort", "prettier", "npx", "goimports", "gofmt", "rustfmt", "clang-format", "terraform", "buf"],
+    "block_rm_paths": [
+      "/Volumes/1TB_SSD/cascade/episodes/",
+      "/Users/samuellarson/Local/Github/cascade/.venv",
+      "/Users/samuellarson/Local/Github/cascade/.git"
+    ],
+    "block_force_push_branches": ["main", "master"]
+  }
+}

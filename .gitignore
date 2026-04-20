@@ -18,8 +18,12 @@ data/
 .DS_Store
 Thumbs.db
 
-# Claude Code (local overrides — not for sharing)
+# Claude Code (local overrides, per-dev corrections, ephemeral state)
 .claude/settings.local.json
+.claude/memory/corrections/
+.claude/memory/rules-compiled.md
+.claude/.state/
+.team-runs/
 
 # IDE
 .vscode/
