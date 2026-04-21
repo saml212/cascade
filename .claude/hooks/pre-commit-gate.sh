@@ -21,20 +21,22 @@ CMD="$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
 [ -z "$CMD" ] && exit 0
 
 # Only fire on actual git commit invocations. Delegates splitting to shared
-# helper (see safety-check.sh for why we extracted it).
+# helper so quoted strings like echo 'git commit foo' don't false-positive.
 SPLITTER="$REPO_ROOT/.claude/scripts/split-subcommands.py"
 HAS_COMMIT=""
 if [ -f "$SPLITTER" ]; then
+  # Trust the splitter fully — if it returns zero sub-commands starting with
+  # "git commit", there's no commit happening, even if the raw string contains
+  # it as a quoted argument. (This was a real bug in v1.)
   while IFS= read -r sub; do
     if echo "$sub" | grep -qE '^git\s+commit\b'; then
       HAS_COMMIT="yes"
       break
     fi
   done < <(python3 "$SPLITTER" "$CMD" 2>/dev/null)
-fi
-# Fallback: raw substring if splitter unavailable
-if [ -z "$HAS_COMMIT" ] && echo "$CMD" | grep -qE '\bgit\s+commit\b'; then
-  HAS_COMMIT="yes"
+else
+  # Splitter missing — fall back to conservative whole-string match
+  echo "$CMD" | grep -qE '\bgit\s+commit\b' && HAS_COMMIT="yes"
 fi
 [ "$HAS_COMMIT" != "yes" ] && exit 0
 

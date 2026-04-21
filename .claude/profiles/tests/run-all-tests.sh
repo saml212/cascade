@@ -109,6 +109,17 @@ check "BLOCK: git reset --hard main (compound)" 2 "${result%%|*}" "${result#*|}"
 result="$(run_hook safety-check.sh '{"tool_input":{"command":"sudo rm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo"}}')"
 check "BLOCK: sudo rm on protected path" 2 "${result%%|*}" "${result#*|}"
 
+# ── Quote-awareness + newline-splitting edge cases ──────────────────────────
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"echo \"rm -rf /Volumes/1TB_SSD/cascade/episodes/x\" # no actual rm"}}')"
+check "ALLOW: rm in double-quoted arg" 0 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh "{\"tool_input\":{\"command\":\"echo 'rm -rf /Volumes/1TB_SSD/cascade/episodes/x in single quotes'\"}}")"
+check "ALLOW: rm in single-quoted arg" 0 "${result%%|*}" "${result#*|}"
+
+# Newline-separated compound — second command is the dangerous one
+result="$(run_hook safety-check.sh "{\"tool_input\":{\"command\":\"ls\nrm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo\"}}")"
+check "BLOCK: rm after newline (compound command)" 2 "${result%%|*}" "${result#*|}"
+
 # ── route-format.sh ─────────────────────────────────────────────────────────
 echo ""
 echo "── route-format.sh ────────────────────────────────────────────────────"
@@ -143,6 +154,10 @@ check "ALLOW: non-commit command" 0 "${result%%|*}" "${result#*|}"
 
 result="$(run_hook pre-commit-gate.sh '{"tool_input":{"command":"CLEAN_BYPASS=1 git commit -m test"}}')"
 check "ALLOW: commit with CLEAN_BYPASS=1" 0 "${result%%|*}" "${result#*|}"
+
+# Regression: "git commit" inside a quoted argument should NOT trigger
+result="$(run_hook pre-commit-gate.sh "{\"tool_input\":{\"command\":\"echo 'the literal string git commit -m foo' | cat\"}}")"
+check "ALLOW: 'git commit' inside quoted echo arg" 0 "${result%%|*}" "${result#*|}"
 
 # Actual `git commit -m test` — expect BLOCK (no sentinel exists for current staged set)
 # Only meaningful if there's something staged

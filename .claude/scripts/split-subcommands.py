@@ -5,25 +5,79 @@ Usage: split-subcommands.py <command-string>
 
 Prints one sub-command per line, trimmed.
 
-Splits on: && || ; | ` $(
-Also strips trailing ) from sub-commands (residue from $(...) splits).
+Understands:
+  Separators:   && || ; | ` $(  and newlines
+  Quoting:      single-quoted 'foo && bar' and double-quoted "foo ; bar"
+                are treated as atomic (no split inside).
 
-This is a helper for safety-check.sh and pre-commit-gate.sh so they can
-inspect each sub-command independently rather than the raw string (which
-would false-positive on quoted content like echo "rm -rf /protected").
+Known limits:
+  - Doesn't handle backslash-escaped quotes inside the same quote type.
+  - Doesn't track shell heredocs.
+  - Doesn't track nested $( ... ) depth beyond splitting at the opener.
+
+For safety-check.sh and pre-commit-gate.sh: the point isn't perfect shell
+parsing, it's "don't match operators inside quoted string arguments".
 """
-import re
+
 import sys
 
 
 def split_subcommands(cmd: str) -> list[str]:
-    parts = re.split(r"&&|\|\||;|\||`|\$\(", cmd)
-    out = []
-    for p in parts:
-        p = p.strip().rstrip(")")
-        if p:
-            out.append(p)
-    return out
+    parts: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(cmd)
+
+    def flush():
+        piece = "".join(current).strip().rstrip(")")
+        if piece:
+            parts.append(piece)
+
+    while i < n:
+        c = cmd[i]
+
+        # Quote state — flip on unescaped matching quote
+        if c == "'" and not in_double:
+            in_single = not in_single
+            current.append(c)
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            current.append(c)
+            i += 1
+            continue
+
+        if in_single or in_double:
+            current.append(c)
+            i += 1
+            continue
+
+        # Outside quotes: recognise separators
+        two = cmd[i : i + 2]
+        if two == "&&" or two == "||":
+            flush()
+            current = []
+            i += 2
+            continue
+        if two == "$(":
+            flush()
+            current = []
+            i += 2
+            continue
+        if c in (";", "|", "`", "\n"):
+            flush()
+            current = []
+            i += 1
+            continue
+
+        current.append(c)
+        i += 1
+
+    flush()
+    return parts
 
 
 if __name__ == "__main__":

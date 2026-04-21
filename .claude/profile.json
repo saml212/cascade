@@ -17,7 +17,8 @@
       "paths": ["frontend/"],
       "format_command": null,
       "lint_fix_command": null,
-      "dead_code_command": "npx knip --no-gitignore",
+      "dead_code_command": null,
+      "$comment": "JS dead-code tooling (knip) needs a package.json-aware runner. Dev agent will wire up when frontend tooling is set up.",
       "complexity": {
         "max_function_lines": 50,
         "max_cyclomatic": 8
@@ -50,7 +51,7 @@
     "enforce_before_commit": true
   },
   "safety": {
-    "format_allowlist": ["ruff", "black", "isort", "prettier", "npx", "goimports", "gofmt", "rustfmt", "clang-format", "terraform", "buf"],
+    "format_allowlist": ["ruff", "vulture", "black", "isort", "prettier", "npx", "goimports", "gofmt", "rustfmt", "clang-format", "terraform", "buf", "knip"],
     "block_rm_paths": [
       "/Volumes/1TB_SSD/cascade/episodes/",
       "/Users/samuellarson/Local/Github/cascade/.venv",
