@@ -25,19 +25,16 @@ CMD="$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
 [ -z "$CMD" ] && exit 0
 
 # ── Split into sub-commands to avoid matching content inside quoted args ────
-# Shell operators that separate independent commands: && || ; | ` $(
-# We use a python one-liner for proper splitting (bash regex is fragile here).
-SUBS="$(python3 - <<PY 2>/dev/null
-import re, sys
-cmd = """$(echo "$CMD" | sed 's/"""/"""/g')"""
-parts = re.split(r'&&|\|\||;|\||' + '`' + r'|\$\(', cmd)
-for p in parts:
-    p = p.strip()
-    if p:
-        print(p)
-PY
-)"
-[ -z "$SUBS" ] && SUBS="$CMD"  # fallback
+# Delegated to .claude/scripts/split-subcommands.py — keeps this hook free of
+# heredoc/paren gymnastics that broke v1 (bash was parsing backticks inside
+# the heredoc as command substitution despite <<'PY').
+SPLITTER="$REPO_ROOT/.claude/scripts/split-subcommands.py"
+if [ -x "$SPLITTER" ] || [ -f "$SPLITTER" ]; then
+  SUBS="$(python3 "$SPLITTER" "$CMD" 2>/dev/null)"
+else
+  SUBS=""
+fi
+[ -z "$SUBS" ] && SUBS="$CMD"  # fallback — still covers simple cases
 
 # ── Guard 1: rm on protected paths ──────────────────────────────────────────
 BLOCK_PATHS="$(jq -r '.safety.block_rm_paths[]?' "$PROFILE" 2>/dev/null)"
@@ -47,10 +44,12 @@ while IFS= read -r sub; do
     while IFS= read -r protected; do
       [ -z "$protected" ] && continue
       if echo "$sub" | grep -qF "$protected"; then
-        echo "🛑 BLOCKED: rm on protected path"
-        echo "   Sub-command: $sub"
-        echo "   Protected:   $protected"
-        echo "   These paths hold irreplaceable data. Delete manually in Finder if you're sure."
+        {
+          echo "🛑 BLOCKED: rm on protected path"
+          echo "   Sub-command: $sub"
+          echo "   Protected:   $protected"
+          echo "   These paths hold irreplaceable data. Delete manually in Finder if you're sure."
+        } >&2
         exit 2
       fi
     done <<< "$BLOCK_PATHS"
@@ -85,9 +84,11 @@ while IFS= read -r sub; do
       fi
 
       if [ "$is_blocked" = "1" ]; then
-        echo "🛑 BLOCKED: force push to main/master (or unspecified target)"
-        echo "   Sub-command: $sub"
-        echo "   Never force push to main. Create a revert commit, or use --force-with-lease on a feature branch."
+        {
+          echo "🛑 BLOCKED: force push to main/master (or unspecified target)"
+          echo "   Sub-command: $sub"
+          echo "   Never force push to main. Create a revert commit, or use --force-with-lease on a feature branch."
+        } >&2
         exit 2
       fi
     fi
@@ -100,9 +101,11 @@ while IFS= read -r sub; do
     if echo "$sub" | grep -qE '\.(env|pem|key|crt|pfx|p12)\b|credentials|\.aws/|\.ssh/'; then
       # .env.example is fine (it's a template)
       if ! echo "$sub" | grep -qE '\.env\.example\b|\.env\.sample\b'; then
-        echo "🛑 BLOCKED: git add of likely-secret file"
-        echo "   Sub-command: $sub"
-        echo "   Add secrets to .gitignore and commit them out-of-band if truly needed."
+        {
+          echo "🛑 BLOCKED: git add of likely-secret file"
+          echo "   Sub-command: $sub"
+          echo "   Add secrets to .gitignore and commit them out-of-band if truly needed."
+        } >&2
         exit 2
       fi
     fi
@@ -115,9 +118,11 @@ while IFS= read -r sub; do
     while IFS= read -r branch; do
       [ -z "$branch" ] && continue
       if echo "$sub" | grep -qE "(\s|/)${branch}(\s|$)"; then
-        echo "🛑 BLOCKED: git reset --hard on $branch"
-        echo "   Sub-command: $sub"
-        echo "   This destroys uncommitted work. Use git stash or create a branch first."
+        {
+          echo "🛑 BLOCKED: git reset --hard on $branch"
+          echo "   Sub-command: $sub"
+          echo "   This destroys uncommitted work. Use git stash or create a branch first."
+        } >&2
         exit 2
       fi
     done <<< "$BLOCK_BRANCHES"

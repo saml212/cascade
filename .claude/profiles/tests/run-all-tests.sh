@@ -87,6 +87,28 @@ check "ALLOW: cat on episode (no rm)" 0 "${result%%|*}" "${result#*|}"
 result="$(run_hook safety-check.sh '{"tool_input":{"command":"echo \"rm -rf /Volumes/1TB_SSD/cascade/episodes/x in echo string\""}}')"
 check "ALLOW: echo containing rm pattern (quoted string)" 0 "${result%%|*}" "${result#*|}"
 
+# ── Edge cases: compound-command bypass protection ──────────────────────────
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"true && rm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo"}}')"
+check "BLOCK: rm after && (compound command)" 2 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"true; rm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo"}}')"
+check "BLOCK: rm after ; (compound command)" 2 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"false || rm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo"}}')"
+check "BLOCK: rm after || (compound command)" 2 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"echo $(rm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo)"}}')"
+check "BLOCK: rm in command substitution \$(...)" 2 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"git push origin main --force && echo done"}}')"
+check "BLOCK: force push before && (compound)" 2 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"ls && git reset --hard main"}}')"
+check "BLOCK: git reset --hard main (compound)" 2 "${result%%|*}" "${result#*|}"
+
+result="$(run_hook safety-check.sh '{"tool_input":{"command":"sudo rm -rf /Volumes/1TB_SSD/cascade/episodes/ep_foo"}}')"
+check "BLOCK: sudo rm on protected path" 2 "${result%%|*}" "${result#*|}"
+
 # ── route-format.sh ─────────────────────────────────────────────────────────
 echo ""
 echo "── route-format.sh ────────────────────────────────────────────────────"
@@ -157,6 +179,42 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# Edge: false-positive protection. These should NOT trigger a nudge.
+for fp in \
+  '{"prompt":"I already told you about this bug"}' \
+  '{"prompt":"I already have X set up, thanks"}' \
+  '{"prompt":"no, that is fine"}' \
+  '{"prompt":"no, thanks"}' \
+  '{"prompt":"I said we should keep it simple"}' ; do
+  result="$(run_hook correction-detect.sh "$fp")"
+  exit_code="${result%%|*}"
+  out="${result#*|}"
+  if ! echo "$out" | grep -q "LEARN"; then
+    echo "  ✅ PASS  [SILENT: $fp]"
+    PASS=$((PASS + 1))
+  else
+    echo "  ❌ FAIL  [SILENT: $fp] — false-positive nudge emitted"
+    FAIL=$((FAIL + 1))
+  fi
+done
+
+# Edge: true-positive patterns should still trigger
+for tp in \
+  '{"prompt":"wrong module, use lib/ffprobe"}' \
+  '{"prompt":"you should have tested this"}' \
+  '{"prompt":"undo that change"}' \
+  '{"prompt":"this is broken"}' ; do
+  result="$(run_hook correction-detect.sh "$tp")"
+  out="${result#*|}"
+  if echo "$out" | grep -q "LEARN"; then
+    echo "  ✅ PASS  [NUDGE: $tp]"
+    PASS=$((PASS + 1))
+  else
+    echo "  ❌ FAIL  [NUDGE: $tp] — correction not detected"
+    FAIL=$((FAIL + 1))
+  fi
+done
+
 # ── learn-capture.sh ────────────────────────────────────────────────────────
 echo ""
 echo "── learn-capture.sh ───────────────────────────────────────────────────"
@@ -188,11 +246,46 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# Clean up the test entry from the real corrections file
+# Edge: [LEARN] block inside a code fence should NOT be captured.
+# This is how docs/chat show examples without triggering capture.
+TRANSCRIPT_FENCED=$(mktemp)
+FENCE_SENTINEL="fenced-sentinel-$$"
+cat > "$TRANSCRIPT_FENCED" <<TRANSCRIPT_EOF
+{"role":"assistant","content":[{"type":"text","text":"Here's an example of the format:\n\n\`\`\`\n[LEARN] ${FENCE_SENTINEL}: this should not be captured\nMistake: it's inside a fence\nCorrection: skip fenced content\n\`\`\`\n\nThat was just documentation."}]}
+TRANSCRIPT_EOF
+
+echo "{\"transcript_path\":\"$TRANSCRIPT_FENCED\"}" | bash .claude/hooks/learn-capture.sh >/dev/null 2>&1
+if ! grep -q "$FENCE_SENTINEL" "$CORRECTIONS_FILE" 2>/dev/null; then
+  echo "  ✅ PASS  [SKIP: [LEARN] inside code fence not captured]"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ FAIL  [SKIP: [LEARN] inside code fence — was captured anyway]"
+  FAIL=$((FAIL + 1))
+fi
+rm -f "$TRANSCRIPT_FENCED"
+
+# Edge: two [LEARN] blocks in one response should both be captured.
+TRANSCRIPT_MULTI=$(mktemp)
+MULTI_A="multi-a-$$"
+MULTI_B="multi-b-$$"
+cat > "$TRANSCRIPT_MULTI" <<TRANSCRIPT_EOF
+{"role":"assistant","content":[{"type":"text","text":"I learned two things:\n\n[LEARN] ${MULTI_A}: first rule\nMistake: missed A\nCorrection: do A\n\n[LEARN] ${MULTI_B}: second rule\nMistake: missed B\nCorrection: do B"}]}
+TRANSCRIPT_EOF
+
+echo "{\"transcript_path\":\"$TRANSCRIPT_MULTI\"}" | bash .claude/hooks/learn-capture.sh >/dev/null 2>&1
+if grep -q "$MULTI_A" "$CORRECTIONS_FILE" 2>/dev/null && grep -q "$MULTI_B" "$CORRECTIONS_FILE" 2>/dev/null; then
+  echo "  ✅ PASS  [CAPTURE: 2 [LEARN] blocks in one response]"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ FAIL  [CAPTURE: 2 [LEARN] blocks]"
+  FAIL=$((FAIL + 1))
+fi
+rm -f "$TRANSCRIPT_MULTI"
+
+# Clean up ALL test entries from the real corrections file
 if [ -f "$CORRECTIONS_FILE" ]; then
-  grep -v "$TEST_SENTINEL" "$CORRECTIONS_FILE" > "$CORRECTIONS_FILE.tmp" || true
+  grep -vE "$TEST_SENTINEL|$FENCE_SENTINEL|$MULTI_A|$MULTI_B" "$CORRECTIONS_FILE" > "$CORRECTIONS_FILE.tmp" || true
   mv "$CORRECTIONS_FILE.tmp" "$CORRECTIONS_FILE"
-  # If the file is now empty, remove it and the dev dir
   [ ! -s "$CORRECTIONS_FILE" ] && rm -f "$CORRECTIONS_FILE" && rmdir ".claude/memory/corrections/${DEV_SLUG}" 2>/dev/null || true
 fi
 rm -f "$TRANSCRIPT"

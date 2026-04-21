@@ -20,20 +20,26 @@ INPUT="$(cat)"
 CMD="$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
 [ -z "$CMD" ] && exit 0
 
-# Only fire on actual git commit invocations
-# Split into sub-commands (same approach as safety-check.sh)
-HAS_COMMIT="$(python3 - <<PY 2>/dev/null
-import re
-cmd = """$(echo "$CMD" | sed 's/"""/"""/g')"""
-parts = re.split(r'&&|\|\||;|\|', cmd)
-for p in parts:
-    p = p.strip()
-    # Match 'git commit' but not 'git commit --amend --no-edit' on an already-ok set? keep it simple: any git commit
-    if re.match(r'^git\s+commit\b', p):
-        print("yes")
-        break
-PY
-)"
+# Only fire on actual git commit invocations. Delegates splitting to shared
+# helper (see safety-check.sh for why we extracted it).
+SPLITTER="$REPO_ROOT/.claude/scripts/split-subcommands.py"
+HAS_COMMIT=""
+if [ -f "$SPLITTER" ]; then
+  while IFS= read -r sub; do
+    case "$sub" in
+      "git commit"*|"git  commit"*) HAS_COMMIT="yes"; break ;;
+    esac
+    # Also match with leading whitespace stripped (split output already strips)
+    if echo "$sub" | grep -qE '^git\s+commit\b'; then
+      HAS_COMMIT="yes"
+      break
+    fi
+  done < <(python3 "$SPLITTER" "$CMD" 2>/dev/null)
+fi
+# Fallback: raw substring if splitter not present
+if [ -z "$HAS_COMMIT" ]; then
+  echo "$CMD" | grep -qE '\bgit\s+commit\b' && HAS_COMMIT="yes"
+fi
 [ "$HAS_COMMIT" != "yes" ] && exit 0
 
 # Allow initial onboarding / docs-only commits with an explicit bypass
@@ -52,16 +58,20 @@ STAGED_HASH="$(cd "$REPO_ROOT" && git diff --cached --name-only | sort | \
 SENTINEL="$REPO_ROOT/.claude/.state/clean-ok-$STAGED_HASH"
 
 if [ ! -f "$SENTINEL" ]; then
-  echo "🛑 BLOCKED: /clean hasn't been run on this staged set"
-  echo ""
-  echo "   Staged files hash: $STAGED_HASH"
-  echo "   Expected sentinel: .claude/.state/clean-ok-$STAGED_HASH"
-  echo ""
-  echo "   Invoke /clean first. The skill will run ruff + vulture + simplifier +"
-  echo "   AI slop audit on the changed files, then write the sentinel on pass."
-  echo ""
-  echo "   To bypass for a docs-only or emergency commit:"
-  echo "   CLEAN_BYPASS=1 git commit ..."
+  # Block messages go to stderr so Claude Code shows them to the user
+  # (stdout on exit 2 is often swallowed).
+  {
+    echo "🛑 BLOCKED: /clean hasn't been run on this staged set"
+    echo ""
+    echo "   Staged files hash: $STAGED_HASH"
+    echo "   Expected sentinel: .claude/.state/clean-ok-$STAGED_HASH"
+    echo ""
+    echo "   Invoke /clean first. The skill will run ruff + vulture + simplifier +"
+    echo "   AI slop audit on the changed files, then write the sentinel on pass."
+    echo ""
+    echo "   To bypass for a docs-only or emergency commit:"
+    echo "   CLEAN_BYPASS=1 git commit ..."
+  } >&2
   exit 2
 fi
 

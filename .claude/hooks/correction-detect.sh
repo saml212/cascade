@@ -18,8 +18,15 @@ PROMPT="$(echo "$INPUT" | jq -r '.prompt // .user_prompt // empty' 2>/dev/null)"
 # Lower-case for matching (bash 4+ or macOS zsh-compatible via tr)
 PROMPT_LOWER="$(echo "$PROMPT" | tr '[:upper:]' '[:lower:]')"
 
-# High-confidence correction patterns (case-insensitive)
-if echo "$PROMPT_LOWER" | grep -qE "that'?s (wrong|not right|incorrect|not what)|you (forgot|should have|shouldn'?t have|missed|need to)|wrong (file|function|variable|approach|repo|directory|way)|(undo|revert|roll ?back) that|i (said|told you|already)|no,? (don'?t|not|it should|you should)"; then
+# High-confidence correction patterns (case-insensitive). Kept narrow on
+# purpose — false positives are worse than false negatives here (they train
+# the assistant to over-emit [LEARN] blocks for non-corrections).
+#
+# Rejected patterns (too noisy):
+#   "i already"       → matches "I already have X", "I already did that"
+#   "no,? ..."        → matches "no, that's fine" and lots of conversational "no"
+#   "i (said|told)"   → matches benign restatement
+if echo "$PROMPT_LOWER" | grep -qE "that'?s (wrong|not right|incorrect|not what i)|you (forgot|should have|shouldn'?t have|missed the|need to fix)|wrong (file|function|variable|approach|repo|directory|way|module)|(undo|revert|roll ?back) that|dude,?\s+(stop|no|fuck)|that'?s not (right|what|how)|this is (wrong|broken|not what)"; then
   cat <<'NUDGE'
 
 ℹ️  correction-detect: the user's message looks like a correction. When you

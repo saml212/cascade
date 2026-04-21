@@ -70,38 +70,55 @@ PATH_MATCH="$(jq -r --arg lang "$MATCHED_LANG" --arg rel "$REL_PATH" '
 ALLOWLIST="$(jq -r '.safety.format_allowlist[]?' "$PROFILE" 2>/dev/null)"
 
 # ── Run format_command, then lint_fix_command ───────────────────────────────
+# Returns:
+#   0 — ran successfully
+#   1 — tool not installed (silently skipped)
+#   2 — tool not in allowlist (security skip)
+#   3 — ran but failed (e.g., syntax error in the file — fail open but report)
 run_command() {
   local cmd_template="$1"
   [ -z "$cmd_template" ] || [ "$cmd_template" = "null" ] && return 0
 
-  # Extract first token to check against allowlist
   local first_token="${cmd_template%% *}"
-  # Strip path components from first_token (e.g., .venv/bin/ruff → ruff)
   local tool_name="${first_token##*/}"
 
-  # Allowlist check
+  # Allowlist check — MUST come before any execution (supply-chain risk)
   if ! echo "$ALLOWLIST" | grep -qx "$tool_name"; then
     echo "route-format: skipping unknown tool '$tool_name' (not in allowlist)" >&2
-    return 0
+    return 2
   fi
 
-  # Substitute {file} with shell-quoted file path
+  # Is the tool actually installed?
+  if ! command -v "$first_token" >/dev/null 2>&1 && ! command -v "$tool_name" >/dev/null 2>&1; then
+    return 1
+  fi
+
   local quoted_file
   quoted_file="$(printf '%q' "$FILE_PATH")"
   local expanded="${cmd_template//\{file\}/$quoted_file}"
 
-  # Run it from the repo root
   (cd "$REPO_ROOT" && eval "$expanded") >/dev/null 2>&1
-  return 0
+  return $?
 }
 
 FORMAT_CMD="$(jq -r --arg lang "$MATCHED_LANG" '.languages[$lang].format_command // empty' "$PROFILE")"
 LINT_CMD="$(jq -r --arg lang "$MATCHED_LANG" '.languages[$lang].lint_fix_command // empty' "$PROFILE")"
 
-run_command "$FORMAT_CMD"
-run_command "$LINT_CMD"
+run_command "$FORMAT_CMD"; FORMAT_RC=$?
+run_command "$LINT_CMD";   LINT_RC=$?
 
-# Show a one-liner so the assistant sees what happened
-echo "✓ route-format: $MATCHED_LANG rules applied to $REL_PATH"
+# Honest reporting — tell the assistant what actually happened.
+if [ "$FORMAT_RC" = "1" ] || [ "$LINT_RC" = "1" ]; then
+  # At least one tool is not installed — say so once, quietly
+  echo "ℹ  route-format: $MATCHED_LANG tools not fully installed (ruff/vulture missing); $REL_PATH not auto-formatted"
+elif [ "$FORMAT_RC" = "0" ] && [ "$LINT_RC" = "0" ]; then
+  echo "✓ route-format: $MATCHED_LANG rules applied to $REL_PATH"
+elif [ "$FORMAT_RC" = "2" ] || [ "$LINT_RC" = "2" ]; then
+  # Allowlist block already logged to stderr; stay quiet on stdout
+  :
+else
+  # Ran but failed (likely syntax error in the file being edited). Not fatal.
+  echo "ℹ  route-format: $MATCHED_LANG ran on $REL_PATH but exited non-zero (likely syntax error; formatter made no changes)"
+fi
 
 exit 0

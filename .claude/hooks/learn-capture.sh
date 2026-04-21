@@ -68,53 +68,21 @@ fi
 [ -z "$TEXT" ] && exit 0
 
 # ── Parse [LEARN] blocks ────────────────────────────────────────────────────
-# Format:
-#   [LEARN] Category: <rule-one-liner>
-#   Mistake: <what>
-#   Correction: <what>
+# Delegated to a standalone python script (same rationale as split-subcommands:
+# bash heredocs + python regex don't mix reliably).
+# Format expected:
+#   [LEARN] <category-slug>: <rule one-liner>
+#   Mistake: <what went wrong>
+#   Correction: <right approach>
 #
-# Python does the parsing — bash regex isn't up to multi-line extraction.
-python3 - "$DEVELOPER" "$CORRECTIONS_FILE" <<PY 2>/dev/null
-import json, os, re, sys, uuid
-from datetime import datetime, timezone
+# Skips [LEARN] blocks inside fenced code (```...```) so example/discussion
+# blocks in docs or chat don't get captured as real corrections.
 
-developer = sys.argv[1]
-out_file = sys.argv[2]
+PARSER="$REPO_ROOT/.claude/scripts/parse-learn-blocks.py"
+if [ ! -f "$PARSER" ]; then
+  exit 0
+fi
 
-text = """$(echo "$TEXT" | sed 's/"""/"""/g')"""
-
-# Find all [LEARN] blocks. Each is:
-#   [LEARN] Category: <rule>
-#   Mistake: <...>
-#   Correction: <...>
-pattern = re.compile(
-    r'\[LEARN\]\s*([^:\n]+)\s*:\s*(.+?)\n'
-    r'\s*Mistake\s*:\s*(.+?)\n'
-    r'\s*Correction\s*:\s*(.+?)(?=\n\s*\[LEARN\]|\n\s*\n|\Z)',
-    re.DOTALL,
-)
-count = 0
-with open(out_file, "a") as f:
-    for m in pattern.finditer(text):
-        category = m.group(1).strip().lower().replace(" ", "-")
-        rule = m.group(2).strip()
-        mistake = m.group(3).strip()
-        correction = m.group(4).strip()
-        rec = {
-            "id": f"corr_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "developer": developer,
-            "category": category,
-            "rule": rule,
-            "mistake": mistake,
-            "correction": correction,
-            "promoted_to_team": False,
-        }
-        f.write(json.dumps(rec) + "\n")
-        count += 1
-
-if count:
-    print(f"📚 learn-capture: saved {count} correction(s) to .claude/memory/corrections/{developer}/corrections.jsonl")
-PY
+printf '%s' "$TEXT" | python3 "$PARSER" "$DEVELOPER" "$CORRECTIONS_FILE" 2>/dev/null
 
 exit 0
