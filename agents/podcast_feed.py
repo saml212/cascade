@@ -21,8 +21,7 @@ import subprocess
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
-from typing import Dict, List, Optional
-from xml.etree.ElementTree import Element, SubElement, ElementTree, tostring
+from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
 from agents.base import BaseAgent
@@ -57,8 +56,7 @@ class PodcastFeedAgent(BaseAgent):
         audio_size = audio_path.stat().st_size
         audio_duration = self._get_duration(audio_path)
         self.logger.info(
-            "Audio: %.1f MB, %d seconds"
-            % (audio_size / 1e6, audio_duration)
+            "Audio: %.1f MB, %d seconds" % (audio_size / 1e6, audio_duration)
         )
 
         # --- Step 2: Upload MP3 to R2 ---
@@ -72,7 +70,9 @@ class PodcastFeedAgent(BaseAgent):
             raise RuntimeError("podcast.r2.public_url not set in config.toml")
 
         audio_key = "audio/%s.mp3" % episode_id
-        self._upload_file_to_r2(bucket, audio_path, audio_key, content_type="audio/mpeg")
+        self._upload_file_to_r2(
+            bucket, audio_path, audio_key, content_type="audio/mpeg"
+        )
         audio_url = "%s/%s" % (public_url, audio_key)
         self.logger.info("MP3 uploaded: %s" % audio_url)
 
@@ -93,11 +93,14 @@ class PodcastFeedAgent(BaseAgent):
         current_ep = {
             "episode_id": episode_id,
             "title": ep_title,
-            "description": episode.get("episode_description", "") or self._get_episode_description(episode),
+            "description": episode.get("episode_description", "")
+            or self._get_episode_description(episode),
             "audio_url": audio_url,
             "audio_size": audio_size,
             "duration_seconds": int(audio_duration),
-            "pub_date": episode.get("created_at", datetime.now(timezone.utc).isoformat()),
+            "pub_date": episode.get(
+                "created_at", datetime.now(timezone.utc).isoformat()
+            ),
         }
 
         # Replace existing entry for this episode or append
@@ -113,7 +116,8 @@ class PodcastFeedAgent(BaseAgent):
         # Sort by pub_date descending (newest first)
         all_episodes.sort(key=lambda e: e.get("pub_date", ""), reverse=True)
 
-        feed_xml = self._build_feed_xml(podcast_cfg, all_episodes)
+        feed_url = "%s/feed.xml" % public_url
+        feed_xml = self._build_feed_xml(podcast_cfg, all_episodes, feed_url=feed_url)
 
         # Write feed locally for reference
         local_feed = self.episode_dir / "feed.xml"
@@ -126,7 +130,6 @@ class PodcastFeedAgent(BaseAgent):
             feed_xml.encode("utf-8"),
             content_type="application/rss+xml; charset=utf-8",
         )
-        feed_url = "%s/feed.xml" % public_url
         self.logger.info("Feed uploaded: %s" % feed_url)
 
         # --- Step 4: Save podcast_feed.json in episode directory ---
@@ -146,17 +149,20 @@ class PodcastFeedAgent(BaseAgent):
     def _extract_audio(self, video_path, audio_path):
         # type: (Path, Path) -> None
         cmd = [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
             "-vn",
-            "-c:a", "libmp3lame",
-            "-b:a", "192k",
-            "-ar", "44100",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
             str(audio_path),
         ]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(
                 "ffmpeg audio extraction failed: %s" % result.stderr[-500:]
@@ -165,8 +171,11 @@ class PodcastFeedAgent(BaseAgent):
     def _get_duration(self, audio_path):
         # type: (Path) -> float
         cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_format",
             str(audio_path),
         ]
@@ -196,8 +205,13 @@ class PodcastFeedAgent(BaseAgent):
                 "with Account > R2 Storage > Edit permission"
             )
 
-        url = "https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s/objects/%s" % (
-            account_id, bucket, key,
+        url = (
+            "https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s/objects/%s"
+            % (
+                account_id,
+                bucket,
+                key,
+            )
         )
 
         resp = httpx.put(
@@ -215,7 +229,9 @@ class PodcastFeedAgent(BaseAgent):
                 "R2 upload failed (HTTP %d): %s" % (resp.status_code, resp.text[:500])
             )
 
-    def _upload_file_to_r2(self, bucket, local_path, key, content_type="application/octet-stream"):
+    def _upload_file_to_r2(
+        self, bucket, local_path, key, content_type="application/octet-stream"
+    ):
         # type: (str, Path, str, str) -> None
         """Upload a file to R2 by reading it into memory."""
         data = Path(local_path).read_bytes()
@@ -227,7 +243,6 @@ class PodcastFeedAgent(BaseAgent):
         # type: (Path, dict) -> List[Dict]
         """Scan all episode directories for podcast_feed.json to build the full feed."""
         episodes = []
-        r2_public_url = podcast_cfg.get("r2", {}).get("public_url", "").rstrip("/")
 
         if not episodes_root.is_dir():
             return episodes
@@ -250,17 +265,24 @@ class PodcastFeedAgent(BaseAgent):
                     if ep_json_path.exists():
                         ep_data = json.loads(ep_json_path.read_text())
 
-                    episodes.append({
-                        "episode_id": data.get("episode_id", ep_dir.name),
-                        "title": ep_data.get("episode_name", "") or ep_data.get("title", "") or ep_dir.name,
-                        "description": ep_data.get("episode_description", "") or self._get_episode_description(ep_data),
-                        "audio_url": data.get("audio_url", ""),
-                        "audio_size": data.get("audio_size_bytes", 0),
-                        "duration_seconds": data.get("duration_seconds", 0),
-                        "pub_date": ep_data.get("created_at", ""),
-                    })
+                    episodes.append(
+                        {
+                            "episode_id": data.get("episode_id", ep_dir.name),
+                            "title": ep_data.get("episode_name", "")
+                            or ep_data.get("title", "")
+                            or ep_dir.name,
+                            "description": ep_data.get("episode_description", "")
+                            or self._get_episode_description(ep_data),
+                            "audio_url": data.get("audio_url", ""),
+                            "audio_size": data.get("audio_size_bytes", 0),
+                            "duration_seconds": data.get("duration_seconds", 0),
+                            "pub_date": ep_data.get("created_at", ""),
+                        }
+                    )
                 except (json.JSONDecodeError, KeyError):
-                    self.logger.warning("Skipping malformed podcast_feed.json in %s" % ep_dir.name)
+                    self.logger.warning(
+                        "Skipping malformed podcast_feed.json in %s" % ep_dir.name
+                    )
                     continue
 
         return episodes
@@ -272,7 +294,9 @@ class PodcastFeedAgent(BaseAgent):
         if episode:
             ep_id = episode.get("episode_id", "")
             if ep_id:
-                meta_path = self.episode_dir.parent / ep_id / "metadata" / "metadata.json"
+                meta_path = (
+                    self.episode_dir.parent / ep_id / "metadata" / "metadata.json"
+                )
                 if meta_path.exists():
                     try:
                         meta = json.loads(meta_path.read_text())
@@ -286,16 +310,20 @@ class PodcastFeedAgent(BaseAgent):
 
     # ---- RSS feed generation ----
 
-    def _build_feed_xml(self, podcast_cfg, episodes):
-        # type: (dict, List[Dict]) -> str
+    def _build_feed_xml(self, podcast_cfg, episodes, *, feed_url=""):
+        # type: (dict, List[Dict], str) -> str
         """Generate an Apple Podcasts + Spotify compliant RSS XML feed."""
-        ITUNES_NS = "http://www.itunes.apple.com/dtds/podcast-1.0.dtd"
+        # Canonical iTunes namespace — itunes.com NOT itunes.apple.com.
+        # Spotify validators are strict; apple.com fails their ingester.
+        ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
         CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
+        ATOM_NS = "http://www.w3.org/2005/Atom"
 
         rss = Element("rss")
         rss.set("version", "2.0")
         rss.set("xmlns:itunes", ITUNES_NS)
         rss.set("xmlns:content", CONTENT_NS)
+        rss.set("xmlns:atom", ATOM_NS)
 
         channel = SubElement(rss, "channel")
 
@@ -314,6 +342,16 @@ class PodcastFeedAgent(BaseAgent):
         self._add_text_element(channel, "description", description)
         self._add_text_element(channel, "language", language)
 
+        # Canonical feed self-link — lets podcatchers discover the feed URL for updates
+        if feed_url:
+            atom_link = SubElement(channel, "atom:link")
+            atom_link.set("href", feed_url)
+            atom_link.set("rel", "self")
+            atom_link.set("type", "application/rss+xml")
+
+        # lastBuildDate — required by many validators
+        self._add_text_element(channel, "lastBuildDate", formatdate(usegmt=True))
+
         itunes_author = SubElement(channel, "itunes:author")
         itunes_author.text = author
 
@@ -325,6 +363,10 @@ class PodcastFeedAgent(BaseAgent):
 
         itunes_explicit = SubElement(channel, "itunes:explicit")
         itunes_explicit.text = explicit
+
+        # episodic type — Spotify treats newest as latest (not a serial sequence)
+        itunes_type = SubElement(channel, "itunes:type")
+        itunes_type.text = "episodic"
 
         itunes_owner = SubElement(channel, "itunes:owner")
         owner_name = SubElement(itunes_owner, "itunes:name")
@@ -338,7 +380,8 @@ class PodcastFeedAgent(BaseAgent):
         for ep in episodes:
             item = SubElement(channel, "item")
 
-            self._add_text_element(item, "title", ep.get("title", ""))
+            ep_title = ep.get("title", "")
+            self._add_text_element(item, "title", ep_title)
             self._add_text_element(item, "description", ep.get("description", ""))
 
             enclosure = SubElement(item, "enclosure")
@@ -361,19 +404,24 @@ class PodcastFeedAgent(BaseAgent):
             item_explicit = SubElement(item, "itunes:explicit")
             item_explicit.text = explicit
 
-        # Pretty-print XML
+            # itunes:episodeType — pipeline only produces full episodes
+            item_ep_type = SubElement(item, "itunes:episodeType")
+            item_ep_type.text = "full"
+
+            # itunes:title — used in Apple Podcasts episode listings
+            item_itunes_title = SubElement(item, "itunes:title")
+            item_itunes_title.text = ep_title
+
+        # Serialize via minidom for pretty-printing
         rough_string = tostring(rss, encoding="unicode")
         reparsed = minidom.parseString(rough_string)
         xml_str = reparsed.toprettyxml(indent="  ", encoding=None)
 
-        # minidom adds an xml declaration; ensure it's UTF-8
-        if not xml_str.startswith("<?xml"):
-            xml_str = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_str
-        else:
-            # Replace minidom's declaration with explicit UTF-8
-            lines = xml_str.split("\n")
-            lines[0] = '<?xml version="1.0" encoding="UTF-8"?>'
-            xml_str = "\n".join(lines)
+        # Normalise declaration to exactly: <?xml version="1.0" encoding="UTF-8"?>
+        # (minidom may produce version="1.0" without encoding, or with extra whitespace)
+        lines = xml_str.split("\n")
+        lines[0] = '<?xml version="1.0" encoding="UTF-8"?>'
+        xml_str = "\n".join(lines)
 
         return xml_str
 

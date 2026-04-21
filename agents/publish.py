@@ -18,7 +18,6 @@ import json
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from agents.base import BaseAgent
 
@@ -26,10 +25,30 @@ UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 STATUS_URL = "https://api.upload-post.com/api/uploadposts/status"
 
 
+def _build_first_comment(youtube_url, spotify_url="", channel_handle=""):
+    """Build the YouTube first-comment text that funnels viewers to the full episode.
+
+    Industry data puts a direct-link pinned comment at 1-3% CTR vs <0.5% for
+    "link in bio". Always include the YouTube URL; optionally include Spotify
+    and channel handle when provided.
+    """
+    lines = ["Full episode: %s" % youtube_url]
+    if spotify_url:
+        lines.append("Listen on Spotify: %s" % spotify_url)
+    if channel_handle:
+        lines.append(channel_handle)
+    return "\n".join(lines)
+
+
 class PublishAgent(BaseAgent):
     name = "publish"
 
     def execute(self) -> dict:
+        # Safety gate: must be explicitly approved before sending to live platforms
+        episode = self.load_json_safe("episode.json")
+        if not episode.get("publish_approved"):
+            raise RuntimeError("not publish_approved — refusing to run")
+
         api_key = os.getenv("UPLOAD_POST_API_KEY")
         if not api_key:
             raise RuntimeError("UPLOAD_POST_API_KEY not set in environment")
@@ -37,6 +56,11 @@ class PublishAgent(BaseAgent):
         user = os.getenv("UPLOAD_POST_USER", "")
         if not user:
             raise RuntimeError("UPLOAD_POST_USER not set in environment")
+
+        # Load longform URLs for the YouTube first-comment funnel
+        youtube_longform_url = episode.get("youtube_longform_url", "")
+        spotify_longform_url = episode.get("spotify_longform_url", "")
+        channel_handle = self.config.get("podcast", {}).get("channel_handle", "")
 
         clips_data = self.load_json("clips.json")
         clips = clips_data.get("clips", [])
@@ -65,8 +89,12 @@ class PublishAgent(BaseAgent):
             raise RuntimeError("No platforms enabled in config")
 
         tz_name = self.get_config("schedule", "timezone", default="America/Los_Angeles")
-        shorts_weekday = self.get_config("schedule", "shorts_per_day_weekday", default=1)
-        shorts_weekend = self.get_config("schedule", "shorts_per_day_weekend", default=2)
+        shorts_weekday = self.get_config(
+            "schedule", "shorts_per_day_weekday", default=1
+        )
+        shorts_weekend = self.get_config(
+            "schedule", "shorts_per_day_weekend", default=2
+        )
 
         results = []
 
@@ -102,12 +130,20 @@ class PublishAgent(BaseAgent):
 
             # Build curl command with repeated platform[] fields
             cmd = [
-                "curl", "-s", "--max-time", "600",
-                "-H", "Authorization: Apikey %s" % api_key,
-                "-F", "video=@%s" % str(short_path),
-                "-F", "user=%s" % user,
-                "-F", "title=%s" % title,
-                "-F", "async_upload=true",
+                "curl",
+                "-s",
+                "--max-time",
+                "600",
+                "-H",
+                "Authorization: Apikey %s" % api_key,
+                "-F",
+                "video=@%s" % str(short_path),
+                "-F",
+                "user=%s" % user,
+                "-F",
+                "title=%s" % title,
+                "-F",
+                "async_upload=true",
             ]
 
             # Add platforms (repeated platform[] fields)
@@ -131,23 +167,37 @@ class PublishAgent(BaseAgent):
             if tt:
                 caption = tt.get("caption", title)
                 hashtags = " ".join(tt.get("hashtags", []))
-                cmd.extend(["-F", "tiktok_title=%s" % ("%s %s" % (caption, hashtags)).strip()])
+                cmd.extend(
+                    ["-F", "tiktok_title=%s" % ("%s %s" % (caption, hashtags)).strip()]
+                )
             if ig:
                 caption = ig.get("caption", title)
                 hashtags = " ".join(ig.get("hashtags", []))
-                cmd.extend(["-F", "instagram_title=%s" % ("%s\n\n%s" % (caption, hashtags)).strip()])
+                cmd.extend(
+                    [
+                        "-F",
+                        "instagram_title=%s"
+                        % ("%s\n\n%s" % (caption, hashtags)).strip(),
+                    ]
+                )
             if x_meta:
                 cmd.extend(["-F", "x_title=%s" % x_meta.get("text", title)])
+                # Defensively send x_long_text_as_post so posts > 280 chars don't fail silently
+                cmd.extend(["-F", "x_long_text_as_post=true"])
             if li:
                 cmd.extend(["-F", "linkedin_title=%s" % li.get("title", title)])
-                cmd.extend(["-F", "linkedin_description=%s" % li.get("description", "")])
+                cmd.extend(
+                    ["-F", "linkedin_description=%s" % li.get("description", "")]
+                )
             if fb:
                 cmd.extend(["-F", "facebook_title=%s" % fb.get("title", title)])
             if th:
                 cmd.extend(["-F", "threads_title=%s" % th.get("text", title)])
             if pin:
                 cmd.extend(["-F", "pinterest_title=%s" % pin.get("title", title)])
-                cmd.extend(["-F", "pinterest_description=%s" % pin.get("description", "")])
+                cmd.extend(
+                    ["-F", "pinterest_description=%s" % pin.get("description", "")]
+                )
             if bs:
                 cmd.extend(["-F", "bluesky_title=%s" % bs.get("text", title)])
 
@@ -158,6 +208,13 @@ class PublishAgent(BaseAgent):
                 cmd.extend(["-F", "scheduled_date=%s" % scheduled_dt.isoformat()])
                 cmd.extend(["-F", "timezone=%s" % tz_name])
 
+            # YouTube first-comment funnel — highest-CTR path from Short to longform
+            if youtube_longform_url:
+                first_comment = _build_first_comment(
+                    youtube_longform_url, spotify_longform_url, channel_handle
+                )
+                cmd.extend(["-F", "youtube_first_comment=%s" % first_comment])
+
             cmd.extend(["-X", "POST", UPLOAD_POST_URL])
 
             size_mb = short_path.stat().st_size / 1e6
@@ -167,38 +224,85 @@ class PublishAgent(BaseAgent):
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                 if proc.returncode != 0:
-                    results.append({
-                        "clip_id": clip_id,
-                        "status": "failed",
-                        "error": "curl error: %s" % proc.stderr[:500],
-                    })
-                    self.logger.error("  %s curl failed: %s" % (clip_id, proc.stderr[:200]))
+                    results.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "failed",
+                            "error": "curl error: %s" % proc.stderr[:500],
+                            "stdout": proc.stdout,
+                        }
+                    )
+                    self.logger.error(
+                        "  %s curl failed: %s" % (clip_id, proc.stderr[:200])
+                    )
                     continue
 
-                resp_data = json.loads(proc.stdout)
-                request_id = resp_data.get("request_id", resp_data.get("job_id", ""))
-                results.append({
-                    "clip_id": clip_id,
-                    "status": "submitted",
-                    "platforms": platforms,
-                    "request_id": request_id,
-                    "scheduled": sched is not None,
-                })
-                self.logger.info("  %s submitted (id: %s)" % (clip_id, request_id))
+                try:
+                    resp_data = json.loads(proc.stdout)
+                except json.JSONDecodeError:
+                    results.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "failed",
+                            "error": "non-JSON response from Upload-Post: %s"
+                            % proc.stdout[:200],
+                        }
+                    )
+                    self.logger.error("  %s non-JSON response" % clip_id)
+                    continue
+
+                request_id = resp_data.get("request_id", resp_data.get("job_id"))
+                if request_id:
+                    results.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "submitted",
+                            "platforms": platforms,
+                            "request_id": request_id,
+                            "scheduled": sched is not None,
+                            "response": resp_data,
+                        }
+                    )
+                    self.logger.info("  %s submitted (id: %s)" % (clip_id, request_id))
+                elif "error" in resp_data:
+                    results.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "failed",
+                            "error": resp_data["error"],
+                            "response": resp_data,
+                        }
+                    )
+                    self.logger.error(
+                        "  %s API error: %s" % (clip_id, resp_data["error"])
+                    )
+                else:
+                    results.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "failed",
+                            "response": resp_data,
+                        }
+                    )
+                    self.logger.error("  %s missing request_id in response" % clip_id)
 
             except subprocess.TimeoutExpired:
-                results.append({
-                    "clip_id": clip_id,
-                    "status": "failed",
-                    "error": "Upload timed out (600s)",
-                })
+                results.append(
+                    {
+                        "clip_id": clip_id,
+                        "status": "failed",
+                        "error": "Upload timed out (600s)",
+                    }
+                )
                 self.logger.error("  %s upload timed out" % clip_id)
-            except (json.JSONDecodeError, Exception) as e:
-                results.append({
-                    "clip_id": clip_id,
-                    "status": "failed",
-                    "error": str(e),
-                })
+            except Exception as e:
+                results.append(
+                    {
+                        "clip_id": clip_id,
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                )
                 self.logger.error("  %s failed: %s" % (clip_id, e))
 
         # === Publish longform to YouTube ===
@@ -211,18 +315,36 @@ class PublishAgent(BaseAgent):
             lf_tags = longform_meta.get("tags", [])
 
             cmd = [
-                "curl", "-s", "--max-time", "1200",
-                "-H", "Authorization: Apikey %s" % api_key,
-                "-F", "video=@%s" % str(longform_path),
-                "-F", "user=%s" % user,
-                "-F", "title=%s" % lf_title,
-                "-F", "platform[]=youtube",
-                "-F", "async_upload=true",
-                "-F", "youtube_title=%s" % lf_title,
-                "-F", "youtube_description=%s" % lf_desc,
+                "curl",
+                "-s",
+                "--max-time",
+                "1200",
+                "-H",
+                "Authorization: Apikey %s" % api_key,
+                "-F",
+                "video=@%s" % str(longform_path),
+                "-F",
+                "user=%s" % user,
+                "-F",
+                "title=%s" % lf_title,
+                "-F",
+                "platform[]=youtube",
+                "-F",
+                "async_upload=true",
+                "-F",
+                "youtube_title=%s" % lf_title,
+                "-F",
+                "youtube_description=%s" % lf_desc,
             ]
             if lf_tags:
                 cmd.extend(["-F", "tags=%s" % ",".join(lf_tags)])
+
+            # First comment on the longform itself (e.g. Spotify listen link)
+            if youtube_longform_url:
+                lf_first_comment = _build_first_comment(
+                    youtube_longform_url, spotify_longform_url, channel_handle
+                )
+                cmd.extend(["-F", "youtube_first_comment=%s" % lf_first_comment])
 
             cmd.extend(["-X", "POST", UPLOAD_POST_URL])
 
@@ -238,15 +360,51 @@ class PublishAgent(BaseAgent):
                     }
                     self.logger.error("  Longform curl failed")
                 else:
-                    resp_data = json.loads(proc.stdout)
-                    longform_result = {
-                        "status": "submitted",
-                        "platform": "youtube",
-                        "request_id": resp_data.get("request_id", resp_data.get("job_id", "")),
-                    }
-                    self.logger.info("  Longform submitted")
+                    try:
+                        resp_data = json.loads(proc.stdout)
+                    except json.JSONDecodeError:
+                        longform_result = {
+                            "status": "failed",
+                            "error": "non-JSON response from Upload-Post: %s"
+                            % proc.stdout[:200],
+                        }
+                        self.logger.error("  Longform non-JSON response")
+                        resp_data = None
+
+                    if resp_data is not None:
+                        request_id = resp_data.get(
+                            "request_id", resp_data.get("job_id")
+                        )
+                        if request_id:
+                            longform_result = {
+                                "status": "submitted",
+                                "platform": "youtube",
+                                "request_id": request_id,
+                                "response": resp_data,
+                            }
+                            self.logger.info("  Longform submitted")
+                        elif "error" in resp_data:
+                            longform_result = {
+                                "status": "failed",
+                                "error": resp_data["error"],
+                                "response": resp_data,
+                            }
+                            self.logger.error(
+                                "  Longform API error: %s" % resp_data["error"]
+                            )
+                        else:
+                            longform_result = {
+                                "status": "failed",
+                                "response": resp_data,
+                            }
+                            self.logger.error(
+                                "  Longform missing request_id in response"
+                            )
             except subprocess.TimeoutExpired:
-                longform_result = {"status": "failed", "error": "Upload timed out (1200s)"}
+                longform_result = {
+                    "status": "failed",
+                    "error": "Upload timed out (1200s)",
+                }
                 self.logger.error("  Longform upload timed out")
             except Exception as e:
                 longform_result = {"status": "failed", "error": str(e)}
@@ -281,12 +439,14 @@ class PublishAgent(BaseAgent):
                     break
                 clip = clips[clip_idx]
                 time_slot = "morning" if slot == 0 else "evening"
-                schedule.append({
-                    "clip_id": clip.get("id"),
-                    "platform": "all",
-                    "day_offset": day_offset,
-                    "time_slot": time_slot,
-                })
+                schedule.append(
+                    {
+                        "clip_id": clip.get("id"),
+                        "platform": "all",
+                        "day_offset": day_offset,
+                        "time_slot": time_slot,
+                    }
+                )
                 clip_idx += 1
             day_offset += 1
 

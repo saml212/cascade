@@ -5,7 +5,6 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from lib.atomic_write import atomic_write_json
@@ -43,7 +42,9 @@ async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dic
     logger.info("POST /api/episodes/%s/run-pipeline", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
-            raise HTTPException(status_code=409, detail="Pipeline already running for this episode")
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
 
         # Resolve source_path and audio_path: use request value, fall back to episode.json
         source_path = req.source_path
@@ -58,10 +59,14 @@ async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dic
                 if not audio_path:
                     audio_path = ep_data.get("audio_path")
         if not source_path:
-            raise HTTPException(status_code=400, detail="source_path required (not found in request or episode.json)")
+            raise HTTPException(
+                status_code=400,
+                detail="source_path required (not found in request or episode.json)",
+            )
 
         def _run():
             from agents.pipeline import run_pipeline
+
             run_pipeline(
                 source_path=source_path,
                 audio_path=audio_path,
@@ -78,7 +83,9 @@ async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dic
 
 
 @router.post("/{episode_id}/run-agent/{agent_name}")
-async def run_single_agent(episode_id: str, agent_name: str, req: RunAgentRequest) -> dict:
+async def run_single_agent(
+    episode_id: str, agent_name: str, req: RunAgentRequest
+) -> dict:
     """Run a single agent for an episode."""
     logger.info("POST /api/episodes/%s/run-agent/%s", episode_id, agent_name)
     from agents import AGENT_REGISTRY
@@ -89,7 +96,9 @@ async def run_single_agent(episode_id: str, agent_name: str, req: RunAgentReques
 
     episode_dir = OUTPUT_DIR / episode_id
     if not episode_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Episode directory not found: {episode_id}")
+        raise HTTPException(
+            status_code=404, detail=f"Episode directory not found: {episode_id}"
+        )
 
     config = load_config()
     agent_cls = AGENT_REGISTRY[agent_name]
@@ -180,11 +189,15 @@ async def resume_pipeline(episode_id: str) -> dict:
     logger.info("POST /api/episodes/%s/resume-pipeline", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
-            raise HTTPException(status_code=409, detail="Pipeline already running for this episode")
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
 
         episode_file = OUTPUT_DIR / episode_id / "episode.json"
         if not episode_file.exists():
-            raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Episode not found: {episode_id}"
+            )
 
         with open(episode_file) as f:
             episode = json.load(f)
@@ -193,6 +206,7 @@ async def resume_pipeline(episode_id: str) -> dict:
         source_path = episode.get("source_path", "")
 
         from agents import PIPELINE_ORDER
+
         remaining = [a for a in PIPELINE_ORDER if a not in completed]
 
         if not remaining:
@@ -200,6 +214,7 @@ async def resume_pipeline(episode_id: str) -> dict:
 
         def _run():
             from agents.pipeline import run_pipeline
+
             run_pipeline(
                 source_path=source_path,
                 episode_id=episode_id,
@@ -211,7 +226,11 @@ async def resume_pipeline(episode_id: str) -> dict:
         _running[episode_id] = thread
 
     logger.info("Pipeline resumed for %s with agents: %s", episode_id, remaining)
-    return {"status": "resumed", "episode_id": episode_id, "remaining_agents": remaining}
+    return {
+        "status": "resumed",
+        "episode_id": episode_id,
+        "remaining_agents": remaining,
+    }
 
 
 @router.post("/{episode_id}/auto-approve")
@@ -254,11 +273,15 @@ async def approve_backup(episode_id: str) -> dict:
     logger.info("POST /api/episodes/%s/approve-backup", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
-            raise HTTPException(status_code=409, detail="Pipeline already running for this episode")
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
 
         episode_file = OUTPUT_DIR / episode_id / "episode.json"
         if not episode_file.exists():
-            raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Episode not found: {episode_id}"
+            )
 
         with open(episode_file) as f:
             episode = json.load(f)
@@ -274,6 +297,7 @@ async def approve_backup(episode_id: str) -> dict:
 
         def _run():
             from agents.pipeline import run_pipeline
+
             run_pipeline(
                 source_path=source_path,
                 episode_id=episode_id,
@@ -288,7 +312,51 @@ async def approve_backup(episode_id: str) -> dict:
     return {"status": "backup_started", "episode_id": episode_id}
 
 
-@router.post("/episodes/{episode_id}/approve-longform")
+@router.post("/{episode_id}/approve-publish")
+async def approve_publish(episode_id: str) -> dict:
+    """Approve publishing to social platforms, then run podcast_feed + publish agents."""
+    logger.info("POST /api/episodes/%s/approve-publish", episode_id)
+    async with _pipeline_lock:
+        if episode_id in _running and _running[episode_id].is_alive():
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
+
+        episode_file = OUTPUT_DIR / episode_id / "episode.json"
+        if not episode_file.exists():
+            raise HTTPException(
+                status_code=404, detail=f"Episode not found: {episode_id}"
+            )
+
+        with open(episode_file) as f:
+            episode = json.load(f)
+
+        episode["publish_approved"] = True
+        episode["publish_approved_at"] = datetime.now(timezone.utc).isoformat()
+        episode["status"] = "processing"
+
+        atomic_write_json(episode_file, episode)
+
+        source_path = episode.get("source_path", "")
+
+        def _run():
+            from agents.pipeline import run_pipeline
+
+            run_pipeline(
+                source_path=source_path,
+                episode_id=episode_id,
+                agents=["podcast_feed", "publish"],
+            )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        _running[episode_id] = thread
+
+    logger.info("Publish approved and started for %s", episode_id)
+    return {"status": "publish_started", "episode_id": episode_id}
+
+
+@router.post("/{episode_id}/approve-longform")
 async def approve_longform(episode_id: str):
     """Approve the longform render and resume pipeline for clip mining, shorts, metadata."""
     async with _pipeline_lock:
@@ -297,7 +365,9 @@ async def approve_longform(episode_id: str):
 
         episode_file = OUTPUT_DIR / episode_id / "episode.json"
         if not episode_file.exists():
-            raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Episode not found: {episode_id}"
+            )
 
         with open(episode_file) as f:
             episode = json.load(f)
@@ -311,10 +381,17 @@ async def approve_longform(episode_id: str):
 
         def _run():
             from agents.pipeline import run_pipeline
+
             run_pipeline(
                 source_path=source_path,
                 episode_id=episode_id,
-                agents=["clip_miner", "shorts_render", "metadata_gen", "thumbnail_gen", "qa"],
+                agents=[
+                    "clip_miner",
+                    "shorts_render",
+                    "metadata_gen",
+                    "thumbnail_gen",
+                    "qa",
+                ],
             )
 
         thread = threading.Thread(target=_run, daemon=True)
