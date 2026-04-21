@@ -15,6 +15,20 @@ import {
   getAgentState,
   readThreadSince,
 } from "./state.js";
+import { validateName } from "./worktree.js";
+
+// Validate :name path params against the same allowlist used for worktree
+// ops. Without this, Express's default :param match is [^/]+ — `..` passes
+// through and routes like /api/agents/../thread.md/output would resolve to
+// files outside the agents/<name>/ directory.
+function requireSafeAgentName(req, res, next) {
+  try {
+    validateName(req.params.name, "agent name");
+    next();
+  } catch {
+    res.status(400).json({ error: "invalid agent name" });
+  }
+}
 
 const ORCHESTRATOR_DIR = path.dirname(new URL(import.meta.url).pathname);
 const PUBLIC_DIR = path.join(ORCHESTRATOR_DIR, "..", "dashboard", "public");
@@ -56,14 +70,14 @@ export function startDashboard({ runDir, port = 0 }) {
     res.type("text/markdown").send(readFileSync(threadPath, "utf8"));
   });
 
-  app.get("/api/agents/:name/output", (req, res) => {
+  app.get("/api/agents/:name/output", requireSafeAgentName, (req, res) => {
     const logPath = path.join(runDir, "agents", req.params.name, "output.log");
     if (!existsSync(logPath)) return res.status(404).send("no output yet");
     res.type("text/plain").send(readFileSync(logPath, "utf8"));
   });
 
   // Per-agent SSE stream of events.jsonl lines as they're appended
-  app.get("/api/agents/:name/events/stream", (req, res) => {
+  app.get("/api/agents/:name/events/stream", requireSafeAgentName, (req, res) => {
     const eventsPath = path.join(runDir, "agents", req.params.name, "events.jsonl");
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -76,6 +90,13 @@ export function startDashboard({ runDir, port = 0 }) {
     const sendNew = () => {
       if (!existsSync(eventsPath)) return;
       const size = statSync(eventsPath).size;
+      // HIGH bug from self-review: if the file is rotated/truncated, size <
+      // lastSize forever and the stream stalls silently. Detect rollback and
+      // resume from the beginning of the new file.
+      if (size < lastSize) {
+        lastSize = 0;
+        partialLine = "";
+      }
       if (size <= lastSize) return;
       const stream = createReadStream(eventsPath, {
         start: lastSize,
@@ -108,7 +129,7 @@ export function startDashboard({ runDir, port = 0 }) {
   });
 
   // Full event log (for late-joiners catching up)
-  app.get("/api/agents/:name/events", (req, res) => {
+  app.get("/api/agents/:name/events", requireSafeAgentName, (req, res) => {
     const eventsPath = path.join(runDir, "agents", req.params.name, "events.jsonl");
     if (!existsSync(eventsPath)) return res.json([]);
     const content = readFileSync(eventsPath, "utf8").trim();
@@ -127,16 +148,32 @@ export function startDashboard({ runDir, port = 0 }) {
     res.json(events);
   });
 
-  // Intervention endpoints — dashboard POSTs → orchestrator drains before dispatch
-  const post = (type) => (req, res) => {
-    const body = req.body || {};
-    const event = { type, ...body };
-    const entry = appendIntervention({ runDir, event });
+  // Intervention endpoints — dashboard POSTs → orchestrator drains before dispatch.
+  // MEDIUM bug from self-review: generic `{ type, ...body }` spread let a body
+  // with its own "type" override the intended event type (e.g., POST to
+  // stop-agent with {"type":"stop_team"} killed the whole team). Fix:
+  // whitelist fields explicitly per endpoint; never accept a client-supplied
+  // `type`.
+  const validateTarget = (target) => {
+    try {
+      validateName(target, "target");
+      return null;
+    } catch (e) {
+      return e.message;
+    }
+  };
+  const targetOnly = (type) => (req, res) => {
+    const target = req.body?.target;
+    const err = validateTarget(target);
+    if (err) return res.status(400).json({ error: err });
+    const entry = appendIntervention({ runDir, event: { type, target } });
     res.json({ ok: true, entry });
   };
+
   app.post("/api/interventions/thread-post", (req, res) => {
-    const { content } = req.body || {};
-    if (!content) return res.status(400).json({ error: "content required" });
+    const content = req.body?.content;
+    if (typeof content !== "string" || !content.trim())
+      return res.status(400).json({ error: "content required" });
     const entry = appendIntervention({
       runDir,
       event: { type: "thread_post", author: "developer", content },
@@ -144,18 +181,21 @@ export function startDashboard({ runDir, port = 0 }) {
     res.json({ ok: true, entry });
   });
   app.post("/api/interventions/direct-message", (req, res) => {
-    const { target, content } = req.body || {};
-    if (!target || !content)
-      return res.status(400).json({ error: "target and content required" });
+    const target = req.body?.target;
+    const content = req.body?.content;
+    const err = validateTarget(target);
+    if (err) return res.status(400).json({ error: err });
+    if (typeof content !== "string" || !content.trim())
+      return res.status(400).json({ error: "content required" });
     const entry = appendIntervention({
       runDir,
       event: { type: "direct_message", target, content },
     });
     res.json({ ok: true, entry });
   });
-  app.post("/api/interventions/stop-agent", post("stop_agent"));
-  app.post("/api/interventions/pause-agent", post("pause_agent"));
-  app.post("/api/interventions/resume-agent", post("resume_agent"));
+  app.post("/api/interventions/stop-agent", targetOnly("stop_agent"));
+  app.post("/api/interventions/pause-agent", targetOnly("pause_agent"));
+  app.post("/api/interventions/resume-agent", targetOnly("resume_agent"));
   app.post("/api/interventions/stop-team", (req, res) => {
     const entry = appendIntervention({ runDir, event: { type: "stop_team" } });
     res.json({ ok: true, entry });

@@ -62,15 +62,33 @@ function stageContextFiles({ repoRoot: root, runDir, files }) {
   if (!files?.length) return;
   const ctxDir = path.join(runDir, "context");
   mkdirSync(ctxDir, { recursive: true });
+  // HIGH bug from self-review: a context_files entry like "../../.env" would
+  // resolve via path.join to a file outside the repo (credentials, system
+  // files) and copy it into the context dir, handing it to every agent.
+  // Containment check: resolved src MUST stay under repoRoot; dst MUST stay
+  // under ctxDir. No symlink-resolution here — path.resolve is syntactic,
+  // which is fine for defense-in-depth against config typos / malicious
+  // configs.
+  const rootReal = path.resolve(root) + path.sep;
+  const ctxReal = path.resolve(ctxDir) + path.sep;
   for (const relPath of files) {
-    const src = path.join(root, relPath);
+    const src = path.resolve(root, relPath);
+    const dst = path.resolve(ctxDir, relPath);
+    if (!src.startsWith(rootReal)) {
+      throw new Error(
+        `context_files entry "${relPath}" escapes repo root (resolves to ${src})`,
+      );
+    }
+    if (!dst.startsWith(ctxReal)) {
+      throw new Error(
+        `context_files entry "${relPath}" would write outside context dir (${dst})`,
+      );
+    }
     if (!existsSync(src)) {
       console.warn(`⚠  context file not found: ${relPath}`);
       continue;
     }
-    // Flatten the path for easy reference (dir/file.md → dir__file.md)
-    const flat = relPath.replace(/[\/\\]/g, "__");
-    const dst = path.join(ctxDir, flat);
+    mkdirSync(path.dirname(dst), { recursive: true });
     copyFileSync(src, dst);
   }
 }

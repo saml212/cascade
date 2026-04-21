@@ -27,6 +27,18 @@ export function createWorktree({ repoRoot, runId, agentName, worktreeRoot, base 
   validateName(runId, "runId");
   validateName(agentName, "agentName");
 
+  // LOW bug from self-review: `base` flows into `git worktree add <path>
+  // <base>`. Because execFileSync uses argv arrays, shell command injection
+  // isn't possible — but git still treats `-` / `--`-prefixed arguments as
+  // flags regardless of position. Values like "--detach" or "--orphan"
+  // would change worktree semantics silently. Reject anything starting
+  // with `-` or containing whitespace.
+  if (typeof base !== "string" || !base || base.startsWith("-") || /\s/.test(base)) {
+    throw new Error(
+      `unsafe base ref "${base}" — must not start with "-" or contain whitespace`,
+    );
+  }
+
   const branch = `team/${runId}/${agentName}`;
   const wtPath = path.join(worktreeRoot, agentName);
 

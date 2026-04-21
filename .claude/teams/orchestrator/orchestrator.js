@@ -13,8 +13,13 @@ import { runIteration } from "./iteration.js";
 
 // Drain interventions that need orchestrator action (thread_post, stop_*).
 // Direct messages are read lazily inside runIteration from the JSONL.
-function drainGlobalInterventions(runDir, sinceTs) {
-  const events = readInterventions({ runDir, afterTs: sinceTs });
+//
+// Each agent gets its own cursor (`afterTs`) so one agent can't advance past
+// interventions another hasn't seen. Thread posts are de-duplicated via a
+// shared `postedInterventionTs` Set keyed by the event's `ts` — the first
+// agent to drain a thread_post materializes it, the rest skip.
+function drainGlobalInterventions({ runDir, afterTs, postedInterventionTs }) {
+  const events = readInterventions({ runDir, afterTs });
   const control = {
     stopTeam: false,
     stopAgents: new Set(),
@@ -24,11 +29,14 @@ function drainGlobalInterventions(runDir, sinceTs) {
   for (const e of events) {
     switch (e.type) {
       case "thread_post":
-        appendThreadPost({
-          runDir,
-          author: e.author || "developer",
-          content: e.content || "",
-        });
+        if (!postedInterventionTs.has(e.ts)) {
+          postedInterventionTs.add(e.ts);
+          appendThreadPost({
+            runDir,
+            author: e.author || "developer",
+            content: e.content || "",
+          });
+        }
         break;
       case "stop_team":
         control.stopTeam = true;
@@ -66,14 +74,32 @@ export async function runTeam({
   const deadline = Date.now() + maxTotalMinutes * 60 * 1000;
   const parallel = config.parallel !== false;
 
-  let lastInterventionTs = null;
+  // Thread-post de-dup: one agent appends a developer thread_post to
+  // thread.md, but every parallel agent sees it in readInterventions and
+  // shouldn't re-append it. Track which intervention timestamps have been
+  // materialized into thread.md globally.
+  const postedInterventionTs = new Set();
 
   const runOne = async (agent) => {
+    // Per-agent cursor — fixes the critical parallel bug from self-review:
+    // a shared cursor let one agent advance past interventions another
+    // hadn't seen, silently dropping stop/pause/resume for that other agent.
+    let lastInterventionTs = null;
+
+    const drainForThisAgent = () => {
+      const control = drainGlobalInterventions({
+        runDir,
+        afterTs: lastInterventionTs,
+        postedInterventionTs,
+      });
+      lastInterventionTs = new Date().toISOString();
+      return control;
+    };
+
     while (true) {
       if (signal?.aborted) return { agent: agent.name, stopped: "abort_signal" };
 
-      const control = drainGlobalInterventions(runDir, lastInterventionTs);
-      lastInterventionTs = new Date().toISOString();
+      const control = drainForThisAgent();
 
       if (control.stopTeam) {
         updateAgentState({
@@ -100,8 +126,7 @@ export async function runTeam({
         // Simple pause loop: poll for resume
         while (true) {
           await new Promise((r) => setTimeout(r, 2000));
-          const fresh = drainGlobalInterventions(runDir, lastInterventionTs);
-          lastInterventionTs = new Date().toISOString();
+          const fresh = drainForThisAgent();
           if (fresh.stopTeam || fresh.stopAgents.has(agent.name)) {
             updateAgentState({
               runDir,
@@ -119,6 +144,12 @@ export async function runTeam({
             break;
           }
           if (Date.now() > deadline) {
+            // MEDIUM bug from self-review: this path didn't update state
+            updateAgentState({
+              runDir,
+              agentName: agent.name,
+              updates: { status: "stopped", done_reason: "deadline_during_pause" },
+            });
             return { agent: agent.name, stopped: "deadline_during_pause" };
           }
         }

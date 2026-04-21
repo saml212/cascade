@@ -97,7 +97,11 @@ export function readThreadSince({ runDir, sinceTs }) {
   const searchText = "\n" + content;
   while ((m = headerRegex.exec(searchText)) !== null) {
     matches.push({
-      startIdx: m.index - 1,
+      // LOW bug from self-review: `m.index - 1` can be -1 when the content
+      // starts with the header directly (no preamble). Clamp to 0 so the
+      // following post's `bodyEnd` doesn't become -1 and chop off its
+      // final byte via the negative-index semantics of slice().
+      startIdx: Math.max(0, m.index - 1),
       ts: m[1],
       author: m[2].trim(),
       bodyStart: m.index + m[0].length - 1,

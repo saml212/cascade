@@ -9,7 +9,7 @@
 //   6. Detect AGENT_DONE sentinel in the final text; update state
 
 import { spawn } from "node:child_process";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import {
   getAgentState,
@@ -41,10 +41,28 @@ function buildPrompt({
     s.push(agent.prompt);
     s.push("");
 
-    if (agent.context_files?.length) {
-      s.push("## Context Files to Read First");
-      for (const f of agent.context_files) s.push(`- ${f}`);
-      s.push("");
+    // Context dir (staged by index.js from team + per-agent context_files).
+    // Paths inside preserve repo-relative structure — an agent referencing
+    // ".claude/teams/orchestrator/state.js" in its prompt can Read
+    // `<contextDir>/.claude/teams/orchestrator/state.js`.
+    const runDir = path.dirname(threadPath);
+    const contextDir = path.join(runDir, "context");
+    if (existsSync(contextDir)) {
+      try {
+        const hasFiles = readdirSync(contextDir).length > 0;
+        if (hasFiles) {
+          s.push("## Context Files (staged — read these with Read, don't try to cd outside your worktree)");
+          s.push(`Location: \`${contextDir}/\``);
+          s.push("Structure: repo-relative paths preserved (e.g., `.claude/teams/orchestrator/state.js`).");
+          if (agent.context_files?.length) {
+            s.push("Files specifically for you:");
+            for (const f of agent.context_files) s.push(`- \`${contextDir}/${f}\``);
+          }
+          s.push("");
+        }
+      } catch {
+        // context dir exists but unreadable — skip
+      }
     }
 
     s.push("## How to Coordinate with Your Team");
@@ -67,7 +85,7 @@ function buildPrompt({
     s.push("```");
     s.push("");
     s.push(
-      `**When you are fully finished with your task**, include the string \`${AGENT_DONE_SENTINEL}\` in your final response.`,
+      `**When you are fully finished with your task**, put the literal string \`${AGENT_DONE_SENTINEL}\` on its own line in your final response (not inside prose, not inside a code block). Anything else is treated as "still working".`,
     );
     s.push("");
   } else {
@@ -108,7 +126,7 @@ function buildPrompt({
   s.push("---");
   s.push("");
   s.push(
-    `Continue your work. Read files, analyze, write code in your worktree, and post to the thread when appropriate. End this iteration with a brief summary of what you did and what you plan next — unless you are finished, in which case include \`${AGENT_DONE_SENTINEL}\`.`,
+    `Continue your work. Read files, analyze, write code in your worktree, and post to the thread when appropriate. End this iteration with a brief summary of what you did and what you plan next — unless you are finished, in which case put \`${AGENT_DONE_SENTINEL}\` on its own line as the last thing in your response.`,
   );
 
   return s.join("\n");
@@ -206,6 +224,11 @@ export async function runIteration({ runDir, agent, worktreePath, threadPath }) 
   let agentState = getAgentState({ runDir, agentName: agent.name });
   const isFirstIteration = agentState.iteration === 0;
 
+  // HIGH bug from self-review: capture the iteration-start ts BEFORE reading
+  // interventions/thread, so anything arriving during Claude's execution
+  // window is picked up on the next iteration rather than silently dropped.
+  const iterationStartTs = new Date().toISOString();
+
   const threadPosts = readThreadSince({
     runDir,
     sinceTs: agentState.last_seen_ts,
@@ -281,22 +304,53 @@ export async function runIteration({ runDir, agent, worktreePath, threadPath }) 
     throw err;
   }
 
-  const done = response.includes(AGENT_DONE_SENTINEL);
+  // HIGH bug from self-review: `response.includes(AGENT_DONE_SENTINEL)` was
+  // a raw substring check that triggered on any mention — inside a code
+  // block, quoted in prose, etc. Require the sentinel to appear as a
+  // standalone line with no surrounding backticks or code fences.
+  const done = hasAgentDoneSignal(response);
+
   const newIteration = agentState.iteration + 1;
-  const newTs = new Date().toISOString();
+  const endTs = new Date().toISOString();
 
   updateAgentState({
     runDir,
     agentName: agent.name,
     updates: {
       iteration: newIteration,
-      last_seen_ts: newTs,
+      // Use iteration-start ts, not end-of-iteration ts, so DMs/thread posts
+      // that arrived during the run aren't lost on the next cursor advance.
+      last_seen_ts: iterationStartTs,
       last_notes: extractNotes(response),
       status: done ? "done" : "idle",
-      ended_at: done ? newTs : null,
+      ended_at: done ? endTs : null,
       done_reason: done ? "agent_declared_done" : null,
     },
   });
 
   return { response, done, iteration: newIteration };
+}
+
+// Detect AGENT_DONE only when it appears as the SOLE content of a line
+// (possibly with leading/trailing whitespace, not inside a fenced block or
+// inline backtick span). Prose mentions like "I should include AGENT_DONE"
+// or "the sentinel `AGENT_DONE`" do NOT trigger — those would prematurely
+// terminate agents that discuss the protocol.
+function hasAgentDoneSignal(text) {
+  if (!text) return false;
+  const lines = text.split("\n");
+  let inFence = false;
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    // Accept the sentinel on its own line, with or without surrounding
+    // backticks (`AGENT_DONE` or AGENT_DONE alone).
+    if (trimmed === AGENT_DONE_SENTINEL) return true;
+    if (trimmed === `\`${AGENT_DONE_SENTINEL}\``) return true;
+  }
+  return false;
 }
