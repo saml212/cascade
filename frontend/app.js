@@ -693,6 +693,24 @@ async function renderEpisodeDetail(episodeId, tab) {
     </div>
     ` : ''}
 
+    ${ep.status === 'awaiting_publish_approval' ? (() => {
+      const publishableClips = (clips || []).filter(c => c.status !== 'rejected');
+      return `
+    <div class="mb-6 bg-green-900/30 border border-green-700/50 rounded-lg p-4 flex items-center justify-between" id="approve-publish-banner">
+      <div class="flex items-center gap-3">
+        <span class="inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse" id="approve-publish-pulse"></span>
+        <div>
+          <p class="text-sm font-medium text-green-200">Ready to publish — ${publishableClips.length} short${publishableClips.length !== 1 ? 's' : ''} + longform</p>
+          <p class="text-xs text-green-400/70">Shorts and longform will be posted to all enabled platforms. This cannot be undone.</p>
+        </div>
+      </div>
+      <button onclick="approvePublish('${episodeId}', ${publishableClips.length})" id="approve-publish-btn" class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition-colors text-white">
+        Approve &amp; Publish
+      </button>
+    </div>
+    `;
+    })() : ''}
+
     <!-- Episode Info (editable) -->
     <div class="mb-6 bg-zinc-900 border border-zinc-800 rounded-lg p-4">
       <div class="flex items-center justify-between mb-3">
@@ -1197,6 +1215,45 @@ async function approveBackup(episodeId) {
     await renderEpisodeDetail(episodeId);
   } catch (err) {
     showToast('Failed: ' + err.message, 'error');
+  }
+}
+
+async function approvePublish(episodeId, shortCount) {
+  const confirmed = confirm(
+    `Publish this episode to all enabled platforms?\n\n` +
+    `  • ${shortCount} short${shortCount !== 1 ? 's' : ''} will be uploaded\n` +
+    `  • Longform will be uploaded\n` +
+    `  • All enabled platforms in config will receive the upload\n\n` +
+    `This will post to your real accounts and cannot be undone.`
+  );
+  if (!confirmed) return;
+
+  const btn = document.getElementById('approve-publish-btn');
+  const pulse = document.getElementById('approve-publish-pulse');
+  const banner = document.getElementById('approve-publish-banner');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Publishing…';
+    btn.className = btn.className.replace('bg-green-600 hover:bg-green-500', 'bg-zinc-600 cursor-not-allowed');
+  }
+  if (pulse) pulse.classList.remove('bg-green-400');
+
+  try {
+    await api(`/episodes/${episodeId}/approve-publish`, { method: 'POST' });
+    showToast('Publishing started — videos are being uploaded to all platforms.', 'success');
+    await renderEpisodeDetail(episodeId);
+  } catch (err) {
+    if (err.message.startsWith('409')) {
+      showToast('Pipeline is already running for this episode.', 'error');
+    } else {
+      showToast('Publish failed: ' + err.message, 'error');
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Approve & Publish';
+      btn.className = btn.className.replace('bg-zinc-600 cursor-not-allowed', 'bg-green-600 hover:bg-green-500');
+    }
+    if (pulse) pulse.classList.add('bg-green-400');
   }
 }
 
