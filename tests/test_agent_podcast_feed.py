@@ -10,7 +10,6 @@ dicts so the test is hermetic.
 """
 
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 import pytest
 
@@ -257,7 +256,9 @@ class TestSerializationFormat:
         # silently mangled.
         episodes[0]["title"] = "Q&A with <Sam>"
         xml_str = agent._build_feed_xml(
-            podcast_cfg, episodes, feed_url="https://example.r2.dev/feed.xml",
+            podcast_cfg,
+            episodes,
+            feed_url="https://example.r2.dev/feed.xml",
         )
         # If escaping is broken, ET.fromstring will raise.
         root = ET.fromstring(xml_str)

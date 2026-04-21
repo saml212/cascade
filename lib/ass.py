@@ -78,6 +78,7 @@ MAX_WORDS_PER_SECOND = 6.0
 @dataclass
 class CaptionStyle:
     """Tunable knobs. Defaults are the research-validated baseline."""
+
     font: str = DEFAULT_FONT
     font_size: int = DEFAULT_FONT_SIZE
     primary_color: str = COLOR_WHITE_OPAQUE
@@ -120,8 +121,7 @@ def escape_ass_text(text: str) -> str:
     line breaks. Curly braces wrap inline overrides, backslash starts an
     override tag, newlines must be \\N."""
     return (
-        text
-        .replace("\\", "\\\\")
+        text.replace("\\", "\\\\")
         .replace("{", "\\{")
         .replace("}", "\\}")
         .replace("\n", "\\N")
@@ -179,12 +179,14 @@ def group_words_into_phrases(
         rel_end = max(rel_start + MIN_PHRASE_DURATION, last["end"] - clip_start)
         # Cap phrase duration so static text doesn't linger
         rel_end = min(rel_end, rel_start + MAX_PHRASE_DURATION)
-        phrases.append({
-            "start": rel_start,
-            "end": rel_end,
-            "text": text,
-            "speaker": first.get("speaker"),
-        })
+        phrases.append(
+            {
+                "start": rel_start,
+                "end": rel_end,
+                "text": text,
+                "speaker": first.get("speaker"),
+            }
+        )
         current.clear()
 
     for i, w in enumerate(words):
@@ -237,26 +239,26 @@ def _format_style_line(style: CaptionStyle) -> str:
         "Style: Default,"
         f"{style.font},"
         f"{style.font_size},"
-        f"{style.primary_color},"   # PrimaryColour
-        f"{style.primary_color},"   # SecondaryColour (unused for static; matches primary)
-        f"{style.outline_color},"   # OutlineColour
-        "&H64000000,"               # BackColour (semi-transparent black, unused at BorderStyle=1)
-        f"{bold},"                  # Bold
-        "0,"                        # Italic
-        "0,"                        # Underline
-        "0,"                        # StrikeOut
-        "100,"                      # ScaleX
-        "100,"                      # ScaleY
-        "0,"                        # Spacing
-        "0,"                        # Angle
-        "1,"                        # BorderStyle: 1 = outline + shadow
-        f"{style.outline},"         # Outline
-        f"{style.shadow},"          # Shadow
-        f"{style.alignment},"       # Alignment (numpad)
-        "80,"                       # MarginL
-        "80,"                       # MarginR
-        f"{style.margin_v},"        # MarginV
-        "1"                         # Encoding (1 = default)
+        f"{style.primary_color},"  # PrimaryColour
+        f"{style.primary_color},"  # SecondaryColour (unused for static; matches primary)
+        f"{style.outline_color},"  # OutlineColour
+        "&H64000000,"  # BackColour (semi-transparent black, unused at BorderStyle=1)
+        f"{bold},"  # Bold
+        "0,"  # Italic
+        "0,"  # Underline
+        "0,"  # StrikeOut
+        "100,"  # ScaleX
+        "100,"  # ScaleY
+        "0,"  # Spacing
+        "0,"  # Angle
+        "1,"  # BorderStyle: 1 = outline + shadow
+        f"{style.outline},"  # Outline
+        f"{style.shadow},"  # Shadow
+        f"{style.alignment},"  # Alignment (numpad)
+        "80,"  # MarginL
+        "80,"  # MarginR
+        f"{style.margin_v},"  # MarginV
+        "1"  # Encoding (1 = default)
     )
 
 

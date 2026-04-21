@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from lib.ass import CaptionStyle, generate_ass_from_diarized
+from lib.ass import generate_ass_from_diarized
 
 
 pytestmark = pytest.mark.skipif(
@@ -27,10 +27,20 @@ def _make_test_video(path: Path, duration: float = 4.0):
     """Render a 1080x1920 testsrc video so the subtitles filter has
     something to overlay."""
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "lavfi",
-        "-i", f"testsrc=size=1080x1920:duration={duration}:rate=30",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc=size=1080x1920:duration={duration}:rate=30",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
         str(path),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -47,16 +57,16 @@ def _diarized_with_words():
                 "end": 3.0,
                 "text": "and that's when I realized the entire thesis was wrong",
                 "words": [
-                    {"word": "and",      "start": 0.10, "end": 0.30, "speaker": 0},
-                    {"word": "that's",   "start": 0.35, "end": 0.65, "speaker": 0},
-                    {"word": "when",     "start": 0.70, "end": 0.90, "speaker": 0},
-                    {"word": "I",        "start": 0.95, "end": 1.05, "speaker": 0},
+                    {"word": "and", "start": 0.10, "end": 0.30, "speaker": 0},
+                    {"word": "that's", "start": 0.35, "end": 0.65, "speaker": 0},
+                    {"word": "when", "start": 0.70, "end": 0.90, "speaker": 0},
+                    {"word": "I", "start": 0.95, "end": 1.05, "speaker": 0},
                     {"word": "realized", "start": 1.10, "end": 1.55, "speaker": 0},
-                    {"word": "the",      "start": 1.60, "end": 1.75, "speaker": 0},
-                    {"word": "entire",   "start": 1.80, "end": 2.10, "speaker": 0},
-                    {"word": "thesis",   "start": 2.15, "end": 2.50, "speaker": 0},
-                    {"word": "was",      "start": 2.55, "end": 2.70, "speaker": 0},
-                    {"word": "wrong",    "start": 2.75, "end": 3.00, "speaker": 0},
+                    {"word": "the", "start": 1.60, "end": 1.75, "speaker": 0},
+                    {"word": "entire", "start": 1.80, "end": 2.10, "speaker": 0},
+                    {"word": "thesis", "start": 2.15, "end": 2.50, "speaker": 0},
+                    {"word": "was", "start": 2.55, "end": 2.70, "speaker": 0},
+                    {"word": "wrong", "start": 2.75, "end": 3.00, "speaker": 0},
                 ],
             },
         ]
@@ -67,12 +77,19 @@ def _diarized_with_words():
 from lib.srt import escape_srt_path  # noqa: E402
 
 
-def _burn_subtitles(video_in: Path, ass_in: Path, video_out: Path, *, lossless: bool = False):
+def _burn_subtitles(
+    video_in: Path, ass_in: Path, video_out: Path, *, lossless: bool = False
+):
     ass_escaped = escape_srt_path(ass_in)
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(video_in),
-        "-vf", f"subtitles='{ass_escaped}'",
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_in),
+        "-vf",
+        f"subtitles='{ass_escaped}'",
     ]
     if lossless:
         # ffv1 in matroska — bit-exact decode → encode → decode round-trip
@@ -92,12 +109,18 @@ def _burn_subtitles(video_in: Path, ass_in: Path, video_out: Path, *, lossless: 
 
 def _ffprobe_video(path: Path) -> dict:
     cmd = [
-        "ffprobe", "-v", "error", "-print_format", "json",
-        "-show_streams", "-show_format",
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
         str(path),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     import json
+
     return json.loads(proc.stdout)
 
 
@@ -110,7 +133,10 @@ class TestEndToEndRender:
         # Step 2: produce ASS file from synthetic transcript
         ass = tmp_path / "captions.ass"
         n_phrases = generate_ass_from_diarized(
-            _diarized_with_words(), start=0.0, end=3.0, ass_path=ass,
+            _diarized_with_words(),
+            start=0.0,
+            end=3.0,
+            ass_path=ass,
         )
         assert n_phrases > 0
         assert ass.exists() and ass.stat().st_size > 0
@@ -142,7 +168,10 @@ class TestEndToEndRender:
         _make_test_video(video, duration=3.5)
         ass = tmp_path / "captions.ass"
         generate_ass_from_diarized(
-            _diarized_with_words(), start=0.0, end=3.0, ass_path=ass,
+            _diarized_with_words(),
+            start=0.0,
+            end=3.0,
+            ass_path=ass,
         )
         burned = tmp_path / "burned.mp4"
         _burn_subtitles(video, ass, burned)
@@ -151,13 +180,27 @@ class TestEndToEndRender:
         unburned_png = tmp_path / "unburned.png"
         burned_png = tmp_path / "burned.png"
         for src, png in [(video, unburned_png), (burned, burned_png)]:
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", "1.5", "-i", str(src),
-                "-frames:v", "1", str(png),
-            ], check=True, capture_output=True, text=True)
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    "1.5",
+                    "-i",
+                    str(src),
+                    "-frames:v",
+                    "1",
+                    str(png),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
         import hashlib
+
         unburned_hash = hashlib.sha256(unburned_png.read_bytes()).hexdigest()
         burned_hash = hashlib.sha256(burned_png.read_bytes()).hexdigest()
         assert unburned_hash != burned_hash, (
@@ -176,17 +219,28 @@ class TestEndToEndRender:
         # the burn step exactly.
         video = tmp_path / "src.mkv"
         cmd_src = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "lavfi",
-            "-i", "testsrc=size=1080x1920:duration=3.5:rate=30",
-            "-c:v", "ffv1", "-pix_fmt", "yuv420p",
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=1080x1920:duration=3.5:rate=30",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
             str(video),
         ]
         subprocess.run(cmd_src, check=True, capture_output=True, text=True)
 
         ass = tmp_path / "captions.ass"
         generate_ass_from_diarized(
-            _diarized_with_words(), start=0.0, end=3.0, ass_path=ass,
+            _diarized_with_words(),
+            start=0.0,
+            end=3.0,
+            ass_path=ass,
         )
         burned = tmp_path / "burned.mkv"
         _burn_subtitles(video, ass, burned, lossless=True)
@@ -195,12 +249,26 @@ class TestEndToEndRender:
         for label, src in [("unburned", video), ("burned", burned)]:
             for region, crop in [("top", "1080:960:0:0"), ("bot", "1080:960:0:960")]:
                 out = tmp_path / f"{label}_{region}.png"
-                subprocess.run([
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-ss", "1.5", "-i", str(src),
-                    "-vf", f"crop={crop}",
-                    "-frames:v", "1", str(out),
-                ], check=True, capture_output=True, text=True)
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        "1.5",
+                        "-i",
+                        str(src),
+                        "-vf",
+                        f"crop={crop}",
+                        "-frames:v",
+                        "1",
+                        str(out),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
 
         import hashlib
 

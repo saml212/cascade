@@ -6,7 +6,6 @@ actually runs ffmpeg + libass against a synthetic video) lives in
 test_lib_ass_render.py — kept separate because it requires ffmpeg.
 """
 
-from pathlib import Path
 
 import pytest
 
@@ -177,7 +176,9 @@ class TestBuildAss:
     def test_has_events_section(self, sample_phrases):
         ass = build_ass(sample_phrases)
         assert "[Events]" in ass
-        assert "Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,first phrase here" in ass
+        assert (
+            "Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,first phrase here" in ass
+        )
         assert "Dialogue: 0,0:00:01.60,0:00:03.00,Default,,0,0,0,,second phrase" in ass
 
     def test_section_order(self, sample_phrases):
@@ -189,13 +190,17 @@ class TestBuildAss:
         assert idx_info < idx_styles < idx_events
 
     def test_custom_style(self, sample_phrases):
-        style = CaptionStyle(font="Inter", font_size=96, margin_v=400, words_per_phrase=4)
+        style = CaptionStyle(
+            font="Inter", font_size=96, margin_v=400, words_per_phrase=4
+        )
         ass = build_ass(sample_phrases, style)
         assert "Style: Default,Inter," in ass
         assert ",96," in ass
 
     def test_text_with_braces_escaped(self):
-        phrases = [{"start": 0.0, "end": 1.0, "text": "use {format} string", "speaker": 0}]
+        phrases = [
+            {"start": 0.0, "end": 1.0, "text": "use {format} string", "speaker": 0}
+        ]
         ass = build_ass(phrases)
         assert "use \\{format\\} string" in ass
         # Bare unescaped braces would be parsed as override block
@@ -229,7 +234,12 @@ class TestGenerateAssFromDiarized:
                         {"word": "that's", "start": 100.3, "end": 100.6, "speaker": 0},
                         {"word": "when", "start": 100.7, "end": 100.9, "speaker": 0},
                         {"word": "I", "start": 101.0, "end": 101.1, "speaker": 0},
-                        {"word": "realized", "start": 101.2, "end": 101.7, "speaker": 0},
+                        {
+                            "word": "realized",
+                            "start": 101.2,
+                            "end": 101.7,
+                            "speaker": 0,
+                        },
                     ],
                 },
                 {
