@@ -399,31 +399,20 @@ class TestYouTubeLongformFunnel:
         ]
         assert len(first_comment_flags) == 0
 
-    def test_longform_first_comment_sent_with_spotify_link(self, env, episode_dir):
+    def test_longform_idempotent_when_url_already_set(self, env, episode_dir):
+        # When youtube_longform_url is already recorded, publish skips the
+        # longform re-upload. This is the two-phase flow: longform uploads on
+        # the first publish run (URL not yet set), then on the SECOND run
+        # (after URL is saved) only shorts upload.
         self._seed_with_longform_url(
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc",
-            spotify_url="https://open.spotify.com/episode/xyz",
         )
         agent = _make_agent(episode_dir)
-        agent.config["podcast"] = {"channel_handle": "@local-pod"}
         captured = self._capture_upload_cmds(env, episode_dir, agent)
-        # 2 calls: short upload, longform upload
-        assert len(captured) == 2
-        longform_cmd = captured[1]
-        # Sanity: this is the longform call (single platform=youtube only)
-        assert "longform.mp4" in " ".join(longform_cmd)
-        flags = [
-            a
-            for i, a in enumerate(longform_cmd)
-            if i > 0 and longform_cmd[i - 1] == "-F"
-        ]
-        first_comment = next(
-            (f for f in flags if f.startswith("youtube_first_comment=")), None
-        )
-        assert first_comment is not None
-        assert "spotify.com/episode/xyz" in first_comment
-        assert "@local-pod" in first_comment
+        # Only 1 call: short upload. Longform upload is skipped by idempotency.
+        assert len(captured) == 1
+        assert "longform.mp4" not in " ".join(captured[0])
 
 
 # ── rejected clips skipped ──────────────────────────────────────────────────

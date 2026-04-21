@@ -12,12 +12,8 @@ Config:
     - processing.shorts_crf, processing.shorts_audio_bitrate
 """
 
-import json
 import os
-import subprocess
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
 from lib.audio_mix import generate_audio_mix
@@ -51,6 +47,20 @@ class ShortsRenderAgent(BaseAgent):
                 "Complete crop setup before rendering."
             )
 
+        # Gate: shorts are the funnel, not the content. Without a live longform URL
+        # they have nowhere to point viewers — publishing them would waste the
+        # virality moment. Refuse to render until the longform has been published
+        # and its URL recorded.
+        youtube_longform_url = episode_data.get("youtube_longform_url", "")
+        if not youtube_longform_url and clips_data.get("clips"):
+            raise RuntimeError(
+                "Shorts cannot render until the longform is live on YouTube and "
+                "its URL is recorded on episode.json.youtube_longform_url. "
+                "Publish the longform first, then save the YouTube URL, then "
+                "re-run shorts_render. (This prevents shorts from shipping "
+                "without the link-in-bio / first-comment funnel.)"
+            )
+
         # Always (re)generate enhanced audio_mix.wav. Works for both H6E
         # multi-track and camera-audio modes (see lib/audio_mix.py).
         self.logger.info("Generating enhanced audio_mix.wav...")
@@ -69,9 +79,7 @@ class ShortsRenderAgent(BaseAgent):
 
         # Get source dimensions
         probe = ffprobe(merged_path)
-        video_stream = next(
-            s for s in probe["streams"] if s["codec_type"] == "video"
-        )
+        video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
 
@@ -92,11 +100,15 @@ class ShortsRenderAgent(BaseAgent):
         subtitles_dir = self.episode_dir / "subtitles"
         subtitles_dir.mkdir(exist_ok=True)
 
-        audio_bitrate = self.config.get("processing", {}).get("shorts_audio_bitrate", "192k")
+        audio_bitrate = self.config.get("processing", {}).get(
+            "shorts_audio_bitrate", "192k"
+        )
         encoder_args = get_video_encoder_args(self.config, crf_key="shorts_crf")
         lut_filter = get_lut_filter(self.config)
         if lut_filter:
-            self.logger.info(f"LUT enabled: {self.config['processing'].get('lut_path')}")
+            self.logger.info(
+                f"LUT enabled: {self.config['processing'].get('lut_path')}"
+            )
 
         # Generate per-clip SRT and render
         rendered = []
@@ -116,11 +128,20 @@ class ShortsRenderAgent(BaseAgent):
                 output_path = shorts_dir / f"{clip_id}.mp4"
                 future = executor.submit(
                     self._render_short,
-                    merged_path, output_path, srt_path,
-                    start, end, segments,
-                    src_w, src_h, audio_bitrate,
-                    crop_config, encoder_args, lut_filter,
-                    audio_mix_path, source_fps_int,
+                    merged_path,
+                    output_path,
+                    srt_path,
+                    start,
+                    end,
+                    segments,
+                    src_w,
+                    src_h,
+                    audio_bitrate,
+                    crop_config,
+                    encoder_args,
+                    lut_filter,
+                    audio_mix_path,
+                    source_fps_int,
                 )
                 futures[future] = clip_id
 
@@ -128,8 +149,7 @@ class ShortsRenderAgent(BaseAgent):
                 clip_id = futures[future]
                 future.result()
                 rendered.append(clip_id)
-                self.report_progress(len(rendered), len(clips),
-                    f"Rendered {clip_id}")
+                self.report_progress(len(rendered), len(clips), f"Rendered {clip_id}")
                 self.logger.info(f"  {clip_id} rendered")
 
         return {
@@ -152,11 +172,13 @@ class ShortsRenderAgent(BaseAgent):
             e = min(seg_end, clip_end)
             if e - s < 0.05:
                 continue
-            clip_segs.append({
-                "start": s,
-                "end": e,
-                "speaker": seg["speaker"],
-            })
+            clip_segs.append(
+                {
+                    "start": s,
+                    "end": e,
+                    "speaker": seg["speaker"],
+                }
+            )
         # Fallback: if no segments found, use BOTH for entire clip
         if not clip_segs:
             clip_segs = [{"start": clip_start, "end": clip_end, "speaker": "BOTH"}]
@@ -181,11 +203,20 @@ class ShortsRenderAgent(BaseAgent):
 
     def _render_short(
         self,
-        source, output, srt_path,
-        start, end, segments,
-        src_w, src_h, audio_bitrate,
-        crop_config, encoder_args, lut_filter="",
-        audio_mix_path=None, fps=30,
+        source,
+        output,
+        srt_path,
+        start,
+        end,
+        segments,
+        src_w,
+        src_h,
+        audio_bitrate,
+        crop_config,
+        encoder_args,
+        lut_filter="",
+        audio_mix_path=None,
+        fps=30,
     ):
         """Render a 9:16 short with per-segment dynamic speaker crops."""
         clip_segs = self._get_clip_segments(segments, start, end)
@@ -205,8 +236,6 @@ class ShortsRenderAgent(BaseAgent):
                 )
             return ([], [], ["-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"])
 
-        # If only one segment (or all same speaker), render directly
-        speakers = set(s["speaker"] for s in clip_segs)
         # Find the dominant speaker for this clip (most time in the clip)
         speaker_time = {}
         for seg in clip_segs:
@@ -234,42 +263,86 @@ class ShortsRenderAgent(BaseAgent):
 
         # Step 1: video-only with precise trim filter
         cmd_video = [
-            "ffmpeg", "-y",
-            "-ss", str(coarse_seek), "-i", str(source),
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(coarse_seek),
+            "-i",
+            str(source),
             "-an",
-            "-vf", f"trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS," + vf,
+            "-vf",
+            f"trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS," + vf,
             *encoder_args,
             *get_color_metadata_args(),
-            "-r", str(fps), "-g", str(fps), "-bf", "0",
-            "-vsync", "cfr",
-            "-video_track_timescale", str(fps * 1000),
-            "-use_editlist", "0",
-            "-movflags", "+faststart",
+            "-r",
+            str(fps),
+            "-g",
+            str(fps),
+            "-bf",
+            "0",
+            "-vsync",
+            "cfr",
+            "-video_track_timescale",
+            str(fps * 1000),
+            "-use_editlist",
+            "0",
+            "-movflags",
+            "+faststart",
             str(temp_video),
         ]
-        timed_ffmpeg(cmd_video, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        timed_ffmpeg(
+            cmd_video,
+            agent_logger=self.logger,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
 
         if not temp_video.exists() or temp_video.stat().st_size == 0:
             raise RuntimeError(f"Video render produced empty file: {temp_video}")
 
         # Step 2: mux with audio from audio_mix.wav (precise WAV seek)
-        audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
+        audio_source = (
+            audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
+        )
         cmd_mux = [
-            "ffmpeg", "-y",
-            "-i", str(temp_video),
-            "-ss", str(start), "-i", str(audio_source),
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", audio_bitrate,
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(temp_video),
+            "-ss",
+            str(start),
+            "-i",
+            str(audio_source),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
             "-shortest",
-            "-use_editlist", "0",
-            "-movflags", "+faststart",
+            "-use_editlist",
+            "0",
+            "-movflags",
+            "+faststart",
             str(output),
         ]
-        timed_ffmpeg(cmd_mux, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        timed_ffmpeg(
+            cmd_mux,
+            agent_logger=self.logger,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         temp_video.unlink(missing_ok=True)
 
-    def _generate_segment_srt(self, clip_srt_path, seg_start_rel, seg_end_rel, out_path):
+    def _generate_segment_srt(
+        self, clip_srt_path, seg_start_rel, seg_end_rel, out_path
+    ):
         """Extract subtitle entries from the clip SRT that fall within segment bounds.
 
         Times in clip SRT are clip-relative. We re-offset them to be segment-relative.
@@ -334,13 +407,17 @@ class ShortsRenderAgent(BaseAgent):
 
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
         """Compute 9:16 crop region (w, h, x, y). Crop math in lib/crop.py."""
-        cx, cy, zoom, _ = resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=True)
+        cx, cy, zoom, _ = resolve_speaker(
+            speaker, src_w, src_h, crop_config, for_shorts=True
+        )
         x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "short")
         return crop_w, crop_h, x, y
 
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
         """Build 9:16 crop filter without subtitle burn-in."""
-        crop_w, crop_h, x, y = self._get_short_crop_region(speaker, src_w, src_h, crop_config)
+        crop_w, crop_h, x, y = self._get_short_crop_region(
+            speaker, src_w, src_h, crop_config
+        )
         scale = get_scale_filter(1080, 1920)
         polish = get_video_polish_filters(self.config)
         chain = f"crop={crop_w}:{crop_h}:{x}:{y},{scale},format=yuv420p"
@@ -348,9 +425,7 @@ class ShortsRenderAgent(BaseAgent):
             chain += f",{polish}"
         return chain
 
-    def _get_short_crop_filter(
-        self, speaker, src_w, src_h, srt_path, crop_config
-    ):
+    def _get_short_crop_filter(self, speaker, src_w, src_h, srt_path, crop_config):
         """Build 9:16 crop filter chain with subtitle burn-in.
 
         Filter order: crop → scale (lanczos+dither) → format=yuv420p →
@@ -359,7 +434,9 @@ class ShortsRenderAgent(BaseAgent):
         LUT runs at 10-bit (added by caller as separate prefix), then dither
         during scale to 8-bit, then polish, then burn subtitles last.
         """
-        crop_w, crop_h, x, y = self._get_short_crop_region(speaker, src_w, src_h, crop_config)
+        crop_w, crop_h, x, y = self._get_short_crop_region(
+            speaker, src_w, src_h, crop_config
+        )
         scale = get_scale_filter(1080, 1920)
         polish = get_video_polish_filters(self.config)
 
@@ -376,9 +453,7 @@ class ShortsRenderAgent(BaseAgent):
         )
         return chain
 
-    def _generate_clip_srt(
-        self, diarized, start, end, srt_path
-    ):
+    def _generate_clip_srt(self, diarized, start, end, srt_path):
         """Slice word-level transcript to clip range and write SRT."""
         words = []
         last_end = -1.0
@@ -404,13 +479,10 @@ class ShortsRenderAgent(BaseAgent):
             text = " ".join(w.get("word", "") for w in chunk)
 
             srt_lines.append(
-                f"{idx}\n"
-                f"{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n"
-                f"{text}\n"
+                f"{idx}\n{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n{text}\n"
             )
             idx += 1
             i += 4
 
         with open(srt_path, "w") as f:
             f.write("\n".join(srt_lines))
-

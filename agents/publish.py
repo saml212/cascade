@@ -308,7 +308,18 @@ class PublishAgent(BaseAgent):
         # === Publish longform to YouTube ===
         longform_path = self.episode_dir / "longform.mp4"
         longform_result = None
-        if longform_path.exists() and "youtube" in platforms:
+        # Idempotency: if the longform URL is already recorded, it was published
+        # in a prior run. Skip re-upload so the two-phase flow (longform first,
+        # shorts after URL is saved) doesn't duplicate the YouTube upload.
+        if episode.get("youtube_longform_url"):
+            self.logger.info(
+                "Longform already published (youtube_longform_url set) — skipping re-upload"
+            )
+            longform_result = {
+                "status": "already_submitted",
+                "youtube_longform_url": episode.get("youtube_longform_url"),
+            }
+        elif longform_path.exists() and "youtube" in platforms:
             self.logger.info("Uploading longform to YouTube...")
             lf_title = longform_meta.get("title", "Podcast Episode")
             lf_desc = longform_meta.get("description", "")
@@ -338,13 +349,6 @@ class PublishAgent(BaseAgent):
             ]
             if lf_tags:
                 cmd.extend(["-F", "tags=%s" % ",".join(lf_tags)])
-
-            # First comment on the longform itself (e.g. Spotify listen link)
-            if youtube_longform_url:
-                lf_first_comment = _build_first_comment(
-                    youtube_longform_url, spotify_longform_url, channel_handle
-                )
-                cmd.extend(["-F", "youtube_first_comment=%s" % lf_first_comment])
 
             cmd.extend(["-X", "POST", UPLOAD_POST_URL])
 

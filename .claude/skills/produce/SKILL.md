@@ -85,6 +85,41 @@ Pipeline is firing a chain of agents. Sam doesn't need to do anything. The skill
 4. **Intercept before `clip_miner` runs:** if the next programmatic agent is `clip_miner`, abort the programmatic run and dispatch the **clip-miner subagent** instead (see below). Update `pipeline.agents_completed` to include clip_miner once the subagent finishes so programmatic longform_render will start.
 5. On error (`status == "error"` or an agent raised): read the error message from the agent's output json (e.g. `ingest.json.error`), translate into plain language, offer a resume option.
 
+## Publishing flow — longform FIRST, then shorts (the funnel requires it)
+
+Shorts exist to funnel viewers to the longform. Without a live longform URL to point at, shorts have nothing to promote — posting them burns the virality window for nothing.
+
+**Sequence (enforced by the code):**
+
+1. Longform renders → Sam approves.
+2. **Longform publishes first** (YouTube via Upload-Post, Spotify via RSS ingest) — shorts are NOT rendered or submitted yet.
+3. YouTube takes 15 min to several hours to process the longform and return its public URL. Sam's RSS feed must be registered with Spotify for Podcasters (one-time; see `roadmap.md` item 3).
+4. `/produce` polls Upload-Post's status endpoint OR Sam pastes the YouTube URL when YouTube emails him. URL lands in `episode.json.youtube_longform_url`.
+5. **Now shorts can render.** The `shorts_render` agent has a hard gate: it refuses to run if `episode.json.youtube_longform_url` is empty and clips exist. This prevents shorts from ever shipping without a funnel.
+6. `metadata_gen` runs with the URL available, so captions and descriptions reference `thelocalpod.link` (link-in-bio) — NOT the raw URL in comments (platforms de-rank that).
+7. `publish` runs again, this time with shorts rendered. The longform block has an idempotency guard (skips re-upload if `youtube_longform_url` is already set), so only the shorts actually go out on the second run.
+
+**What `/produce` fires at each transition (explicit agent lists, not the bundled approve-longform):**
+
+After longform approval:
+```
+POST /api/episodes/<id>/resume-pipeline  agents=["podcast_feed", "publish"]
+```
+This publishes the feed (triggers Spotify ingest) and uploads the longform to YouTube. Shorts skip because none exist yet.
+
+After YouTube URL returns:
+1. Save URL to `episode.json.youtube_longform_url` (for now: Sam pastes; future: auto-poll).
+2. `POST /api/episodes/<id>/resume-pipeline` with `agents=["shorts_render", "metadata_gen", "thumbnail_gen", "qa"]`.
+
+After clip + metadata review and Sam's "ship it":
+```
+POST /api/episodes/<id>/resume-pipeline  agents=["publish"]
+```
+Longform block no-ops (idempotency); shorts upload with the funnel.
+
+After shorts publish:
+Sam gets the backup prompt.
+
 ### ● `awaiting_longform_approval`  —  *Sam's move*
 The longform video is rendered. Sam needs to watch it and decide.
 
@@ -104,8 +139,20 @@ The longform video is rendered. Sam needs to watch it and decide.
 ### ● `processing` (post-longform: shorts_render → metadata_gen → thumbnail_gen → qa → podcast_feed)  —  *pipeline running*
 Same monitoring as the first `processing` block. No subagent dispatch here (clip-miner has already run pre-longform per the interception above).
 
+### ● `awaiting_longform_urls`  —  *async wait*
+**This is the two-phase pause between longform publish and shorts render.**
+
+After Sam approves the longform, `/produce` fires longform publish (no shorts yet). Then it enters this phase: wait for YouTube's public URL to come back (15 min to several hours after submit) and wait for Spotify RSS ingest (~1 hour, assuming the feed is registered with Spotify).
+
+**Skill does:**
+1. Write state to `episode.json`: either a new `status: "awaiting_longform_urls"` OR just leave as `processing` + check for `youtube_longform_url`.
+2. If URL polling is available: poll `/api/uploadposts/status` every 5-15 min until YouTube returns the video URL. Save to `episode.json.youtube_longform_url` when it lands.
+3. If URL polling isn't available: tell Sam "longform uploaded. YouTube will process for 15 min to a few hours. Paste the URL here when it's live, or send me the YouTube email." On next turn, extract URL and save.
+4. For Spotify URL: if registered with Spotify for Podcasters, the RSS ingest happens automatically within ~1 hour. Sam may or may not paste the Spotify URL — not strictly required to proceed, but richer funnel if he does.
+5. Once `youtube_longform_url` is set: announce "Longform is live. Rendering shorts now with the funnel." Fire `resume-pipeline` with `["shorts_render", "metadata_gen", "thumbnail_gen", "qa"]`.
+
 ### ● `ready_for_review`  —  *Sam's move*
-**This is the publish-approval gate.** The pipeline doesn't have a discrete `awaiting_publish_approval` state — it lands at `ready_for_review` and waits for the user to fire approve-publish via the button that this session added.
+**This is the shorts-publish gate, reached ONLY AFTER the longform is live and URL-ed.** The pipeline lands at `ready_for_review` after shorts_render + metadata_gen + thumbnail_gen + qa complete in phase 2.
 
 Clip + metadata review happens here as ONE conversation. This is the biggest UX win: stop making Sam click through 10 clips × 8 platforms of metadata.
 
