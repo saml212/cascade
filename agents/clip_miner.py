@@ -18,7 +18,6 @@ Environment:
 
 import json
 import os
-from pathlib import Path
 
 from agents.base import BaseAgent
 
@@ -108,9 +107,15 @@ Return ONLY the JSON object, no other text."""
         parsed = json.loads(response_text)
 
         # Extract episode info
-        episode_info = parsed.get("episode_info", {
-            "guest_name": "", "guest_title": "", "episode_title": "", "episode_description": ""
-        })
+        episode_info = parsed.get(
+            "episode_info",
+            {
+                "guest_name": "",
+                "guest_title": "",
+                "episode_title": "",
+                "episode_description": "",
+            },
+        )
         self.save_json("episode_info.json", episode_info)
 
         # Update episode.json with extracted info
@@ -131,7 +136,7 @@ Return ONLY the JSON object, no other text."""
         # Determine dominant speaker per clip
         segments = segments_data.get("segments", [])
         for i, clip in enumerate(clips):
-            clip["id"] = f"clip_{i+1:02d}"
+            clip["id"] = f"clip_{i + 1:02d}"
             clip["rank"] = i + 1
             clip["duration"] = round(clip["end_seconds"] - clip["start_seconds"], 1)
             clip["speaker"] = self._get_dominant_speaker(
@@ -160,7 +165,9 @@ Return ONLY the JSON object, no other text."""
 
     def _snap_to_silence(self, clips: list, segments_data: dict) -> list:
         """Snap clip boundaries to nearest low-energy point."""
-        tolerance = self.get_config("clip_mining", "boundary_snap_tolerance_seconds", default=3.0)
+        tolerance = self.get_config(
+            "clip_mining", "boundary_snap_tolerance_seconds", default=3.0
+        )
 
         import numpy as np
 
@@ -211,9 +218,7 @@ Return ONLY the JSON object, no other text."""
 
         return clips
 
-    def _get_dominant_speaker(
-        self, start: float, end: float, segments: list
-    ) -> str:
+    def _get_dominant_speaker(self, start: float, end: float, segments: list) -> str:
         """Determine dominant speaker for a time range from segments."""
         speaker_time = {}
         for seg in segments:
