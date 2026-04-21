@@ -38,14 +38,29 @@ Running list of things to hand to a dev agent once the harness is built. Organiz
 - [ ] Save/load crop presets by guest — if Todd comes back, reuse his crop.
 - [ ] Better zoom level preview — scrubber with thumbnails showing what each zoom looks like.
 
-## Harness things the dev agent should also tackle
+## Harness (mostly built — dev agent uses + critiques)
 
-- [x] ~~Hooks, subagents, settings.json~~ — built 2026-04-20 (see `.claude/`)
-- [x] ~~Plugin noise pruned~~ — `disabledPlugins` in `.claude/settings.json` kills testing-handbook-skills, mutation-testing, rust-analyzer-lsp, supply-chain-risk-auditor, insecure-defaults, fp-check, property-based-testing
-- [x] ~~ruff added to requirements.txt~~ — will be installed on next `./start.sh`
-- [ ] `/autoresearch` on the clip_miner prompt — score clip quality across a few test episodes, iterate.
-- [ ] `/autoresearch` on metadata_gen per-platform prompts.
-- [ ] Agent team tool (v2 §8) for multi-lens clip mining (humor, drama, educational, quotable). Defer until Tier 1+2 pay off.
+Built 2026-04-20→21 (see `.claude/` and `docs/`):
+- [x] ~~Slim CLAUDE.md + structured docs/~~
+- [x] ~~`.claude/profile.json` (single-repo config)~~
+- [x] ~~5 hooks: route-format, safety-check, pre-commit-gate, learn-capture, correction-detect~~
+- [x] ~~Memory system: JSONL corrections + team/ markdown + compile script~~
+- [x] ~~Plugin noise pruned (7 plugins uninstalled)~~
+- [x] ~~ruff + vulture added to venv~~
+- [x] ~~4 subagents: orchestrator, python-specialist, frontend-specialist, verifier~~
+- [x] ~~`/clean` skill (3-step anti-slop pipeline with sentinel)~~
+- [x] ~~`/autoresearch` skill (generate → score → lessons ledger loop)~~
+- [x] ~~Team tool: Node orchestrator + Express+SSE dashboard + `/deploy-team` skill~~
+- [x] ~~Self-review ran; 8 real bugs fixed~~
+
+Applications of the built tooling (still TODO):
+- [ ] Run `/autoresearch` on the `agents/clip_miner.py` prompt — rubric: picks clips in the 45-75s sweet spot, prefers complete thoughts, rejects filler. Score against 2–3 test episodes.
+- [ ] Run `/autoresearch` on `agents/metadata_gen.py` per-platform prompts — rubric: per-platform tone match, length compliance, hashtag quality.
+- [ ] Design a `/deploy-team` config for **multi-lens clip mining** — agents for humor / drama / educational / quotable lenses, each scoring the same transcript independently, then main agent synthesizes a final ranked clip list. Good first real use of the team tool beyond self-review.
+
+Harness gaps discovered but not yet built:
+- [ ] `/publish-memory` skill — described in `docs/memory-system.md`, listed in CLAUDE.md, but not implemented. Should: take a correction from a dev's JSONL, confirm with dev, write to `.claude/memory/team/<slug>.md`, update `MEMORY-TEAM.md` index.
+- [ ] Two style nits from self-review left unfixed (low value): `agentWantsMore()` and `extractNotes()` in orchestrator/ are single-use helpers that could be inlined. Skipped because they're clearer as named helpers — leaving as judgment call.
 
 ## Repo cleanup (for the `dev` or `clean` subagent)
 

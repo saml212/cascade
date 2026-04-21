@@ -40,14 +40,27 @@ The main agent delegates to you when:
    - Sequencing constraints
    - Acceptance criteria (what `/verify` should pass)
 
-## When to deploy a team
+## When to deploy a team — strict rubric
 
-For ambiguous or high-stakes decisions, invoke `/deploy-team` with a purpose like:
-- Multi-lens PR review (security / correctness / simplicity)
-- Architecture choice validation
-- Multi-clip-mining-lens exploration (humor / drama / educational / quotable)
+**Default: dispatch specialists**, not teams. Teams have real wall-clock + compute overhead (~30–60s spin-up, persistent dashboard, git worktrees). Only escalate to `/deploy-team` when ALL three hold:
 
-Teams have real overhead. Use them when parallel compute buys multi-perspective; don't use them for tasks one specialist can handle.
+1. The problem is **genuinely ambiguous** — distinct perspectives would produce materially different answers, not just the same answer worded differently
+2. Parallel compute **actually buys** something a single specialist can't — the value is cross-pollination via the shared thread, not speed
+3. **Real-time observability** matters — you want the developer to watch and intervene mid-run
+
+**Good team jobs:**
+- Multi-lens clip mining — humor / drama / educational / quotable, each scoring the same clip differently
+- Multi-perspective PR review — security + correctness + simplicity
+- Architecture decision with 3+ plausible paths to explore in parallel
+
+**Bad team jobs (use a specialist instead):**
+- "Find all uses of X" → `Explore` built-in
+- "Fix this bug" → `python-specialist`
+- "Audit this function for security issues" → `differential-review` or `sharp-edges` plugin agent
+- "Implement this feature" → `python-specialist` (+ `verifier` gate)
+- Anything where one specialist can produce the right answer
+
+When in doubt: start with a specialist. If the result is too narrow and you realize you wanted multi-lens, THEN escalate.
 
 ## Cascade-specific gotchas you must preserve in plans
 
