@@ -108,16 +108,21 @@ run_command "$FORMAT_CMD"; FORMAT_RC=$?
 run_command "$LINT_CMD";   LINT_RC=$?
 
 # Honest reporting — tell the assistant what actually happened.
+# Pull the actual tool names from the profile so the message is accurate
+# for any language, not hardcoded to ruff/vulture.
+MISSING_TOOLS=""
+[ "$FORMAT_RC" = "1" ] && MISSING_TOOLS="${FORMAT_CMD%% *}"
+[ "$LINT_RC" = "1" ]   && MISSING_TOOLS="${MISSING_TOOLS:+$MISSING_TOOLS, }${LINT_CMD%% *}"
+MISSING_TOOLS="${MISSING_TOOLS##*/}"  # strip path prefix if any
+
 if [ "$FORMAT_RC" = "1" ] || [ "$LINT_RC" = "1" ]; then
-  # At least one tool is not installed — say so once, quietly
-  echo "ℹ  route-format: $MATCHED_LANG tools not fully installed (ruff/vulture missing); $REL_PATH not auto-formatted"
+  echo "ℹ  route-format: $MATCHED_LANG tool(s) not installed ($MISSING_TOOLS); $REL_PATH not auto-formatted"
 elif [ "$FORMAT_RC" = "0" ] && [ "$LINT_RC" = "0" ]; then
   echo "✓ route-format: $MATCHED_LANG rules applied to $REL_PATH"
 elif [ "$FORMAT_RC" = "2" ] || [ "$LINT_RC" = "2" ]; then
   # Allowlist block already logged to stderr; stay quiet on stdout
   :
 else
-  # Ran but failed (likely syntax error in the file being edited). Not fatal.
   echo "ℹ  route-format: $MATCHED_LANG ran on $REL_PATH but exited non-zero (likely syntax error; formatter made no changes)"
 fi
 

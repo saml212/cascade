@@ -26,19 +26,15 @@ SPLITTER="$REPO_ROOT/.claude/scripts/split-subcommands.py"
 HAS_COMMIT=""
 if [ -f "$SPLITTER" ]; then
   while IFS= read -r sub; do
-    case "$sub" in
-      "git commit"*|"git  commit"*) HAS_COMMIT="yes"; break ;;
-    esac
-    # Also match with leading whitespace stripped (split output already strips)
     if echo "$sub" | grep -qE '^git\s+commit\b'; then
       HAS_COMMIT="yes"
       break
     fi
   done < <(python3 "$SPLITTER" "$CMD" 2>/dev/null)
 fi
-# Fallback: raw substring if splitter not present
-if [ -z "$HAS_COMMIT" ]; then
-  echo "$CMD" | grep -qE '\bgit\s+commit\b' && HAS_COMMIT="yes"
+# Fallback: raw substring if splitter unavailable
+if [ -z "$HAS_COMMIT" ] && echo "$CMD" | grep -qE '\bgit\s+commit\b'; then
+  HAS_COMMIT="yes"
 fi
 [ "$HAS_COMMIT" != "yes" ] && exit 0
 

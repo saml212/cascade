@@ -2,6 +2,7 @@
 """Split a shell command on operators that introduce independent sub-commands.
 
 Usage: split-subcommands.py <command-string>
+
 Prints one sub-command per line, trimmed.
 
 Splits on: && || ; | ` $(

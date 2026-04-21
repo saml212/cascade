@@ -20,6 +20,7 @@ Ingests camera + multi-track audio, produces longform (16:9) + shorts (9:16) + m
 ## Key Rules
 - ONE main agent. Subagent specialists and agent teams are tools the main agent dispatches, not workflows the developer manages.
 - **Cognitive burden is on the main agent**, not the developer. The developer should never have to remember to type `/clean` or `/verify` — hooks and main-agent judgment handle it.
+- **Skills and hooks are general-purpose but cascade-scoped.** A skill should be reusable across tasks (e.g., `/clean` works on any changed file set, not just agents/) but its defaults and profile tooling reflect cascade's stack (Python + vanilla JS, ruff/vulture, ffmpeg pipeline). Write once, apply broadly within cascade — don't hardcode specific agent names or episode IDs.
 - Every token fights for its place — skills over MCP, concise over comprehensive.
 - macOS SD-card resource forks (`._*.MP4`) must be filtered: `if not f.name.startswith("._"):`
 - Deepgram SDK v5 broke compatibility — use httpx REST directly.

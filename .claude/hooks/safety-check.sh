@@ -40,7 +40,8 @@ fi
 BLOCK_PATHS="$(jq -r '.safety.block_rm_paths[]?' "$PROFILE" 2>/dev/null)"
 while IFS= read -r sub; do
   # All rm flag orderings: -rf, -fr, -Rf, -fR, -r -f, -f -r, --recursive --force, etc.
-  if echo "$sub" | grep -qE '^(sudo +)?rm(\s+-[a-zA-Z]+)*(\s+-[a-zA-Z]+)*\s'; then
+  # The (\s+-[a-zA-Z\-]+)* star covers any number of dash flags regardless of order.
+  if echo "$sub" | grep -qE '^(sudo +)?rm(\s+-[a-zA-Z\-]+)*\s'; then
     while IFS= read -r protected; do
       [ -z "$protected" ] && continue
       if echo "$sub" | grep -qF "$protected"; then
