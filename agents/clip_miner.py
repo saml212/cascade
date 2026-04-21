@@ -26,6 +26,23 @@ class ClipMinerAgent(BaseAgent):
     name = "clip_miner"
 
     def execute(self) -> dict:
+        # Skip the paid-API clip mining if clips.json is already populated by the
+        # /produce skill's clip-miner subagent (which runs on the Max-subscription
+        # quota via Claude Code). The Python path still works as a fallback when
+        # /produce is not driving, but must never run twice on the same episode.
+        existing = self.load_json_safe("clips.json")
+        if existing.get("clips") and len(existing["clips"]) > 0:
+            self.logger.info(
+                "clips.json already has %d clips — skipping programmatic clip_miner. "
+                "Remove clips.json to force a re-mine via the API path."
+                % len(existing["clips"])
+            )
+            return {
+                "_status": "skipped",
+                "reason": "clips.json already populated",
+                "clip_count": len(existing["clips"]),
+            }
+
         diarized = self.load_json("diarized_transcript.json")
         segments_data = self.load_json("segments.json")
         stitch_data = self.load_json("stitch.json")
