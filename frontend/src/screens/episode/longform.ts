@@ -37,6 +37,7 @@ export function renderLongform(
             { class: 'panel overflow-hidden' },
             h('video', {
               src: videoUrl,
+              poster: `/api/episodes/${episodeId}/crop-frame`,
               controls: true,
               preload: 'metadata',
               class: 'w-full bg-black block',

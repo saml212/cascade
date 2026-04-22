@@ -195,8 +195,11 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
     day.items.length === 0
       ? h(
           'div',
-          { class: 'text-body-sm text-ink-tertiary italic' },
-          isToday ? 'Open day.' : '—'
+          {
+            class:
+              'flex-1 flex items-center justify-center text-body-sm text-ink-tertiary/70 italic',
+          },
+          isToday ? 'Open day — nothing queued.' : 'No posts'
         )
       : h(
           'div',

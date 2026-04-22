@@ -33,6 +33,8 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
   const edits = signal<Edit[]>([]);
   const chatSending = signal<boolean>(false);
   const error = signal<string | null>(null);
+  // Held ref so the cut timeline can seek the longform player on click.
+  const videoRef: { el: HTMLVideoElement | null } = { el: null };
 
   async function load(): Promise<void> {
     try {
@@ -70,8 +72,8 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       h(
         'div',
         { class: 'max-w-[1200px] mx-auto px-8 py-6 flex flex-col gap-6 w-full' },
-        renderPlayer(episodeId, ep),
-        renderTimeline(ep, edits()),
+        renderPlayer(episodeId, ep, videoRef),
+        renderTimeline(ep, edits(), videoRef),
         renderEditsList(episodeId, edits, load),
         renderEditInput(episodeId, chatSending, load)
       ),
@@ -139,13 +141,15 @@ function renderHeader(
 
 function renderPlayer(
   episodeId: string,
-  ep: UnknownRecord
+  ep: UnknownRecord,
+  videoRef: { el: HTMLVideoElement | null }
 ): HTMLElement {
   const status = describeStatus(ep.status as string);
   const hasLongform =
     status.key === 'awaiting_longform_review' ||
     status.key === 'awaiting_clip_review' ||
     status.key === 'awaiting_publish' ||
+    status.key === 'awaiting_backup' ||
     status.key === 'live';
 
   if (!hasLongform) {
@@ -167,11 +171,13 @@ function renderPlayer(
 
   const video = h('video', {
     src: `/media/episodes/${episodeId}/longform.mp4`,
+    poster: `/api/episodes/${episodeId}/crop-frame`,
     controls: true,
     preload: 'metadata',
     class: 'w-full bg-black',
     style: { maxHeight: '64vh' },
-  });
+  }) as HTMLVideoElement;
+  videoRef.el = video;
 
   return h(
     'div',
@@ -182,10 +188,18 @@ function renderPlayer(
 
 function renderTimeline(
   ep: UnknownRecord,
-  edits: Edit[]
+  edits: Edit[],
+  videoRef: { el: HTMLVideoElement | null }
 ): HTMLElement {
   const duration = (ep.duration_seconds as number) ?? 0;
   if (duration <= 0) return h('div');
+
+  const seekTo = (seconds: number): void => {
+    const v = videoRef.el;
+    if (!v) return;
+    v.currentTime = Math.max(0, Math.min(seconds, duration));
+    v.play().catch(() => {});
+  };
 
   const lanes = edits.map((e, i) => {
     const start =
@@ -208,16 +222,20 @@ function renderTimeline(
         : e.type === 'trim_start'
         ? 'bg-accent/60'
         : 'bg-accent/60';
-    return h('div', {
-      class: `absolute top-0 bottom-0 rounded ${tone}`,
+    return h('button', {
+      class: `absolute top-0 bottom-0 rounded ${tone} hover:brightness-125 transition-[filter] duration-[120ms]`,
       style: {
         left: `${leftPct}%`,
         width: `${widthPct}%`,
       },
       title: `${e.type} · ${formatTimecode(start)}–${formatTimecode(end)}${
         e.reason ? ` · ${e.reason}` : ''
-      }`,
+      }\nClick to seek there.`,
       dataset: { idx: String(i) },
+      onclick: (ev: MouseEvent) => {
+        ev.stopPropagation();
+        seekTo(start);
+      },
     });
   });
 
@@ -240,7 +258,16 @@ function renderTimeline(
     ),
     h(
       'div',
-      { class: 'relative h-9 rounded bg-surface-inset border border-border-subtle' },
+      {
+        class:
+          'relative h-9 rounded bg-surface-inset border border-border-subtle cursor-pointer',
+        onclick: (ev: MouseEvent) => {
+          const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+          const frac = (ev.clientX - rect.left) / rect.width;
+          seekTo(frac * duration);
+        },
+        title: 'Click to seek',
+      },
       ...lanes
     ),
     h(
