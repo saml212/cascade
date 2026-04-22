@@ -200,19 +200,28 @@ Publish is out. Offer backup: "Ready to copy this episode folder to the Seagate 
 The Python pipeline has a `run-pipeline` route that fires all 14 agents in order. /produce does NOT use that route — it would run the API-driven `clip_miner` and cost Sam real money. Instead:
 
 - **Initial production from SD cards:** Sam fires `run-pipeline` via the UI or CLI; it runs through `ingest → stitch → audio_analysis` and pauses at `awaiting_crop_setup`. /produce picks up from there.
-- **After crop:** Save crop-config (Sam does this in UI). /produce then uses `POST /api/episodes/<id>/resume-pipeline` with **explicit agents list** `["speaker_cut", "transcribe"]` (NOT `approve-longform`, which would also fire `clip_miner`).
+- **After crop:** Save crop-config (Sam does this in UI). /produce then uses `POST /api/episodes/<id>/resume-pipeline` with **explicit agents list** `["speaker_cut", "transcribe"]`.
 - **After transcribe:** /produce dispatches the `clip-miner` subagent. Once it writes clips.json, /produce fires `resume-pipeline` with `["longform_render"]`.
-- **After longform:** Sam reviews + approves. /produce fires `resume-pipeline` with `["shorts_render", "metadata_gen", "thumbnail_gen", "qa"]`.
-- **After qa:** /produce drives clip + metadata review. On Sam's approve-publish, fires `approve-publish` route (adds publish_approved=True, fires podcast_feed + publish).
+- **After longform renders + Sam approves:** /produce POSTs `/approve-longform`, which now fires `["podcast_feed", "publish"]`. This publishes the LONGFORM only (shorts/ dir is empty so publish skips them). RSS updates trigger Spotify auto-ingest.
+- **After YouTube returns the URL (async wait):** save to `episode.json.youtube_longform_url`. /produce dispatches `metadata-writer` subagent (writes metadata.json), then fires `resume-pipeline` with `["shorts_render", "thumbnail_gen", "qa"]`. `shorts_render` now unblocks because URL is set.
+- **After shorts render + Sam approves clip/metadata review:** /produce POSTs `/approve-publish`, which now fires `["publish"]` only. The longform upload block in publish.py idempotent-skips (URL already set); shorts upload with youtube_first_comment funnel.
 - **After publish:** backup approval as normal.
 
-**Known hazard:** the `approve-longform` route currently includes `clip_miner` in its agent list (`server/routes/pipeline.py:approve_longform`). If any other code path or the UI button triggers it, it'll re-run the programmatic clip_miner and hit the paid API. TODO: strip `clip_miner` from that route's agent list, OR make the Python `agents/clip_miner.py` a stub that checks for existing `clips.json` and skips. The stub approach is safer — it makes /produce's interception idempotent.
+**Cost-safety gates (all three paid-API agents):**
+
+- `agents/clip_miner.py` — hard-raises if `clips.json` missing AND `CASCADE_ALLOW_API_CLIP_MINER` ≠ "1"
+- `agents/metadata_gen.py` — hard-raises if `metadata/metadata.json` missing AND `CASCADE_ALLOW_API_METADATA_GEN` ≠ "1"
+- `agents/thumbnail_gen.py` — hard-raises if `thumbnail.png` missing AND `CASCADE_ALLOW_API_THUMBNAIL_GEN` ≠ "1"
+
+Each refuses to consume API tokens unless explicitly opted in. The canonical path is to dispatch the corresponding subagent (clip-miner, metadata-writer — thumbnail subagent TBD) to produce the artifact first, then let the pipeline agent idempotent-skip.
+
+`server/routes/chat.py` has been fully migrated to the claude CLI subprocess — no API consumption from the chat endpoint or the auto_trim action.
 
 **CRITICAL — cost-safety rules for /produce orchestration:**
 
-1. **NEVER call `POST /api/episodes/<id>/resume-pipeline` with an empty body.** The default is "run all remaining agents," which includes `clip_miner` — and `clip_miner` without `clips.json` will fail (gate raises). On a real episode, NEVER fire a blanket resume. Always pass an explicit `agents` list.
+1. **NEVER call `POST /api/episodes/<id>/resume-pipeline` with an empty body.** The default is "run all remaining agents," which includes `clip_miner` / `metadata_gen` / `thumbnail_gen` — all three now hard-raise without their artifacts present. A blanket resume will fail fast, but it's wasteful — always pass an explicit `agents` list.
 
-2. **Never fire `resume-pipeline` after `transcribe` without first dispatching the clip-miner subagent and verifying `clips.json` exists.** If `clips.json` is missing and the pipeline hits `clip_miner`, it now RAISES (hard gate, not silent fallback). Set `CASCADE_ALLOW_API_CLIP_MINER=1` ONLY when you've explicitly agreed to pay for the API call.
+2. **Never fire a pipeline stage that requires a paid-API agent's output without first dispatching that agent's subagent counterpart.** The flow must be: transcribe → dispatch clip-miner subagent → longform_render → (publish longform + URL wait) → dispatch metadata-writer subagent (writes metadata.json) → shorts_render → (thumbnail_gen still needs a subagent path — for now, opt in manually with `CASCADE_ALLOW_API_THUMBNAIL_GEN=1` if you want it) → qa → review → publish shorts.
 
 3. **Post-crop resume must be TWO steps, not one:**
    - Step A: `resume-pipeline` with `agents=["speaker_cut", "transcribe"]` ONLY.
