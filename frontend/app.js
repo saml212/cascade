@@ -2688,6 +2688,7 @@ async function renderCropSetup(episodeId) {
           </div>
           <canvas id="crop-canvas" class="w-full cursor-crosshair rounded-lg" style="background: #000;"></canvas>
           <video id="crop-scrub-video" class="hidden w-full rounded-lg mt-3" controls preload="none"
+            controlsList="nomute novolume nodownload noplaybackrate"
             style="max-height: 360px; background: #000;">
             <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
           </video>
@@ -2945,7 +2946,14 @@ let _cropScrubH6EInit = false;
 function initCropScrubH6E(episodeId) {
   const video = document.getElementById('crop-scrub-video');
   const h6eAudio = document.getElementById('crop-scrub-h6e');
-  if (!video || !h6eAudio) return;
+  const stateEl = document.getElementById('crop-scrub-audio-state');
+  const setState = (s) => { if (stateEl) stateEl.textContent = s; };
+
+  if (!video || !h6eAudio) {
+    setState('ERR: video/audio element missing');
+    console.error('[crop-scrub] missing elements', { video: !!video, h6eAudio: !!h6eAudio });
+    return;
+  }
 
   // Load the H6E audio src lazily (only once)
   if (!h6eAudio.src) {
@@ -2953,9 +2961,14 @@ function initCropScrubH6E(episodeId) {
     const syncTrack = audioTracks.find(t => t.track_type === 'stereo_mix')
       || audioTracks.find(t => t.track_type === 'builtin_mic')
       || audioTracks.find(t => t.track_type === 'input');
-    if (!syncTrack) return;
+    if (!syncTrack) {
+      setState(`ERR: no H6E track (tracks=${audioTracks.length})`);
+      console.error('[crop-scrub] no sync track found', audioTracks);
+      return;
+    }
     const stem = syncTrack.filename.replace(/\.(WAV|wav)$/, '');
     h6eAudio.src = `${API}/episodes/${episodeId}/audio-preview/${stem}?start=0&duration=1800`;
+    console.log('[crop-scrub] H6E src set:', h6eAudio.src);
   }
 
   if (_cropScrubH6EInit) return;
@@ -2969,10 +2982,17 @@ function initCropScrubH6E(episodeId) {
 
   video.addEventListener('play', () => {
     h6eAudio.currentTime = video.currentTime + getOffset();
-    h6eAudio.play().catch((err) => {
-      const state = document.getElementById('crop-scrub-audio-state');
-      if (state) state.textContent = `cam: ${video.muted ? 'muted' : 'on'} / h6e: ERR (${err.name})`;
-    });
+    const playPromise = h6eAudio.play();
+    if (playPromise) {
+      playPromise.then(() => {
+        console.log('[crop-scrub] H6E .play() resolved, paused=', h6eAudio.paused, 'currentTime=', h6eAudio.currentTime);
+        syncCropScrubAudioButtons();
+      }).catch((err) => {
+        console.error('[crop-scrub] H6E .play() rejected:', err.name, err.message);
+        const stateEl = document.getElementById('crop-scrub-audio-state');
+        if (stateEl) stateEl.textContent = `cam: ${video.muted ? 'muted' : 'on'} / h6e: REJECT(${err.name})`;
+      });
+    }
     syncCropScrubAudioButtons();
   });
   video.addEventListener('pause', () => { h6eAudio.pause(); syncCropScrubAudioButtons(); });
