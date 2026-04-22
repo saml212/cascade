@@ -86,9 +86,24 @@ async def serve_index():
 
 @app.get("/{path:path}")
 async def spa_catchall(path: str):
-    """Catch-all: serve index.html for any non-API, non-static path (SPA routing)."""
+    """Catch-all: serve index.html for any non-API, non-static path (SPA routing).
+
+    API paths: if the real route exists at `<path>/` (trailing-slash form),
+    redirect. Otherwise return 404. FastAPI's built-in redirect_slashes
+    doesn't fire here because this catchall matches before it can run.
+    """
     if path.startswith(("api/", "media/", "frontend/", "assets/")):
-        from fastapi.responses import JSONResponse
+        # api/ paths should never hit the SPA. If the path exists in the
+        # real FastAPI route table at `<path>/` (trailing-slash form),
+        # redirect — otherwise 404. This emulates FastAPI's redirect_slashes
+        # behavior which the catchall would otherwise block.
+        from fastapi.responses import JSONResponse, RedirectResponse
+
+        if path.startswith("api/") and not path.endswith("/"):
+            slashed = f"/{path}/"
+            for route in app.router.routes:
+                if getattr(route, "path", None) == slashed:
+                    return RedirectResponse(url=slashed, status_code=307)
 
         return JSONResponse({"error": "not found"}, status_code=404)
 

@@ -140,9 +140,12 @@ async def get_episode(episode_id: str) -> dict:
     logger.info("GET /api/episodes/%s", episode_id)
     ep = read_episode(episode_id)
 
-    # Also load clips.json if it exists
+    # clips.json is the source of truth — it's what the clip action handlers
+    # (approve, reject, update_metadata) write to. episode.json often carries
+    # a stale snapshot from initial clip-mining. Always prefer clips.json if
+    # it exists.
     clips_file = EPISODES_DIR / episode_id / "clips.json"
-    if clips_file.exists() and not ep.get("clips"):
+    if clips_file.exists():
         try:
             with open(clips_file) as f:
                 clips_data = json.load(f)
@@ -153,10 +156,10 @@ async def get_episode(episode_id: str) -> dict:
             )
             ep["clips"] = [_normalize_clip(c) for c in clips]
         except (json.JSONDecodeError, OSError):
-            pass
-
-    # Normalize any clips already in episode data
-    if ep.get("clips"):
+            # Fall back to whatever episode.json has if clips.json is malformed
+            if ep.get("clips"):
+                ep["clips"] = [_normalize_clip(c) for c in ep["clips"]]
+    elif ep.get("clips"):
         ep["clips"] = [_normalize_clip(c) for c in ep["clips"]]
 
     return ep
@@ -383,8 +386,15 @@ class SyncOffsetRequest(BaseModel):
     offset_seconds: float
 
 
+class SyncOffsetResponse(BaseModel):
+    status: str
+    offset_seconds: float
+
+
 @router.post("/{episode_id}/sync-offset")
-async def save_sync_offset(episode_id: str, req: SyncOffsetRequest):
+async def save_sync_offset(
+    episode_id: str, req: SyncOffsetRequest
+) -> SyncOffsetResponse:
     """Save a manually adjusted sync offset."""
     ep = read_episode(episode_id)
     if "audio_sync" not in ep:
