@@ -28,15 +28,17 @@ Ingests camera + multi-track audio, produces longform (16:9) + shorts (9:16) + m
 
 ## Self-Correcting Memory
 
-When you are corrected or discover a mistake, emit a `[LEARN]` block in your final response. The Stop hook captures it automatically.
+Active rules for this repo + cross-repo globals: [.claude/memory/rules-compiled.md](.claude/memory/rules-compiled.md) (auto-generated on session start).
+
+When you are corrected or discover a mistake, emit a `[LEARN]` block in your final response. The Stop hook captures it to the global SQLite memory store and surfaces it next session.
 
 ```
-[LEARN] Category: One-line rule
+[LEARN] <category-slug>: One-line rule
 Mistake: What went wrong
 Correction: What the right approach is
 ```
 
-See [memory-system.md](docs/memory-system.md) for how this compounds into loaded rules over time.
+See [memory-system.md](docs/memory-system.md) for the architecture (SQLite backend, two-tier repo/global, auto-promotion, auto-dedup).
 
 ## Skills & Subagents (main-agent triggers)
 

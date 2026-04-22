@@ -67,22 +67,28 @@ fi
 
 [ -z "$TEXT" ] && exit 0
 
-# ── Parse [LEARN] blocks ────────────────────────────────────────────────────
-# Delegated to a standalone python script (same rationale as split-subcommands:
-# bash heredocs + python regex don't mix reliably).
+# ── Parse [LEARN] blocks → SQLite memory ────────────────────────────────────
+# Writes to ~/.claude/memory/memory.db via the global insert.py. The DB is
+# the source of truth — JSONL is legacy and gets migrated on session start.
+#
 # Format expected:
 #   [LEARN] <category-slug>: <rule one-liner>
 #   Mistake: <what went wrong>
 #   Correction: <right approach>
 #
 # Skips [LEARN] blocks inside fenced code (```...```) so example/discussion
-# blocks in docs or chat don't get captured as real corrections.
+# blocks don't false-capture (handled inside insert.py).
 
-PARSER="$REPO_ROOT/.claude/scripts/parse-learn-blocks.py"
-if [ ! -f "$PARSER" ]; then
+INSERT="$HOME/.claude/scripts/memory/insert.py"
+if [ ! -f "$INSERT" ]; then
+  # Fallback to legacy JSONL writer if global memory isn't set up yet
+  PARSER="$REPO_ROOT/.claude/scripts/parse-learn-blocks.py"
+  if [ -f "$PARSER" ]; then
+    printf '%s' "$TEXT" | python3 "$PARSER" "$DEVELOPER" "$CORRECTIONS_FILE" 2>/dev/null
+  fi
   exit 0
 fi
 
-printf '%s' "$TEXT" | python3 "$PARSER" "$DEVELOPER" "$CORRECTIONS_FILE" 2>/dev/null
+printf '%s' "$TEXT" | python3 "$INSERT" --repo "$REPO_ROOT" 2>&1 >&2 || true
 
 exit 0

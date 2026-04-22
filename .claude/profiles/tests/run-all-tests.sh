@@ -234,6 +234,22 @@ done
 echo ""
 echo "── learn-capture.sh ───────────────────────────────────────────────────"
 
+# Memory is now SQLite at ~/.claude/memory/memory.db (replaces JSONL).
+# Reset the test sentinels BEFORE any hook runs so we start clean and
+# don't accidentally delete the row we just inserted.
+MEM_DB="$HOME/.claude/memory/memory.db"
+if [ -f "$MEM_DB" ]; then
+  sqlite3 "$MEM_DB" "DELETE FROM memories WHERE category LIKE 'hook-test-%' OR category LIKE 'fenced-sentinel-%' OR category LIKE 'multi-a-%' OR category LIKE 'multi-b-%'" 2>/dev/null || true
+fi
+
+memdb_has() {
+  local sentinel="$1"
+  [ -f "$MEM_DB" ] || return 1
+  local n
+  n=$(sqlite3 "$MEM_DB" "SELECT COUNT(*) FROM memories WHERE rule LIKE '%${sentinel}%' OR category = '${sentinel}'" 2>/dev/null || echo 0)
+  [ "$n" -gt 0 ]
+}
+
 # Create a fake transcript file with [LEARN] blocks. Use a recognizable
 # sentinel category so we can remove the test entry afterward.
 TRANSCRIPT=$(mktemp)
@@ -247,22 +263,18 @@ result="$(echo "{\"transcript_path\":\"$TRANSCRIPT\"}" | bash .claude/hooks/lear
 exit_code="$(echo "$result" | awk 'END{print}' | cut -d: -f2)"
 out="$(echo "$result" | sed '$d')"
 
-DEV_SLUG="$(git config user.email | cut -d@ -f1 | tr -cd 'a-zA-Z0-9._-')"
-CORRECTIONS_FILE=".claude/memory/corrections/${DEV_SLUG}/corrections.jsonl"
-
-if [ "$exit_code" = "0" ] && [ -f "$CORRECTIONS_FILE" ] && grep -q "$TEST_SENTINEL" "$CORRECTIONS_FILE"; then
-  echo "  ✅ PASS  [CAPTURE: [LEARN] block saved to corrections.jsonl]"
+if [ "$exit_code" = "0" ] && memdb_has "$TEST_SENTINEL"; then
+  echo "  ✅ PASS  [CAPTURE: [LEARN] block saved to SQLite]"
   PASS=$((PASS + 1))
 else
   echo "  ❌ FAIL  [CAPTURE: [LEARN] block] exit=$exit_code"
   echo "    output: $out"
-  echo "    corrections file: $CORRECTIONS_FILE"
-  [ -f "$CORRECTIONS_FILE" ] && echo "    contents: $(cat "$CORRECTIONS_FILE")"
+  echo "    DB path: $MEM_DB"
+  [ -f "$MEM_DB" ] && sqlite3 "$MEM_DB" "SELECT category, rule FROM memories LIMIT 5" | sed 's/^/    /'
   FAIL=$((FAIL + 1))
 fi
 
 # Edge: [LEARN] block inside a code fence should NOT be captured.
-# This is how docs/chat show examples without triggering capture.
 TRANSCRIPT_FENCED=$(mktemp)
 FENCE_SENTINEL="fenced-sentinel-$$"
 cat > "$TRANSCRIPT_FENCED" <<TRANSCRIPT_EOF
@@ -270,7 +282,7 @@ cat > "$TRANSCRIPT_FENCED" <<TRANSCRIPT_EOF
 TRANSCRIPT_EOF
 
 echo "{\"transcript_path\":\"$TRANSCRIPT_FENCED\"}" | bash .claude/hooks/learn-capture.sh >/dev/null 2>&1
-if ! grep -q "$FENCE_SENTINEL" "$CORRECTIONS_FILE" 2>/dev/null; then
+if ! memdb_has "$FENCE_SENTINEL"; then
   echo "  ✅ PASS  [SKIP: [LEARN] inside code fence not captured]"
   PASS=$((PASS + 1))
 else
@@ -288,7 +300,7 @@ cat > "$TRANSCRIPT_MULTI" <<TRANSCRIPT_EOF
 TRANSCRIPT_EOF
 
 echo "{\"transcript_path\":\"$TRANSCRIPT_MULTI\"}" | bash .claude/hooks/learn-capture.sh >/dev/null 2>&1
-if grep -q "$MULTI_A" "$CORRECTIONS_FILE" 2>/dev/null && grep -q "$MULTI_B" "$CORRECTIONS_FILE" 2>/dev/null; then
+if memdb_has "$MULTI_A" && memdb_has "$MULTI_B"; then
   echo "  ✅ PASS  [CAPTURE: 2 [LEARN] blocks in one response]"
   PASS=$((PASS + 1))
 else
@@ -297,11 +309,9 @@ else
 fi
 rm -f "$TRANSCRIPT_MULTI"
 
-# Clean up ALL test entries from the real corrections file
-if [ -f "$CORRECTIONS_FILE" ]; then
-  grep -vE "$TEST_SENTINEL|$FENCE_SENTINEL|$MULTI_A|$MULTI_B" "$CORRECTIONS_FILE" > "$CORRECTIONS_FILE.tmp" || true
-  mv "$CORRECTIONS_FILE.tmp" "$CORRECTIONS_FILE"
-  [ ! -s "$CORRECTIONS_FILE" ] && rm -f "$CORRECTIONS_FILE" && rmdir ".claude/memory/corrections/${DEV_SLUG}" 2>/dev/null || true
+# Clean up ALL test entries from the DB
+if [ -f "$MEM_DB" ]; then
+  sqlite3 "$MEM_DB" "DELETE FROM memories WHERE category IN ('$TEST_SENTINEL', '$FENCE_SENTINEL', '$MULTI_A', '$MULTI_B')" 2>/dev/null || true
 fi
 rm -f "$TRANSCRIPT"
 

@@ -26,7 +26,7 @@ PROMPT_LOWER="$(echo "$PROMPT" | tr '[:upper:]' '[:lower:]')"
 #   "i already"       → matches "I already have X", "I already did that"
 #   "no,? ..."        → matches "no, that's fine" and lots of conversational "no"
 #   "i (said|told)"   → matches benign restatement
-if echo "$PROMPT_LOWER" | grep -qE "that'?s (wrong|not right|incorrect|not what i)|you (forgot|should have|shouldn'?t have|missed the|need to fix)|wrong (file|function|variable|approach|repo|directory|way|module)|(undo|revert|roll ?back) that|dude,?\s+(stop|no|fuck)|that'?s not (right|what|how)|this is (wrong|broken|not what)"; then
+if echo "$PROMPT_LOWER" | grep -qE "that'?s (wrong|not right|incorrect|not what (i|you))|you (forgot|should have|shouldn'?t have|missed the|need to fix)|wrong (file|function|variable|approach|repo|directory|way|module|answer)|(undo|revert|roll ?back) (that|this|the last)|dude,?\s+(stop|no|fuck|what)|that'?s not (right|what|how|correct)|this is (wrong|broken|not what|not it)"; then
   cat <<'NUDGE'
 
 ℹ️  correction-detect: the user's message looks like a correction. When you
