@@ -26,11 +26,13 @@ The pipeline itself stays programmatic (Python agents under `agents/`, FastAPI r
 ### Step 1 — preconditions
 Fail fast with a one-sentence fix if any of these miss:
 
-| Check | How | Fix to tell Sam |
+| Check | How | Fix (skill takes action, not Sam) |
 |---|---|---|
-| SSD mounted | `ls /Volumes/1TB_SSD/cascade/episodes/` | "Plug the SSD in." |
-| Cascade server up | `lsof -iTCP:8000 -sTCP:LISTEN` (non-empty) | "Run `./start.sh` in a terminal." |
+| SSD mounted | `ls /Volumes/1TB_SSD/cascade/episodes/` | Tell Sam: "Plug the SSD in." (physical action only Sam can do) |
+| Cascade server up | `lsof -iTCP:8420 -sTCP:LISTEN` (non-empty) | **Skill starts the server itself:** `nohup ./start.sh > /tmp/cascade-server.log 2>&1 &`. Poll `curl -s http://localhost:8420/api/episodes` until it responds (up to 30s). Only tell Sam if startup fails after two tries. |
 | Episode exists | `ls /Volumes/1TB_SSD/cascade/episodes/<id>/episode.json` | "I can't find that episode — did you mean `<closest match>`?" |
+
+**Server lifecycle is the skill's responsibility, not Sam's.** Start it when needed, restart it if it dies mid-session, leave it running between turns. Sam should never be asked to run `./start.sh` manually. The skill OWNS the server process.
 
 ### Step 2 — check for concurrent drivers (best effort)
 Write/refresh a lock file: `/Volumes/1TB_SSD/cascade/episodes/<id>/.produce.lock` with the current timestamp. If the file exists with a timestamp < 5 min old AND Sam hasn't explicitly said "continue anyway," warn: "Another /produce session may be working on this — if that's wrong, delete `.produce.lock` and retry."
@@ -288,9 +290,78 @@ Before firing publish:
 
 ---
 
+## Monitoring & recovery protocol
+
+Claude Code is turn-based — I don't get push notifications when an agent crashes at 3am. To compensate, I spawn a **background watcher daemon** when the pipeline starts, and I read its events file as the FIRST action on every turn.
+
+### Start the watcher
+When any pipeline stage fires for an episode, immediately spawn:
+```bash
+bash .claude/scripts/produce-monitor.sh <episode_id> &  # run_in_background
+```
+
+It polls every 10 seconds and emits JSONL events to `/tmp/produce-<episode_id>-events.jsonl`:
+- `start` — watcher launched
+- `status-change` — episode.json status transitioned
+- `stage-completed` — new entry in agents_completed
+- `error` — new ERROR / Traceback / CRITICAL in `/tmp/cascade-server.log`
+- `stage-stalled` — progress.json modified time > 2× stage's worst-case ETA
+- `episode-dir-missing` — SSD unplugged mid-run
+
+### Every turn, start here
+Before responding to Sam's message, I:
+1. Read `/tmp/produce-<id>-events.jsonl` tail (last 20 lines).
+2. Diff against what I already told Sam about.
+3. If anything new surfaced (error, pause state, completion) — lead with that, don't wait for him to ask.
+
+### Detect an error
+Signatures in the cascade log and episode files:
+- `Traceback (most recent call last):` in `/tmp/cascade-server.log` — Python agent crashed
+- `ERROR:` or `CRITICAL:` — explicit log error
+- ffmpeg exit != 0 — encoding failure (read the last 500 chars of stderr from the agent's output JSON)
+- `progress.json` mtime > 2× stage ETA — stalled
+- `episode.json.status == "error"` — pipeline itself flagged
+
+### Stop a run
+- **Graceful:** `POST /api/episodes/<id>/cancel-pipeline` — pipeline checks cancellation between agents.
+- **Force a stuck agent:** find the uvicorn worker PID via `lsof -iTCP:8420`, kill just the worker (not the parent — the parent's `--reload` spawns a new worker; killing the parent ends the server).
+- **Nuclear:** `kill -9` all Python on 8420, then `nohup ./start.sh &` to restart.
+
+### Change code mid-run
+- Edit the file normally — uvicorn `--reload` picks it up.
+- If the stuck agent is currently running: cancel pipeline → edit → resume.
+- If the agent already completed: edit, invalidate downstream artifacts (see dependency map below), resume with the affected stages.
+
+### Resume from the correct spot — dependency map
+
+When I fix a bug in agent X, I delete specific artifacts and resume with a specific agent list so downstream doesn't short-circuit on stale data:
+
+| Fix in | Delete these files | Resume with |
+|---|---|---|
+| `lib/audio_enhance.py` | `work/audio_mix.wav`, `longform.mp4` | `["longform_render"]` — segs stay (video-only), audio re-mixes, re-muxes |
+| `agents/speaker_cut.py` | `segments.json`, `work/*channel*.npy`, everything downstream | `["speaker_cut", "transcribe", "longform_render"]` |
+| `agents/transcribe.py` | `transcript.json`, `diarized_transcript.json`, `clips.json`, `shorts/*.mp4`, `metadata/` | `["transcribe"]` + re-dispatch clip-miner subagent |
+| clip-miner subagent | `clips.json`, `episode_info.json`, `shorts/*.mp4`, `metadata/` | re-dispatch subagent, then `["shorts_render", "metadata_gen", "thumbnail_gen"]` (gated on URL) |
+| `agents/longform_render.py` (video chain) | `work/longform_seg_*.mp4`, `longform.mp4`, `longform_render.json` | `["longform_render"]` |
+| `agents/longform_render.py` (audio mux only) | `longform.mp4` (NOT segs) | `["longform_render"]` — segs skip, fresh mux |
+| `agents/shorts_render.py` | `shorts/*.mp4`, `subtitles/*.srt` | `["shorts_render"]` |
+| `agents/metadata_gen.py` | `metadata/metadata.json` | `["metadata_gen"]` |
+| `agents/thumbnail_gen.py` | `thumbnails/*` | `["thumbnail_gen"]` |
+| `agents/publish.py` | `publish.json` + clear `youtube_longform_url` if re-publishing longform | `["publish"]` |
+| `agents/podcast_feed.py` | `feed.xml`, `podcast_audio.mp3`, `podcast_feed.json` | `["podcast_feed"]` |
+
+**General rule:** each cascade agent is idempotent if its output artifacts are fresh. When in doubt about what to invalidate, ask before deleting.
+
+### Server lifecycle
+- **I own the server process.** Sam should never run `./start.sh` manually.
+- **Start:** `nohup ./start.sh > /tmp/cascade-server.log 2>&1 & disown`
+- **Health check:** `lsof -iTCP:8420 -sTCP:LISTEN` (listener present) AND `curl -sf http://localhost:8420/api/episodes/` (responds under 5s)
+- **If port bound but unresponsive (like a zombied --reload parent):** kill -9 all uvicorn, relaunch.
+- **If multiple listeners on 8420:** normal — uvicorn `--reload` uses parent + worker processes.
+
 ## Quality monitoring (run on every state transition)
 
-- **Server up:** `lsof -iTCP:8000 -sTCP:LISTEN` non-empty
+- **Server up:** `lsof -iTCP:8420 -sTCP:LISTEN` non-empty
 - **SSD mounted:** `/Volumes/1TB_SSD/cascade/` exists
 - **Episode consistent:** `episode.json.status` matches side-state (e.g. clips.json exists iff clip_miner has completed)
 - **Pipeline responsive:** `progress.json` modified in last 2× ETA of current stage
