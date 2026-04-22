@@ -1,14 +1,19 @@
 /**
- * Track mixer — read-only view of how the 6 H6E tracks are assigned to
- * speakers or ambient. Volume sliders here nudge the speaker's track
- * volume (which is saved into the crop config on Save & continue).
+ * Track mixer — shows each of the six H6E tracks with its assignment, lets
+ * Sam adjust per-speaker volume (saved into crop_config), mute / solo
+ * individual tracks live through a Web Audio graph.
  *
- * Tracks are fixed — Tr1, Tr2, Tr3, Tr4 plus the stereo Mix and built-in
- * Mic. The speaker panel is the source of truth for assignments, so this
- * component accepts a read-only snapshot plus a volume mutator.
+ * Playback is an in-panel affordance separate from the SyncVerifier's
+ * camera+H6E preview — here each of the six stems is loaded individually
+ * so Sam can A/B tracks without crop setup getting in his way.
  */
 
 import { h } from '../../lib/dom';
+import { signal, effect } from '../../lib/signals';
+import { createAudioGraph, type AudioGraph } from '../../lib/audio-graph';
+import { Button } from '../Button';
+import { Icon } from '../icons';
+import { showToast } from '../../state/ui';
 
 interface TrackRow {
   key: string;
@@ -33,44 +38,167 @@ const SPEAKER_VARS = [
   'var(--speaker-4)',
 ];
 
+export interface MixerSpeaker {
+  label: string;
+  track: number | null;
+  volume: number;
+}
+export interface MixerAmbient {
+  track_number?: number | null;
+  stem?: string;
+  volume: number;
+}
+
 export interface TrackMixerProps {
-  speakers: Array<{ label: string; track: number | null; volume: number }>;
-  ambientTracks: Array<{ track_number?: number | null; stem?: string; volume: number }>;
+  episodeId: string;
+  /** Re-read per render so live assignment changes in the speaker panel
+   *  flow through without rebuilding the audio graph. */
+  getSpeakers: () => MixerSpeaker[];
+  getAmbient: () => MixerAmbient[];
   onSpeakerVolume: (speakerIdx: number, volume: number) => void;
 }
 
-export function TrackMixer(props: TrackMixerProps): HTMLElement {
-  return h(
-    'div',
-    { class: 'panel p-5' },
-    h(
-      'div',
-      { class: 'flex items-baseline justify-between mb-3' },
-      h(
-        'span',
-        { class: 'text-heading-sm uppercase text-ink-tertiary' },
-        'Track mixer'
-      ),
-      h(
-        'span',
-        { class: 'text-body-sm text-ink-tertiary' },
-        'Assignments come from the speaker panel. Faders adjust that speaker’s track volume.'
-      )
-    ),
-    h(
-      'div',
-      { class: 'flex flex-col divide-y divide-border-subtle' },
-      ...ROWS.map((row) => renderRow(row, props))
-    )
-  );
+interface MixerState {
+  graph: AudioGraph | null;
+  loading: boolean;
+  playing: boolean;
+  error: string | null;
+  solo: string | null;
+  muted: Record<string, boolean>;
 }
 
-function renderRow(row: TrackRow, props: TrackMixerProps): HTMLElement {
+export function TrackMixer(props: TrackMixerProps): HTMLElement {
+  const state = signal<MixerState>({
+    graph: null,
+    loading: false,
+    playing: false,
+    error: null,
+    solo: null,
+    muted: {},
+  });
+
+  const host = h('div', { class: 'panel p-5' });
+
+  effect(() => {
+    const s = state();
+    host.replaceChildren(
+      h(
+        'div',
+        { class: 'flex items-baseline justify-between mb-3' },
+        h(
+          'span',
+          { class: 'text-heading-sm uppercase text-ink-tertiary' },
+          'Track mixer'
+        ),
+        playButton(props.episodeId, state, s)
+      ),
+      h(
+        'p',
+        { class: 'text-body-sm text-ink-tertiary mb-3' },
+        'Assignments follow the speaker panel. Use solo / mute to A/B tracks before saving.'
+      ),
+      h(
+        'div',
+        { class: 'flex flex-col divide-y divide-border-subtle' },
+        ...ROWS.map((row) =>
+          renderRow(row, props, state, s, props.getSpeakers(), props.getAmbient())
+        )
+      )
+    );
+  });
+
+  // Clean up the audio graph when the mixer leaves the DOM.
+  const cleanup = new MutationObserver(() => {
+    if (!host.isConnected) {
+      const g = state.peek().graph;
+      if (g) g.dispose();
+      cleanup.disconnect();
+    }
+  });
+  cleanup.observe(document.body, { childList: true, subtree: true });
+
+  return host;
+}
+
+function playButton(
+  episodeId: string,
+  state: ReturnType<typeof signal<MixerState>>,
+  s: MixerState
+): HTMLElement {
+  const toggle = async (): Promise<void> => {
+    const cur = state.peek();
+    if (cur.graph && cur.playing) {
+      cur.graph.pause();
+      state.set({ ...cur, playing: false });
+      return;
+    }
+    if (cur.graph) {
+      cur.graph.play();
+      state.set({ ...cur, playing: true });
+      return;
+    }
+    // First play — lazy load all six stems
+    state.set({ ...cur, loading: true, error: null });
+    const graph = createAudioGraph(
+      ROWS.map((r) => ({
+        key: r.key,
+        url: `/api/episodes/${episodeId}/audio-preview/${r.stem}`,
+      }))
+    );
+    try {
+      await graph.ready;
+      const errors: string[] = [];
+      for (const [k, n] of graph.tracks.entries()) {
+        if (n.error) errors.push(`${k}: ${n.error}`);
+      }
+      if (errors.length === ROWS.length) {
+        state.set({
+          ...state.peek(),
+          loading: false,
+          error: 'No stems loaded. Rendered audio may not exist yet.',
+        });
+        showToast('Audio preview failed — run audio_enhance first.', 'error');
+        graph.dispose();
+        return;
+      }
+      graph.play();
+      state.set({ ...state.peek(), graph, loading: false, playing: true });
+    } catch (e) {
+      state.set({
+        ...state.peek(),
+        loading: false,
+        error: (e as Error).message,
+      });
+    }
+  };
+
+  return Button({
+    variant: s.playing ? 'primary' : 'secondary',
+    size: 'sm',
+    label: s.loading ? 'Loading…' : s.playing ? 'Stop' : 'Play all',
+    icon: s.loading
+      ? undefined
+      : s.playing
+      ? Icon.pause({ size: 14 })
+      : Icon.play({ size: 14 }),
+    loading: s.loading,
+    onClick: toggle,
+  });
+}
+
+function renderRow(
+  row: TrackRow,
+  props: TrackMixerProps,
+  state: ReturnType<typeof signal<MixerState>>,
+  s: MixerState,
+  speakers: MixerSpeaker[],
+  ambientTracks: MixerAmbient[]
+): HTMLElement {
   const speakerIdx = row.trackNumber
-    ? props.speakers.findIndex((s) => s.track === row.trackNumber)
+    ? speakers.findIndex((spk) => spk.track === row.trackNumber)
     : -1;
-  const speaker = speakerIdx >= 0 ? props.speakers[speakerIdx] : null;
-  const ambient = props.ambientTracks.find(
+  const speaker = speakerIdx >= 0 ? speakers[speakerIdx] : null;
+  const ambient = ambientTracks.find(
     (a) =>
       (a.track_number != null && a.track_number === row.trackNumber) ||
       (a.stem != null && a.stem === row.stem)
@@ -80,9 +208,7 @@ function renderRow(row: TrackRow, props: TrackMixerProps): HTMLElement {
   if (speaker && speakerIdx >= 0) {
     assignment = h(
       'span',
-      {
-        class: 'chip flex items-center gap-1.5',
-      },
+      { class: 'chip flex items-center gap-1.5' },
       h('span', {
         class: 'w-1.5 h-1.5 rounded-full',
         style: { background: SPEAKER_VARS[speakerIdx % SPEAKER_VARS.length] },
@@ -100,7 +226,9 @@ function renderRow(row: TrackRow, props: TrackMixerProps): HTMLElement {
   }
 
   const volume = speaker ? speaker.volume : ambient ? ambient.volume : 1.0;
-  const volumeLabel = `${Math.round(volume * 100)}%`;
+  const muted = !!s.muted[row.key];
+  const soloed = s.solo === row.key;
+
   const slider = h('input', {
     type: 'range',
     min: '0',
@@ -113,12 +241,62 @@ function renderRow(row: TrackRow, props: TrackMixerProps): HTMLElement {
       if (speakerIdx < 0) return;
       const v = Number((e.target as HTMLInputElement).value);
       props.onSpeakerVolume(speakerIdx, v);
+      const g = state.peek().graph;
+      if (g) g.setTrackGain(row.key, v);
     },
   });
 
+  const muteBtn = h(
+    'button',
+    {
+      onclick: () => {
+        const next = !muted;
+        const cur = state.peek();
+        state.set({
+          ...cur,
+          muted: { ...cur.muted, [row.key]: next },
+        });
+        const g = cur.graph;
+        if (g) g.setTrackMute(row.key, next);
+      },
+      class: [
+        'w-7 h-7 rounded-md border text-code-sm font-mono tabular',
+        muted
+          ? 'bg-status-danger/20 border-status-danger/40 text-status-danger'
+          : 'bg-surface-2 border-border text-ink-secondary hover:text-ink-primary',
+      ].join(' '),
+      title: muted ? 'Unmute' : 'Mute',
+    },
+    'M'
+  );
+
+  const soloBtn = h(
+    'button',
+    {
+      onclick: () => {
+        const next = soloed ? null : row.key;
+        const cur = state.peek();
+        state.set({ ...cur, solo: next });
+        const g = cur.graph;
+        if (g) g.setSolo(next);
+      },
+      class: [
+        'w-7 h-7 rounded-md border text-code-sm font-mono tabular',
+        soloed
+          ? 'bg-accent text-ink-on-accent border-transparent'
+          : 'bg-surface-2 border-border text-ink-secondary hover:text-ink-primary',
+      ].join(' '),
+      title: soloed ? 'Unsolo' : 'Solo',
+    },
+    'S'
+  );
+
   return h(
     'div',
-    { class: 'grid grid-cols-[100px_170px_1fr_56px] gap-4 items-center py-3' },
+    {
+      class:
+        'grid grid-cols-[100px_60px_150px_1fr_56px] gap-3 items-center py-3',
+    },
     h(
       'div',
       null,
@@ -133,6 +311,12 @@ function renderRow(row: TrackRow, props: TrackMixerProps): HTMLElement {
         row.stem
       )
     ),
+    h(
+      'div',
+      { class: 'flex gap-1' },
+      muteBtn,
+      soloBtn
+    ),
     assignment,
     slider,
     h(
@@ -140,10 +324,14 @@ function renderRow(row: TrackRow, props: TrackMixerProps): HTMLElement {
       {
         class: [
           'text-code text-right font-mono tabular',
-          speaker ? 'text-ink-primary' : 'text-ink-tertiary',
+          muted
+            ? 'text-status-danger'
+            : speaker
+            ? 'text-ink-primary'
+            : 'text-ink-tertiary',
         ].join(' '),
       },
-      volumeLabel
+      muted ? 'MUTE' : `${Math.round(volume * 100)}%`
     )
   );
 }

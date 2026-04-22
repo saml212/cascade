@@ -16,7 +16,9 @@ import { h } from '../../lib/dom';
 import { signal, effect, type Signal } from '../../lib/signals';
 import { api } from '../../lib/api';
 import { formatOffsetMs } from '../../lib/format';
+import { createAudioGraph, type AudioGraph } from '../../lib/audio-graph';
 import { Button } from '../Button';
+import { Icon } from '../icons';
 import { showToast } from '../../state/ui';
 
 interface SyncState {
@@ -33,6 +35,10 @@ interface SyncState {
   error: string | null;
   viewStart: number; // seconds
   viewEnd: number;
+  graph: AudioGraph | null;
+  audioLoading: boolean;
+  audioError: string | null;
+  audioPlaying: boolean;
 }
 
 export function SyncVerifier(episodeId: string): HTMLElement {
@@ -50,6 +56,10 @@ export function SyncVerifier(episodeId: string): HTMLElement {
     error: null,
     viewStart: 0,
     viewEnd: 0,
+    graph: null,
+    audioLoading: false,
+    audioError: null,
+    audioPlaying: false,
   });
 
   (async () => {
@@ -57,7 +67,8 @@ export function SyncVerifier(episodeId: string): HTMLElement {
       const data = (await api.syncPreview(episodeId)) as Record<string, unknown>;
       const camera = new Float32Array(data.camera_waveform as number[]);
       const h6e = new Float32Array(data.h6e_waveform as number[]);
-      state.set({
+      state.set((prev) => ({
+        ...prev,
         cameraPeaks: camera,
         h6ePeaks: h6e,
         peaksPerSecond: (data.peaks_per_second as number) ?? 100,
@@ -71,7 +82,7 @@ export function SyncVerifier(episodeId: string): HTMLElement {
         error: null,
         viewStart: 0,
         viewEnd: (data.duration as number) ?? 0,
-      });
+      }));
     } catch (e) {
       state.set((prev) => ({
         ...prev,
@@ -114,6 +125,16 @@ export function SyncVerifier(episodeId: string): HTMLElement {
     statsRow,
     controlRow
   );
+
+  // Dispose the audio graph when this component leaves the DOM.
+  const cleanup = new MutationObserver(() => {
+    if (!host.isConnected) {
+      const g = state.peek().graph;
+      if (g) g.dispose();
+      cleanup.disconnect();
+    }
+  });
+  cleanup.observe(document.body, { childList: true, subtree: true });
 
   // Redraw on any state change.
   effect(() => {
@@ -194,11 +215,12 @@ function renderControls(
     h(
       'button',
       {
-        onclick: () =>
-          state.set({
-            ...state.peek(),
-            currentOffset: roundOffset(state.peek().currentOffset + delta),
-          }),
+        onclick: () => {
+          const next = roundOffset(state.peek().currentOffset + delta);
+          state.set({ ...state.peek(), currentOffset: next });
+          const g = state.peek().graph;
+          if (g) g.updateDelay('h6e', next > 0 ? next : 0);
+        },
         class:
           'h-8 px-2.5 rounded-md border border-border bg-surface-2 text-body-sm font-mono tabular text-ink-primary hover:bg-surface-3',
       },
@@ -213,7 +235,11 @@ function renderControls(
       'w-28 h-9 bg-surface-2 border border-border rounded-md px-2.5 text-body font-mono tabular text-ink-primary focus:border-accent focus:outline-none',
     oninput: (e: Event) => {
       const v = Number((e.target as HTMLInputElement).value);
-      if (!isNaN(v)) state.set({ ...state.peek(), currentOffset: v });
+      if (!isNaN(v)) {
+        state.set({ ...state.peek(), currentOffset: v });
+        const g = state.peek().graph;
+        if (g) g.updateDelay('h6e', v > 0 ? v : 0);
+      }
     },
   });
 
@@ -249,7 +275,43 @@ function renderControls(
     },
   });
 
+  const playBtn = h(
+    'button',
+    {
+      onclick: () => togglePlayback(episodeId, state),
+      class: [
+        'h-8 px-3 rounded-md border text-body-sm font-medium flex items-center gap-1.5 transition-colors duration-[120ms]',
+        s.audioPlaying
+          ? 'bg-accent text-ink-on-accent border-transparent'
+          : 'bg-surface-2 text-ink-primary border-border hover:bg-surface-3',
+      ].join(' '),
+      disabled: s.audioLoading,
+      title: s.audioError
+        ? s.audioError
+        : 'Play camera + H6E together with the current offset',
+    },
+    s.audioLoading
+      ? h('span', {
+          class:
+            'w-3 h-3 rounded-full border border-current border-t-transparent animate-spin',
+        })
+      : s.audioPlaying
+      ? Icon.pause({ size: 14 })
+      : Icon.play({ size: 14 }),
+    h(
+      'span',
+      null,
+      s.audioLoading
+        ? 'Loading audio…'
+        : s.audioPlaying
+        ? 'Stop'
+        : 'Play preview'
+    )
+  );
+
   return [
+    playBtn,
+    h('span', { class: 'mx-1 text-ink-disabled' }, '·'),
     h(
       'span',
       {
@@ -270,6 +332,61 @@ function renderControls(
     resetBtn,
     saveBtn,
   ];
+}
+
+function togglePlayback(
+  episodeId: string,
+  state: Signal<SyncState>
+): void {
+  const s = state.peek();
+  if (s.graph && s.audioPlaying) {
+    s.graph.pause();
+    state.set({ ...state.peek(), audioPlaying: false });
+    return;
+  }
+  if (s.graph) {
+    s.graph.play();
+    state.set({ ...state.peek(), audioPlaying: true });
+    return;
+  }
+  // First play — lazy-build the graph. Camera L channel plus H6E TrLR with
+  // the current offset applied as a delay on the H6E track.
+  const offset = state.peek().currentOffset;
+  const graph = createAudioGraph([
+    {
+      key: 'camera',
+      url: `/api/episodes/${episodeId}/channel-preview/left`,
+      delaySeconds: 0,
+    },
+    {
+      key: 'h6e',
+      url: `/api/episodes/${episodeId}/audio-preview/TrLR`,
+      delaySeconds: offset > 0 ? offset : 0,
+    },
+  ]);
+  state.set({ ...state.peek(), graph, audioLoading: true });
+  graph.ready.then(() => {
+    // If any stem failed, surface it and abort
+    const errors: string[] = [];
+    for (const [key, node] of graph.tracks.entries()) {
+      if (node.error) errors.push(`${key}: ${node.error}`);
+    }
+    if (errors.length) {
+      state.set({
+        ...state.peek(),
+        audioLoading: false,
+        audioError: errors.join(' · '),
+      });
+      showToast('Audio preview failed: ' + errors.join(' · '), 'error');
+      return;
+    }
+    graph.play();
+    state.set({
+      ...state.peek(),
+      audioLoading: false,
+      audioPlaying: true,
+    });
+  });
 }
 
 function roundOffset(v: number): number {

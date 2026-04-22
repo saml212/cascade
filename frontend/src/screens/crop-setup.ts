@@ -50,6 +50,12 @@ interface CropState {
   placeMode: 'shorts' | 'longform';
   loadError: string | null;
   saving: boolean;
+  scrubMode: 'frame' | 'video';
+  videoElement: HTMLVideoElement | null;
+  videoTime: number;
+  videoDuration: number;
+  videoPlaying: boolean;
+  videoLoading: boolean;
 }
 
 const SPEAKER_CSS_VARS = [
@@ -82,6 +88,12 @@ export function CropSetup(target: HTMLElement, episodeId: string): void {
     placeMode: 'shorts',
     loadError: null,
     saving: false,
+    scrubMode: 'frame',
+    videoElement: null,
+    videoTime: 0,
+    videoDuration: 0,
+    videoPlaying: false,
+    videoLoading: false,
   });
 
   let initialised = false;
@@ -359,7 +371,10 @@ function renderBody(
     const isH6E = !!(ep && ep.audio_sync);
     if (isH6E && !audioMounted) {
       audioMounted = true;
-      audioHost.replaceChildren(SyncVerifier(episodeId), renderMixer(state));
+      audioHost.replaceChildren(
+        SyncVerifier(episodeId),
+        renderMixer(state, episodeId)
+      );
     } else if (!isH6E && audioMounted) {
       audioMounted = false;
       audioHost.replaceChildren();
@@ -372,41 +387,42 @@ function renderBody(
     h(
       'div',
       { class: 'grid grid-cols-[minmax(0,1fr)_380px] gap-6' },
-      renderEditor(state),
+      renderEditor(state, episodeId),
       renderSidebar(episodeId, state)
     ),
     audioHost
   );
 }
 
-function renderMixer(state: Signal<CropState>): HTMLElement {
-  const host = h('div');
-  effect(() => {
-    const s = state();
-    host.replaceChildren(
-      TrackMixer({
-        speakers: s.speakers.map((spk) => ({
-          label: spk.label,
-          track: spk.track,
-          volume: spk.volume ?? 1.0,
-        })),
-        ambientTracks: [],
-        onSpeakerVolume: (idx, volume) =>
-          state.set((prev) => ({
-            ...prev,
-            speakers: prev.speakers.map((s, i) =>
-              i === idx ? { ...s, volume } : s
-            ),
-          })),
-      })
-    );
+function renderMixer(state: Signal<CropState>, episodeId: string): HTMLElement {
+  // Render the mixer once so its internal Web Audio graph is stable, but
+  // pass getters that read reactively so assignment + volume changes in
+  // the speaker panel flow through without tearing down the graph.
+  return TrackMixer({
+    episodeId,
+    getSpeakers: () =>
+      state().speakers.map((spk) => ({
+        label: spk.label,
+        track: spk.track,
+        volume: spk.volume ?? 1.0,
+      })),
+    getAmbient: () => [],
+    onSpeakerVolume: (idx, volume) =>
+      state.set((prev) => ({
+        ...prev,
+        speakers: prev.speakers.map((sp, i) =>
+          i === idx ? { ...sp, volume } : sp
+        ),
+      })),
   });
-  return host;
 }
 
 /* ------------------------------ Canvas editor ----------------------------- */
 
-function renderEditor(state: Signal<CropState>): HTMLElement {
+function renderEditor(
+  state: Signal<CropState>,
+  episodeId: string
+): HTMLElement {
   const canvas = document.createElement('canvas');
   canvas.className = 'w-full h-auto block rounded-lg cursor-crosshair bg-surface-inset';
 
@@ -419,6 +435,10 @@ function renderEditor(state: Signal<CropState>): HTMLElement {
 
   const speakerPickerBar = h('div', {
     class: 'flex items-center gap-2 mb-4 flex-wrap',
+  });
+
+  const scrubBar = h('div', {
+    class: 'mt-3 flex items-center gap-3',
   });
 
   const hint = h('div', {
@@ -504,8 +524,33 @@ function renderEditor(state: Signal<CropState>): HTMLElement {
     const s = state();
     placementBar.replaceChildren(renderPlacementBar(state, s));
     speakerPickerBar.replaceChildren(renderSpeakerPicker(state, s));
+    scrubBar.replaceChildren(renderScrubBar(state, s, episodeId));
     hint.replaceChildren(renderHint(s));
   });
+
+  // RAF loop that keeps the canvas in sync with the video element while
+  // scrubbing. Only runs when video mode is active and the video is either
+  // playing or its time was just seeked; polls readyState.
+  let rafId: number | null = null;
+  function loop(): void {
+    const s = state.peek();
+    if (s.scrubMode === 'video' && s.videoElement) {
+      drawOverlays(canvas, s);
+      if (s.videoElement.currentTime !== s.videoTime) {
+        state.set({ ...s, videoTime: s.videoElement.currentTime });
+      }
+    }
+    rafId = window.requestAnimationFrame(loop);
+  }
+  rafId = window.requestAnimationFrame(loop);
+  const stopRaf = new MutationObserver(() => {
+    if (!canvas.isConnected && rafId != null) {
+      window.cancelAnimationFrame(rafId);
+      rafId = null;
+      stopRaf.disconnect();
+    }
+  });
+  stopRaf.observe(document.body, { childList: true, subtree: true });
 
   return h(
     'section',
@@ -513,6 +558,7 @@ function renderEditor(state: Signal<CropState>): HTMLElement {
     placementBar,
     speakerPickerBar,
     canvasWrap,
+    scrubBar,
     hint
   );
 }
@@ -528,13 +574,25 @@ function resizeCanvas(canvas: HTMLCanvasElement, s: CropState): void {
 
 function drawOverlays(canvas: HTMLCanvasElement, s: CropState): void {
   const ctx = canvas.getContext('2d');
-  if (!ctx || !s.image) return;
+  if (!ctx) return;
   const sf = s.sourceWidth / canvas.width;
   const srcW = s.sourceWidth;
   const srcH = s.sourceHeight;
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(s.image, 0, 0, canvas.width, canvas.height);
+  // Video scrub mode draws the current video frame as the background;
+  // otherwise fall back to the static crop frame.
+  if (
+    s.scrubMode === 'video' &&
+    s.videoElement &&
+    s.videoElement.readyState >= 2
+  ) {
+    ctx.drawImage(s.videoElement, 0, 0, canvas.width, canvas.height);
+  } else if (s.image) {
+    ctx.drawImage(s.image, 0, 0, canvas.width, canvas.height);
+  } else {
+    return;
+  }
 
   // Wide shot
   if (s.wide && s.wide.zoom > 0) {
@@ -670,6 +728,25 @@ function renderPlacementBar(
     );
   };
 
+  const scrubToggleActive = s.scrubMode === 'video';
+  const scrubToggle = h(
+    'button',
+    {
+      onclick: () => toggleScrubMode(state),
+      class: [
+        'h-9 px-3.5 rounded-md border text-body-sm font-medium transition-colors duration-[120ms] flex items-center gap-2',
+        scrubToggleActive
+          ? 'bg-accent text-ink-on-accent border-transparent'
+          : 'bg-surface-2 text-ink-primary border-border hover:bg-surface-3',
+      ].join(' '),
+      title: scrubToggleActive
+        ? 'Back to crop frame'
+        : 'Scrub the source video to find a better frame',
+    },
+    Icon.film({ size: 14 }),
+    scrubToggleActive ? 'Using video' : 'Scrub video'
+  );
+
   return h(
     'div',
     { class: 'flex items-center gap-4 w-full flex-wrap' },
@@ -684,8 +761,154 @@ function renderPlacementBar(
       modeBtn('shorts', '9:16 Shorts'),
       modeBtn('longform', '16:9 Longform')
     ),
-    h('div', { class: 'flex-1' })
+    h('div', { class: 'flex-1' }),
+    scrubToggle
   );
+}
+
+function toggleScrubMode(state: Signal<CropState>): void {
+  const prev = state.peek();
+  if (prev.scrubMode === 'video') {
+    // Turning off — pause and drop back to frame
+    if (prev.videoElement) {
+      prev.videoElement.pause();
+    }
+    state.set({ ...prev, scrubMode: 'frame', videoPlaying: false });
+    return;
+  }
+  // Turning on — lazy-create the video element if we haven't yet
+  if (!prev.videoElement) {
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.playsInline = true;
+    v.crossOrigin = 'anonymous';
+    v.muted = true;
+    v.addEventListener('loadedmetadata', () => {
+      state.set({
+        ...state.peek(),
+        videoDuration: v.duration,
+        videoLoading: false,
+      });
+    });
+    v.addEventListener('play', () => {
+      state.set({ ...state.peek(), videoPlaying: true });
+    });
+    v.addEventListener('pause', () => {
+      state.set({ ...state.peek(), videoPlaying: false });
+    });
+    v.addEventListener('seeked', () => {
+      state.set({ ...state.peek(), videoTime: v.currentTime });
+    });
+    v.addEventListener('error', () => {
+      state.set({
+        ...state.peek(),
+        videoLoading: false,
+        scrubMode: 'frame',
+        loadError:
+          'Couldn’t load the source video for scrubbing. Falling back to the crop frame.',
+      });
+    });
+    state.set({
+      ...prev,
+      scrubMode: 'video',
+      videoElement: v,
+      videoLoading: true,
+    });
+    // Kick off load after state is set so readers see loading state
+    // Source URL uses the episode_id from closure; we stash it in the
+    // element's dataset so the renderScrubBar can pick it up.
+    return;
+  }
+  state.set({ ...prev, scrubMode: 'video' });
+}
+
+function renderScrubBar(
+  state: Signal<CropState>,
+  s: CropState,
+  episodeId: string
+): HTMLElement {
+  if (s.scrubMode !== 'video') {
+    return h(
+      'div',
+      null,
+      // Empty filler — effect replaces host children each render.
+      h('span', { class: 'hidden' }, '')
+    );
+  }
+
+  // Attach the source if not yet set
+  if (s.videoElement && !s.videoElement.src) {
+    s.videoElement.src = `/api/episodes/${episodeId}/video-preview`;
+  }
+
+  if (s.videoLoading || (s.videoElement && s.videoElement.readyState < 1)) {
+    return h(
+      'div',
+      { class: 'flex items-center gap-3 text-body-sm text-ink-tertiary' },
+      h('span', { class: 'live-dot' }),
+      h('span', null, 'Loading source video…')
+    );
+  }
+
+  const playPauseBtn = h(
+    'button',
+    {
+      onclick: () => {
+        const v = state.peek().videoElement;
+        if (!v) return;
+        if (v.paused) v.play().catch(() => {});
+        else v.pause();
+      },
+      class:
+        'w-9 h-9 rounded-md border border-border bg-surface-2 text-ink-primary flex items-center justify-center hover:bg-surface-3',
+      title: s.videoPlaying ? 'Pause' : 'Play',
+    },
+    s.videoPlaying ? Icon.pause({ size: 16 }) : Icon.play({ size: 16 })
+  );
+
+  const seek = h('input', {
+    type: 'range',
+    min: '0',
+    max: String(s.videoDuration || 0),
+    step: '0.05',
+    value: String(s.videoTime || 0),
+    class: 'cascade-slider flex-1',
+    oninput: (e: Event) => {
+      const v = state.peek().videoElement;
+      if (!v) return;
+      const t = Number((e.target as HTMLInputElement).value);
+      v.currentTime = t;
+    },
+  });
+
+  return h(
+    'div',
+    { class: 'flex items-center gap-3 w-full' },
+    playPauseBtn,
+    h(
+      'span',
+      { class: 'text-code text-ink-secondary font-mono tabular' },
+      formatClock(s.videoTime)
+    ),
+    seek,
+    h(
+      'span',
+      { class: 'text-code text-ink-tertiary font-mono tabular' },
+      formatClock(s.videoDuration)
+    )
+  );
+}
+
+function formatClock(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return '0:00';
+  const s = Math.floor(seconds);
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  const h2 = Math.floor(m / 60);
+  const mm = String(m % 60).padStart(2, '0');
+  const ss = String(sec).padStart(2, '0');
+  if (h2 > 0) return `${h2}:${mm}:${ss}`;
+  return `${m}:${ss}`;
 }
 
 function renderSpeakerPicker(
