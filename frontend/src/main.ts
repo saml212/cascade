@@ -7,6 +7,9 @@ import { Episode } from './screens/episode/index';
 import { NewEpisode } from './screens/new-episode';
 import { CropSetup } from './screens/crop-setup';
 import { ClipReview } from './screens/clip-review';
+import { LongformReview } from './screens/longform-review';
+import { Publish } from './screens/publish';
+import { Backup } from './screens/backup';
 import { Schedule } from './screens/schedule';
 import { Analytics } from './screens/analytics';
 import { NotFound } from './screens/not-found';
@@ -43,6 +46,9 @@ route('/episodes/:id/metadata', ({ id }) => Episode(main, id));
 
 route('/episodes/:id/crop-setup', ({ id }) => CropSetup(main, id));
 route('/episodes/:id/clips/review', ({ id }) => ClipReview(main, id));
+route('/episodes/:id/longform/review', ({ id }) => LongformReview(main, id));
+route('/episodes/:id/publish', ({ id }) => Publish(main, id));
+route('/episodes/:id/backup', ({ id }) => Backup(main, id));
 
 setFallback(() => NotFound(main));
 

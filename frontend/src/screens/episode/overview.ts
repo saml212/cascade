@@ -120,11 +120,11 @@ export function renderOverview(
             'Adjust speaker crops + audio sync',
             () => navigate(`/episodes/${episodeId}/crop-setup`)
           ),
-          navigationRow('Longform', 'Watch the cut, request edits', () =>
-            navigate(`/episodes/${episodeId}/longform`)
+          navigationRow('Longform review', 'Watch the cut, request edits', () =>
+            navigate(`/episodes/${episodeId}/longform/review`)
           ),
-          navigationRow('Clips', 'Review 10 short clips', () =>
-            navigate(`/episodes/${episodeId}/clips`)
+          navigationRow('Clip review', 'Keep/reject the 10 shorts, sign off per-platform', () =>
+            navigate(`/episodes/${episodeId}/clips/review`)
           ),
           navigationRow('Publish', 'Schedule across platforms', () =>
             navigate(`/episodes/${episodeId}/publish`)

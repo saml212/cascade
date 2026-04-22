@@ -37,6 +37,7 @@ export function renderClips(
             size: 'lg',
             label: 'Review clips',
             onClick: () => navigate(`/episodes/${episodeId}/clips/review`),
+
           })
         : null
     )

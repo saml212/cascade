@@ -198,13 +198,16 @@ export const api = {
 
   /* Edits */
   listEdits: (id: string) =>
-    request<UnknownRecord[]>('GET', `/api/episodes/${id}/edits/`),
+    request<{ edits: UnknownRecord[]; count: number }>(
+      'GET',
+      `/api/episodes/${id}/edits`
+    ),
   addEdit: (id: string, body: UnknownRecord) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/edits/`, body),
+    request<UnknownRecord>('POST', `/api/episodes/${id}/edits`, body),
   removeEdit: (id: string, index: number) =>
     request<UnknownRecord>('DELETE', `/api/episodes/${id}/edits/${index}`),
   clearEdits: (id: string) =>
-    request<UnknownRecord>('DELETE', `/api/episodes/${id}/edits/`),
+    request<UnknownRecord>('DELETE', `/api/episodes/${id}/edits`),
   findEdits: (id: string, body: { query: string; max_results?: number }) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/edits/find`, body),
   applyEdits: (id: string) =>

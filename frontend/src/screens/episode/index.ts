@@ -254,13 +254,13 @@ function primaryActionFor(key: string, episodeId: string): HTMLElement | null {
       return Button({
         variant: 'primary',
         label: 'Review longform',
-        onClick: () => navigate(`/episodes/${episodeId}/longform`),
+        onClick: () => navigate(`/episodes/${episodeId}/longform/review`),
       });
     case 'awaiting_clip_review':
       return Button({
         variant: 'primary',
         label: 'Review clips',
-        onClick: () => navigate(`/episodes/${episodeId}/clips`),
+        onClick: () => navigate(`/episodes/${episodeId}/clips/review`),
       });
     case 'awaiting_publish':
       return Button({
