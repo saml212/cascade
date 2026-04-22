@@ -58,7 +58,7 @@ export function formatRelative(iso: string | null | undefined): string {
 
 /* ---------------------- Status → plain-English mapping --------------------- */
 
-export type StatusKey =
+type StatusKey =
   | 'queued'
   | 'processing'
   | 'awaiting_crop'
@@ -233,6 +233,24 @@ export function describeAgent(agent: string | null | undefined): string {
 export function pluralize(n: number, word: string, plural?: string): string {
   if (n === 1) return `1 ${word}`;
   return `${n} ${plural ?? word + 's'}`;
+}
+
+/**
+ * Distill a backend error string into a one-line summary that fits in chrome.
+ * rsync timeouts become `Command timed out after 1800 seconds`; JSON parse
+ * errors become a generic `Parse error — response was truncated`; anything
+ * else returns its first line, truncated to `maxLen`.
+ */
+export function summarizeErrorText(text: string, maxLen = 100): string {
+  if (/timed out/i.test(text)) {
+    const m = text.match(/timed out after \d+ seconds?/i);
+    if (m) return `Command ${m[0]}`;
+  }
+  if (/Unterminated string/i.test(text)) {
+    return 'Parse error — response was truncated';
+  }
+  const first = text.split(/\r?\n/)[0];
+  return first.length > maxLen ? first.slice(0, maxLen) + '…' : first;
 }
 
 /** Parse an `ep_YYYY-MM-DD_HHMMSS` episode id into a short human date. */

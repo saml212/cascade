@@ -34,7 +34,7 @@ const TONE_CLASSES: Record<StatusTone, { dot: string; text: string; bg: string; 
   },
 };
 
-export interface StatusPillOptions {
+interface StatusPillOptions {
   raw?: string | null;
   descriptor?: StatusDescriptor;
   size?: 'sm' | 'md' | 'lg';

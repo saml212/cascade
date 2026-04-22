@@ -1,6 +1,7 @@
 import { h } from '../lib/dom';
 import { effect, signal } from '../lib/signals';
 import { subscribe, type PipelineEvent } from '../lib/events';
+import { summarizeErrorText } from '../lib/format';
 
 const KIND_STYLE: Record<PipelineEvent['kind'], { dot: string; text: string }> = {
   status: { dot: 'bg-ink-tertiary', text: 'text-ink-secondary' },
@@ -12,18 +13,6 @@ const KIND_STYLE: Record<PipelineEvent['kind'], { dot: string; text: string }> =
 };
 
 const MAX_EVENTS = 50;
-
-function summarize(text: string): string {
-  if (/timed out/i.test(text)) {
-    const m = text.match(/timed out after \d+ seconds?/i);
-    if (m) return `Command ${m[0]}`;
-  }
-  if (/Unterminated string/i.test(text)) {
-    return 'Parse error — response was truncated';
-  }
-  const first = text.split(/\r?\n/)[0];
-  return first.length > 80 ? first.slice(0, 80) + '…' : first;
-}
 
 export function EventFeed(episodeId: string): HTMLElement {
   const events = signal<PipelineEvent[]>([]);
@@ -65,7 +54,7 @@ export function EventFeed(episodeId: string): HTMLElement {
           hour: '2-digit',
           minute: '2-digit',
         });
-        const summarizedDetail = e.detail ? summarize(e.detail) : null;
+        const summarizedDetail = e.detail ? summarizeErrorText(e.detail, 80) : null;
         return h(
           'div',
           { class: 'flex gap-2.5 items-start text-body-sm' },

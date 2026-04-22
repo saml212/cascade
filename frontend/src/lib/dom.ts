@@ -94,7 +94,3 @@ export function svg(tag: string, props?: Props | null, ...children: Child[]): SV
 export function mount(target: Element, node: Node): void {
   target.replaceChildren(node);
 }
-
-export function empty(el: Element): void {
-  el.replaceChildren();
-}

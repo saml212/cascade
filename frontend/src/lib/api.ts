@@ -108,16 +108,8 @@ export const api = {
     request<UnknownRecord>('POST', '/api/episodes/', req),
   updateEpisode: (id: string, req: EpisodeUpdateRequest) =>
     request<UnknownRecord>('PATCH', `/api/episodes/${id}`, req),
-  deleteEpisode: (id: string) => request<void>('DELETE', `/api/episodes/${id}`),
-  approveEpisode: (id: string) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/approve`),
 
   cropFrameUrl: (id: string) => `/api/episodes/${id}/crop-frame`,
-  videoPreviewUrl: (id: string) => `/api/episodes/${id}/video-preview`,
-  audioPreviewUrl: (id: string, track: string) =>
-    `/api/episodes/${id}/audio-preview/${track}`,
-  channelPreviewUrl: (id: string, channel: 'left' | 'right') =>
-    `/api/episodes/${id}/channel-preview/${channel}`,
 
   syncPreview: (id: string) =>
     request<UnknownRecord>('GET', `/api/episodes/${id}/sync-preview`),
@@ -130,14 +122,8 @@ export const api = {
     request<UnknownRecord>('POST', `/api/episodes/${id}/crop-config`, cfg),
 
   /* Pipeline */
-  runPipeline: (id: string, body: { source_path?: string; audio_path?: string; agents?: string[] } = {}) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/run-pipeline`, body),
-  runAgent: (id: string, agent: string, body: { source_path?: string } = {}) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/run-agent/${agent}`, body),
   pipelineStatus: (id: string) =>
     request<UnknownRecord>('GET', `/api/episodes/${id}/pipeline-status`),
-  cancelPipeline: (id: string) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/cancel-pipeline`),
   resumePipeline: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/resume-pipeline`),
   autoApprove: (id: string) =>
@@ -152,16 +138,12 @@ export const api = {
   /* Clips */
   listClips: (id: string) =>
     request<UnknownRecord[]>('GET', `/api/episodes/${id}/clips/`),
-  getClip: (id: string, clipId: string) =>
-    request<UnknownRecord>('GET', `/api/episodes/${id}/clips/${clipId}`),
   approveClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/approve`),
   rejectClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/reject`),
   alternativeClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/alternative`),
-  addManualClip: (id: string, body: { start_seconds: number; end_seconds: number }) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/clips/manual`, body),
   updateClip: (
     id: string,
     clipId: string,
@@ -192,24 +174,14 @@ export const api = {
   completeMetadata: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/complete-metadata`),
 
-  /* Trim */
-  trim: (id: string, body: { trim_start_seconds?: number; trim_end_seconds?: number }) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/trim`, body),
-
   /* Edits */
   listEdits: (id: string) =>
     request<{ edits: UnknownRecord[]; count: number }>(
       'GET',
       `/api/episodes/${id}/edits`
     ),
-  addEdit: (id: string, body: UnknownRecord) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/edits`, body),
   removeEdit: (id: string, index: number) =>
     request<UnknownRecord>('DELETE', `/api/episodes/${id}/edits/${index}`),
-  clearEdits: (id: string) =>
-    request<UnknownRecord>('DELETE', `/api/episodes/${id}/edits`),
-  findEdits: (id: string, body: { query: string; max_results?: number }) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/edits/find`, body),
   applyEdits: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/edits/apply`),
 

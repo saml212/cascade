@@ -17,7 +17,12 @@
 import { h, mount } from '../lib/dom';
 import { effect, signal, type Signal } from '../lib/signals';
 import { api, type SpeakerCropConfig, type CropConfigRequest } from '../lib/api';
-import { describeStatus, episodeDateLabel, formatDuration } from '../lib/format';
+import {
+  describeStatus,
+  episodeDateLabel,
+  formatDuration,
+  formatTimecode,
+} from '../lib/format';
 import { episodeDetail, watchEpisode } from '../state/episodes';
 import { agentPanelCollapsed, showToast } from '../state/ui';
 import { StatusPill } from '../components/StatusPill';
@@ -888,27 +893,15 @@ function renderScrubBar(
     h(
       'span',
       { class: 'text-code text-ink-secondary font-mono tabular' },
-      formatClock(s.videoTime)
+      formatTimecode(s.videoTime)
     ),
     seek,
     h(
       'span',
       { class: 'text-code text-ink-tertiary font-mono tabular' },
-      formatClock(s.videoDuration)
+      formatTimecode(s.videoDuration)
     )
   );
-}
-
-function formatClock(seconds: number): string {
-  if (!isFinite(seconds) || seconds < 0) return '0:00';
-  const s = Math.floor(seconds);
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  const h2 = Math.floor(m / 60);
-  const mm = String(m % 60).padStart(2, '0');
-  const ss = String(sec).padStart(2, '0');
-  if (h2 > 0) return `${h2}:${mm}:${ss}`;
-  return `${m}:${ss}`;
 }
 
 function renderSpeakerPicker(

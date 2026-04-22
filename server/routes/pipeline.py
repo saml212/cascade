@@ -10,6 +10,7 @@ from typing import Optional
 from lib.atomic_write import atomic_write_json
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from lib.paths import get_episodes_dir
@@ -472,3 +473,253 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
 
     logger.info("Shorts publish approved and started for %s", episode_id)
     return {"status": "shorts_publishing", "episode_id": episode_id}
+
+
+# ── Upload-Post URL polling ─────────────────────────────────────────────────
+# After longform is submitted via Upload-Post, YouTube takes 15 min to several
+# hours to process before the public URL is returned. Rather than force Sam to
+# paste the URL by hand, this endpoint queries Upload-Post's status API for
+# any pending request IDs on the episode and PATCHes episode.json with the
+# URLs once they're live. Frontend polls this on a cadence.
+
+
+class CheckUploadUrlsResponse(BaseModel):
+    longform: dict = {}  # {"status": "pending" | "live" | "failed", "url": str | None}
+    shorts: list[dict] = []  # per-clip {"clip_id": ..., "status": ..., "url": ...}
+
+
+@router.post("/{episode_id}/check-upload-urls")
+async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
+    """Poll Upload-Post for any pending request_ids on this episode and
+    update episode.json.youtube_longform_url when the URL becomes available.
+
+    Returns a per-submission status so the frontend can show "YouTube is
+    still processing..." vs "Live on YouTube" without additional calls.
+    """
+    import os
+
+    import httpx
+
+    ep_dir = OUTPUT_DIR / episode_id
+    episode_file = ep_dir / "episode.json"
+    publish_file = ep_dir / "publish.json"
+
+    if not episode_file.exists():
+        raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+    if not publish_file.exists():
+        return CheckUploadUrlsResponse(
+            longform={"status": "not_submitted", "url": None}, shorts=[]
+        )
+
+    api_key = os.getenv("UPLOAD_POST_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500, detail="UPLOAD_POST_API_KEY not set in environment"
+        )
+
+    with open(publish_file) as f:
+        publish_data = json.load(f)
+    with open(episode_file) as f:
+        episode = json.load(f)
+
+    result = CheckUploadUrlsResponse()
+    status_url = "https://api.upload-post.com/api/uploadposts/status"
+
+    def _extract_youtube_url(resp_data: dict) -> Optional[str]:
+        """Upload-Post's response shape varies; try several known paths."""
+        # Direct URL at top level
+        for key in ("video_url", "youtube_url", "url"):
+            if resp_data.get(key):
+                return resp_data[key]
+        # Per-platform nested
+        platforms = resp_data.get("platforms", {})
+        if isinstance(platforms, dict):
+            yt = platforms.get("youtube", {})
+            if isinstance(yt, dict):
+                for key in ("video_url", "url", "post_url"):
+                    if yt.get(key):
+                        return yt[key]
+        return None
+
+    # Longform check
+    longform_res = publish_data.get("longform") or {}
+    longform_status = longform_res.get("status")
+    longform_request_id = longform_res.get("request_id")
+    existing_url = episode.get("youtube_longform_url", "")
+
+    if existing_url:
+        result.longform = {"status": "live", "url": existing_url}
+    elif longform_status == "submitted" and longform_request_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    status_url,
+                    params={"request_id": longform_request_id},
+                    headers={"Authorization": f"Apikey {api_key}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPError as e:
+            logger.warning(
+                "Upload-Post status check failed for %s longform: %s",
+                episode_id,
+                e,
+            )
+            result.longform = {"status": "pending", "url": None, "error": str(e)}
+        else:
+            url = _extract_youtube_url(data)
+            if url:
+                episode["youtube_longform_url"] = url
+                episode["youtube_longform_url_captured_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                atomic_write_json(episode_file, episode)
+                result.longform = {"status": "live", "url": url}
+            else:
+                result.longform = {
+                    "status": "pending",
+                    "url": None,
+                    "upload_post_state": data.get("status") or data.get("state"),
+                }
+    else:
+        result.longform = {"status": longform_status or "not_submitted", "url": None}
+
+    # Per-clip checks (best-effort; failures don't error the endpoint)
+    for clip_result in publish_data.get("shorts", []):
+        clip_id = clip_result.get("clip_id", "")
+        clip_request_id = clip_result.get("request_id")
+        if clip_result.get("status") != "submitted" or not clip_request_id:
+            result.shorts.append(
+                {
+                    "clip_id": clip_id,
+                    "status": clip_result.get("status", "unknown"),
+                    "url": None,
+                }
+            )
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    status_url,
+                    params={"request_id": clip_request_id},
+                    headers={"Authorization": f"Apikey {api_key}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            url = _extract_youtube_url(data)
+            result.shorts.append(
+                {
+                    "clip_id": clip_id,
+                    "status": "live" if url else "pending",
+                    "url": url,
+                }
+            )
+        except httpx.HTTPError as e:
+            result.shorts.append(
+                {"clip_id": clip_id, "status": "pending", "url": None, "error": str(e)}
+            )
+
+    return result
+
+
+# ── SSE event stream ────────────────────────────────────────────────────────
+# Frontend's frontend/src/lib/events.ts expects to swap from polling to SSE
+# in one line when this endpoint lands. Emits server-sent events of shape:
+#   kind: "status" | "progress" | "agent_start" | "agent_done" | "agent_error"
+# Implementation: watches episode.json + progress.json mtimes and re-reads
+# on change. Lightweight fs polling inside the server so the frontend doesn't
+# poll via HTTP.
+
+
+@router.get("/{episode_id}/events")
+async def pipeline_events(episode_id: str) -> StreamingResponse:
+    """Server-sent-events stream of pipeline state transitions.
+
+    Watches `<episode_dir>/episode.json` and `<episode_dir>/progress.json`
+    for mtime changes and emits events. Keeps the connection open until
+    the client disconnects. Emits an initial `status` event immediately
+    so clients hydrate without a separate fetch.
+    """
+    ep_dir = OUTPUT_DIR / episode_id
+    episode_file = ep_dir / "episode.json"
+    progress_file = ep_dir / "progress.json"
+    if not episode_file.exists():
+        raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+
+    async def _event_stream():
+        last_status: Optional[str] = None
+        last_completed: list[str] = []
+        last_progress_mtime: float = 0.0
+        last_episode_mtime: float = 0.0
+
+        def _emit(kind: str, data: dict) -> str:
+            payload = json.dumps({"kind": kind, **data}, default=str)
+            return f"event: {kind}\ndata: {payload}\n\n"
+
+        try:
+            while True:
+                # Episode.json change detection
+                try:
+                    ep_mtime = episode_file.stat().st_mtime
+                except FileNotFoundError:
+                    yield _emit("error", {"detail": "episode.json vanished"})
+                    break
+
+                if ep_mtime != last_episode_mtime:
+                    last_episode_mtime = ep_mtime
+                    try:
+                        with open(episode_file) as f:
+                            episode = json.load(f)
+                    except (json.JSONDecodeError, OSError):
+                        await asyncio.sleep(1)
+                        continue
+
+                    status = episode.get("status", "unknown")
+                    completed = list(
+                        episode.get("pipeline", {}).get("agents_completed", [])
+                    )
+
+                    if status != last_status:
+                        yield _emit("status", {"status": status})
+                        last_status = status
+
+                    # Detect newly-completed agents vs previous snapshot
+                    new_done = [a for a in completed if a not in last_completed]
+                    for agent in new_done:
+                        yield _emit("agent_done", {"agent": agent})
+                    last_completed = completed
+
+                    # Current agent (if any) as agent_start
+                    current = episode.get("pipeline", {}).get("current_agent")
+                    if current and current not in completed:
+                        yield _emit("agent_start", {"agent": current})
+
+                # Progress.json change detection (separate file, updated by
+                # agents mid-run)
+                if progress_file.exists():
+                    try:
+                        pg_mtime = progress_file.stat().st_mtime
+                    except FileNotFoundError:
+                        pg_mtime = 0
+                    if pg_mtime and pg_mtime != last_progress_mtime:
+                        last_progress_mtime = pg_mtime
+                        try:
+                            with open(progress_file) as f:
+                                progress = json.load(f)
+                            yield _emit("progress", progress)
+                        except (json.JSONDecodeError, OSError):
+                            pass
+
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable proxy buffering
+        },
+    )

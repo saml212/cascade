@@ -6,6 +6,7 @@ import subprocess
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Optional
 
 from lib.atomic_write import atomic_write_json
 
@@ -38,15 +39,36 @@ class BaseAgent(ABC):
         self.episode_dir = Path(episode_dir)
         self.config = config
         self.logger = logging.getLogger(f"cascade.{self.name}")
+        self._progress_start_time: Optional[float] = None
 
     def report_progress(self, current: int, total: int, detail: str = ""):
-        """Write progress.json so the API can report real-time status."""
+        """Write progress.json so the API can report real-time status.
+
+        Tracks the first call's timestamp to compute eta_seconds for
+        later calls. The frontend's ProgressBar component reads
+        `{percent, eta_seconds, detail}` — total and current are there
+        too for older clients.
+        """
+        now = time.time()
+        if self._progress_start_time is None:
+            self._progress_start_time = now
+
+        eta_seconds: Optional[float] = None
+        if current > 0 and total > current:
+            elapsed = now - self._progress_start_time
+            if elapsed > 0:
+                per_unit = elapsed / current
+                remaining_units = total - current
+                eta_seconds = round(per_unit * remaining_units, 1)
+
         progress = {
             "agent": self.name,
             "current": current,
             "total": total,
             "percent": round(current / total * 100, 1) if total > 0 else 0,
+            "eta_seconds": eta_seconds,
             "detail": detail,
+            "updated_at": now,
         }
         atomic_write_json(self.episode_dir / "progress.json", progress, indent=0)
 

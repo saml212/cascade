@@ -8,7 +8,7 @@ import {
 } from '../../lib/format';
 import { StatusPill } from '../../components/StatusPill';
 import { Button } from '../../components/Button';
-import { StepProgress } from '../../components/ProgressBar';
+import { StepProgress } from '../../components/StepProgress';
 import { Icon } from '../../components/icons';
 import {
   episodeDetail,

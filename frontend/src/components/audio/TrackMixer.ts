@@ -40,18 +40,18 @@ const SPEAKER_VARS = [
   'var(--speaker-4)',
 ];
 
-export interface MixerSpeaker {
+interface MixerSpeaker {
   label: string;
   track: number | null;
   volume: number;
 }
-export interface MixerAmbient {
+interface MixerAmbient {
   track_number?: number | null;
   stem?: string;
   volume: number;
 }
 
-export interface TrackMixerProps {
+interface TrackMixerProps {
   episodeId: string;
   /** Re-read per render so live assignment changes in the speaker panel
    *  flow through without rebuilding the audio graph. */

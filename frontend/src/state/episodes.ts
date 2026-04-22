@@ -1,23 +1,16 @@
-import { signal, effect } from '../lib/signals';
+import { signal } from '../lib/signals';
 import { api, type EpisodeSummary, type UnknownRecord } from '../lib/api';
 
 export const episodes = signal<EpisodeSummary[] | null>(null);
-export const episodesError = signal<string | null>(null);
-export const episodesLoading = signal<boolean>(false);
 
 let episodesTimer: number | null = null;
 const EPISODES_POLL_MS = 8000;
 
-export async function refreshEpisodes(): Promise<void> {
-  episodesLoading.set(true);
+async function refreshEpisodes(): Promise<void> {
   try {
-    const list = await api.listEpisodes();
-    episodes.set(list);
-    episodesError.set(null);
-  } catch (e) {
-    episodesError.set((e as Error).message ?? 'Could not load episodes');
-  } finally {
-    episodesLoading.set(false);
+    episodes.set(await api.listEpisodes());
+  } catch {
+    // Poll will retry.
   }
 }
 
@@ -25,13 +18,6 @@ export function startEpisodesPoll(): void {
   if (episodesTimer != null) return;
   refreshEpisodes();
   episodesTimer = window.setInterval(refreshEpisodes, EPISODES_POLL_MS);
-}
-
-export function stopEpisodesPoll(): void {
-  if (episodesTimer != null) {
-    clearInterval(episodesTimer);
-    episodesTimer = null;
-  }
 }
 
 /* Per-episode detail store */
@@ -71,8 +57,3 @@ export function watchEpisode(id: string | null): void {
   loadDetail(id);
   detailTimer = window.setInterval(() => loadDetail(id), DETAIL_POLL_MS);
 }
-
-// Auto-stop detail polling when nothing's watching
-effect(() => {
-  if (!episodeDetailId()) return;
-});
