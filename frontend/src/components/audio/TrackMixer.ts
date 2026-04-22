@@ -58,6 +58,12 @@ interface TrackMixerProps {
   getSpeakers: () => MixerSpeaker[];
   getAmbient: () => MixerAmbient[];
   onSpeakerVolume: (speakerIdx: number, volume: number) => void;
+  /** Called when the assignment dropdown on a mixer row changes. Lets Sam
+   *  reassign "Track N plays Host/Guest 1/etc." inline while auditioning
+   *  tracks via solo — without leaving the mixer to hit the speaker panel.
+   *  trackNumber is the H6E track (1-based) being assigned; speakerIdx is
+   *  the target speaker (-1 = unassign). */
+  onAssignTrack?: (trackNumber: number, speakerIdx: number) => void;
 }
 
 interface MixerState {
@@ -245,7 +251,39 @@ function renderRow(
   );
 
   let assignment: HTMLElement;
-  if (speaker && speakerIdx >= 0) {
+  // Inline-editable speaker picker for numbered input tracks (Tr1-Tr4). Lets
+  // Sam audition via solo, hear a voice, and reassign in one click without
+  // leaving the mixer. TrLR/TrMic (ambient) stay as static chips.
+  if (
+    row.trackNumber != null &&
+    props.onAssignTrack &&
+    props.getSpeakers().length > 0
+  ) {
+    const speakers = props.getSpeakers();
+    assignment = h(
+      'select',
+      {
+        class:
+          'h-7 px-2 rounded-md border border-border bg-surface-2 text-ink-primary text-body-sm focus:outline-none focus:ring-2 focus:ring-accent',
+        onchange: (e: Event) => {
+          const v = (e.target as HTMLSelectElement).value;
+          const idx = v === '' ? -1 : Number(v);
+          props.onAssignTrack!(row.trackNumber!, idx);
+        },
+      },
+      h('option', { value: '' }, '— Unassigned —'),
+      ...speakers.map((spk, i) =>
+        h(
+          'option',
+          {
+            value: String(i),
+            selected: speakerIdx === i ? true : undefined,
+          },
+          spk.label
+        )
+      )
+    );
+  } else if (speaker && speakerIdx >= 0) {
     assignment = h(
       'span',
       { class: 'chip flex items-center gap-1.5' },

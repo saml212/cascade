@@ -415,6 +415,22 @@ function renderMixer(state: Signal<CropState>, episodeId: string): HTMLElement {
           i === idx ? { ...sp, volume } : sp
         ),
       })),
+    onAssignTrack: (trackNumber, targetIdx) =>
+      state.set((prev) => ({
+        ...prev,
+        speakers: prev.speakers.map((sp, i) => {
+          // Clear this track from any other speaker that had it (tracks are
+          // 1:1 with speakers in cascade's crop schema). Then assign to the
+          // target speaker if targetIdx >= 0.
+          if (sp.track === trackNumber && i !== targetIdx) {
+            return { ...sp, track: null };
+          }
+          if (i === targetIdx) {
+            return { ...sp, track: trackNumber };
+          }
+          return sp;
+        }),
+      })),
   });
 }
 

@@ -33,7 +33,15 @@ function pickSpotlight(list: EpisodeSummary[]): EpisodeSummary | null {
     const key = describeStatus(ep.status, { cropConfig: ep.has_crop_config, clips: ep.clips }).key;
     return { ep, score: PRIORITY[key] ?? 0 };
   });
-  scored.sort((a, b) => b.score - a.score);
+  // Highest priority first; within the same priority, newest created_at wins.
+  // Without the created_at tie-break the sort was stable on the API's
+  // alphabetical order and the OLDEST matching episode got "Today's episode."
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const ta = new Date(a.ep.created_at ?? 0).getTime();
+    const tb = new Date(b.ep.created_at ?? 0).getTime();
+    return tb - ta;
+  });
   return scored[0].ep;
 }
 
