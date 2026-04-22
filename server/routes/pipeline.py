@@ -36,8 +36,49 @@ class RunAgentRequest(BaseModel):
     source_path: Optional[str] = None
 
 
+# ── Response models ─────────────────────────────────────────────────────────
+# Typed responses so the frontend can read the contract from the Pydantic
+# model instead of inferring it from handler bodies.
+
+
+class PipelineActionResponse(BaseModel):
+    """Generic response for pipeline-action endpoints that start work."""
+
+    status: str  # e.g. "started", "resumed", "cancel_requested", "approved",
+    # "backup_started", "longform_publishing", "shorts_publishing", "not_running",
+    # "already_complete"
+    episode_id: str
+
+
+class ResumePipelineResponse(PipelineActionResponse):
+    """Resume endpoint additionally reports the remaining agent list."""
+
+    remaining_agents: Optional[list[str]] = None
+
+
+class RunAgentResponse(BaseModel):
+    status: str  # "completed"
+    agent: str
+    result: dict
+
+
+class PipelineStatusResponse(BaseModel):
+    episode_id: str
+    status: str
+    is_running: bool
+    current_agent: Optional[str] = None
+    agents_completed: list[str] = []
+    agents_requested: Optional[list[str]] = None
+    errors: dict = {}
+    progress: Optional[dict] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
 @router.post("/{episode_id}/run-pipeline")
-async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dict:
+async def run_pipeline_endpoint(
+    episode_id: str, req: RunPipelineRequest
+) -> PipelineActionResponse:
     """Trigger the full pipeline as a background task."""
     logger.info("POST /api/episodes/%s/run-pipeline", episode_id)
     async with _pipeline_lock:
@@ -85,7 +126,7 @@ async def run_pipeline_endpoint(episode_id: str, req: RunPipelineRequest) -> dic
 @router.post("/{episode_id}/run-agent/{agent_name}")
 async def run_single_agent(
     episode_id: str, agent_name: str, req: RunAgentRequest
-) -> dict:
+) -> RunAgentResponse:
     """Run a single agent for an episode."""
     logger.info("POST /api/episodes/%s/run-agent/%s", episode_id, agent_name)
     from agents import AGENT_REGISTRY
@@ -112,7 +153,7 @@ async def run_single_agent(
 
 
 @router.get("/{episode_id}/pipeline-status")
-async def pipeline_status(episode_id: str) -> dict:
+async def pipeline_status(episode_id: str) -> PipelineStatusResponse:
     """Get current pipeline status for an episode."""
     logger.info("GET /api/episodes/%s/pipeline-status", episode_id)
     episode_file = OUTPUT_DIR / episode_id / "episode.json"
@@ -150,7 +191,7 @@ async def pipeline_status(episode_id: str) -> dict:
 
 
 @router.post("/{episode_id}/cancel-pipeline")
-async def cancel_pipeline(episode_id: str) -> dict:
+async def cancel_pipeline(episode_id: str) -> PipelineActionResponse:
     """Request cancellation of a running pipeline."""
     logger.info("POST /api/episodes/%s/cancel-pipeline", episode_id)
     async with _pipeline_lock:
@@ -184,7 +225,7 @@ async def cancel_pipeline(episode_id: str) -> dict:
 
 
 @router.post("/{episode_id}/resume-pipeline")
-async def resume_pipeline(episode_id: str) -> dict:
+async def resume_pipeline(episode_id: str) -> ResumePipelineResponse:
     """Resume pipeline after crop setup — runs remaining agents."""
     logger.info("POST /api/episodes/%s/resume-pipeline", episode_id)
     async with _pipeline_lock:
@@ -234,7 +275,7 @@ async def resume_pipeline(episode_id: str) -> dict:
 
 
 @router.post("/{episode_id}/auto-approve")
-async def auto_approve(episode_id: str) -> dict:
+async def auto_approve(episode_id: str) -> PipelineActionResponse:
     """Auto-approve all clips for an episode (skip manual review)."""
     logger.info("POST /api/episodes/%s/auto-approve", episode_id)
     episode_file = OUTPUT_DIR / episode_id / "episode.json"
@@ -268,7 +309,7 @@ async def auto_approve(episode_id: str) -> dict:
 
 
 @router.post("/{episode_id}/approve-backup")
-async def approve_backup(episode_id: str) -> dict:
+async def approve_backup(episode_id: str) -> PipelineActionResponse:
     """Approve backup + SD card cleanup, then resume pipeline to run backup agent."""
     logger.info("POST /api/episodes/%s/approve-backup", episode_id)
     async with _pipeline_lock:
@@ -313,7 +354,7 @@ async def approve_backup(episode_id: str) -> dict:
 
 
 @router.post("/{episode_id}/approve-longform")
-async def approve_longform(episode_id: str) -> dict:
+async def approve_longform(episode_id: str) -> PipelineActionResponse:
     """Approve the longform render — publishes the longform FIRST.
 
     Fires podcast_feed (triggers Spotify RSS ingest) + publish (uploads
@@ -378,7 +419,7 @@ async def approve_longform(episode_id: str) -> dict:
 
 
 @router.post("/{episode_id}/approve-publish")
-async def approve_publish(episode_id: str) -> dict:
+async def approve_publish(episode_id: str) -> PipelineActionResponse:
     """Approve publishing the SHORTS (phase 4 of the flow).
 
     Assumes longform is already live (approve-longform was fired earlier,
