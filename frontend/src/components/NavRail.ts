@@ -13,13 +13,13 @@ interface NavItem {
 const ITEMS: NavItem[] = [
   {
     path: '/',
-    label: 'Dashboard',
+    label: 'Episodes',
     icon: () => Icon.dashboard(),
     matcher: (p) => p === '/' || p.startsWith('/episodes/'),
   },
   {
     path: '/new',
-    label: 'New Episode',
+    label: 'New',
     icon: () => Icon.plus(),
     matcher: (p) => p === '/new',
   },
@@ -70,9 +70,9 @@ export function NavRail(): HTMLElement {
             h(
               'span',
               {
-                class: 'text-[10px] font-medium tracking-wide uppercase opacity-70',
+                class: 'text-[9.5px] font-medium tracking-wide uppercase opacity-80',
               },
-              item.label.split(' ')[0]
+              item.label
             )
           )
         );
