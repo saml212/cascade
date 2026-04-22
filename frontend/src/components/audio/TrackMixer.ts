@@ -14,11 +14,13 @@ import { createAudioGraph, type AudioGraph } from '../../lib/audio-graph';
 import { Button } from '../Button';
 import { Icon } from '../icons';
 import { showToast } from '../../state/ui';
+import { episodeDetail } from '../../state/episodes';
 
 interface TrackRow {
   key: string;
   label: string;
-  stem: 'Tr1' | 'Tr2' | 'Tr3' | 'Tr4' | 'Mix' | 'Mic';
+  /** H6E stem convention (what appears in the WAV filename). */
+  stem: 'Tr1' | 'Tr2' | 'Tr3' | 'Tr4' | 'TrLR' | 'TrMic';
   trackNumber: number | null;
 }
 
@@ -27,8 +29,8 @@ const ROWS: TrackRow[] = [
   { key: 'tr2', label: 'Track 2', stem: 'Tr2', trackNumber: 2 },
   { key: 'tr3', label: 'Track 3', stem: 'Tr3', trackNumber: 3 },
   { key: 'tr4', label: 'Track 4', stem: 'Tr4', trackNumber: 4 },
-  { key: 'mix', label: 'Stereo Mix', stem: 'Mix', trackNumber: null },
-  { key: 'mic', label: 'Built-in Mic', stem: 'Mic', trackNumber: null },
+  { key: 'mix', label: 'Stereo Mix', stem: 'TrLR', trackNumber: null },
+  { key: 'mic', label: 'Built-in Mic', stem: 'TrMic', trackNumber: null },
 ];
 
 const SPEAKER_VARS = [
@@ -137,12 +139,26 @@ function playButton(
       state.set({ ...cur, playing: true });
       return;
     }
-    // First play — lazy load all six stems
+    // First play — lazy load every available stem. The backend's
+    // audio-preview endpoint matches by filename stem, and H6E stems
+    // carry the recorder's timestamp prefix (e.g. 260311_162356_Tr1).
+    // We resolve each logical row to its actual stem via episode.audio_tracks.
+    const stems = resolveStems();
+    if (stems.length === 0) {
+      state.set({
+        ...cur,
+        loading: false,
+        error:
+          'No H6E audio tracks on this episode — mixer preview needs the multi-track recorder.',
+      });
+      showToast('No H6E stems to preview.', 'error');
+      return;
+    }
     state.set({ ...cur, loading: true, error: null });
     const graph = createAudioGraph(
-      ROWS.map((r) => ({
-        key: r.key,
-        url: `/api/episodes/${episodeId}/audio-preview/${r.stem}`,
+      stems.map((s) => ({
+        key: s.key,
+        url: `/api/episodes/${episodeId}/audio-preview/${encodeURIComponent(s.stem)}`,
       }))
     );
     try {
@@ -184,6 +200,30 @@ function playButton(
     loading: s.loading,
     onClick: toggle,
   });
+}
+
+/**
+ * Map each logical TrackRow to the actual filename stem for this episode.
+ * Returns only stems that have a matching filename on disk.
+ */
+function resolveStems(): Array<{ key: string; stem: string }> {
+  const ep = episodeDetail.peek();
+  const tracks =
+    (ep?.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
+  if (tracks.length === 0) return [];
+  const out: Array<{ key: string; stem: string }> = [];
+  for (const row of ROWS) {
+    // Match by filename ending (e.g. _Tr1.WAV, _TrLR.WAV, _TrMic.WAV)
+    const needle = new RegExp(`_${row.stem}\\.`, 'i');
+    const match = tracks.find((t) =>
+      typeof t.filename === 'string' && needle.test(t.filename)
+    );
+    if (match) {
+      const name = (match.filename as string).replace(/\.[^./]+$/, '');
+      out.push({ key: row.key, stem: name });
+    }
+  }
+  return out;
 }
 
 function renderRow(

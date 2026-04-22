@@ -20,6 +20,7 @@ import { createAudioGraph, type AudioGraph } from '../../lib/audio-graph';
 import { Button } from '../Button';
 import { Icon } from '../icons';
 import { showToast } from '../../state/ui';
+import { episodeDetail } from '../../state/episodes';
 
 interface SyncState {
   cameraPeaks: Float32Array | null;
@@ -334,6 +335,28 @@ function renderControls(
   ];
 }
 
+/** Resolve the H6E sync track's file stem from the loaded episode. */
+function findSyncStem(): string | null {
+  const ep = episodeDetail.peek();
+  if (!ep) return null;
+  const sync = ep.audio_sync as Record<string, unknown> | undefined;
+  const direct = sync?.sync_track as string | undefined;
+  if (direct) return stripExt(direct);
+  const tracks = ep.audio_tracks as Array<Record<string, unknown>> | undefined;
+  if (!tracks) return null;
+  // Prefer a track whose filename ends in TrLR, fall back to the first
+  for (const t of tracks) {
+    const fn = (t.filename as string) ?? '';
+    if (/TrLR\.wav$/i.test(fn)) return stripExt(fn);
+  }
+  const first = tracks[0]?.filename as string | undefined;
+  return first ? stripExt(first) : null;
+}
+
+function stripExt(name: string): string {
+  return name.replace(/\.[^./]+$/, '');
+}
+
 function togglePlayback(
   episodeId: string,
   state: Signal<SyncState>
@@ -349,9 +372,20 @@ function togglePlayback(
     state.set({ ...state.peek(), audioPlaying: true });
     return;
   }
-  // First play — lazy-build the graph. Camera L channel plus H6E TrLR with
-  // the current offset applied as a delay on the H6E track.
+  // First play — lazy-build the graph. Camera L channel plus the H6E sync
+  // track (TrLR by convention, but the stem name has the recorder's
+  // timestamp prefix so we look it up from audio_sync.sync_track).
   const offset = state.peek().currentOffset;
+  const h6eStem = findSyncStem();
+  if (!h6eStem) {
+    state.set({
+      ...state.peek(),
+      audioError:
+        'No H6E sync track available. Has audio_sync run for this episode?',
+    });
+    showToast('No H6E sync track to preview.', 'error');
+    return;
+  }
   const graph = createAudioGraph([
     {
       key: 'camera',
@@ -360,7 +394,7 @@ function togglePlayback(
     },
     {
       key: 'h6e',
-      url: `/api/episodes/${episodeId}/audio-preview/TrLR`,
+      url: `/api/episodes/${episodeId}/audio-preview/${encodeURIComponent(h6eStem)}`,
       delaySeconds: offset > 0 ? offset : 0,
     },
   ]);
