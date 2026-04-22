@@ -32,6 +32,13 @@ export interface AudioGraph {
   currentTime(): number;
   /** Duration of the longest loaded track. */
   duration(): number;
+  /**
+   * Read current audio level of a track (pre-gain, pre-mute) as a 0-1
+   * peak value. Used by the mixer row's level meter so Sam can SEE
+   * which track is active without having to solo/audition each one.
+   * Returns 0 when the track isn't loaded or playing.
+   */
+  getTrackLevel(key: string): number;
   dispose(): void;
 }
 
@@ -41,6 +48,10 @@ interface TrackNode {
   source: AudioBufferSourceNode | null;
   gain: GainNode;
   delay: DelayNode;
+  /** Taps the signal BEFORE the gain node so the meter shows the
+   *  underlying source level regardless of mute/solo state. */
+  analyser: AnalyserNode;
+  analyserBuf: Uint8Array<ArrayBuffer>;
   delaySeconds: number;
   baseGain: number;
   muted: boolean;
@@ -65,6 +76,19 @@ export function createAudioGraph(bindings: TrackBinding[]): AudioGraph {
     gain.gain.value = 1;
     const delay = ctx.createDelay(10);
     delay.delayTime.value = b.delaySeconds ?? 0;
+    // Analyser on the raw pre-gain path so the meter shows the underlying
+    // source level even when a track is muted/soloed. Small FFT + fast
+    // time-domain polling — cheap enough to read every RAF tick.
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.3;
+    // Explicit ArrayBuffer (not SharedArrayBuffer) so TS's strict
+    // Uint8Array variance is happy with getByteTimeDomainData.
+    const analyserBuf = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+    // Tap BEFORE the gain so mute/solo changes gain but the analyser still
+    // sees the source. Chain: source → delay → analyser (dead-ends for
+    // measurement) + delay → gain → destination (actual output path).
+    delay.connect(analyser);
     delay.connect(gain).connect(ctx.destination);
     tracks.set(b.key, {
       key: b.key,
@@ -72,6 +96,8 @@ export function createAudioGraph(bindings: TrackBinding[]): AudioGraph {
       source: null,
       gain,
       delay,
+      analyser,
+      analyserBuf,
       delaySeconds: b.delaySeconds ?? 0,
       baseGain: 1,
       muted: false,
@@ -193,6 +219,18 @@ export function createAudioGraph(bindings: TrackBinding[]): AudioGraph {
         if (t.buffer && t.buffer.duration > max) max = t.buffer.duration;
       }
       return max;
+    },
+    getTrackLevel(key: string): number {
+      const t = tracks.get(key);
+      if (!t || !t.buffer || !playing) return 0;
+      t.analyser.getByteTimeDomainData(t.analyserBuf);
+      // Compute peak deviation from the 128 mid-line (unsigned 8-bit PCM).
+      let peak = 0;
+      for (let i = 0; i < t.analyserBuf.length; i++) {
+        const d = Math.abs(t.analyserBuf[i] - 128);
+        if (d > peak) peak = d;
+      }
+      return Math.min(1, peak / 128);
     },
     dispose(): void {
       stopSources();

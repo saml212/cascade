@@ -103,7 +103,7 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
       h(
         'p',
         { class: 'text-body-sm text-ink-tertiary mb-3' },
-        'Assignments follow the speaker panel. Use solo / mute to A/B tracks before saving.'
+        'H6E tracks — this is what will land in the final longform. Hit Play, watch the level meters to see who is on which track, then assign in the dropdowns. Solo / mute to A/B before saving.'
       ),
       h(
         'div',
@@ -115,11 +115,32 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
     );
   });
 
+  // Level-meter RAF loop. Reads analyser peak per track and writes the
+  // bar width directly to each #mixer-meter-<key> element. Does NOT
+  // touch the state signal — we don't want the whole mixer row tree
+  // rebuilding every frame (that bug bit us on the scrub-bar play
+  // button in the crop-setup screen).
+  let rafId: number | null = null;
+  function levelLoop(): void {
+    const g = state.peek().graph;
+    if (g && state.peek().playing) {
+      for (const row of ROWS) {
+        const level = g.getTrackLevel(row.key);
+        const el = document.getElementById(`mixer-meter-${row.key}`);
+        if (el) el.style.width = `${Math.round(level * 100)}%`;
+      }
+    }
+    rafId = window.requestAnimationFrame(levelLoop);
+  }
+  rafId = window.requestAnimationFrame(levelLoop);
+
   // Clean up the audio graph when the mixer leaves the DOM.
   const cleanup = new MutationObserver(() => {
     if (!host.isConnected) {
       const g = state.peek().graph;
       if (g) g.dispose();
+      if (rafId != null) window.cancelAnimationFrame(rafId);
+      rafId = null;
       cleanup.disconnect();
     }
   });
@@ -369,11 +390,30 @@ function renderRow(
     'S'
   );
 
+  // Live level meter — filled by RAF loop in the mixer component. Pre-gain
+  // tap (see audio-graph.ts), so the meter shows the underlying track
+  // activity even when Sam mutes or solos. This is how Sam SEES which
+  // speaker is on which track without having to solo-audition each one:
+  // whoever is talking lights up a meter.
+  const meter = h(
+    'div',
+    {
+      class:
+        'relative h-2 rounded-full bg-surface-3 border border-border/60 overflow-hidden',
+    },
+    h('div', {
+      id: `mixer-meter-${row.key}`,
+      class:
+        'h-full bg-gradient-to-r from-status-success via-accent to-status-danger transition-[width] duration-75',
+      style: { width: '0%' },
+    })
+  );
+
   return h(
     'div',
     {
       class:
-        'grid grid-cols-[100px_60px_150px_1fr_56px] gap-3 items-center py-3',
+        'grid grid-cols-[100px_60px_150px_80px_1fr_56px] gap-3 items-center py-3',
     },
     h(
       'div',
@@ -396,6 +436,7 @@ function renderRow(
       soloBtn
     ),
     assignment,
+    meter,
     slider,
     h(
       'div',

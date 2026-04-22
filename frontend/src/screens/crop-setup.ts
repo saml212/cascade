@@ -317,7 +317,10 @@ function renderHeader(
       { class: 'flex items-center gap-6 text-body-sm text-ink-secondary' },
       metaTag('Duration', formatDuration(duration)),
       metaTag('Speakers', String(speakerCount)),
-      metaTag('Audio', isH6E ? 'H6E + Camera' : 'Camera only'),
+      // NOT "what you're hearing right now" — that's camera audio during
+      // scrub and H6E tracks in the mixer below. This tag describes what
+      // the FINAL longform mix will use as its source.
+      metaTag('Final mix source', isH6E ? 'H6E multi-track' : 'Camera stereo'),
       metaTag('ID', episodeId)
     )
   );
@@ -915,21 +918,34 @@ function renderScrubBar(
 
   return h(
     'div',
-    { class: 'flex items-center gap-3 w-full' },
-    playPauseBtn,
+    { class: 'flex flex-col gap-1 w-full' },
     h(
-      'span',
-      {
-        id: 'scrub-time-label',
-        class: 'text-code text-ink-secondary font-mono tabular',
-      },
-      formatTimecode(s.videoTime)
+      'div',
+      { class: 'flex items-center gap-3 w-full' },
+      playPauseBtn,
+      h(
+        'span',
+        {
+          id: 'scrub-time-label',
+          class: 'text-code text-ink-secondary font-mono tabular',
+        },
+        formatTimecode(s.videoTime)
+      ),
+      seek,
+      h(
+        'span',
+        { class: 'text-code text-ink-tertiary font-mono tabular' },
+        formatTimecode(s.videoDuration)
+      )
     ),
-    seek,
+    // Unambiguous caption so Sam knows what's actually audible here.
+    // The video plays the camera's stereo track regardless of whether
+    // the episode has H6E — the H6E mixer below is a separate audio
+    // path. Camera audio is fine for identifying WHO is speaking.
     h(
-      'span',
-      { class: 'text-code text-ink-tertiary font-mono tabular' },
-      formatTimecode(s.videoDuration)
+      'div',
+      { class: 'text-caption text-ink-tertiary pl-12' },
+      'Playing camera audio (for speaker identification). Use the Track mixer below to audition H6E tracks.'
     )
   );
 }
