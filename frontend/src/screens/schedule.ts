@@ -8,27 +8,27 @@ import { signal, effect } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
 import { formatTimecode, pluralize } from '../lib/format';
 
-interface ScheduleEntry {
-  date: string;
-  platform: string;
-  title: string;
+interface ScheduleItem {
+  type: 'longform' | 'clip' | string;
+  episode_id: string;
+  name?: string;
+  title?: string;
+  scheduled_date: string;
+  platform?: string;
   clip_id?: string;
-  episode_id?: string;
-  time?: string;
-  kind?: 'clip' | 'longform';
+  virality_score?: number;
+  scheduled_time?: string;
 }
 
-const PLATFORM_COLOR: Record<string, string> = {
-  youtube: '#ff3344',
-  tiktok: '#69c9d0',
-  instagram: '#e1306c',
-  x: '#e8e8e8',
-  linkedin: '#0a66c2',
-  facebook: '#1877f2',
-  threads: '#a0a0a0',
-  pinterest: '#e60023',
-  bluesky: '#1185fe',
-  spotify: '#1db954',
+interface ScheduleDay {
+  date: string;
+  day_name: string;
+  items: ScheduleItem[];
+}
+
+const TYPE_COLOR: Record<string, string> = {
+  longform: '#6fcf8e',
+  clip: '#f5a524',
 };
 
 export function Schedule(target: HTMLElement): void {
@@ -78,16 +78,18 @@ export function Schedule(target: HTMLElement): void {
 }
 
 function renderCalendar(d: UnknownRecord): HTMLElement {
-  const entries = (d.entries as ScheduleEntry[]) ?? [];
-  const days = groupByDay(entries);
-  const total = entries.length;
+  const days = (d.schedule as ScheduleDay[]) ?? [];
+  const total = (d.total_items as number) ?? 0;
+  const unscheduledShorts = (d.unscheduled_shorts as number) ?? 0;
+  const unscheduledLongforms = (d.unscheduled_longforms as number) ?? 0;
+  const unscheduled = unscheduledShorts + unscheduledLongforms;
 
   return h(
     'div',
     { class: 'max-w-[1400px] mx-auto px-10 py-10' },
     h(
       'header',
-      { class: 'flex items-baseline justify-between mb-10' },
+      { class: 'flex items-baseline justify-between mb-8' },
       h(
         'div',
         null,
@@ -103,9 +105,19 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
             ? `${pluralize(total, 'post')} queued across the next seven days.`
             : 'Nothing queued for the next seven days.'
         )
-      )
+      ),
+      unscheduled > 0
+        ? h(
+            'div',
+            {
+              class:
+                'panel px-5 py-3 border-status-warning/30 text-body-sm text-status-warning',
+            },
+            `${pluralize(unscheduled, 'post')} waiting for a slot.`
+          )
+        : null
     ),
-    days.length === 0
+    total === 0
       ? h(
           'div',
           { class: 'panel p-16 text-center' },
@@ -133,59 +145,75 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           ...days.map(renderDayColumn)
         )
   );
+
+  void formatTimecode;
 }
 
-function groupByDay(
-  entries: ScheduleEntry[]
-): Array<{ date: string; entries: ScheduleEntry[] }> {
-  const map = new Map<string, ScheduleEntry[]>();
-  for (const e of entries) {
-    const bucket = map.get(e.date) ?? [];
-    bucket.push(e);
-    map.set(e.date, bucket);
-  }
-  return [...map.entries()]
-    .map(([date, entries]) => ({ date, entries }))
-    .sort((a, b) => a.date.localeCompare(b.date));
-}
-
-function renderDayColumn(day: {
-  date: string;
-  entries: ScheduleEntry[];
-}): HTMLElement {
-  const d = new Date(day.date);
-  const weekday = d.toLocaleDateString(undefined, { weekday: 'short' });
-  const monthDay = d.toLocaleDateString(undefined, {
-    month: 'short',
+function renderDayColumn(day: ScheduleDay): HTMLElement {
+  const dateObj = new Date(day.date + 'T00:00:00');
+  const dayOfMonth = dateObj.toLocaleDateString(undefined, {
     day: 'numeric',
   });
+  const weekday = day.day_name?.slice(0, 3) || '';
+  const isToday = day.date === new Date().toISOString().slice(0, 10);
 
   return h(
     'div',
-    { class: 'panel p-4 flex flex-col gap-2 min-h-[200px]' },
+    {
+      class: [
+        'panel p-4 flex flex-col gap-2 min-h-[220px]',
+        isToday ? 'border-accent/40' : '',
+      ].join(' '),
+    },
     h(
       'div',
       { class: 'pb-2 mb-2 border-b border-border-subtle' },
       h(
         'div',
         {
-          class:
-            'text-heading-sm uppercase text-ink-tertiary font-mono tabular',
+          class: 'flex items-baseline justify-between',
         },
-        weekday
-      ),
-      h(
-        'div',
-        { class: 'text-heading-md text-ink-primary font-display' },
-        monthDay
+        h(
+          'span',
+          {
+            class: [
+              'text-heading-sm uppercase font-mono tabular',
+              isToday ? 'text-accent' : 'text-ink-tertiary',
+            ].join(' '),
+          },
+          weekday
+        ),
+        h(
+          'span',
+          {
+            class: 'text-display-md font-display text-ink-primary',
+          },
+          dayOfMonth
+        )
       )
     ),
-    ...day.entries.map(renderEntry)
+    day.items.length === 0
+      ? h(
+          'div',
+          { class: 'text-body-sm text-ink-tertiary italic' },
+          isToday ? 'Open day.' : '—'
+        )
+      : h(
+          'div',
+          { class: 'flex flex-col gap-2' },
+          ...day.items.map(renderItem)
+        )
   );
 }
 
-function renderEntry(e: ScheduleEntry): HTMLElement {
-  const color = PLATFORM_COLOR[e.platform.toLowerCase()] ?? '#7a7466';
+function renderItem(item: ScheduleItem): HTMLElement {
+  const color = TYPE_COLOR[item.type] ?? '#7a7466';
+  const typeLabel =
+    item.type === 'longform'
+      ? 'Longform'
+      : item.type === 'clip'
+      ? 'Short'
+      : item.type;
   return h(
     'div',
     {
@@ -205,25 +233,25 @@ function renderEntry(e: ScheduleEntry): HTMLElement {
           class:
             'text-code-sm text-ink-tertiary font-mono tabular uppercase tracking-wide',
         },
-        e.platform
+        typeLabel
       ),
-      e.time
+      item.scheduled_time
         ? h(
             'span',
             {
               class:
                 'text-code-sm text-ink-tertiary font-mono tabular ml-auto',
             },
-            e.time
+            item.scheduled_time
           )
         : null
     ),
     h(
       'div',
-      { class: 'text-body-sm text-ink-primary leading-snug line-clamp-2' },
-      e.title || 'Untitled'
+      {
+        class: 'text-body-sm text-ink-primary leading-snug line-clamp-3',
+      },
+      item.title || item.name || 'Untitled'
     )
   );
-
-  void formatTimecode;
 }

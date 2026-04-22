@@ -426,6 +426,26 @@ function renderApprovalBar(
   const status = describeStatus(ep.status as string);
   const pending = edits.length > 0;
   const canApprove = status.key === 'awaiting_longform_review';
+  const alreadyPast =
+    status.key === 'awaiting_clip_review' ||
+    status.key === 'awaiting_publish' ||
+    status.key === 'awaiting_backup' ||
+    status.key === 'live';
+
+  const headline = pending
+    ? `${edits.length} edit${edits.length === 1 ? '' : 's'} queued`
+    : canApprove
+    ? 'Happy with this cut?'
+    : alreadyPast
+    ? 'Longform is already approved'
+    : status.label;
+  const sub = pending
+    ? 'Apply them to re-render before approving.'
+    : canApprove
+    ? 'Approving uploads to YouTube, updates the RSS feed, and fires clip mining.'
+    : alreadyPast
+    ? 'Downstream work has started. Request edits here to re-open.'
+    : status.hint;
 
   return h(
     'footer',
@@ -438,39 +458,20 @@ function renderApprovalBar(
       {
         class: 'max-w-[1200px] mx-auto flex items-center gap-4',
       },
-      pending
-        ? h(
-            'div',
-            { class: 'flex-1' },
-            h(
-              'div',
-              { class: 'text-body text-ink-primary font-medium' },
-              `${edits.length} edit${edits.length === 1 ? '' : 's'} queued`
-            ),
-            h(
-              'div',
-              { class: 'text-body-sm text-ink-secondary' },
-              'Apply them to re-render before approving.'
-            )
-          )
-        : h(
-            'div',
-            { class: 'flex-1' },
-            h(
-              'div',
-              { class: 'text-body text-ink-primary font-medium' },
-              canApprove
-                ? 'Happy with this cut?'
-                : status.label
-            ),
-            h(
-              'div',
-              { class: 'text-body-sm text-ink-secondary' },
-              canApprove
-                ? 'Approving uploads to YouTube, updates the RSS feed, and fires clip mining.'
-                : status.hint
-            )
-          ),
+      h(
+        'div',
+        { class: 'flex-1' },
+        h(
+          'div',
+          { class: 'text-body text-ink-primary font-medium' },
+          headline
+        ),
+        h(
+          'div',
+          { class: 'text-body-sm text-ink-secondary' },
+          sub
+        )
+      ),
       pending
         ? Button({
             variant: 'secondary',

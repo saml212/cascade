@@ -177,6 +177,48 @@ function navigationRow(
   );
 }
 
+function renderAgentError(err: string): HTMLElement {
+  const summary = summarizeError(err);
+  return h(
+    'div',
+    {
+      class:
+        'mt-1 flex items-start gap-2 text-body-sm text-status-danger/90 leading-snug max-w-full',
+      title: err,
+    },
+    h(
+      'span',
+      { class: 'shrink-0 font-medium' },
+      'Error:'
+    ),
+    h(
+      'span',
+      {
+        class: 'flex-1 min-w-0 truncate',
+      },
+      summary
+    )
+  );
+}
+
+/**
+ * Agents report raw errors (often multi-line rsync commands or stack traces).
+ * This distills them into a one-liner worth of signal: for rsync commands we
+ * extract the timeout message; for JSON parse errors we keep the short
+ * description; everything else gets its first line.
+ */
+function summarizeError(err: string): string {
+  if (/timed out/i.test(err)) {
+    const m = err.match(/timed out after \d+ seconds?/i);
+    if (m) return `Command ${m[0]}`;
+  }
+  if (/Unterminated string/i.test(err)) {
+    return 'Parse error — response was truncated';
+  }
+  const firstLine = err.split(/\r?\n/)[0];
+  return firstLine.length > 100 ? firstLine.slice(0, 100) + '…' : firstLine;
+}
+
 function speakerCountOf(ep: Record<string, unknown>): string {
   const cfg = ep.crop_config as Record<string, unknown> | undefined;
   if (!cfg) return 'not set';
@@ -242,22 +284,7 @@ function agentTimeline(
             },
             describeAgent(a)
           ),
-          err
-            ? h(
-                'div',
-                {
-                  class:
-                    'text-body-sm text-status-danger/90 mt-0.5 font-mono tabular break-words overflow-hidden max-w-full',
-                  style: {
-                    display: '-webkit-box',
-                    WebkitLineClamp: '2',
-                    WebkitBoxOrient: 'vertical',
-                  },
-                  title: err,
-                },
-                err
-              )
-            : null
+          err ? renderAgentError(err) : null
         )
       );
     })
