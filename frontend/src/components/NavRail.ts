@@ -110,16 +110,12 @@ export function NavRail(): HTMLElement {
     ),
     h(
       'div',
-      { class: 'flex flex-col items-center gap-1 px-2' },
-      h(
-        'button',
-        {
-          class:
-            'w-14 h-14 rounded-lg text-ink-tertiary hover:text-ink-primary hover:bg-surface-2 flex items-center justify-center',
-          title: 'Settings',
-        },
-        Icon.settings()
-      )
+      {
+        class:
+          'flex flex-col items-center gap-1 px-2 text-code-sm text-ink-disabled font-mono tabular select-none',
+        title: 'Cascade frontend version',
+      },
+      h('span', null, 'v0.1')
     )
   );
 }

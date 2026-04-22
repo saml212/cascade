@@ -167,11 +167,12 @@ function emptyHero(): HTMLElement {
 function heroSpotlight(ep: EpisodeSummary): HTMLElement {
   const status = describeStatus(ep.status);
   const cta = ctaFor(ep);
+  const target = ctaTarget(ep, status.key);
 
   return h(
     'a',
     {
-      ...link(`/episodes/${ep.episode_id}`),
+      ...link(target),
       class:
         'block panel p-8 hover:border-border-strong transition-colors duration-[120ms] group',
     },
@@ -275,6 +276,24 @@ function ctaFor(ep: EpisodeSummary): { label: string } {
   }
 }
 
+function ctaTarget(ep: EpisodeSummary, key: string): string {
+  const base = `/episodes/${ep.episode_id}`;
+  switch (key) {
+    case 'awaiting_crop':
+      return `${base}/crop-setup`;
+    case 'awaiting_longform_review':
+      return `${base}/longform/review`;
+    case 'awaiting_clip_review':
+      return `${base}/clips/review`;
+    case 'awaiting_publish':
+      return `${base}/publish`;
+    case 'awaiting_backup':
+      return `${base}/backup`;
+    default:
+      return base;
+  }
+}
+
 function episodesTable(list: EpisodeSummary[]): HTMLElement {
   const rows = [...list].sort(
     (a, b) =>
@@ -303,7 +322,7 @@ function episodesTable(list: EpisodeSummary[]): HTMLElement {
         {
           ...link(`/episodes/${ep.episode_id}`),
           class:
-            'grid grid-cols-[1fr_160px_140px_110px_80px] gap-4 px-5 py-4 border-b border-border-subtle last:border-0 hover:bg-surface-2 transition-colors duration-[120ms] items-center',
+            'group grid grid-cols-[1fr_160px_140px_110px_80px] gap-4 px-5 py-4 border-b border-border-subtle last:border-0 hover:bg-surface-2 transition-colors duration-[120ms] items-center',
         },
         h(
           'div',

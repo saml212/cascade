@@ -373,7 +373,7 @@ function renderBody(
       'div',
       { class: 'grid grid-cols-[minmax(0,1fr)_380px] gap-6' },
       renderEditor(state),
-      renderSidebar(episodeId, state, true)
+      renderSidebar(episodeId, state)
     ),
     audioHost
   );
@@ -770,8 +770,7 @@ function renderHint(s: CropState): HTMLElement {
 
 function renderSidebar(
   episodeId: string,
-  state: Signal<CropState>,
-  _isH6E: boolean
+  state: Signal<CropState>
 ): HTMLElement {
   const host = h('aside', {
     class: 'flex flex-col gap-4 min-w-0 overflow-y-auto',
@@ -779,8 +778,10 @@ function renderSidebar(
 
   effect(() => {
     const s = state();
+    const ep = episodeDetail();
+    const isH6E = !!(ep && ep.audio_sync);
     host.replaceChildren(
-      ...s.speakers.map((spk, i) => renderSpeakerCard(state, s, i, spk)),
+      ...s.speakers.map((spk, i) => renderSpeakerCard(state, s, i, spk, isH6E)),
       renderWideCard(state, s),
       renderSaveCard(episodeId, state, s)
     );
@@ -793,7 +794,8 @@ function renderSpeakerCard(
   state: Signal<CropState>,
   s: CropState,
   idx: number,
-  spk: SpeakerState
+  spk: SpeakerState,
+  isH6E: boolean
 ): HTMLElement {
   const color = SPEAKER_CSS_VARS[idx % SPEAKER_CSS_VARS.length];
   const active = idx === s.activeIdx;
@@ -871,16 +873,18 @@ function renderSpeakerCard(
           { class: 'text-body-sm text-ink-tertiary' },
           '16:9 crop inherits from the 9:16 center.'
         ),
-    h(
-      'div',
-      { class: 'flex items-center gap-2' },
-      h(
-        'label',
-        { class: 'text-body-sm text-ink-tertiary' },
-        'Track'
-      ),
-      trackSelect(spk.track, (v) => updateSpeaker(state, idx, { track: v }))
-    )
+    isH6E
+      ? h(
+          'div',
+          { class: 'flex items-center gap-2' },
+          h(
+            'label',
+            { class: 'text-body-sm text-ink-tertiary' },
+            'Track'
+          ),
+          trackSelect(spk.track, (v) => updateSpeaker(state, idx, { track: v }))
+        )
+      : null
   );
 }
 
