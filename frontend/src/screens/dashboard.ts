@@ -30,7 +30,7 @@ const PRIORITY: Record<string, number> = {
 function pickSpotlight(list: EpisodeSummary[]): EpisodeSummary | null {
   if (list.length === 0) return null;
   const scored = list.map((ep) => {
-    const key = describeStatus(ep.status).key;
+    const key = describeStatus(ep.status, { cropConfig: ep.has_crop_config, clips: ep.clips }).key;
     return { ep, score: PRIORITY[key] ?? 0 };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -164,7 +164,10 @@ function emptyHero(): HTMLElement {
 }
 
 function heroSpotlight(ep: EpisodeSummary): HTMLElement {
-  const status = describeStatus(ep.status);
+  const status = describeStatus(ep.status, {
+    cropConfig: ep.has_crop_config,
+    clips: ep.clips,
+  });
   const cta = ctaFor(ep);
   const target = ctaTarget(ep, status.key);
 
@@ -252,7 +255,7 @@ function meta(label: string, value: string): HTMLElement {
 }
 
 function ctaFor(ep: EpisodeSummary): { label: string } {
-  const key = describeStatus(ep.status).key;
+  const key = describeStatus(ep.status, { cropConfig: ep.has_crop_config, clips: ep.clips }).key;
   switch (key) {
     case 'awaiting_crop':
       return { label: 'Set up crops →' };
@@ -315,7 +318,10 @@ function episodesTable(list: EpisodeSummary[]): HTMLElement {
       h('div', { class: 'text-right' }, 'Created')
     ),
     ...rows.map((ep) => {
-      const status = describeStatus(ep.status);
+      const status = describeStatus(ep.status, {
+    cropConfig: ep.has_crop_config,
+    clips: ep.clips,
+  });
       return h(
         'a',
         {

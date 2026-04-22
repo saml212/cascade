@@ -162,8 +162,45 @@ const STATUS_ALIASES: Record<string, StatusKey> = {
   new: 'queued',
 };
 
-export function describeStatus(raw: string | null | undefined): StatusDescriptor {
-  const key = STATUS_ALIASES[(raw ?? '').toLowerCase()];
+/**
+ * Context-aware status resolution. The raw backend string is a hint, not
+ * the whole story — the same string means different things depending on
+ * what's actually on disk for this episode.
+ *
+ * Example: `ready_for_review` is set by the pipeline both (a) when the
+ * full pipeline finished and clips are waiting, and (b) when only a
+ * truncated agent list finished. Case (b) with `crop_config == null`
+ * actually means "awaiting crop setup" from the user's POV.
+ */
+export function describeStatus(
+  raw: string | null | undefined,
+  context?: { cropConfig?: unknown; clips?: unknown[] }
+): StatusDescriptor {
+  const rawLower = (raw ?? '').toLowerCase();
+  let key = STATUS_ALIASES[rawLower];
+
+  // Context overrides: ready_for_review / approved without crop_config
+  // means the pipeline hasn't actually reached clip review yet.
+  if (context) {
+    const hasCrop = !!context.cropConfig;
+    const hasClips = Array.isArray(context.clips) && context.clips.length > 0;
+    if (
+      !hasCrop &&
+      (rawLower === 'ready_for_review' ||
+        rawLower === 'approved' ||
+        rawLower === 'awaiting_clip_review')
+    ) {
+      key = 'awaiting_crop';
+    } else if (
+      hasCrop &&
+      !hasClips &&
+      (rawLower === 'ready_for_review' || rawLower === 'awaiting_clip_review')
+    ) {
+      // Crop done but no clips yet — still processing, not ready for review.
+      key = 'processing';
+    }
+  }
+
   if (key) return { key, ...STATUS[key] };
   const label = raw
     ? raw.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())

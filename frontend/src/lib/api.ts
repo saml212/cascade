@@ -51,6 +51,13 @@ export interface EpisodeSummary {
   guest_title?: string | null;
   episode_name?: string | null;
   episode_description?: string | null;
+  /**
+   * True iff crop_config has been saved. Needed to disambiguate the
+   * overloaded `ready_for_review` status (same string for "truncated
+   * pipeline done, awaiting crop" and "full pipeline done, awaiting
+   * clip review"). Fall back to `false` if backend hasn't surfaced it.
+   */
+  has_crop_config?: boolean;
 }
 
 export interface NewEpisodeRequest {

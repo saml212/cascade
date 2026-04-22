@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
@@ -10,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agents import AGENT_REGISTRY, PIPELINE_ORDER
-from agents.base import BaseAgent
 from lib.atomic_write import atomic_write_json
 from lib.paths import resolve_path
 
@@ -41,6 +39,7 @@ def load_config() -> dict:
     """Load config.toml from project root."""
     config_path = Path(__file__).resolve().parent.parent / "config" / "config.toml"
     import tomllib
+
     with open(config_path, "rb") as f:
         return tomllib.load(f)
 
@@ -135,15 +134,18 @@ def run_pipeline(
     episode_lock = threading.Lock()
 
     # Mutable refs that may change after clip_miner rename
-    mutable = {"episode_dir": episode_dir, "episode_id": episode_id,
-               "episode_file": episode_file}
+    mutable = {
+        "episode_dir": episode_dir,
+        "episode_id": episode_id,
+        "episode_file": episode_file,
+    }
 
     def _get_ready():
         """Return agents whose dependencies are all satisfied."""
         return [
-            name for name in deps
-            if name not in completed and name not in failed
-            and deps[name] <= completed
+            name
+            for name in deps
+            if name not in completed and name not in failed and deps[name] <= completed
         ]
 
     def _run_agent(agent_name):
@@ -179,7 +181,9 @@ def run_pipeline(
             if "audio_sync" in result:
                 existing_sync = episode.get("audio_sync", {})
                 if existing_sync.get("manually_adjusted"):
-                    result["audio_sync"]["offset_seconds"] = existing_sync["offset_seconds"]
+                    result["audio_sync"]["offset_seconds"] = existing_sync[
+                        "offset_seconds"
+                    ]
                     result["audio_sync"]["manually_adjusted"] = True
                 episode["audio_sync"] = result["audio_sync"]
             if "audio" in result:
@@ -194,6 +198,7 @@ def run_pipeline(
             source_dir = mutable["episode_dir"] / "source"
             if source_dir.exists():
                 import shutil
+
                 try:
                     shutil.rmtree(source_dir)
                     logger.info(f"Cleaned up source/ directory after stitch")
@@ -207,9 +212,18 @@ def run_pipeline(
                 with open(ef) as f:
                     ep_data = json.load(f)
                 # Merge any updates clip_miner wrote directly
-                episode.update({k: ep_data[k] for k in
-                    ("guest_name", "guest_title", "episode_name", "episode_description")
-                    if k in ep_data})
+                episode.update(
+                    {
+                        k: ep_data[k]
+                        for k in (
+                            "guest_name",
+                            "guest_title",
+                            "episode_name",
+                            "episode_description",
+                        )
+                        if k in ep_data
+                    }
+                )
                 guest_name = episode.get("guest_name", "")
                 if guest_name and not _has_name_slug(mutable["episode_id"]):
                     slug = _slugify(guest_name)
@@ -243,16 +257,22 @@ def run_pipeline(
     # to run agents that depend on it (anything after stitch)
     # Agents that require crop_config to produce correct results
     crop_dependent_agents = {"speaker_cut", "longform_render", "shorts_render"}
-    stitch_pause_needed = (bool(requested_set & crop_dependent_agents) and "crop_config" not in episode)
+    stitch_pause_needed = (
+        bool(requested_set & crop_dependent_agents) and "crop_config" not in episode
+    )
     # Pause after longform_render for user approval before spending API tokens
     # on clip mining, metadata, shorts, etc.
     # Only pause if longform_render is in the requested set AND has completed.
     longform_approval_agents = {"clip_miner", "shorts_render", "metadata_gen"}
-    longform_pause_needed = (bool(requested_set & longform_approval_agents)
-                             and "longform_render" in requested_set
-                             and not episode.get("longform_approved"))
+    longform_pause_needed = (
+        bool(requested_set & longform_approval_agents)
+        and "longform_render" in requested_set
+        and not episode.get("longform_approved")
+    )
     # Special handling: backup must pause for user approval (destructive SD cleanup)
-    backup_pause_needed = ("backup" in requested_set and not episode.get("backup_approved"))
+    backup_pause_needed = "backup" in requested_set and not episode.get(
+        "backup_approved"
+    )
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         pending_futures = {}  # future -> agent_name
@@ -284,7 +304,9 @@ def run_pipeline(
                             episode["status"] = "awaiting_crop_setup"
                             episode["pipeline"].pop("current_agent", None)
                             _save_episode(mutable["episode_file"], episode)
-                            logger.info(f"Pipeline paused for {mutable['episode_id']}: awaiting crop setup")
+                            logger.info(
+                                f"Pipeline paused for {mutable['episode_id']}: awaiting crop setup"
+                            )
                             # Cancel any pending futures
                             for fut in pending_futures:
                                 fut.cancel()
@@ -295,8 +317,11 @@ def run_pipeline(
 
                 # Pause before clip_miner/shorts/metadata until longform is approved
                 # Only pause if longform_render has actually completed
-                if longform_pause_needed and name in longform_approval_agents \
-                        and "longform_render" in completed:
+                if (
+                    longform_pause_needed
+                    and name in longform_approval_agents
+                    and "longform_render" in completed
+                ):
                     with episode_lock:
                         with open(mutable["episode_file"]) as f:
                             ep_check = json.load(f)
@@ -304,7 +329,9 @@ def run_pipeline(
                             episode["status"] = "awaiting_longform_approval"
                             episode["pipeline"].pop("current_agent", None)
                             _save_episode(mutable["episode_file"], episode)
-                            logger.info(f"Pipeline paused for {mutable['episode_id']}: awaiting longform approval")
+                            logger.info(
+                                f"Pipeline paused for {mutable['episode_id']}: awaiting longform approval"
+                            )
                             for fut in pending_futures:
                                 fut.cancel()
                             return episode
@@ -321,7 +348,9 @@ def run_pipeline(
                             episode["status"] = "awaiting_backup_approval"
                             episode["pipeline"].pop("current_agent", None)
                             _save_episode(mutable["episode_file"], episode)
-                            logger.info(f"Pipeline paused for {mutable['episode_id']}: awaiting backup approval")
+                            logger.info(
+                                f"Pipeline paused for {mutable['episode_id']}: awaiting backup approval"
+                            )
                             for fut in pending_futures:
                                 fut.cancel()
                             return episode
@@ -345,16 +374,24 @@ def run_pipeline(
                     result = future.result()
                     _on_agent_complete(agent_name, result)
                     completed.add(agent_name)
-                    logger.info(f"Agent {agent_name} completed for {mutable['episode_id']}")
+                    logger.info(
+                        f"Agent {agent_name} completed for {mutable['episode_id']}"
+                    )
                 except Exception as e:
-                    logger.error(f"Agent {agent_name} failed for {mutable['episode_id']}: {e}")
+                    logger.error(
+                        f"Agent {agent_name} failed for {mutable['episode_id']}: {e}"
+                    )
                     with episode_lock:
                         episode["pipeline"]["current_agent"] = None
-                        episode["pipeline"].setdefault("errors", {})[agent_name] = str(e)
+                        episode["pipeline"].setdefault("errors", {})[agent_name] = str(
+                            e
+                        )
                         _save_episode(mutable["episode_file"], episode)
 
                     if agent_name in NON_CRITICAL_AGENTS:
-                        logger.info(f"Skipping non-critical agent {agent_name}, continuing pipeline")
+                        logger.info(
+                            f"Skipping non-critical agent {agent_name}, continuing pipeline"
+                        )
                         # Mark as completed so dependents can still check
                         completed.add(agent_name)
                     else:
@@ -366,10 +403,15 @@ def run_pipeline(
                         _save_episode(mutable["episode_file"], episode)
                         return episode
 
-    # Pipeline complete
+    # Pipeline complete. The "done" status depends on where we actually
+    # landed. If crop_config is missing, the user still has crop setup to
+    # do — don't pretend clips are ready for review.
     episode["pipeline"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     episode["pipeline"].pop("current_agent", None)
-    episode["status"] = "ready_for_review"
+    if not episode.get("crop_config"):
+        episode["status"] = "awaiting_crop_setup"
+    else:
+        episode["status"] = "ready_for_review"
     progress_file = mutable["episode_dir"] / "progress.json"
     if progress_file.exists():
         progress_file.unlink()
@@ -399,6 +441,7 @@ def _is_cancelled(episode_id: str) -> bool:
     """Check if a pipeline cancellation has been requested."""
     try:
         from server.routes.pipeline import _cancel_requested
+
         if episode_id in _cancel_requested:
             _cancel_requested.discard(episode_id)
             return True

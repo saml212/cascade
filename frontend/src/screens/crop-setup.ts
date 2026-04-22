@@ -530,16 +530,25 @@ function renderEditor(
   });
 
   // RAF loop that keeps the canvas in sync with the video element while
-  // scrubbing. Only runs when video mode is active and the video is either
-  // playing or its time was just seeked; polls readyState.
+  // scrubbing. CRITICAL: we do NOT call state.set() from this loop. Doing
+  // so would fire every reactive effect (including the one that rebuilds
+  // the scrub bar) on every frame, replacing the play/pause button 60
+  // times a second — clicks on it would land on a detached DOM node.
+  // Instead, we draw the canvas and update the time readout + seek slider
+  // directly in the DOM. Signal updates only happen on discrete events
+  // (play, pause, seeked, loadedmetadata).
   let rafId: number | null = null;
   function loop(): void {
     const s = state.peek();
     if (s.scrubMode === 'video' && s.videoElement) {
       drawOverlays(canvas, s);
-      if (s.videoElement.currentTime !== s.videoTime) {
-        state.set({ ...s, videoTime: s.videoElement.currentTime });
-      }
+      const t = s.videoElement.currentTime;
+      const label = document.getElementById('scrub-time-label');
+      if (label) label.textContent = formatTimecode(t);
+      const seek = document.getElementById('scrub-seek') as HTMLInputElement | null;
+      // Only update the slider if the user isn't actively dragging it
+      // (detected by focus). Otherwise we fight their input.
+      if (seek && document.activeElement !== seek) seek.value = String(t);
     }
     rafId = window.requestAnimationFrame(loop);
   }
@@ -783,7 +792,12 @@ function toggleScrubMode(state: Signal<CropState>): void {
     v.preload = 'metadata';
     v.playsInline = true;
     v.crossOrigin = 'anonymous';
-    v.muted = true;
+    // Camera audio plays during scrub so Sam can identify who's speaking
+    // while he's placing crops. For H6E episodes the SyncVerifier panel
+    // below handles the "is H6E in sync" check — those are two distinct
+    // needs and both should be audible independently.
+    v.muted = false;
+    v.volume = 0.6;
     v.addEventListener('loadedmetadata', () => {
       state.set({
         ...state.peek(),
@@ -869,6 +883,7 @@ function renderScrubBar(
 
   const seek = h('input', {
     type: 'range',
+    id: 'scrub-seek',
     min: '0',
     max: String(s.videoDuration || 0),
     step: '0.05',
@@ -888,7 +903,10 @@ function renderScrubBar(
     playPauseBtn,
     h(
       'span',
-      { class: 'text-code text-ink-secondary font-mono tabular' },
+      {
+        id: 'scrub-time-label',
+        class: 'text-code text-ink-secondary font-mono tabular',
+      },
       formatTimecode(s.videoTime)
     ),
     seek,

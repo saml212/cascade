@@ -15,7 +15,10 @@ export function renderOverview(
   ep: Record<string, unknown>,
   episodeId: string
 ): void {
-  const status = describeStatus(ep.status as string);
+  const status = describeStatus(ep.status as string, {
+    cropConfig: ep.crop_config,
+    clips: ep.clips as unknown[] | undefined,
+  });
   const pipeline = ep.pipeline as Record<string, unknown> | undefined;
   const completed = (pipeline?.agents_completed as string[]) ?? [];
   const requested = (pipeline?.agents_requested as string[]) ?? [];

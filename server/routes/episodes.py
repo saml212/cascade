@@ -92,6 +92,11 @@ async def list_episodes() -> list[dict]:
                     "guest_title": ep.get("guest_title", ""),
                     "episode_name": ep.get("episode_name", ""),
                     "episode_description": ep.get("episode_description", ""),
+                    # Boolean so clients can disambiguate the overloaded
+                    # `ready_for_review` status (same string used for
+                    # "truncated pipeline done, awaiting crop" and "full
+                    # pipeline done, awaiting clip review").
+                    "has_crop_config": bool(ep.get("crop_config")),
                 }
             )
         except (json.JSONDecodeError, OSError):

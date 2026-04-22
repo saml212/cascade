@@ -104,7 +104,10 @@ function renderHeader(
   ep: Record<string, unknown>,
   episodeId: string
 ): HTMLElement {
-  const status = describeStatus(ep.status as string);
+  const status = describeStatus(ep.status as string, {
+    cropConfig: ep.crop_config,
+    clips: ep.clips as unknown[] | undefined,
+  });
   const title = episodeTitle(ep, episodeId);
   const subtitle = (ep.guest_title as string) || (ep.episode_name as string) || '';
   const pipeline = ep.pipeline as Record<string, unknown> | undefined;
