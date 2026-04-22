@@ -8,7 +8,11 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from lib.clips import normalize_clip as _normalize_clip, load_clips as _load_clips_from_dir, save_clips as _save_clips_to_dir
+from lib.clips import (
+    normalize_clip as _normalize_clip,
+    load_clips as _load_clips_from_dir,
+    save_clips as _save_clips_to_dir,
+)
 from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
@@ -109,34 +113,49 @@ async def reject_clip(episode_id: str, clip_id: str) -> dict:
 
 @router.post("/{clip_id}/alternative")
 async def request_alternative(episode_id: str, clip_id: str) -> dict:
-    """Request a Claude-generated alternative clip.
+    """Request an alternative clip in place of clip_id.
 
-    This is a placeholder — the full implementation will call the Anthropic API
-    with the transcript, excluding the rejected clip's time range, and ask for
-    a replacement clip suggestion.
+    This used to be a stub that returned a message about ANTHROPIC_API_KEY.
+    Cascade has since moved to subagent-driven clip mining (clip-miner runs
+    as a Claude Code subagent on Sam's Max-subscription quota, not paid API).
+    Full re-mining here would require dispatching that subagent from the
+    server, which the backend can't do directly — that's the /produce skill's
+    job.
+
+    Returns HTTP 501 with a clear message so clients can surface "feature
+    needs /produce" instead of silently failing. The response includes the
+    rejected clip's time range so /produce can re-dispatch the subagent with
+    an exclusion when Sam next runs it.
     """
     clips, _ = load_clips(episode_id)
     clip, _ = find_clip(clips, clip_id)
 
-    return {
-        "message": "Alternative clip requested. This feature requires the full pipeline to be running with a valid ANTHROPIC_API_KEY.",
-        "rejected_clip_id": clip_id,
-        "excluded_range": {
-            "start": clip.get("start"),
-            "end": clip.get("end"),
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "message": "Alternative clip generation must be driven by the /produce skill's clip-miner subagent. Mark this clip rejected and run /produce to re-mine with the exclusion.",
+            "rejected_clip_id": clip_id,
+            "excluded_range": {
+                "start": clip.get("start_seconds") or clip.get("start"),
+                "end": clip.get("end_seconds") or clip.get("end"),
+            },
         },
-    }
+    )
 
 
 @router.post("/manual")
 async def add_manual_clip(episode_id: str, req: ManualClipRequest) -> dict:
     """Add a custom clip by specifying start and end timestamps."""
     if req.end_seconds <= req.start_seconds:
-        raise HTTPException(status_code=400, detail="end_seconds must be greater than start_seconds")
+        raise HTTPException(
+            status_code=400, detail="end_seconds must be greater than start_seconds"
+        )
 
     duration = req.end_seconds - req.start_seconds
     if duration < 5 or duration > 300:
-        raise HTTPException(status_code=400, detail="Clip duration must be between 5 and 300 seconds")
+        raise HTTPException(
+            status_code=400, detail="Clip duration must be between 5 and 300 seconds"
+        )
 
     clips, clips_file = load_clips(episode_id)
 
@@ -168,7 +187,9 @@ async def add_manual_clip(episode_id: str, req: ManualClipRequest) -> dict:
 
 
 @router.patch("/{clip_id}/metadata")
-async def update_clip_metadata(episode_id: str, clip_id: str, update: MetadataUpdate) -> dict:
+async def update_clip_metadata(
+    episode_id: str, clip_id: str, update: MetadataUpdate
+) -> dict:
     """Update clip metadata (title, description, hashtags, time range, per-platform metadata)."""
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)

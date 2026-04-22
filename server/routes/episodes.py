@@ -282,6 +282,52 @@ async def get_crop_frame(episode_id: str):
     return FileResponse(frame_path, media_type="image/jpeg")
 
 
+@router.get("/{episode_id}/thumbnail")
+async def get_thumbnail(
+    episode_id: str,
+    type: str = "longform",
+    clip_id: Optional[str] = None,
+):
+    """Serve an episode thumbnail image with a crop_frame.jpg fallback.
+
+    Query params:
+      type=longform (default) — returns thumbnails/longform.jpg if present,
+        else falls back to thumbnail.png at the episode root (legacy),
+        else falls back to crop_frame.jpg.
+      type=clip&clip_id=clip_01 — returns thumbnails/<clip_id>.jpg if present,
+        else falls back to crop_frame.jpg.
+
+    The fallback ordering lets the UI render SOMETHING useful even when
+    thumbnail_gen hasn't run (it's gated behind an opt-in API env var).
+    """
+    ep_dir = EPISODES_DIR / episode_id
+    if not ep_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+
+    candidates: list[Path] = []
+    if type == "clip" and clip_id:
+        # Normalize clip_id to strip path traversal attempts
+        safe_id = clip_id.replace("/", "").replace("..", "")
+        candidates.append(ep_dir / "thumbnails" / f"{safe_id}.jpg")
+        candidates.append(ep_dir / "thumbnails" / f"{safe_id}.png")
+    else:
+        candidates.append(ep_dir / "thumbnails" / "longform.jpg")
+        candidates.append(ep_dir / "thumbnails" / "longform.png")
+        candidates.append(ep_dir / "thumbnail.png")  # legacy thumbnail_gen output
+
+    # Universal fallback — crop_frame.jpg is produced by stitch for ANY episode.
+    candidates.append(ep_dir / "crop_frame.jpg")
+
+    for path in candidates:
+        if path.exists():
+            mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+            return FileResponse(path, media_type=mime)
+
+    raise HTTPException(
+        status_code=404, detail="No thumbnail available for this episode"
+    )
+
+
 @router.get("/{episode_id}/video-preview")
 async def get_video_preview(episode_id: str):
     """Serve source_merged.mp4 for video preview in crop/sync UI."""
@@ -439,12 +485,31 @@ async def get_audio_preview(
     ep = read_episode(episode_id)
     ep_dir = EPISODES_DIR / episode_id
 
-    # Find track by stem name
+    # Find track by stem or logical name. H6E filenames are session-timestamp-
+    # prefixed (e.g. "260311_162356_TrLR.WAV"), which forces clients to resolve
+    # the prefix on every call. Accept logical suffixes (TrLR, TrMic, Tr1-Tr4)
+    # and track_type aliases (stereo_mix, builtin_mic) as first-class names.
     audio_tracks = ep.get("audio_tracks", [])
     track = None
+    type_aliases = {
+        "stereo_mix": "TrLR",
+        "builtin_mic": "TrMic",
+        "TrLR": "TrLR",
+        "TrMic": "TrMic",
+    }
+    wanted_suffix = type_aliases.get(track_name, track_name)
     for t in audio_tracks:
         stem = Path(t["filename"]).stem
+        # Exact match (legacy)
         if stem == track_name or t.get("filename") == track_name:
+            track = t
+            break
+        # Logical-suffix match: stem ends with "_TrLR" / "_TrMic" / "_Tr1" etc.
+        if stem.endswith(f"_{wanted_suffix}"):
+            track = t
+            break
+        # track_type alias (e.g. client asks for "stereo_mix"):
+        if t.get("track_type") == track_name:
             track = t
             break
     if not track:
