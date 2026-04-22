@@ -1,11 +1,7 @@
 import { h, mount } from '../../lib/dom';
 import { effect } from '../../lib/signals';
 import { link, navigate, currentPath } from '../../lib/router';
-import {
-  describeAgent,
-  describeStatus,
-  episodeDateLabel,
-} from '../../lib/format';
+import { describeAgent, describeStatus, episodeTitle } from '../../lib/format';
 import { StatusPill } from '../../components/StatusPill';
 import { Button } from '../../components/Button';
 import { StepProgress } from '../../components/StepProgress';
@@ -109,11 +105,7 @@ function renderHeader(
   episodeId: string
 ): HTMLElement {
   const status = describeStatus(ep.status as string);
-  const title =
-    (ep.guest_name as string)?.trim() ||
-    (ep.episode_name as string)?.trim() ||
-    (ep.title as string)?.trim() ||
-    `Untitled — ${episodeDateLabel(episodeId)}`;
+  const title = episodeTitle(ep, episodeId);
   const subtitle = (ep.guest_title as string) || (ep.episode_name as string) || '';
   const pipeline = ep.pipeline as Record<string, unknown> | undefined;
   const currentAgent = (pipeline?.current_agent as string) ?? null;

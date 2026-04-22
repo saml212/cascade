@@ -13,7 +13,7 @@
 import { h, mount } from '../lib/dom';
 import { signal, effect, type Signal } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
-import { describeStatus, formatDuration, formatTimecode } from '../lib/format';
+import { describeStatus, episodeTitle, formatDuration, formatTimecode } from '../lib/format';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
 import { Icon } from '../components/icons';
@@ -97,10 +97,7 @@ function renderHeader(
   ep: UnknownRecord
 ): HTMLElement {
   const status = describeStatus(ep.status as string);
-  const title =
-    (ep.guest_name as string)?.trim() ||
-    (ep.episode_name as string)?.trim() ||
-    episodeId;
+  const title = episodeTitle(ep, episodeId);
 
   return h(
     'header',

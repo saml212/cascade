@@ -12,6 +12,7 @@ import { signal, effect, type Signal } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
 import {
   describeStatus,
+  episodeTitle,
   formatDuration,
   formatTimecode,
   pluralize,
@@ -211,7 +212,7 @@ export function ClipReview(target: HTMLElement, episodeId: string): void {
         { class: 'flex-1 min-h-0 overflow-y-auto' },
         h('div', { class: 'max-w-[1080px] mx-auto px-10 py-6' }, body)
       ),
-      renderChatDock(episodeId, chatMessages, chatSending, sendChat)
+      renderChatDock(chatMessages, chatSending, sendChat)
     )
   );
 }
@@ -228,10 +229,7 @@ function renderHeader(
   effect(() => {
     const ep = episode();
     const cs = clipsSig();
-    const name =
-      (ep?.guest_name as string)?.trim() ||
-      (ep?.episode_name as string)?.trim() ||
-      episodeId;
+    const name = episodeTitle(ep ?? undefined, episodeId);
     const countLine = cs
       ? `${pluralize(cs.length, 'clip')} · ${episodeId}`
       : episodeId;
@@ -886,7 +884,6 @@ function platformEditor(
 /* --------------------------------- Chat dock ------------------------------ */
 
 function renderChatDock(
-  episodeId: string,
   messages: Signal<ChatMessage[]>,
   sending: Signal<boolean>,
   send: (msg: string) => Promise<void>
@@ -965,8 +962,6 @@ function renderChatDock(
       sendBtn
     )
   );
-
-  void episodeId;
 }
 
 function chatBubble(m: ChatMessage): HTMLElement {

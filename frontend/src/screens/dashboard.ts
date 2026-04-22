@@ -4,7 +4,7 @@ import { episodes, startEpisodesPoll } from '../state/episodes';
 import { type EpisodeSummary } from '../lib/api';
 import {
   describeStatus,
-  episodeDateLabel,
+  episodeTitle,
   formatDuration,
   formatRelative,
   pluralize,
@@ -38,11 +38,10 @@ function pickSpotlight(list: EpisodeSummary[]): EpisodeSummary | null {
 }
 
 function titleOf(ep: EpisodeSummary): string {
-  const g = ep.guest_name?.trim();
-  if (g) return g;
-  if (ep.episode_name?.trim()) return ep.episode_name!;
-  if (ep.title?.trim()) return ep.title!;
-  return `Untitled — ${episodeDateLabel(ep.episode_id)}`;
+  return episodeTitle(
+    ep as unknown as Record<string, unknown>,
+    ep.episode_id
+  );
 }
 
 function subtitleOf(ep: EpisodeSummary): string {

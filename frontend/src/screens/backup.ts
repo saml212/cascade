@@ -6,9 +6,9 @@
  */
 
 import { h, mount } from '../lib/dom';
-import { signal, effect } from '../lib/signals';
+import { signal, effect, type Signal } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
-import { describeStatus, formatDuration } from '../lib/format';
+import { describeStatus, episodeTitle, formatDuration } from '../lib/format';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
 import { Icon } from '../components/icons';
@@ -51,14 +51,11 @@ export function Backup(target: HTMLElement, episodeId: string): void {
 function renderPage(
   episodeId: string,
   ep: UnknownRecord,
-  approving: ReturnType<typeof signal<boolean>>,
-  confirmPhrase: ReturnType<typeof signal<string>>
+  approving: Signal<boolean>,
+  confirmPhrase: Signal<string>
 ): HTMLElement {
   const status = describeStatus(ep.status as string);
-  const title =
-    (ep.guest_name as string)?.trim() ||
-    (ep.episode_name as string)?.trim() ||
-    episodeId;
+  const title = episodeTitle(ep, episodeId);
   const canBackup = status.key === 'awaiting_backup';
   const expectedPhrase = 'back it up';
 

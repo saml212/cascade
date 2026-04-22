@@ -6,7 +6,7 @@
 import { h, mount } from '../lib/dom';
 import { signal, effect } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
-import { formatTimecode, pluralize } from '../lib/format';
+import { pluralize } from '../lib/format';
 
 interface ScheduleItem {
   type: 'longform' | 'clip' | string;
@@ -145,8 +145,6 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           ...days.map(renderDayColumn)
         )
   );
-
-  void formatTimecode;
 }
 
 function renderDayColumn(day: ScheduleDay): HTMLElement {

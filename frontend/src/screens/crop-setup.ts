@@ -5,13 +5,13 @@
  * crop canvas + placement controls; right column is the speakers panel
  * with zoom sliders, track assignments, and the save CTA.
  *
- * Crop math mirrors lib/crop.py (canonical) and the legacy frontend's
- * redrawCropCanvas():
+ * Crop math mirrors lib/crop.py (canonical):
  *   Shorts (9:16): crop_h = srcH / zoom, crop_w = crop_h * 9 / 16
  *   Longform (16:9): crop_w = srcW / (2 * zoom), crop_h = crop_w * 9 / 16
  *   Wide (16:9): crop_w = srcW / zoom, crop_h = crop_w * 9 / 16
  *
- * Audio sync + mixer for H6E episodes ship in a follow-up pass.
+ * For H6E episodes the sync verifier + track mixer mount below the canvas
+ * via the audioHost effect — see renderBody.
  */
 
 import { h, mount } from '../lib/dom';
@@ -19,7 +19,7 @@ import { effect, signal, type Signal } from '../lib/signals';
 import { api, type SpeakerCropConfig, type CropConfigRequest } from '../lib/api';
 import {
   describeStatus,
-  episodeDateLabel,
+  episodeTitle,
   formatDuration,
   formatTimecode,
 } from '../lib/format';
@@ -269,11 +269,7 @@ function renderHeader(
   episodeId: string,
   ep: Record<string, unknown> | null
 ): HTMLElement {
-  const title = ep
-    ? (ep.guest_name as string)?.trim() ||
-      (ep.episode_name as string)?.trim() ||
-      `Untitled — ${episodeDateLabel(episodeId)}`
-    : episodeId;
+  const title = ep ? episodeTitle(ep, episodeId) : episodeId;
   const duration = ep ? (ep.duration_seconds as number) : null;
   const cfg = (ep?.crop_config as Record<string, unknown>) ?? {};
   const speakers = (cfg.speakers as unknown[] | undefined) ?? [];

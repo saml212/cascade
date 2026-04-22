@@ -6,9 +6,9 @@
  */
 
 import { h, mount } from '../lib/dom';
-import { signal, effect } from '../lib/signals';
+import { signal, effect, type Signal } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
-import { describeStatus, formatDuration, pluralize } from '../lib/format';
+import { describeStatus, episodeTitle, formatDuration, pluralize } from '../lib/format';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
 import { Icon } from '../components/icons';
@@ -101,10 +101,7 @@ function renderHeader(
   ep: UnknownRecord
 ): HTMLElement {
   const status = describeStatus(ep.status as string);
-  const title =
-    (ep.guest_name as string)?.trim() ||
-    (ep.episode_name as string)?.trim() ||
-    episodeId;
+  const title = episodeTitle(ep, episodeId);
 
   return h(
     'header',
@@ -305,7 +302,7 @@ function renderPublishBar(
   episodeId: string,
   ep: UnknownRecord,
   approvedCount: number,
-  publishing: ReturnType<typeof signal<boolean>>
+  publishing: Signal<boolean>
 ): HTMLElement {
   const status = describeStatus(ep.status as string);
   const canPublish =

@@ -9,7 +9,7 @@
  */
 
 import { h } from '../../lib/dom';
-import { signal, effect } from '../../lib/signals';
+import { signal, effect, type Signal } from '../../lib/signals';
 import { createAudioGraph, type AudioGraph } from '../../lib/audio-graph';
 import { Button } from '../Button';
 import { Icon } from '../icons';
@@ -124,7 +124,7 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
 
 function playButton(
   episodeId: string,
-  state: ReturnType<typeof signal<MixerState>>,
+  state: Signal<MixerState>,
   s: MixerState
 ): HTMLElement {
   const toggle = async (): Promise<void> => {
@@ -229,7 +229,7 @@ function resolveStems(): Array<{ key: string; stem: string }> {
 function renderRow(
   row: TrackRow,
   props: TrackMixerProps,
-  state: ReturnType<typeof signal<MixerState>>,
+  state: Signal<MixerState>,
   s: MixerState,
   speakers: MixerSpeaker[],
   ambientTracks: MixerAmbient[]

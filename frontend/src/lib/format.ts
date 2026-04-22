@@ -84,105 +84,91 @@ export interface StatusDescriptor {
   hint: string;
 }
 
-export function describeStatus(raw: string | null | undefined): StatusDescriptor {
-  const s = (raw ?? '').toLowerCase();
-  switch (s) {
-    case 'processing':
-    case 'running':
-      return {
-        key: 'processing',
-        tone: 'working',
-        label: 'Processing',
-        hint: 'Pipeline running — no action needed.',
-      };
-    case 'awaiting_crop_setup':
-    case 'awaiting_crop':
-    case 'needs_crop_setup':
-      return {
-        key: 'awaiting_crop',
-        tone: 'waiting',
-        label: 'Crop setup needed',
-        hint: 'Draw speaker crops and confirm audio sync.',
-      };
-    case 'awaiting_longform_approval':
-    case 'awaiting_longform_review':
-      return {
-        key: 'awaiting_longform_review',
-        tone: 'waiting',
-        label: 'Longform review',
-        hint: 'Watch the cut and approve or request edits.',
-      };
-    case 'ready_for_review':
-    case 'awaiting_clip_review':
-    case 'awaiting_approval':
-      return {
-        key: 'awaiting_clip_review',
-        tone: 'waiting',
-        label: 'Clip review',
-        hint: 'Review 10 clips and per-platform metadata.',
-      };
-    case 'awaiting_publish':
-    case 'approved':
-      return {
-        key: 'awaiting_publish',
-        tone: 'waiting',
-        label: 'Ready to publish',
-        hint: 'Clips approved — confirm to go live.',
-      };
-    case 'awaiting_backup_approval':
-    case 'awaiting_backup':
-      return {
-        key: 'awaiting_backup',
-        tone: 'waiting',
-        label: 'Backup pending',
-        hint: 'Confirm backup to external drive.',
-      };
-    case 'published':
-    case 'completed':
-    case 'live':
-      return {
-        key: 'live',
-        tone: 'success',
-        label: 'Live',
-        hint: 'Episode is live across platforms.',
-      };
-    case 'error':
-    case 'failed':
-      return {
-        key: 'error',
-        tone: 'danger',
-        label: 'Error',
-        hint: 'Pipeline hit a blocker — details below.',
-      };
-    case 'cancelled':
-    case 'canceled':
-      return {
-        key: 'cancelled',
-        tone: 'neutral',
-        label: 'Cancelled',
-        hint: 'Pipeline was cancelled.',
-      };
-    case 'queued':
-    case 'created':
-    case 'new':
-      return {
-        key: 'queued',
-        tone: 'neutral',
-        label: 'Queued',
-        hint: 'Waiting to start.',
-      };
-    default:
-      return {
-        key: 'queued',
-        tone: 'neutral',
-        label: raw ? titleCase(raw) : 'Unknown',
-        hint: '',
-      };
-  }
-}
+/** Descriptor shape keyed by StatusKey. */
+const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
+  processing: {
+    tone: 'working',
+    label: 'Processing',
+    hint: 'Pipeline running — no action needed.',
+  },
+  awaiting_crop: {
+    tone: 'waiting',
+    label: 'Crop setup needed',
+    hint: 'Draw speaker crops and confirm audio sync.',
+  },
+  awaiting_longform_review: {
+    tone: 'waiting',
+    label: 'Longform review',
+    hint: 'Watch the cut and approve or request edits.',
+  },
+  awaiting_clip_review: {
+    tone: 'waiting',
+    label: 'Clip review',
+    hint: 'Review 10 clips and per-platform metadata.',
+  },
+  awaiting_publish: {
+    tone: 'waiting',
+    label: 'Ready to publish',
+    hint: 'Clips approved — confirm to go live.',
+  },
+  awaiting_backup: {
+    tone: 'waiting',
+    label: 'Backup pending',
+    hint: 'Confirm backup to external drive.',
+  },
+  live: {
+    tone: 'success',
+    label: 'Live',
+    hint: 'Episode is live across platforms.',
+  },
+  error: {
+    tone: 'danger',
+    label: 'Error',
+    hint: 'Pipeline hit a blocker — details below.',
+  },
+  cancelled: {
+    tone: 'neutral',
+    label: 'Cancelled',
+    hint: 'Pipeline was cancelled.',
+  },
+  queued: { tone: 'neutral', label: 'Queued', hint: 'Waiting to start.' },
+};
 
-function titleCase(s: string): string {
-  return s.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+/** Raw backend strings that map onto each canonical StatusKey. */
+const STATUS_ALIASES: Record<string, StatusKey> = {
+  processing: 'processing',
+  running: 'processing',
+  awaiting_crop_setup: 'awaiting_crop',
+  awaiting_crop: 'awaiting_crop',
+  needs_crop_setup: 'awaiting_crop',
+  awaiting_longform_approval: 'awaiting_longform_review',
+  awaiting_longform_review: 'awaiting_longform_review',
+  ready_for_review: 'awaiting_clip_review',
+  awaiting_clip_review: 'awaiting_clip_review',
+  awaiting_approval: 'awaiting_clip_review',
+  awaiting_publish: 'awaiting_publish',
+  approved: 'awaiting_publish',
+  awaiting_backup_approval: 'awaiting_backup',
+  awaiting_backup: 'awaiting_backup',
+  published: 'live',
+  completed: 'live',
+  live: 'live',
+  error: 'error',
+  failed: 'error',
+  cancelled: 'cancelled',
+  canceled: 'cancelled',
+  queued: 'queued',
+  created: 'queued',
+  new: 'queued',
+};
+
+export function describeStatus(raw: string | null | undefined): StatusDescriptor {
+  const key = STATUS_ALIASES[(raw ?? '').toLowerCase()];
+  if (key) return { key, ...STATUS[key] };
+  const label = raw
+    ? raw.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+    : 'Unknown';
+  return { key: 'queued', tone: 'neutral', label, hint: '' };
 }
 
 /* ---------------------- Agent → plain-English mapping --------------------- */
@@ -227,7 +213,10 @@ export const CANONICAL_AGENTS: string[] = [
 
 export function describeAgent(agent: string | null | undefined): string {
   if (!agent) return '';
-  return AGENT_LABELS[agent] ?? titleCase(agent);
+  return (
+    AGENT_LABELS[agent] ??
+    agent.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+  );
 }
 
 export function pluralize(n: number, word: string, plural?: string): string {
@@ -251,6 +240,25 @@ export function summarizeErrorText(text: string, maxLen = 100): string {
   }
   const first = text.split(/\r?\n/)[0];
   return first.length > maxLen ? first.slice(0, maxLen) + '…' : first;
+}
+
+/**
+ * Pick the best human title for an episode.
+ * Priority: guest_name → episode_name → title → `Untitled — <date>`.
+ */
+export function episodeTitle(
+  ep: Record<string, unknown> | null | undefined,
+  episodeId: string
+): string {
+  if (ep) {
+    const g = (ep.guest_name as string | undefined)?.trim();
+    if (g) return g;
+    const en = (ep.episode_name as string | undefined)?.trim();
+    if (en) return en;
+    const t = (ep.title as string | undefined)?.trim();
+    if (t) return t;
+  }
+  return `Untitled — ${episodeDateLabel(episodeId)}`;
 }
 
 /** Parse an `ep_YYYY-MM-DD_HHMMSS` episode id into a short human date. */
