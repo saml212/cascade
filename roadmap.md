@@ -97,7 +97,33 @@ Longer-term workstreams captured during the 2026-04-21 session. Ordered roughly 
 
 **Size:** Focused 1-2 sessions of research + tuning, then iterate per-episode as Sam's ear catches new issues.
 
-### 11. Preview-vs-final audio parity in crop mixer
+### 11. Full frontend redesign (in parallel, separate dev-agent session)
+
+**What:** Hand off the entire cascade frontend to a dedicated Claude Code session using the frontend-design skill. Sam has that skill installed elsewhere and it has produced quality UI on other projects. The current UI is functional but visually/interactionally underwhelming — especially the crop-setup page (too dense, confusing affordances), the audio mixer (widgets and sync verification keep surprising us), and the dashboard (no strong sense of "what's happening" at a glance).
+
+**Why:** Every UI bug we hit today (port 8420 vs 8000, camera mute button desync, initSyncAudio missing from one of two pages, mixer placebo, duplicate track assignments) is both a specific fix AND a symptom of a UI that grew organically rather than being designed. A dedicated design pass pays off in fewer surprises per episode.
+
+**How:** A separate Claude Code session with the frontend-design skill. The handoff prompt lives at `docs/frontend-redesign-handoff.md`. While that work is happening, the backend dev-agent (this session's successor) keeps hardening the API + CLI + subagent layer. Backend API contract is FROZEN from the redesign agent's perspective — routes, pydantic models, episode.json schema all stay stable.
+
+**Size:** likely 2-3 full sessions by the design agent.
+
+### 12. Agent-inside-UI (eventual)
+
+**What:** Embed a chat interface inside the cascade UI so Sam talks to the /produce agent there instead of in a terminal/Claude Code session. Long-term vision.
+
+**Challenges:**
+- Bootstrap problem — agent needs backend; backend is what hosts the agent UI.
+- Agent tool (subagents) traditionally comes from the Claude Code binary, not a web backend — exposing it over HTTP is a big surface.
+- Session lifecycle — how do turns persist across page reloads?
+
+**Sequencing:**
+1. Phase A (current): terminal + browser, two contexts.
+2. Phase B: native desktop wrapper (tiny macOS .app or Electron) that starts uvicorn + spawns a Claude Code subprocess on /produce + opens the browser. One double-click. Sam never sees a terminal. Cheap, huge UX win.
+3. Phase C: chat input in the cascade UI. Messages go to a server endpoint that forwards to a Claude Code process (spawned by the launcher from Phase B, persistent across UI turns). Agent output streams back to the UI. No terminal at all, no context switching. Requires a server-side session manager.
+
+**Size:** Phase B is a one-afternoon project once Phase 1-10 settle. Phase C is a meaningful build (session manager, websocket streaming, auth). Defer Phase C until the backend is fully locked-in.
+
+### 13. Preview-vs-final audio parity in crop mixer
 
 **What:** The Audio Track Mixer's Play button previews audio using Web Audio API with client-side gain nodes. When Sam saves, `audio_mix.wav` regenerates server-side using the same volumes BUT also applies the full `audio_enhance` chain (DFN denoise, compression, loudnorm, etc). So preview ≠ final output. This destroys Sam's confidence in the mixer ("I haven't seen any this work").
 
