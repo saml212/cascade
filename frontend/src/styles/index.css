@@ -158,4 +158,54 @@
     box-shadow: 0 0 10px rgba(245, 165, 36, 0.5);
     animation: pulseBreath 2s ease-in-out infinite;
   }
+
+  /* Range slider — warm amber thumb, restrained track */
+  .cascade-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    height: 22px;
+    cursor: pointer;
+  }
+  .cascade-slider::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+  }
+  .cascade-slider::-moz-range-track {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+  }
+  .cascade-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -6px;
+    border-radius: 999px;
+    background: var(--accent);
+    border: 2px solid var(--surface-canvas);
+    box-shadow: 0 0 0 1px var(--accent), 0 1px 6px rgba(0, 0, 0, 0.4);
+    transition: transform 120ms var(--ease-expressive, ease-out);
+  }
+  .cascade-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    background: var(--accent);
+    border: 2px solid var(--surface-canvas);
+    box-shadow: 0 0 0 1px var(--accent), 0 1px 6px rgba(0, 0, 0, 0.4);
+  }
+  .cascade-slider:hover::-webkit-slider-thumb {
+    transform: scale(1.15);
+  }
+  .cascade-slider:focus {
+    outline: none;
+  }
+  .cascade-slider:focus::-webkit-slider-thumb {
+    box-shadow: 0 0 0 1px var(--accent), 0 0 0 4px rgba(245, 165, 36, 0.25);
+  }
 }
