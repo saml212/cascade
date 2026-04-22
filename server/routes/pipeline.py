@@ -312,15 +312,31 @@ async def approve_backup(episode_id: str) -> dict:
     return {"status": "backup_started", "episode_id": episode_id}
 
 
-@router.post("/{episode_id}/approve-publish")
-async def approve_publish(episode_id: str) -> dict:
-    """Approve publishing to social platforms, then run podcast_feed + publish agents."""
-    logger.info("POST /api/episodes/%s/approve-publish", episode_id)
+@router.post("/{episode_id}/approve-longform")
+async def approve_longform(episode_id: str) -> dict:
+    """Approve the longform render — publishes the longform FIRST.
+
+    Fires podcast_feed (triggers Spotify RSS ingest) + publish (uploads
+    longform to YouTube via Upload-Post). Shorts do NOT render here — the
+    shorts_render agent is hard-gated on episode.json.youtube_longform_url
+    being set, which only happens after YouTube returns the processed URL
+    (15 min to several hours after submit).
+
+    After this route:
+    1. Longform uploads to YouTube (publish.py loops over clips, skips them
+       because the shorts/ dir is empty; then uploads longform).
+    2. RSS updates, Spotify auto-ingests.
+    3. /produce polls for YouTube URL OR Sam pastes it in.
+    4. /produce fires resume-pipeline with ["shorts_render", "metadata_gen",
+       "thumbnail_gen", "qa"] to produce the shorts (URL now known).
+    5. Sam reviews clips + metadata.
+    6. /produce fires approve-publish → shorts upload (longform idempotently
+       skips because youtube_longform_url is set).
+    """
+    logger.info("POST /api/episodes/%s/approve-longform", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
-            raise HTTPException(
-                status_code=409, detail="Pipeline already running for this episode"
-            )
+            raise HTTPException(status_code=409, detail="Pipeline already running")
 
         episode_file = OUTPUT_DIR / episode_id / "episode.json"
         if not episode_file.exists():
@@ -331,10 +347,15 @@ async def approve_publish(episode_id: str) -> dict:
         with open(episode_file) as f:
             episode = json.load(f)
 
+        # Both flags must be set: longform_approved unpauses the
+        # awaiting_longform_approval gate, publish_approved passes publish.py's
+        # safety gate so the longform upload can fire.
+        now = datetime.now(timezone.utc).isoformat()
+        episode["longform_approved"] = True
+        episode["longform_approved_at"] = now
         episode["publish_approved"] = True
-        episode["publish_approved_at"] = datetime.now(timezone.utc).isoformat()
+        episode["publish_approved_at"] = now
         episode["status"] = "processing"
-
         atomic_write_json(episode_file, episode)
 
         source_path = episode.get("source_path", "")
@@ -352,16 +373,28 @@ async def approve_publish(episode_id: str) -> dict:
         thread.start()
         _running[episode_id] = thread
 
-    logger.info("Publish approved and started for %s", episode_id)
-    return {"status": "publish_started", "episode_id": episode_id}
+    logger.info("Longform approved, publishing longform for %s", episode_id)
+    return {"status": "longform_publishing", "episode_id": episode_id}
 
 
-@router.post("/{episode_id}/approve-longform")
-async def approve_longform(episode_id: str):
-    """Approve the longform render and resume pipeline for clip mining, shorts, metadata."""
+@router.post("/{episode_id}/approve-publish")
+async def approve_publish(episode_id: str) -> dict:
+    """Approve publishing the SHORTS (phase 4 of the flow).
+
+    Assumes longform is already live (approve-longform was fired earlier,
+    publish_approved is already True, youtube_longform_url is saved to
+    episode.json). Shorts are already rendered with metadata.
+
+    Fires publish only — the longform upload block in publish.py is
+    idempotent and will skip because youtube_longform_url is set. Shorts
+    upload with youtube_first_comment referencing the longform URL.
+    """
+    logger.info("POST /api/episodes/%s/approve-publish", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
-            raise HTTPException(status_code=409, detail="Pipeline already running")
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
 
         episode_file = OUTPUT_DIR / episode_id / "episode.json"
         if not episode_file.exists():
@@ -372,9 +405,13 @@ async def approve_longform(episode_id: str):
         with open(episode_file) as f:
             episode = json.load(f)
 
-        episode["longform_approved"] = True
-        episode["longform_approved_at"] = datetime.now(timezone.utc).isoformat()
+        # publish_approved should already be set by approve-longform; set
+        # defensively in case this route is called directly.
+        episode["publish_approved"] = True
+        if not episode.get("publish_approved_at"):
+            episode["publish_approved_at"] = datetime.now(timezone.utc).isoformat()
         episode["status"] = "processing"
+
         atomic_write_json(episode_file, episode)
 
         source_path = episode.get("source_path", "")
@@ -385,18 +422,12 @@ async def approve_longform(episode_id: str):
             run_pipeline(
                 source_path=source_path,
                 episode_id=episode_id,
-                agents=[
-                    "clip_miner",
-                    "shorts_render",
-                    "metadata_gen",
-                    "thumbnail_gen",
-                    "qa",
-                ],
+                agents=["publish"],
             )
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
         _running[episode_id] = thread
 
-    logger.info("Longform approved, resuming pipeline for %s", episode_id)
-    return {"status": "resumed", "episode_id": episode_id}
+    logger.info("Shorts publish approved and started for %s", episode_id)
+    return {"status": "shorts_publishing", "episode_id": episode_id}

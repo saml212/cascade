@@ -14,8 +14,6 @@ Environment:
 
 import json
 import os
-from datetime import datetime, timezone
-from pathlib import Path
 
 from agents.base import BaseAgent
 
@@ -24,6 +22,36 @@ class MetadataGenAgent(BaseAgent):
     name = "metadata_gen"
 
     def execute(self) -> dict:
+        # Two-phase safety gate (mirrors agents/clip_miner.py):
+        # 1. If metadata/metadata.json is already populated by the /produce
+        #    skill's metadata-writer subagent (runs on Sam's Max-subscription
+        #    quota), skip this agent.
+        # 2. If metadata.json is MISSING, do NOT fall through to the paid
+        #    Anthropic API. The subagent-driven path is canonical. Raise
+        #    loudly. Set CASCADE_ALLOW_API_METADATA_GEN=1 to explicitly opt
+        #    into the legacy paid path (not recommended).
+        existing_meta = self.load_json_safe("metadata/metadata.json")
+        existing_clip_metas = existing_meta.get("clips", [])
+        if existing_clip_metas and len(existing_clip_metas) > 0:
+            self.logger.info(
+                "metadata.json already has %d clip metas — skipping programmatic metadata_gen."
+                % len(existing_clip_metas)
+            )
+            return {
+                "_status": "skipped",
+                "reason": "metadata.json already populated",
+                "clip_count": len(existing_clip_metas),
+            }
+
+        if os.getenv("CASCADE_ALLOW_API_METADATA_GEN") != "1":
+            raise RuntimeError(
+                "metadata/metadata.json is missing and the paid-API metadata generator "
+                "is disabled. Dispatch the metadata-writer subagent via the /produce "
+                "skill (runs on Claude Code's Max-subscription quota) to produce "
+                "metadata.json, then resume the pipeline. To explicitly opt into the "
+                "legacy paid-API path, set CASCADE_ALLOW_API_METADATA_GEN=1 (not recommended)."
+            )
+
         clips_data = self.load_json("clips.json")
         diarized = self.load_json("diarized_transcript.json")
         clips = clips_data.get("clips", [])
@@ -46,7 +74,6 @@ class MetadataGenAgent(BaseAgent):
 
         youtube_longform_url = episode_data.get("youtube_longform_url", "")
         spotify_longform_url = episode_data.get("spotify_longform_url", "")
-        link_tree_url = episode_data.get("link_tree_url", "")
 
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -55,28 +82,34 @@ class MetadataGenAgent(BaseAgent):
         import anthropic
 
         client = anthropic.Anthropic(api_key=api_key)
-        model = self.get_config("clip_mining", "metadata_model", default="claude-sonnet-4-20250514")
+        model = self.get_config(
+            "clip_mining", "metadata_model", default="claude-sonnet-4-20250514"
+        )
 
         # Build context: clips + transcript excerpts
         clip_summaries = []
         for clip in clips:
             # Get transcript excerpt for this clip
-            excerpt = self._get_excerpt(diarized, clip["start_seconds"], clip["end_seconds"])
-            clip_summaries.append({
-                "id": clip["id"],
-                "title": clip["title"],
-                "hook_text": clip["hook_text"],
-                "duration": clip["duration"],
-                "virality_score": clip["virality_score"],
-                "transcript_excerpt": excerpt[:500],
-            })
+            excerpt = self._get_excerpt(
+                diarized, clip["start_seconds"], clip["end_seconds"]
+            )
+            clip_summaries.append(
+                {
+                    "id": clip["id"],
+                    "title": clip["title"],
+                    "hook_text": clip["hook_text"],
+                    "duration": clip["duration"],
+                    "virality_score": clip["virality_score"],
+                    "transcript_excerpt": excerpt[:500],
+                }
+            )
 
         # Build guest/episode context block
         guest_context = ""
         if guest_name:
             guest_context = f"""
 EPISODE CONTEXT:
-- Guest: {guest_name}{f' — {guest_title}' if guest_title else ''}
+- Guest: {guest_name}{f" — {guest_title}" if guest_title else ""}
 - Podcast: {podcast_title} (channel: {channel_handle})
 - Episode description: {episode_description}
 
@@ -86,13 +119,13 @@ IMPORTANT RULES:
 - ALL short-form clip metadata MUST include a reference to the full episode channel ({channel_handle})
 - Include "{guest_name}" in clip captions/descriptions where natural
 - YouTube Shorts descriptions should include "Full episode on {channel_handle}"
-{f'- YouTube Shorts descriptions MUST include the longform link: {youtube_longform_url}' if youtube_longform_url else ''}
-{f'- LinkedIn and Facebook descriptions should include "Watch the full episode: {youtube_longform_url}"' if youtube_longform_url else ''}
-{f'- LinkedIn and Facebook descriptions should include "Listen on Spotify: {spotify_longform_url}"' if spotify_longform_url else ''}
+{f"- YouTube Shorts descriptions MUST include the longform link: {youtube_longform_url}" if youtube_longform_url else ""}
+{f'- LinkedIn and Facebook descriptions should include "Watch the full episode: {youtube_longform_url}"' if youtube_longform_url else ""}
+{f'- LinkedIn and Facebook descriptions should include "Listen on Spotify: {spotify_longform_url}"' if spotify_longform_url else ""}
 - TikTok captions should include "{channel_handle}"
 - Instagram captions should include "Full ep on {channel_handle}"
-{f'- Instagram and TikTok captions should include "Link in bio: {link_in_bio}"' if link_in_bio else ''}
-{f'- Threads and Bluesky should include the YouTube link: {youtube_longform_url}' if youtube_longform_url else ''}
+{f'- Instagram and TikTok captions should include "Link in bio: {link_in_bio}"' if link_in_bio else ""}
+{f"- Threads and Bluesky should include the YouTube link: {youtube_longform_url}" if youtube_longform_url else ""}
 """
         else:
             guest_context = f"""
@@ -102,13 +135,13 @@ EPISODE CONTEXT:
 IMPORTANT RULES:
 - ALL short-form clip metadata MUST include a reference to the full episode channel ({channel_handle})
 - YouTube Shorts descriptions should include "Full episode on {channel_handle}"
-{f'- YouTube Shorts descriptions MUST include the longform link: {youtube_longform_url}' if youtube_longform_url else ''}
-{f'- LinkedIn and Facebook descriptions should include "Watch the full episode: {youtube_longform_url}"' if youtube_longform_url else ''}
-{f'- LinkedIn and Facebook descriptions should include "Listen on Spotify: {spotify_longform_url}"' if spotify_longform_url else ''}
+{f"- YouTube Shorts descriptions MUST include the longform link: {youtube_longform_url}" if youtube_longform_url else ""}
+{f'- LinkedIn and Facebook descriptions should include "Watch the full episode: {youtube_longform_url}"' if youtube_longform_url else ""}
+{f'- LinkedIn and Facebook descriptions should include "Listen on Spotify: {spotify_longform_url}"' if spotify_longform_url else ""}
 - TikTok captions should include "{channel_handle}"
 - Instagram captions should include "Full ep on {channel_handle}"
-{f'- Instagram and TikTok captions should include "Link in bio: {link_in_bio}"' if link_in_bio else ''}
-{f'- Threads and Bluesky should include the YouTube link: {youtube_longform_url}' if youtube_longform_url else ''}
+{f'- Instagram and TikTok captions should include "Link in bio: {link_in_bio}"' if link_in_bio else ""}
+{f"- Threads and Bluesky should include the YouTube link: {youtube_longform_url}" if youtube_longform_url else ""}
 """
 
         prompt = f"""You are a social media strategist for a podcast. Generate metadata for these clips and the longform episode.
@@ -134,7 +167,7 @@ CLIPS:
 Generate a JSON object with these sections:
 
 1. "longform": object with:
-   - "title": YouTube episode title (max 100 chars{f', format: "{guest_name} | {podcast_title}"' if guest_name else ''})
+   - "title": YouTube episode title (max 100 chars{f', format: "{guest_name} | {podcast_title}"' if guest_name else ""})
    - "description": YouTube description (2-3 paragraphs, include timestamps, call to action)
    - "tags": array of 10-15 relevant tags
 
@@ -218,7 +251,12 @@ Return ONLY the JSON object, no other text."""
             episode_data["tags"] = longform["tags"]
 
         # Copy guest info from episode_info if present
-        for field in ("guest_name", "guest_title", "episode_name", "episode_description"):
+        for field in (
+            "guest_name",
+            "guest_title",
+            "episode_name",
+            "episode_description",
+        ):
             val = episode_info.get(field)
             if val and not episode_data.get(field):
                 episode_data[field] = val
@@ -226,7 +264,10 @@ Return ONLY the JSON object, no other text."""
         with open(episode_file, "w") as f:
             json.dump(episode_data, f, indent=2)
 
-        self.logger.info("Wrote longform metadata to episode.json: title=%s", longform.get("title", ""))
+        self.logger.info(
+            "Wrote longform metadata to episode.json: title=%s",
+            longform.get("title", ""),
+        )
 
     def _sync_clip_metadata_to_clips(self, metadata: dict):
         """Merge per-clip platform metadata from metadata.json into clips.json."""
@@ -236,11 +277,25 @@ Return ONLY the JSON object, no other text."""
 
         with open(clips_file) as f:
             clips_data = json.load(f)
-        clips = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+        clips = (
+            clips_data.get("clips", clips_data)
+            if isinstance(clips_data, dict)
+            else clips_data
+        )
 
         # Build lookup from metadata clips
         meta_clips = {c["id"]: c for c in metadata.get("clips", []) if "id" in c}
-        platforms = ["youtube", "tiktok", "instagram", "linkedin", "x", "facebook", "threads", "pinterest", "bluesky"]
+        platforms = [
+            "youtube",
+            "tiktok",
+            "instagram",
+            "linkedin",
+            "x",
+            "facebook",
+            "threads",
+            "pinterest",
+            "bluesky",
+        ]
 
         for clip in clips:
             clip_id = clip.get("id", "")
@@ -256,7 +311,9 @@ Return ONLY the JSON object, no other text."""
         with open(clips_file, "w") as f:
             json.dump({"clips": clips}, f, indent=2)
 
-        self.logger.info("Synced platform metadata into clips.json for %d clips", len(meta_clips))
+        self.logger.info(
+            "Synced platform metadata into clips.json for %d clips", len(meta_clips)
+        )
 
     def _get_excerpt(self, diarized: dict, start: float, end: float) -> str:
         lines = []
