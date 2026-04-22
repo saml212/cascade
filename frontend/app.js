@@ -2579,7 +2579,8 @@ async function renderCropSetup(episodeId) {
       </div>
 
       <div class="mb-3 flex gap-4 items-start">
-        <video id="sync-video" width="480" class="rounded-lg bg-black" preload="metadata" controls>
+        <video id="sync-video" width="480" class="rounded-lg bg-black" preload="metadata" controls
+          controlsList="nomute novolume nodownload noplaybackrate">
           <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
         </video>
         <div class="flex flex-col gap-2 min-w-[160px]">
@@ -2591,6 +2592,7 @@ async function renderCropSetup(episodeId) {
             <button onclick="toggleSyncMute('h6e')" id="sync-mute-h6e" class="px-2 py-1 text-xs rounded font-medium bg-blue-800 text-blue-200">H6E ON</button>
             <span class="text-xs text-zinc-500">External mic</span>
           </div>
+          <span id="sync-audio-state" class="text-xs text-zinc-500 font-mono">cam: ? / h6e: ?</span>
           <audio id="sync-h6e-audio" preload="auto"></audio>
           <div class="mt-2">
             <label class="text-xs text-zinc-500">Offset (scroll or type):</label>
@@ -3373,7 +3375,8 @@ function renderAudioTab(episodeId, ep) {
         </div>
 
         <div class="mb-3">
-          <video id="sync-video" width="100%" style="max-height:240px;" class="rounded-lg bg-black" preload="metadata" controls>
+          <video id="sync-video" width="100%" style="max-height:240px;" class="rounded-lg bg-black" preload="metadata" controls
+            controlsList="nomute novolume nodownload noplaybackrate">
             <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
           </video>
         </div>
@@ -4010,21 +4013,35 @@ async function saveSyncOffset(episodeId) {
 function toggleSyncMute(which) {
   const video = document.getElementById('sync-video');
   const h6eAudio = document.getElementById('sync-h6e-audio');
-  if (which === 'camera' && video) {
-    video.muted = !video.muted;
-    const btn = document.getElementById('sync-mute-cam');
-    if (btn) {
-      btn.textContent = video.muted ? 'Camera OFF' : 'Camera ON';
-      btn.className = `px-2 py-1 text-xs rounded font-medium ${video.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-orange-800 text-orange-200'}`;
-    }
+  if (which === 'camera' && video) video.muted = !video.muted;
+  if (which === 'h6e' && h6eAudio) h6eAudio.muted = !h6eAudio.muted;
+  // syncSyncAudioButtons fires via volumechange event listener
+}
+
+// Single source of truth for the Audio Sync panel buttons + status
+function syncSyncAudioButtons() {
+  const video = document.getElementById('sync-video');
+  const h6eAudio = document.getElementById('sync-h6e-audio');
+  const camBtn = document.getElementById('sync-mute-cam');
+  const h6eBtn = document.getElementById('sync-mute-h6e');
+  const stateEl = document.getElementById('sync-audio-state');
+  if (video && camBtn) {
+    camBtn.textContent = video.muted ? 'Camera OFF' : 'Camera ON';
+    camBtn.className = `px-2 py-1 text-xs rounded font-medium ${video.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-orange-800 text-orange-200'}`;
   }
-  if (which === 'h6e' && h6eAudio) {
-    h6eAudio.muted = !h6eAudio.muted;
-    const btn = document.getElementById('sync-mute-h6e');
-    if (btn) {
-      btn.textContent = h6eAudio.muted ? 'H6E OFF' : 'H6E ON';
-      btn.className = `px-2 py-1 text-xs rounded font-medium ${h6eAudio.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-blue-800 text-blue-200'}`;
-    }
+  if (h6eAudio && h6eBtn) {
+    h6eBtn.textContent = h6eAudio.muted ? 'H6E OFF' : 'H6E ON';
+    h6eBtn.className = `px-2 py-1 text-xs rounded font-medium ${h6eAudio.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-blue-800 text-blue-200'}`;
+  }
+  if (stateEl && video && h6eAudio) {
+    const camWord = video.muted ? 'muted' : (video.paused ? 'paused' : 'playing');
+    let h6eWord;
+    if (h6eAudio.error) h6eWord = `ERR(${h6eAudio.error.code})`;
+    else if (!h6eAudio.src) h6eWord = 'no-src';
+    else if (h6eAudio.muted) h6eWord = 'muted';
+    else if (h6eAudio.paused) h6eWord = 'paused';
+    else h6eWord = 'playing';
+    stateEl.textContent = `cam: ${camWord} / h6e: ${h6eWord}`;
   }
 }
 
@@ -4036,26 +4053,48 @@ function syncH6EPlayback() {
 }
 
 function initSyncAudio(episodeId, audioTracks) {
+  const stateEl = document.getElementById('sync-audio-state');
+  const setState = (s) => { if (stateEl) stateEl.textContent = s; };
+
   // Find the stereo mix or builtin mic track for sync preview
   let syncTrack = audioTracks.find(t => t.track_type === 'stereo_mix')
     || audioTracks.find(t => t.track_type === 'builtin_mic')
     || audioTracks.find(t => t.track_type === 'input');
-  if (!syncTrack) return;
+  if (!syncTrack) {
+    setState(`ERR: no H6E track (tracks=${audioTracks.length})`);
+    console.error('[sync-audio] no sync track in', audioTracks);
+    return;
+  }
 
   const stem = syncTrack.filename.replace(/\.(WAV|wav)$/, '');
   const h6eAudio = document.getElementById('sync-h6e-audio');
   const video = document.getElementById('sync-video');
-  if (!h6eAudio || !video) return;
+  if (!h6eAudio || !video) {
+    setState('ERR: elements missing');
+    console.error('[sync-audio] missing elements', { h6eAudio: !!h6eAudio, video: !!video });
+    return;
+  }
 
   // Load H6E audio preview (first 30 minutes — enough to verify drift)
   h6eAudio.src = `${API}/episodes/${episodeId}/audio-preview/${stem}?start=0&duration=1800`;
+  console.log('[sync-audio] H6E src set:', h6eAudio.src);
 
   // Sync H6E playback with video
   video.addEventListener('play', () => {
     syncH6EPlayback();
-    h6eAudio.play().catch(() => {});
+    const p = h6eAudio.play();
+    if (p) {
+      p.then(() => {
+        console.log('[sync-audio] H6E .play() resolved, paused=', h6eAudio.paused);
+        syncSyncAudioButtons();
+      }).catch((err) => {
+        console.error('[sync-audio] H6E .play() rejected:', err.name, err.message);
+        setState(`cam: ${video.muted ? 'muted' : 'on'} / h6e: REJECT(${err.name})`);
+      });
+    }
+    syncSyncAudioButtons();
   });
-  video.addEventListener('pause', () => h6eAudio.pause());
+  video.addEventListener('pause', () => { h6eAudio.pause(); syncSyncAudioButtons(); });
   video.addEventListener('seeked', () => syncH6EPlayback());
   video.addEventListener('timeupdate', () => {
     // Correct drift every second
@@ -4064,6 +4103,17 @@ function initSyncAudio(episodeId, audioTracks) {
       h6eAudio.currentTime = expected;
     }
   });
+  // Reflect ACTUAL element state back to buttons + status, no matter how
+  // the mute state changes (our button OR anything else).
+  video.addEventListener('volumechange', syncSyncAudioButtons);
+  h6eAudio.addEventListener('volumechange', syncSyncAudioButtons);
+  h6eAudio.addEventListener('playing', syncSyncAudioButtons);
+  h6eAudio.addEventListener('pause', syncSyncAudioButtons);
+  h6eAudio.addEventListener('error', () => {
+    setState(`h6e: ERR(code=${h6eAudio.error ? h6eAudio.error.code : '?'})`);
+    console.error('[sync-audio] H6E element error:', h6eAudio.error);
+  });
+  syncSyncAudioButtons();
 
   // Scroll on offset input to adjust
   const input = document.getElementById('sync-offset-input');
