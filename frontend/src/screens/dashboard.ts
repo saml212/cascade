@@ -296,14 +296,15 @@ function episodesTable(list: EpisodeSummary[]): HTMLElement {
       h('div', { class: 'text-right' }, 'Clips'),
       h('div', { class: 'text-right' }, 'Created')
     ),
-    ...rows.map((ep) => {
+    ...rows.map((ep, i) => {
       const status = describeStatus(ep.status);
       return h(
         'a',
         {
           ...link(`/episodes/${ep.episode_id}`),
           class:
-            'grid grid-cols-[1fr_160px_140px_110px_80px] gap-4 px-5 py-4 border-b border-border-subtle last:border-0 hover:bg-surface-2 transition-colors duration-[120ms] items-center',
+            'grid grid-cols-[1fr_160px_140px_110px_80px] gap-4 px-5 py-4 border-b border-border-subtle last:border-0 hover:bg-surface-2 transition-colors duration-[120ms] items-center animate-fade-up',
+          style: { animationDelay: `${Math.min(i, 6) * 35}ms` },
         },
         h(
           'div',
