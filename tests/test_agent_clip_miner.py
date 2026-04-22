@@ -75,6 +75,7 @@ class TestClipMinerAgent:
     @patch("anthropic.Anthropic")
     def test_execute_integration(self, mock_anthropic_cls, tmp_episode_dir, sample_config, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("CASCADE_ALLOW_API_CLIP_MINER", "1")
         self._setup_inputs(tmp_episode_dir)
 
         # Mock Claude response (single combined call)
@@ -103,6 +104,7 @@ class TestClipMinerAgent:
 
     def test_clips_get_ids_and_ranks(self, tmp_episode_dir, sample_config, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("CASCADE_ALLOW_API_CLIP_MINER", "1")
         self._setup_inputs(tmp_episode_dir)
 
         mock_client = MagicMock()
@@ -129,6 +131,7 @@ class TestClipMinerAgent:
     def test_markdown_code_block_parsing(self, tmp_episode_dir, sample_config, monkeypatch):
         """Test that Claude responses wrapped in markdown code blocks are parsed correctly."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("CASCADE_ALLOW_API_CLIP_MINER", "1")
         self._setup_inputs(tmp_episode_dir)
 
         mock_client = MagicMock()

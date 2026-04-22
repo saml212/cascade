@@ -208,6 +208,24 @@ The Python pipeline has a `run-pipeline` route that fires all 14 agents in order
 
 **Known hazard:** the `approve-longform` route currently includes `clip_miner` in its agent list (`server/routes/pipeline.py:approve_longform`). If any other code path or the UI button triggers it, it'll re-run the programmatic clip_miner and hit the paid API. TODO: strip `clip_miner` from that route's agent list, OR make the Python `agents/clip_miner.py` a stub that checks for existing `clips.json` and skips. The stub approach is safer — it makes /produce's interception idempotent.
 
+**CRITICAL — cost-safety rules for /produce orchestration:**
+
+1. **NEVER call `POST /api/episodes/<id>/resume-pipeline` with an empty body.** The default is "run all remaining agents," which includes `clip_miner` — and `clip_miner` without `clips.json` will fail (gate raises). On a real episode, NEVER fire a blanket resume. Always pass an explicit `agents` list.
+
+2. **Never fire `resume-pipeline` after `transcribe` without first dispatching the clip-miner subagent and verifying `clips.json` exists.** If `clips.json` is missing and the pipeline hits `clip_miner`, it now RAISES (hard gate, not silent fallback). Set `CASCADE_ALLOW_API_CLIP_MINER=1` ONLY when you've explicitly agreed to pay for the API call.
+
+3. **Post-crop resume must be TWO steps, not one:**
+   - Step A: `resume-pipeline` with `agents=["speaker_cut", "transcribe"]` ONLY.
+   - Step B: After transcribe completes, dispatch `clip-miner` subagent (Agent tool), wait for `clips.json`.
+   - Step C: `resume-pipeline` with `agents=["longform_render"]`.
+   - Step D: After longform review + approval: `agents=["podcast_feed", "publish"]` (longform-only because shorts_render will gate on URL; fine).
+   - Step E: Wait for YouTube URL, save to `episode.json.youtube_longform_url`.
+   - Step F: `agents=["shorts_render", "metadata_gen", "thumbnail_gen", "qa"]`.
+   - Step G: Clip review → `agents=["publish"]` (longform idempotent, shorts upload).
+   - Step H: `approve-backup`.
+
+4. **If the pipeline halts with `status: "error"` AND the thread lock is stale (resume-pipeline returns 409 but no work is happening):** `POST /cancel-pipeline` first, then resume with an explicit agent list. The cancel call can itself time out if the server is stuck — if it does, restart the server (see Server lifecycle section).
+
 ## Clip-mining subagent dispatch
 
 **Why this matters:** The programmatic `clip_miner` agent uses the paid Anthropic API. Sam's Max subscription gives him generous Claude Code quota. Dispatching a `clip-miner` subagent via the Agent tool runs on that quota — effectively free per episode.

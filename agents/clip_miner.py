@@ -26,15 +26,21 @@ class ClipMinerAgent(BaseAgent):
     name = "clip_miner"
 
     def execute(self) -> dict:
-        # Skip the paid-API clip mining if clips.json is already populated by the
-        # /produce skill's clip-miner subagent (which runs on the Max-subscription
-        # quota via Claude Code). The Python path still works as a fallback when
-        # /produce is not driving, but must never run twice on the same episode.
+        # Two-phase safety gate:
+        # 1. If clips.json is already populated (e.g. by the /produce skill's
+        #    clip-miner subagent that runs on Sam's Max-subscription quota),
+        #    skip this agent — it's idempotent, no reason to re-run.
+        # 2. If clips.json is MISSING, do NOT fall through to the paid Anthropic
+        #    API path. Cascade has moved to the subagent-driven model, so a
+        #    missing clips.json means the /produce skill failed to dispatch the
+        #    subagent first. Raise loudly so the operator knows they need to
+        #    run clip-miner via /produce (Claude Code) rather than silently
+        #    consuming API tokens. Set the env var CASCADE_ALLOW_API_CLIP_MINER=1
+        #    to explicitly opt into the legacy paid path (not recommended).
         existing = self.load_json_safe("clips.json")
         if existing.get("clips") and len(existing["clips"]) > 0:
             self.logger.info(
-                "clips.json already has %d clips — skipping programmatic clip_miner. "
-                "Remove clips.json to force a re-mine via the API path."
+                "clips.json already has %d clips — skipping programmatic clip_miner."
                 % len(existing["clips"])
             )
             return {
@@ -42,6 +48,16 @@ class ClipMinerAgent(BaseAgent):
                 "reason": "clips.json already populated",
                 "clip_count": len(existing["clips"]),
             }
+
+        if os.getenv("CASCADE_ALLOW_API_CLIP_MINER") != "1":
+            raise RuntimeError(
+                "clips.json is missing and the paid-API clip miner is disabled. "
+                "Dispatch the clip-miner subagent via the /produce skill (runs on "
+                "Claude Code's Max-subscription quota) to produce clips.json, then "
+                "resume the pipeline with ['longform_render', ...]. "
+                "To explicitly opt into the legacy paid-API path, set "
+                "CASCADE_ALLOW_API_CLIP_MINER=1 (not recommended)."
+            )
 
         diarized = self.load_json("diarized_transcript.json")
         segments_data = self.load_json("segments.json")
