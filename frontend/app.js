@@ -2556,6 +2556,7 @@ async function renderCropSetup(episodeId) {
   // Clean up any previous scrubber rAF loop before re-rendering
   stopVideoFrameLoop();
   cropScrubState.active = false;
+  _cropScrubH6EInit = false;
 
   const app = document.getElementById('app');
   app.innerHTML = `${container()}
@@ -2663,11 +2664,12 @@ async function renderCropSetup(episodeId) {
           <canvas id="mixer-meter-${i}" width="200" height="16" class="rounded" style="background:#111;min-width:100px;height:16px;flex:2;"></canvas>
           <input type="range" id="mixer-vol-${i}" min="0" max="200" value="${Math.round(t.volume * 100)}" oninput="setMixerTrackVolume(${i},this.value)" class="w-48 h-2 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
           <span id="mixer-vol-label-${i}" class="text-xs text-zinc-400 w-8 text-right font-mono">${Math.round(t.volume * 100)}%</span>
-          <select id="mixer-assign-${i}" onchange="assignMixerTrack(${i},this.value)" class="bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 px-1.5 py-1 w-24">
-            <option value="">—</option>
-            ${cropState.speakers.map((s, si) => `<option value="speaker-${si}" ${t.assignment === 'speaker-' + si ? 'selected' : ''}>${escapeHtml(s.label)}</option>`).join('')}
-            <option value="ambient" ${t.assignment === 'ambient' ? 'selected' : ''}>Ambient</option>
-          </select>
+          <span id="mixer-assign-label-${i}" class="text-xs text-zinc-500 w-24 truncate" title="${escapeHtml(t.assignment)}">${
+            t.assignment.startsWith('speaker-')
+              ? '→ ' + escapeHtml((cropState.speakers[parseInt(t.assignment.split('-')[1])] || {}).label || t.assignment)
+              : t.assignment === 'ambient' ? '→ Ambient'
+              : '—'
+          }</span>
         </div>`).join('')}
       </div>
       <p id="mixer-status" class="text-xs text-zinc-600 mt-2">Click "Load Audio" to preview tracks and identify speakers.</p>
@@ -2689,6 +2691,19 @@ async function renderCropSetup(episodeId) {
             style="max-height: 360px; background: #000;">
             <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
           </video>
+          ${allAudioTracks.length > 0 ? `
+          <audio id="crop-scrub-h6e" preload="none"></audio>
+          <div id="crop-scrub-audio-controls" class="hidden mt-2 space-y-2">
+            <p class="text-xs text-zinc-500">Camera audio ON = perfectly synced reference (baked in with video). H6E audio ON = auto-synced via offset. If they drift, you'll hear echo — adjust on Audio tab.</p>
+            <div class="flex items-center gap-3">
+              <button onclick="toggleCropScrubAudio('camera')" id="crop-scrub-cam-btn"
+                class="px-2 py-1 text-xs rounded font-medium bg-orange-800 text-orange-200 transition-colors">Camera ON</button>
+              <span class="text-xs text-zinc-500">Video mic (reference)</span>
+              <button onclick="toggleCropScrubAudio('h6e')" id="crop-scrub-h6e-btn"
+                class="px-2 py-1 text-xs rounded font-medium bg-blue-800 text-blue-200 transition-colors ml-4">H6E ON</button>
+              <span class="text-xs text-zinc-500">External mic</span>
+            </div>
+          </div>` : ''}
         </div>
       </div>
 
@@ -2721,16 +2736,23 @@ async function renderCropSetup(episodeId) {
                   <span id="crop-pos-${i}" class="text-zinc-400 font-mono text-xs">${s.x}, ${s.y}</span>
                 </div>
                 <div class="flex items-center gap-2">
-                  <span class="text-xs text-zinc-500 w-10">Zoom</span>
+                  <span class="text-xs text-zinc-500 w-10">Shorts</span>
                   <input type="range" id="crop-zoom-${i}" min="0.5" max="3.0" step="0.1" value="${s.zoom}"
                     oninput="setCropZoomN(${i}, this.value)"
                     class="flex-1 h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
                   <span id="crop-zoom-${i}-val" class="text-zinc-400 font-mono text-xs w-8">${s.zoom.toFixed(1)}x</span>
                 </div>
+                <div class="flex items-center gap-2 mt-1">
+                  <span class="text-xs text-zinc-500 w-10">Longform</span>
+                  <input type="range" id="crop-lf-zoom-${i}" min="0.5" max="3.0" step="0.1" value="${s.longform_zoom || s.zoom}"
+                    oninput="setCropLfZoomN(${i}, this.value)"
+                    class="flex-1 h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+                  <span id="crop-lf-zoom-${i}-val" class="text-zinc-400 font-mono text-xs w-8">${(s.longform_zoom || s.zoom).toFixed(1)}x</span>
+                </div>
                 ${inputTracks.length > 0 ? `
                 <div class="flex items-center gap-2 mt-1">
                   <span class="text-xs text-zinc-500 w-10">Track</span>
-                  <select id="crop-track-${i}" onchange="cropState.speakers[${i}].track=parseInt(this.value)||null"
+                  <select id="crop-track-${i}" onchange="setSpeakerTrack(${i},this.value)"
                     class="flex-1 bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 px-2 py-1">
                     <option value="">None</option>
                     ${inputTracks.map(t => `<option value="${t.track_number}" ${s.track === t.track_number ? 'selected' : ''}>Tr${t.track_number}</option>`).join('')}
@@ -2853,6 +2875,13 @@ function toggleCropScrubber(episodeId) {
     btn.classList.remove('bg-zinc-800', 'border-zinc-700', 'text-zinc-300');
     btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg> Show static frame`;
 
+    // Show H6E sync controls and lazily initialize H6E audio
+    const audioControls = document.getElementById('crop-scrub-audio-controls');
+    if (audioControls) {
+      audioControls.classList.remove('hidden');
+      initCropScrubH6E(episodeId);
+    }
+
     // When video metadata is ready, resize canvas to match video dimensions
     function onVideoReady() {
       const w = video.videoWidth || cropState.sourceWidth;
@@ -2879,6 +2908,10 @@ function toggleCropScrubber(episodeId) {
     // Switch back to static image
     video.classList.add('hidden');
     video.pause();
+    const h6eAudio = document.getElementById('crop-scrub-h6e');
+    if (h6eAudio) h6eAudio.pause();
+    const audioControls = document.getElementById('crop-scrub-audio-controls');
+    if (audioControls) audioControls.classList.add('hidden');
     btn.classList.remove('bg-amber-800', 'border-amber-700', 'text-amber-200');
     btn.classList.add('bg-zinc-800', 'border-zinc-700', 'text-zinc-300');
     btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg> Scrub video`;
@@ -2900,6 +2933,73 @@ function toggleCropScrubber(episodeId) {
       .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.blob(); })
       .then(blob => { img.src = URL.createObjectURL(blob); })
       .catch(() => {});
+  }
+}
+
+// ── Crop scrubber H6E dual-audio sync ────────────────────────────────
+
+// Track whether listeners have been attached to avoid duplicates
+let _cropScrubH6EInit = false;
+
+function initCropScrubH6E(episodeId) {
+  const video = document.getElementById('crop-scrub-video');
+  const h6eAudio = document.getElementById('crop-scrub-h6e');
+  if (!video || !h6eAudio) return;
+
+  // Load the H6E audio src lazily (only once)
+  if (!h6eAudio.src) {
+    const audioTracks = (state.currentEpisode && state.currentEpisode.audio_tracks) || [];
+    const syncTrack = audioTracks.find(t => t.track_type === 'stereo_mix')
+      || audioTracks.find(t => t.track_type === 'builtin_mic')
+      || audioTracks.find(t => t.track_type === 'input');
+    if (!syncTrack) return;
+    const stem = syncTrack.filename.replace(/\.(WAV|wav)$/, '');
+    h6eAudio.src = `${API}/episodes/${episodeId}/audio-preview/${stem}?start=0&duration=1800`;
+  }
+
+  if (_cropScrubH6EInit) return;
+  _cropScrubH6EInit = true;
+
+  const getOffset = () => {
+    const ep = state.currentEpisode;
+    return (ep && ep.audio_sync && ep.audio_sync.offset_seconds != null)
+      ? ep.audio_sync.offset_seconds : 0;
+  };
+
+  video.addEventListener('play', () => {
+    h6eAudio.currentTime = video.currentTime + getOffset();
+    h6eAudio.play().catch(() => {});
+  });
+  video.addEventListener('pause', () => h6eAudio.pause());
+  video.addEventListener('seeked', () => {
+    h6eAudio.currentTime = video.currentTime + getOffset();
+  });
+  video.addEventListener('timeupdate', () => {
+    const expected = video.currentTime + getOffset();
+    if (Math.abs(h6eAudio.currentTime - expected) > 0.3) {
+      h6eAudio.currentTime = expected;
+    }
+  });
+}
+
+function toggleCropScrubAudio(which) {
+  const video = document.getElementById('crop-scrub-video');
+  const h6eAudio = document.getElementById('crop-scrub-h6e');
+  if (which === 'camera' && video) {
+    video.muted = !video.muted;
+    const btn = document.getElementById('crop-scrub-cam-btn');
+    if (btn) {
+      btn.textContent = video.muted ? 'Camera OFF' : 'Camera ON';
+      btn.className = `px-2 py-1 text-xs rounded font-medium transition-colors ${video.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-orange-800 text-orange-200'}`;
+    }
+  }
+  if (which === 'h6e' && h6eAudio) {
+    h6eAudio.muted = !h6eAudio.muted;
+    const btn = document.getElementById('crop-scrub-h6e-btn');
+    if (btn) {
+      btn.textContent = h6eAudio.muted ? 'H6E OFF' : 'H6E ON';
+      btn.className = `px-2 py-1 text-xs rounded font-medium transition-colors ml-4 ${h6eAudio.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-blue-800 text-blue-200'}`;
+    }
   }
 }
 
@@ -2943,6 +3043,14 @@ function setCropZoomN(idx, value) {
   const zoom = parseFloat(value);
   if (cropState.speakers[idx]) cropState.speakers[idx].zoom = zoom;
   const valEl = document.getElementById(`crop-zoom-${idx}-val`);
+  if (valEl) valEl.textContent = zoom.toFixed(1) + 'x';
+  redrawCropCanvas();
+}
+
+function setCropLfZoomN(idx, value) {
+  const zoom = parseFloat(value);
+  if (cropState.speakers[idx]) cropState.speakers[idx].longform_zoom = zoom;
+  const valEl = document.getElementById(`crop-lf-zoom-${idx}-val`);
   if (valEl) valEl.textContent = zoom.toFixed(1) + 'x';
   redrawCropCanvas();
 }
@@ -4105,18 +4213,67 @@ function assignMixerTrack(trackIdx, value) {
     for (let i = 0; i < mixerState.tracks.length; i++) {
       if (i !== trackIdx && mixerState.tracks[i].assignment === value) {
         mixerState.tracks[i].assignment = '';
-        const sel = document.getElementById(`mixer-assign-${i}`);
-        if (sel) sel.value = '';
+        updateMixerAssignLabel(i);
       }
     }
   } else {
     // Unassigned or ambient — clear from speakers
     for (const spk of cropState.speakers) { if (spk.track === trackNum) spk.track = null; }
   }
+  updateMixerAssignLabel(trackIdx);
   // Sync sidebar track dropdowns
   for (let i = 0; i < cropState.speakers.length; i++) {
     const sel = document.getElementById(`crop-track-${i}`);
     if (sel) sel.value = cropState.speakers[i].track || '';
+  }
+}
+
+function setSpeakerTrack(speakerIdx, value) {
+  const trackNum = parseInt(value) || null;
+  const oldTrack = cropState.speakers[speakerIdx] ? cropState.speakers[speakerIdx].track : null;
+  if (cropState.speakers[speakerIdx]) cropState.speakers[speakerIdx].track = trackNum;
+
+  // Clear the old track's assignment in mixer state
+  if (oldTrack) {
+    const oldMi = mixerState.tracks.findIndex(t => t.trackNumber === oldTrack);
+    if (oldMi >= 0 && mixerState.tracks[oldMi].assignment === `speaker-${speakerIdx}`) {
+      mixerState.tracks[oldMi].assignment = '';
+      updateMixerAssignLabel(oldMi);
+    }
+  }
+  // Set the new track's assignment in mixer state
+  if (trackNum) {
+    const newMi = mixerState.tracks.findIndex(t => t.trackNumber === trackNum);
+    if (newMi >= 0) {
+      // Remove this speaker assignment from any other mixer track
+      for (let i = 0; i < mixerState.tracks.length; i++) {
+        if (i !== newMi && mixerState.tracks[i].assignment === `speaker-${speakerIdx}`) {
+          mixerState.tracks[i].assignment = '';
+          updateMixerAssignLabel(i);
+        }
+      }
+      mixerState.tracks[newMi].assignment = `speaker-${speakerIdx}`;
+      updateMixerAssignLabel(newMi);
+    }
+  }
+}
+
+function updateMixerAssignLabel(trackIdx) {
+  const t = mixerState.tracks[trackIdx];
+  if (!t) return;
+  const lbl = document.getElementById(`mixer-assign-label-${trackIdx}`);
+  if (!lbl) return;
+  if (t.assignment.startsWith('speaker-')) {
+    const si = parseInt(t.assignment.split('-')[1]);
+    const spkLabel = (cropState.speakers[si] || {}).label || t.assignment;
+    lbl.textContent = '→ ' + spkLabel;
+    lbl.title = t.assignment;
+  } else if (t.assignment === 'ambient') {
+    lbl.textContent = '→ Ambient';
+    lbl.title = 'ambient';
+  } else {
+    lbl.textContent = '—';
+    lbl.title = '';
   }
 }
 
