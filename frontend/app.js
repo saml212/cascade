@@ -2859,6 +2859,13 @@ async function renderCropSetup(episodeId) {
   // Load sync preview if audio_sync data exists
   if (ep.audio_sync && ep.audio_sync.offset_seconds != null) {
     loadSyncPreview(episodeId, ep.audio_sync.offset_seconds);
+    // Wire the Camera/H6E buttons + audio playback to the sync-video element.
+    // Without this, clicking the buttons mutes the underlying <video>.muted
+    // but nothing updates the button labels, status indicator, or H6E audio.
+    syncState.offset = ep.audio_sync.offset_seconds;
+    if (allAudioTracks.length > 0) {
+      initSyncAudio(episodeId, allAudioTracks);
+    }
   }
 }
 
