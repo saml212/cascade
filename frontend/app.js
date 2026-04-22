@@ -70,6 +70,9 @@ const cropState = {
   get zoomR() { return (this.speakers[1] || {}).zoom || 1.0; },
 };
 
+// ── Crop scrubber state (video scrub toggle) ──
+const cropScrubState = { active: false, rafId: null };
+
 // ── Audio Sync Verification State ──
 const syncState = {
   loaded: false,
@@ -2528,6 +2531,10 @@ async function renderCropSetup(episodeId) {
     }
   }
 
+  // Clean up any previous scrubber rAF loop before re-rendering
+  stopVideoFrameLoop();
+  cropScrubState.active = false;
+
   const app = document.getElementById('app');
   app.innerHTML = `${container()}
     <div class="flex items-center gap-2 text-sm text-zinc-500 mb-6">
@@ -2647,7 +2654,19 @@ async function renderCropSetup(episodeId) {
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
       <div class="lg:col-span-3">
         <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-xs text-zinc-500">Click the frame to set speaker center points</span>
+            <button id="crop-scrub-btn" onclick="toggleCropScrubber('${episodeId}')"
+              class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg text-xs font-medium transition-colors text-zinc-300 hover:text-white flex items-center gap-1.5">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+              Scrub video
+            </button>
+          </div>
           <canvas id="crop-canvas" class="w-full cursor-crosshair rounded-lg" style="background: #000;"></canvas>
+          <video id="crop-scrub-video" class="hidden w-full rounded-lg mt-3" controls preload="none"
+            style="max-height: 360px; background: #000;">
+            <source src="${API}/episodes/${episodeId}/video-preview" type="video/mp4">
+          </video>
         </div>
       </div>
 
@@ -2792,6 +2811,90 @@ async function renderCropSetup(episodeId) {
   // Load sync preview if audio_sync data exists
   if (ep.audio_sync && ep.audio_sync.offset_seconds != null) {
     loadSyncPreview(episodeId, ep.audio_sync.offset_seconds);
+  }
+}
+
+// ── Crop scrubber toggle ──────────────────────────────────────────────
+
+function toggleCropScrubber(episodeId) {
+  const video = document.getElementById('crop-scrub-video');
+  const canvas = document.getElementById('crop-canvas');
+  const btn = document.getElementById('crop-scrub-btn');
+  if (!video || !canvas) return;
+
+  cropScrubState.active = !cropScrubState.active;
+
+  if (cropScrubState.active) {
+    // Switch to video mode
+    video.classList.remove('hidden');
+    btn.classList.add('bg-amber-800', 'border-amber-700', 'text-amber-200');
+    btn.classList.remove('bg-zinc-800', 'border-zinc-700', 'text-zinc-300');
+    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg> Show static frame`;
+
+    // When video metadata is ready, resize canvas to match video dimensions
+    function onVideoReady() {
+      const w = video.videoWidth || cropState.sourceWidth;
+      const h = video.videoHeight || cropState.sourceHeight;
+      cropState.sourceWidth = w;
+      cropState.sourceHeight = h;
+      const containerWidth = canvas.parentElement.clientWidth - 32;
+      const aspect = h / w;
+      canvas.width = containerWidth;
+      canvas.height = Math.round(containerWidth * aspect);
+      cropState.scaleFactor = w / canvas.width;
+      // Swap cropState.image to the video element so redrawCropCanvas works
+      cropState.image = video;
+      redrawCropCanvas();
+      startVideoFrameLoop();
+    }
+
+    if (video.readyState >= 1) {
+      onVideoReady();
+    } else {
+      video.addEventListener('loadedmetadata', onVideoReady, { once: true });
+    }
+  } else {
+    // Switch back to static image
+    video.classList.add('hidden');
+    video.pause();
+    btn.classList.remove('bg-amber-800', 'border-amber-700', 'text-amber-200');
+    btn.classList.add('bg-zinc-800', 'border-zinc-700', 'text-zinc-300');
+    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg> Scrub video`;
+    stopVideoFrameLoop();
+    // Reload the static image
+    const img = new Image();
+    img.onload = function() {
+      cropState.image = img;
+      cropState.sourceWidth = img.naturalWidth;
+      cropState.sourceHeight = img.naturalHeight;
+      const containerWidth = canvas.parentElement.clientWidth - 32;
+      const aspect = img.naturalHeight / img.naturalWidth;
+      canvas.width = containerWidth;
+      canvas.height = Math.round(containerWidth * aspect);
+      cropState.scaleFactor = img.naturalWidth / canvas.width;
+      redrawCropCanvas();
+    };
+    fetch(`${API}/episodes/${episodeId}/crop-frame`)
+      .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.blob(); })
+      .then(blob => { img.src = URL.createObjectURL(blob); })
+      .catch(() => {});
+  }
+}
+
+function startVideoFrameLoop() {
+  stopVideoFrameLoop();
+  function loop() {
+    if (!cropScrubState.active) return;
+    redrawCropCanvas();
+    cropScrubState.rafId = requestAnimationFrame(loop);
+  }
+  cropScrubState.rafId = requestAnimationFrame(loop);
+}
+
+function stopVideoFrameLoop() {
+  if (cropScrubState.rafId !== null) {
+    cancelAnimationFrame(cropScrubState.rafId);
+    cropScrubState.rafId = null;
   }
 }
 
