@@ -23,6 +23,8 @@ import { agentPanelCollapsed, showToast } from '../state/ui';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
 import { Icon } from '../components/icons';
+import { SyncVerifier } from '../components/audio/SyncVerifier';
+import { TrackMixer } from '../components/audio/TrackMixer';
 import { link, navigate } from '../lib/router';
 
 interface SpeakerState {
@@ -34,6 +36,7 @@ interface SpeakerState {
   longform_y: number | null;
   longform_zoom: number;
   track: number | null;
+  volume: number;
 }
 
 interface CropState {
@@ -114,9 +117,9 @@ function seedFromEpisode(
       longform_y: s.longform_center_y ?? null,
       longform_zoom: s.longform_zoom ?? 0.75,
       track: s.track ?? null,
+      volume: s.volume ?? 1.0,
     }));
   } else if (cfg.speaker_l_center_x != null && cfg.speaker_r_center_x != null) {
-    // Legacy 2-speaker shape
     speakers = [
       {
         label: 'Host',
@@ -127,6 +130,7 @@ function seedFromEpisode(
         longform_y: null,
         longform_zoom: 0.75,
         track: null,
+        volume: 1.0,
       },
       {
         label: 'Guest',
@@ -137,10 +141,10 @@ function seedFromEpisode(
         longform_y: null,
         longform_zoom: 0.75,
         track: null,
+        volume: 1.0,
       },
     ];
   } else {
-    // No saved config — seed N blank speakers so Sam can place each one
     speakers = Array.from({ length: Math.max(2, speakerCountHint) }, (_, i) => ({
       label: i === 0 ? 'Host' : `Guest ${i}`,
       x: 0,
@@ -150,6 +154,7 @@ function seedFromEpisode(
       longform_y: null,
       longform_zoom: 0.75,
       track: speakerCountHint > 2 ? i + 1 : null,
+      volume: 1.0,
     }));
   }
 
@@ -342,15 +347,61 @@ function renderBody(
   episodeId: string,
   state: Signal<CropState>
 ): HTMLElement {
+  const audioHost = h('div', { class: 'flex flex-col gap-6' });
+
+  // The H6E sync + mixer sections render lazily: we need episodeDetail()
+  // loaded to know whether this episode even has H6E audio. The editor
+  // and sidebar render once (they're stable, re-rendering would tear the
+  // canvas); the audio section rebuilds when isH6E flips.
+  let audioMounted = false;
+  effect(() => {
+    const ep = episodeDetail();
+    const isH6E = !!(ep && ep.audio_sync);
+    if (isH6E && !audioMounted) {
+      audioMounted = true;
+      audioHost.replaceChildren(SyncVerifier(episodeId), renderMixer(state));
+    } else if (!isH6E && audioMounted) {
+      audioMounted = false;
+      audioHost.replaceChildren();
+    }
+  });
+
   return h(
     'div',
-    {
-      class:
-        'flex-1 grid grid-cols-[minmax(0,1fr)_380px] gap-6 px-8 py-6 min-h-0',
-    },
-    renderEditor(state),
-    renderSidebar(episodeId, state)
+    { class: 'flex-1 flex flex-col gap-6 px-8 py-6 min-h-0' },
+    h(
+      'div',
+      { class: 'grid grid-cols-[minmax(0,1fr)_380px] gap-6' },
+      renderEditor(state),
+      renderSidebar(episodeId, state, true)
+    ),
+    audioHost
   );
+}
+
+function renderMixer(state: Signal<CropState>): HTMLElement {
+  const host = h('div');
+  effect(() => {
+    const s = state();
+    host.replaceChildren(
+      TrackMixer({
+        speakers: s.speakers.map((spk) => ({
+          label: spk.label,
+          track: spk.track,
+          volume: spk.volume ?? 1.0,
+        })),
+        ambientTracks: [],
+        onSpeakerVolume: (idx, volume) =>
+          state.set((prev) => ({
+            ...prev,
+            speakers: prev.speakers.map((s, i) =>
+              i === idx ? { ...s, volume } : s
+            ),
+          })),
+      })
+    );
+  });
+  return host;
 }
 
 /* ------------------------------ Canvas editor ----------------------------- */
@@ -719,7 +770,8 @@ function renderHint(s: CropState): HTMLElement {
 
 function renderSidebar(
   episodeId: string,
-  state: Signal<CropState>
+  state: Signal<CropState>,
+  _isH6E: boolean
 ): HTMLElement {
   const host = h('aside', {
     class: 'flex flex-col gap-4 min-w-0 overflow-y-auto',
@@ -1029,7 +1081,7 @@ async function doSave(
         center_y: spk.y,
         zoom: spk.zoom,
         longform_zoom: spk.longform_zoom,
-        volume: 1.0,
+        volume: spk.volume,
       };
       if (spk.longform_x != null) entry.longform_center_x = spk.longform_x;
       if (spk.longform_y != null) entry.longform_center_y = spk.longform_y;

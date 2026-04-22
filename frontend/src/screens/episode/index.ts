@@ -19,6 +19,7 @@ import { renderOverview } from './overview';
 import { renderLongform } from './longform';
 import { renderClips } from './clips';
 import { renderAudio } from './audio';
+import { renderMetadata } from './metadata';
 
 type SectionKey = 'overview' | 'longform' | 'clips' | 'audio' | 'metadata';
 
@@ -96,22 +97,7 @@ function renderSection(
       renderAudio(target, ep, episodeId);
       break;
     case 'metadata':
-      target.replaceChildren(
-        h(
-          'div',
-          { class: 'panel px-10 py-16 text-center' },
-          h(
-            'div',
-            { class: 'font-display text-display-md text-ink-secondary mb-3' },
-            'Metadata editor coming here.'
-          ),
-          h(
-            'p',
-            { class: 'text-body text-ink-tertiary' },
-            'Per-platform fields live inside each clip for now. Visit the Clips section.'
-          )
-        )
-      );
+      renderMetadata(target, ep, episodeId);
       break;
     default:
       renderOverview(target, ep, episodeId);
