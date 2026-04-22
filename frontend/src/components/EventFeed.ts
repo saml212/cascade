@@ -13,6 +13,18 @@ const KIND_STYLE: Record<PipelineEvent['kind'], { dot: string; text: string }> =
 
 const MAX_EVENTS = 50;
 
+function summarize(text: string): string {
+  if (/timed out/i.test(text)) {
+    const m = text.match(/timed out after \d+ seconds?/i);
+    if (m) return `Command ${m[0]}`;
+  }
+  if (/Unterminated string/i.test(text)) {
+    return 'Parse error — response was truncated';
+  }
+  const first = text.split(/\r?\n/)[0];
+  return first.length > 80 ? first.slice(0, 80) + '…' : first;
+}
+
 export function EventFeed(episodeId: string): HTMLElement {
   const events = signal<PipelineEvent[]>([]);
 
@@ -53,6 +65,7 @@ export function EventFeed(episodeId: string): HTMLElement {
           hour: '2-digit',
           minute: '2-digit',
         });
+        const summarizedDetail = e.detail ? summarize(e.detail) : null;
         return h(
           'div',
           { class: 'flex gap-2.5 items-start text-body-sm' },
@@ -67,11 +80,15 @@ export function EventFeed(episodeId: string): HTMLElement {
               { class: `${style.text} leading-snug` },
               e.label
             ),
-            e.detail
+            summarizedDetail
               ? h(
                   'div',
-                  { class: 'text-ink-tertiary text-body-sm mt-0.5' },
-                  e.detail
+                  {
+                    class:
+                      'text-ink-tertiary text-body-sm mt-0.5 leading-snug truncate',
+                    title: e.detail,
+                  },
+                  summarizedDetail
                 )
               : null
           ),

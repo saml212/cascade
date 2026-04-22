@@ -191,6 +191,7 @@ const AGENT_LABELS: Record<string, string> = {
   ingest: 'Reading SD card',
   stitch: 'Stitching source clips',
   audio_sync: 'Syncing H6E to camera',
+  audio_analysis: 'Analyzing audio',
   audio_enhance: 'Enhancing audio',
   speaker_cut: 'Splitting by speaker',
   transcribe: 'Transcribing',
@@ -204,6 +205,25 @@ const AGENT_LABELS: Record<string, string> = {
   publish: 'Publishing',
   backup: 'Backing up',
 };
+
+/** Canonical order of the 14-stage cascade pipeline. */
+export const CANONICAL_AGENTS: string[] = [
+  'ingest',
+  'stitch',
+  'audio_sync',
+  'audio_enhance',
+  'speaker_cut',
+  'transcribe',
+  'clip_miner',
+  'longform_render',
+  'shorts_render',
+  'metadata_gen',
+  'thumbnail_gen',
+  'qa',
+  'podcast_feed',
+  'publish',
+  'backup',
+];
 
 export function describeAgent(agent: string | null | undefined): string {
   if (!agent) return '';

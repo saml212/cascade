@@ -54,14 +54,14 @@ export function AgentPanel(): HTMLElement {
           h(
             'div',
             {
-              class: 'font-display text-display-md leading-none',
+              class: 'font-display text-heading-lg leading-none',
             },
-            'Agent'
+            'Pipeline feed'
           ),
           h(
             'div',
             { class: 'text-body-sm text-ink-tertiary mt-1' },
-            'Pipeline activity'
+            'What the cascade agent is doing'
           )
         ),
         h(
@@ -77,23 +77,7 @@ export function AgentPanel(): HTMLElement {
       ),
       h(
         'div',
-        { class: 'flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-5' },
-        h(
-          'div',
-          {
-            class: 'panel-inset px-4 py-3',
-          },
-          h(
-            'div',
-            { class: 'text-heading-sm uppercase text-ink-tertiary mb-1' },
-            'Chat'
-          ),
-          h(
-            'p',
-            { class: 'text-body-sm text-ink-secondary leading-relaxed' },
-            'Chat with the cascade agent arrives in the next phase. For now, the feed below streams what the agent is doing.'
-          )
-        ),
+        { class: 'flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4' },
         feedSection()
       )
     );
@@ -108,23 +92,14 @@ export function AgentPanel(): HTMLElement {
           h(
             'div',
             { class: 'text-body-sm text-ink-tertiary italic' },
-            'No episode selected.'
+            'Open an episode to see what the agent is up to.'
           )
         );
       } else {
         inner.replaceChildren(EventFeed(id));
       }
     });
-    return h(
-      'div',
-      null,
-      h(
-        'div',
-        { class: 'text-heading-sm uppercase text-ink-tertiary mb-3' },
-        'Live feed'
-      ),
-      inner
-    );
+    return inner;
   }
 
   return host;

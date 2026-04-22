@@ -1,5 +1,12 @@
 import { h } from '../../lib/dom';
-import { describeAgent, describeStatus, formatDuration, formatRelative, pluralize } from '../../lib/format';
+import {
+  CANONICAL_AGENTS,
+  describeAgent,
+  describeStatus,
+  formatDuration,
+  formatRelative,
+  pluralize,
+} from '../../lib/format';
 import { navigate } from '../../lib/router';
 
 export function renderOverview(
@@ -59,7 +66,7 @@ export function renderOverview(
             : null
         ),
 
-        // Timeline of the pipeline
+        // Full canonical 14-stage pipeline timeline
         h(
           'div',
           { class: 'panel p-6' },
@@ -68,7 +75,12 @@ export function renderOverview(
             { class: 'text-heading-md text-ink-primary mb-4' },
             'Pipeline'
           ),
-          agentTimeline(requested.length ? requested : completed, completed, pipeline?.current_agent as string | null, errors)
+          agentTimeline(
+            canonicalSequence(completed, requested),
+            completed,
+            pipeline?.current_agent as string | null,
+            errors
+          )
         ),
 
         // Description preview if present
@@ -226,6 +238,30 @@ function speakerCountOf(ep: Record<string, unknown>): string {
   if (speakers) return pluralize(speakers.length, 'speaker');
   if (cfg.speaker_l_center_x != null) return '2 speakers';
   return 'not set';
+}
+
+/**
+ * Build the visible pipeline list: start with the canonical 14 stages,
+ * then append any agents that actually ran but aren't in the canonical
+ * set (legacy runs, renamed agents, etc.). Dedupes repeated entries so
+ * re-runs of speaker_cut + transcribe + clip_miner collapse to one pill.
+ */
+function canonicalSequence(completed: string[], requested: string[]): string[] {
+  const seen = new Set<string>();
+  const seq: string[] = [];
+  for (const a of CANONICAL_AGENTS) {
+    if (!seen.has(a)) {
+      seen.add(a);
+      seq.push(a);
+    }
+  }
+  for (const a of [...completed, ...requested]) {
+    if (!seen.has(a)) {
+      seen.add(a);
+      seq.push(a);
+    }
+  }
+  return seq;
 }
 
 function agentTimeline(

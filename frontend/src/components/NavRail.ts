@@ -93,14 +93,15 @@ export function NavRail(): HTMLElement {
         'a',
         {
           ...link('/'),
-          class: 'flex items-center justify-center h-10 mb-2',
+          class:
+            'relative flex items-center justify-center h-10 w-10 mx-auto mb-3 rounded-[10px] bg-gradient-to-b from-accent to-[#c97f12] text-ink-on-accent shadow-[0_4px_14px_rgba(245,165,36,0.35),inset_0_1px_0_rgba(255,255,255,0.25)] hover:brightness-110 transition-[filter] duration-[120ms]',
           title: 'Cascade',
         },
         h(
           'span',
           {
             class:
-              'font-display text-display-md text-accent leading-none select-none',
+              'font-display font-semibold text-[20px] leading-none select-none tracking-tight',
           },
           'C'
         )
