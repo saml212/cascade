@@ -2695,13 +2695,14 @@ async function renderCropSetup(episodeId) {
           <audio id="crop-scrub-h6e" preload="none"></audio>
           <div id="crop-scrub-audio-controls" class="hidden mt-2 space-y-2">
             <p class="text-xs text-zinc-500">Camera audio ON = perfectly synced reference (baked in with video). H6E audio ON = auto-synced via offset. If they drift, you'll hear echo — adjust on Audio tab.</p>
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-3 flex-wrap">
               <button onclick="toggleCropScrubAudio('camera')" id="crop-scrub-cam-btn"
                 class="px-2 py-1 text-xs rounded font-medium bg-orange-800 text-orange-200 transition-colors">Camera ON</button>
               <span class="text-xs text-zinc-500">Video mic (reference)</span>
               <button onclick="toggleCropScrubAudio('h6e')" id="crop-scrub-h6e-btn"
                 class="px-2 py-1 text-xs rounded font-medium bg-blue-800 text-blue-200 transition-colors ml-4">H6E ON</button>
               <span class="text-xs text-zinc-500">External mic</span>
+              <span id="crop-scrub-audio-state" class="text-xs text-zinc-500 font-mono ml-auto">cam: ? / h6e: ?</span>
             </div>
           </div>` : ''}
         </div>
@@ -2968,9 +2969,13 @@ function initCropScrubH6E(episodeId) {
 
   video.addEventListener('play', () => {
     h6eAudio.currentTime = video.currentTime + getOffset();
-    h6eAudio.play().catch(() => {});
+    h6eAudio.play().catch((err) => {
+      const state = document.getElementById('crop-scrub-audio-state');
+      if (state) state.textContent = `cam: ${video.muted ? 'muted' : 'on'} / h6e: ERR (${err.name})`;
+    });
+    syncCropScrubAudioButtons();
   });
-  video.addEventListener('pause', () => h6eAudio.pause());
+  video.addEventListener('pause', () => { h6eAudio.pause(); syncCropScrubAudioButtons(); });
   video.addEventListener('seeked', () => {
     h6eAudio.currentTime = video.currentTime + getOffset();
   });
@@ -2980,27 +2985,51 @@ function initCropScrubH6E(episodeId) {
       h6eAudio.currentTime = expected;
     }
   });
+  // Source of truth: whenever the video or H6E element's mute state changes
+  // (via button OR native controls OR anything else), reflect that in the UI.
+  video.addEventListener('volumechange', syncCropScrubAudioButtons);
+  h6eAudio.addEventListener('volumechange', syncCropScrubAudioButtons);
+  h6eAudio.addEventListener('playing', syncCropScrubAudioButtons);
+  h6eAudio.addEventListener('pause', syncCropScrubAudioButtons);
+  h6eAudio.addEventListener('error', syncCropScrubAudioButtons);
+  syncCropScrubAudioButtons();
+}
+
+// Read the ACTUAL state of the video + H6E audio elements and reflect it in
+// the buttons + status. This is the only path that updates button labels —
+// the toggle functions just flip element state, then this function reacts.
+function syncCropScrubAudioButtons() {
+  const video = document.getElementById('crop-scrub-video');
+  const h6eAudio = document.getElementById('crop-scrub-h6e');
+  const camBtn = document.getElementById('crop-scrub-cam-btn');
+  const h6eBtn = document.getElementById('crop-scrub-h6e-btn');
+  const stateEl = document.getElementById('crop-scrub-audio-state');
+  if (video && camBtn) {
+    camBtn.textContent = video.muted ? 'Camera OFF' : 'Camera ON';
+    camBtn.className = `px-2 py-1 text-xs rounded font-medium transition-colors ${video.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-orange-800 text-orange-200'}`;
+  }
+  if (h6eAudio && h6eBtn) {
+    h6eBtn.textContent = h6eAudio.muted ? 'H6E OFF' : 'H6E ON';
+    h6eBtn.className = `px-2 py-1 text-xs rounded font-medium transition-colors ml-4 ${h6eAudio.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-blue-800 text-blue-200'}`;
+  }
+  if (stateEl && video && h6eAudio) {
+    const camWord = video.muted ? 'muted' : (video.paused ? 'paused' : 'playing');
+    let h6eWord;
+    if (h6eAudio.error) h6eWord = `ERR(${h6eAudio.error.code})`;
+    else if (!h6eAudio.src) h6eWord = 'no-src';
+    else if (h6eAudio.muted) h6eWord = 'muted';
+    else if (h6eAudio.paused) h6eWord = 'paused';
+    else h6eWord = 'playing';
+    stateEl.textContent = `cam: ${camWord} / h6e: ${h6eWord}`;
+  }
 }
 
 function toggleCropScrubAudio(which) {
   const video = document.getElementById('crop-scrub-video');
   const h6eAudio = document.getElementById('crop-scrub-h6e');
-  if (which === 'camera' && video) {
-    video.muted = !video.muted;
-    const btn = document.getElementById('crop-scrub-cam-btn');
-    if (btn) {
-      btn.textContent = video.muted ? 'Camera OFF' : 'Camera ON';
-      btn.className = `px-2 py-1 text-xs rounded font-medium transition-colors ${video.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-orange-800 text-orange-200'}`;
-    }
-  }
-  if (which === 'h6e' && h6eAudio) {
-    h6eAudio.muted = !h6eAudio.muted;
-    const btn = document.getElementById('crop-scrub-h6e-btn');
-    if (btn) {
-      btn.textContent = h6eAudio.muted ? 'H6E OFF' : 'H6E ON';
-      btn.className = `px-2 py-1 text-xs rounded font-medium transition-colors ml-4 ${h6eAudio.muted ? 'bg-zinc-700 text-zinc-400' : 'bg-blue-800 text-blue-200'}`;
-    }
-  }
+  if (which === 'camera' && video) video.muted = !video.muted;
+  if (which === 'h6e' && h6eAudio) h6eAudio.muted = !h6eAudio.muted;
+  // syncCropScrubAudioButtons will fire via the volumechange event listener
 }
 
 function startVideoFrameLoop() {
