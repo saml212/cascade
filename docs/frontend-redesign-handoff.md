@@ -221,6 +221,32 @@ Use these to verify every screen. The crop-setup page specifically needs one 2-s
 - Don't invent config options; read what's in `config/config.toml`.
 - Don't commit on `main` without `/clean` passing (project has a pre-commit gate sentinel).
 
+## Future vision — design for this, don't implement it yet
+
+Two eventual states influence design decisions now, even though you won't build them:
+
+### Phase B (near-term, after redesign ships): native launcher
+
+A small macOS `.app` (SwiftUI wrapper + shell script, or Electron) will become the single entry point for this product. On double-click:
+1. Starts uvicorn in the background.
+2. Spawns `claude /produce` as a persistent subprocess.
+3. Opens a browser tab to `localhost:8420`.
+4. On quit: cleanly kills all three.
+
+Sam never sees a terminal. The cascade UI (your redesign) is the primary surface. The Claude Code agent is a separate window driven from the same launcher.
+
+**Design implication for you:** assume the cascade UI is ALWAYS running alongside a Claude Code agent session. Don't design as if the UI is self-sufficient. Status from the agent (events, progress, decisions) will eventually flow back into the UI via the backend — leave architectural space for that.
+
+### Phase C (later): agent chat embedded in the cascade UI
+
+Longer-term, messages to the agent move INSIDE the cascade UI. A chat input in the cascade frontend POSTs to a new `/agent/chat` endpoint on the backend; that endpoint proxies to the persistent Claude Code process spawned by Phase B; agent responses stream back via SSE or websocket and render in the cascade UI.
+
+**Design implication for you:** somewhere in your layout, leave room for an agent conversation panel. You don't need to build it now — no chat input, no message history, no streaming UI. But the layout should be amenable to adding a right-rail or bottom-panel chat surface later without a full re-layout. If you pick a side-nav + content-panel shape, a docked agent panel on the right is a natural fit.
+
+You're NOT building Phase B or Phase C. But design the frontend as if they're coming — specifically:
+- Each screen surfaces status changes loudly so the future agent panel can echo "I noticed the crop was saved, firing speaker_cut + transcribe now" in human language.
+- The backend will eventually expose an SSE stream of pipeline events (`/api/episodes/<id>/events`) — assume that contract exists and plan status display around it. (If it doesn't exist yet when you build the status UI, fall back to polling, but structure the code so swapping to SSE later is one-line.)
+
 ## How to know you're done
 
 - Every flow Sam walks in the "What Sam actually does" section above works in the new UI from start to finish without needing terminal help.
