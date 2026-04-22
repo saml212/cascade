@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import re
 import subprocess
 import time
@@ -12,10 +11,9 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from lib.crop import compute_crop, resolve_speaker
 from lib.encoding import get_video_encoder_args, get_lut_filter
 from lib.paths import get_episodes_dir
-from lib.srt import escape_srt_path, fmt_timecode
+from lib.srt import fmt_timecode
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +24,89 @@ EPISODES_DIR = get_episodes_dir()
 # Episode context cache: {episode_id: {"ctx": dict, "mtime": float, "loaded_at": float}}
 _context_cache = {}
 _CACHE_TTL = 300  # 5 minutes
+
+
+def _call_claude(
+    system_prompt: str,
+    messages: list[dict],
+    model: str = "sonnet",
+    timeout: float = 120.0,
+) -> str:
+    """Invoke the `claude` CLI as a subprocess and return the assistant's text.
+
+    Runs on Sam's Max-subscription quota instead of the paid Anthropic API.
+    Replaces the old `anthropic.Anthropic().messages.create(...)` call sites.
+
+    Behavior:
+    - Flattens `messages` (multi-turn history) into a single stdin prompt,
+      wrapped with role labels since `claude -p` is single-turn.
+    - Uses `--append-system-prompt` to pass the system prompt cleanly.
+    - Uses `--output-format json` so we get a structured `result` field.
+    - Raises RuntimeError on subprocess failure, timeout, or parse error —
+      the caller converts to an HTTPException.
+
+    Opt-in API fallback: if `CASCADE_ALLOW_API_CHAT=1` AND `ANTHROPIC_API_KEY`
+    is set, the caller may choose to route to the paid API instead. This
+    function ONLY talks to the claude CLI.
+    """
+    conversation_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        conversation_parts.append(f"<{role}>\n{content}\n</{role}>")
+    stdin_payload = "\n\n".join(conversation_parts)
+
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--model",
+        model,
+    ]
+    if system_prompt:
+        cmd.extend(["--append-system-prompt", system_prompt])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "claude CLI not found on PATH. Install Claude Code so chat can run "
+            "on Max-subscription quota instead of paid API."
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"claude CLI timed out after {timeout}s")
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI failed (exit {proc.returncode}): {proc.stderr[:500]}"
+        )
+
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"claude CLI returned non-JSON output: {proc.stdout[:500]}")
+
+    # The `claude -p --output-format json` shape is {"type": "result", "result": "<text>", ...}
+    text = parsed.get("result") or parsed.get("response") or ""
+    if not text and isinstance(parsed.get("content"), list):
+        # Defensive: older shape where content is a list of blocks
+        text = "".join(
+            block.get("text", "")
+            for block in parsed["content"]
+            if isinstance(block, dict)
+        )
+    if not text:
+        raise RuntimeError(
+            f"claude CLI response had no text: {json.dumps(parsed)[:500]}"
+        )
+    return text
 
 
 def _load_episode_context_cached(ep_dir: Path, episode_id: str) -> dict:
@@ -39,9 +120,11 @@ def _load_episode_context_cached(ep_dir: Path, episode_id: str) -> dict:
     cached = _context_cache.get(episode_id)
     now = time.time()
 
-    if (cached
-            and cached["mtime"] == current_mtime
-            and now - cached["loaded_at"] < _CACHE_TTL):
+    if (
+        cached
+        and cached["mtime"] == current_mtime
+        and now - cached["loaded_at"] < _CACHE_TTL
+    ):
         return cached["ctx"]
 
     ctx = _load_episode_context(ep_dir)
@@ -79,6 +162,7 @@ def _save_chat_history(ep_dir: Path, history: list):
 # Request / response models
 # ---------------------------------------------------------------------------
 
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -91,6 +175,7 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers — episode data loading
 # ---------------------------------------------------------------------------
+
 
 def _episode_dir(episode_id: str) -> Path:
     ep_dir = EPISODES_DIR / episode_id
@@ -344,8 +429,8 @@ def _format_transcript_text(diarized: Optional[dict]) -> str:
     first_half = full_text[:half]
     second_half = full_text[-half:]
     # Trim to line boundaries
-    first_half = first_half[:first_half.rfind("\n")]
-    second_half = second_half[second_half.find("\n") + 1:]
+    first_half = first_half[: first_half.rfind("\n")]
+    second_half = second_half[second_half.find("\n") + 1 :]
     omitted = len(lines) - first_half.count("\n") - second_half.count("\n") - 2
     return f"{first_half}\n\n... [{omitted} utterances omitted for length] ...\n\n{second_half}"
 
@@ -358,7 +443,11 @@ def _build_system_prompt(ctx: dict) -> str:
     # Clips JSON (full)
     clips_data = ctx.get("clips")
     if clips_data:
-        clips_list = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+        clips_list = (
+            clips_data.get("clips", clips_data)
+            if isinstance(clips_data, dict)
+            else clips_data
+        )
         clips_json = json.dumps(clips_list, indent=2)
     else:
         clips_json = "No clips data available."
@@ -373,7 +462,9 @@ def _build_system_prompt(ctx: dict) -> str:
     segments_data = ctx.get("segments")
     if segments_data:
         segs = segments_data.get("segments", [])
-        segments_summary = f"{len(segs)} speaker segments. First few: {json.dumps(segs[:5], indent=2)}"
+        segments_summary = (
+            f"{len(segs)} speaker segments. First few: {json.dumps(segs[:5], indent=2)}"
+        )
     else:
         segments_summary = "No segments data available."
 
@@ -389,6 +480,7 @@ def _build_system_prompt(ctx: dict) -> str:
 # ---------------------------------------------------------------------------
 # Action execution
 # ---------------------------------------------------------------------------
+
 
 def _execute_action(action: dict, ep_dir: Path) -> dict:
     """Execute a single action and return a result dict."""
@@ -423,13 +515,21 @@ def _execute_action(action: dict, ep_dir: Path) -> dict:
     elif action_type == "auto_trim":
         return _action_auto_trim(action, ep_dir)
     else:
-        return {"action": action_type, "status": "error", "detail": f"Unknown action: {action_type}"}
+        return {
+            "action": action_type,
+            "status": "error",
+            "detail": f"Unknown action: {action_type}",
+        }
 
 
 def _action_update_clip_metadata(action: dict, ep_dir: Path) -> dict:
     clip_id = action.get("clip_id")
     if not clip_id:
-        return {"action": "update_clip_metadata", "status": "error", "detail": "Missing clip_id"}
+        return {
+            "action": "update_clip_metadata",
+            "status": "error",
+            "detail": "Missing clip_id",
+        }
 
     clips, clips_file = _load_clips(ep_dir)
     for i, clip in enumerate(clips):
@@ -439,15 +539,27 @@ def _action_update_clip_metadata(action: dict, ep_dir: Path) -> dict:
                     clip[field] = action[field]
             clips[i] = clip
             _save_clips(clips, clips_file)
-            return {"action": "update_clip_metadata", "status": "ok", "clip_id": clip_id}
+            return {
+                "action": "update_clip_metadata",
+                "status": "ok",
+                "clip_id": clip_id,
+            }
 
-    return {"action": "update_clip_metadata", "status": "error", "detail": f"Clip {clip_id} not found"}
+    return {
+        "action": "update_clip_metadata",
+        "status": "error",
+        "detail": f"Clip {clip_id} not found",
+    }
 
 
 def _action_update_clip_times(action: dict, ep_dir: Path) -> dict:
     clip_id = action.get("clip_id")
     if not clip_id:
-        return {"action": "update_clip_times", "status": "error", "detail": "Missing clip_id"}
+        return {
+            "action": "update_clip_times",
+            "status": "error",
+            "detail": "Missing clip_id",
+        }
 
     clips, clips_file = _load_clips(ep_dir)
     for i, clip in enumerate(clips):
@@ -458,21 +570,35 @@ def _action_update_clip_times(action: dict, ep_dir: Path) -> dict:
             if "end_seconds" in action:
                 clip["end_seconds"] = action["end_seconds"]
                 clip["end"] = action["end_seconds"]
-            clip["duration"] = clip.get("end_seconds", clip.get("end", 0)) - clip.get("start_seconds", clip.get("start", 0))
+            clip["duration"] = clip.get("end_seconds", clip.get("end", 0)) - clip.get(
+                "start_seconds", clip.get("start", 0)
+            )
             clips[i] = clip
             _save_clips(clips, clips_file)
             return {"action": "update_clip_times", "status": "ok", "clip_id": clip_id}
 
-    return {"action": "update_clip_times", "status": "error", "detail": f"Clip {clip_id} not found"}
+    return {
+        "action": "update_clip_times",
+        "status": "error",
+        "detail": f"Clip {clip_id} not found",
+    }
 
 
 def _action_add_clip(action: dict, ep_dir: Path) -> dict:
     start = action.get("start_seconds")
     end = action.get("end_seconds")
     if start is None or end is None:
-        return {"action": "add_clip", "status": "error", "detail": "Missing start_seconds or end_seconds"}
+        return {
+            "action": "add_clip",
+            "status": "error",
+            "detail": "Missing start_seconds or end_seconds",
+        }
     if end <= start:
-        return {"action": "add_clip", "status": "error", "detail": "end_seconds must be > start_seconds"}
+        return {
+            "action": "add_clip",
+            "status": "error",
+            "detail": "end_seconds must be > start_seconds",
+        }
 
     clips, clips_file = _load_clips(ep_dir)
 
@@ -493,7 +619,9 @@ def _action_add_clip(action: dict, ep_dir: Path) -> dict:
         "duration": end - start,
         "title": action.get("title", "Untitled clip"),
         "hook_text": action.get("hook_text", ""),
-        "compelling_reason": action.get("compelling_reason", "Suggested by AI assistant"),
+        "compelling_reason": action.get(
+            "compelling_reason", "Suggested by AI assistant"
+        ),
         "virality_score": action.get("virality_score", 0),
         "speaker": action.get("speaker", "BOTH"),
         "status": "pending",
@@ -505,7 +633,12 @@ def _action_add_clip(action: dict, ep_dir: Path) -> dict:
     # Auto-generate subtitles and render the short
     render_result = _auto_render_new_clip(clip_id, start, end, ep_dir)
 
-    return {"action": "add_clip", "status": "ok", "clip_id": clip_id, "render": render_result}
+    return {
+        "action": "add_clip",
+        "status": "ok",
+        "clip_id": clip_id,
+        "render": render_result,
+    }
 
 
 def _generate_clip_srt(ep_dir: Path, clip_id: str, start: float, end: float):
@@ -536,9 +669,7 @@ def _generate_clip_srt(ep_dir: Path, clip_id: str, start: float, end: float):
         text = " ".join(w.get("word", "") for w in chunk)
 
         srt_lines.append(
-            f"{idx}\n"
-            f"{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n"
-            f"{text}\n"
+            f"{idx}\n{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n{text}\n"
         )
         idx += 1
         i += 4
@@ -578,14 +709,22 @@ def _action_reject_clip(action: dict, ep_dir: Path) -> dict:
             _save_clips(clips, clips_file)
             return {"action": "reject_clip", "status": "ok", "clip_id": clip_id}
 
-    return {"action": "reject_clip", "status": "error", "detail": f"Clip {clip_id} not found"}
+    return {
+        "action": "reject_clip",
+        "status": "error",
+        "detail": f"Clip {clip_id} not found",
+    }
 
 
 def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
     """Re-render a single short clip using the shorts_render agent for full parity."""
     clip_id = action.get("clip_id")
     if not clip_id:
-        return {"action": "rerender_short", "status": "error", "detail": "Missing clip_id"}
+        return {
+            "action": "rerender_short",
+            "status": "error",
+            "detail": "Missing clip_id",
+        }
 
     clips, _ = _load_clips(ep_dir)
     clip = None
@@ -594,11 +733,19 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
             clip = c
             break
     if not clip:
-        return {"action": "rerender_short", "status": "error", "detail": f"Clip {clip_id} not found"}
+        return {
+            "action": "rerender_short",
+            "status": "error",
+            "detail": f"Clip {clip_id} not found",
+        }
 
     merged_path = ep_dir / "source_merged.mp4"
     if not merged_path.exists():
-        return {"action": "rerender_short", "status": "error", "detail": "source_merged.mp4 not found"}
+        return {
+            "action": "rerender_short",
+            "status": "error",
+            "detail": "source_merged.mp4 not found",
+        }
 
     # Delegate to ShortsRenderAgent so LUT, 10-bit, audio_mix, and per-segment
     # crops are all handled identically to the pipeline render.
@@ -615,7 +762,11 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
         episode_data = agent.load_json("episode.json")
         crop_config = episode_data.get("crop_config")
         if not crop_config:
-            return {"action": "rerender_short", "status": "error", "detail": "crop_config not set"}
+            return {
+                "action": "rerender_short",
+                "status": "error",
+                "detail": "crop_config not set",
+            }
 
         # Audio source — use H6E audio_mix.wav when available
         audio_mix_path = ep_dir / "work" / "audio_mix.wav"
@@ -628,6 +779,7 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
 
         # Probe source dimensions
         from lib.ffprobe import probe as ffprobe
+
         probe = ffprobe(merged_path)
         video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
         src_w = int(video_stream["width"])
@@ -648,16 +800,29 @@ def _action_rerender_short(action: dict, ep_dir: Path) -> dict:
 
         output_path = shorts_dir / f"{clip_id}.mp4"
         agent._render_short(
-            merged_path, output_path, srt_path,
-            start, end, segments,
-            src_w, src_h, audio_bitrate,
-            crop_config, encoder_args, lut_filter,
+            merged_path,
+            output_path,
+            srt_path,
+            start,
+            end,
+            segments,
+            src_w,
+            src_h,
+            audio_bitrate,
+            crop_config,
+            encoder_args,
+            lut_filter,
             audio_mix_path,
         )
     except Exception as e:
         return {"action": "rerender_short", "status": "error", "detail": str(e)[:500]}
 
-    return {"action": "rerender_short", "status": "ok", "clip_id": clip_id, "output": str(output_path)}
+    return {
+        "action": "rerender_short",
+        "status": "ok",
+        "clip_id": clip_id,
+        "output": str(output_path),
+    }
 
 
 def _action_approve_clips(action: dict, ep_dir: Path) -> dict:
@@ -681,7 +846,12 @@ def _action_approve_clips(action: dict, ep_dir: Path) -> dict:
     if approved:
         _save_clips(clips, clips_file)
 
-    return {"action": "approve_clips", "status": "ok", "approved": approved, "count": len(approved)}
+    return {
+        "action": "approve_clips",
+        "status": "ok",
+        "approved": approved,
+        "count": len(approved),
+    }
 
 
 def _action_reject_clips(action: dict, ep_dir: Path) -> dict:
@@ -705,7 +875,12 @@ def _action_reject_clips(action: dict, ep_dir: Path) -> dict:
     if rejected:
         _save_clips(clips, clips_file)
 
-    return {"action": "reject_clips", "status": "ok", "rejected": rejected, "count": len(rejected)}
+    return {
+        "action": "reject_clips",
+        "status": "ok",
+        "rejected": rejected,
+        "count": len(rejected),
+    }
 
 
 def _action_update_platform_metadata(action: dict, ep_dir: Path) -> dict:
@@ -713,7 +888,11 @@ def _action_update_platform_metadata(action: dict, ep_dir: Path) -> dict:
     clip_id = action.get("clip_id")
     platform = action.get("platform")
     if not clip_id or not platform:
-        return {"action": "update_platform_metadata", "status": "error", "detail": "Missing clip_id or platform"}
+        return {
+            "action": "update_platform_metadata",
+            "status": "error",
+            "detail": "Missing clip_id or platform",
+        }
 
     clips, clips_file = _load_clips(ep_dir)
     for i, clip in enumerate(clips):
@@ -728,9 +907,18 @@ def _action_update_platform_metadata(action: dict, ep_dir: Path) -> dict:
             clip["metadata"] = meta
             clips[i] = clip
             _save_clips(clips, clips_file)
-            return {"action": "update_platform_metadata", "status": "ok", "clip_id": clip_id, "platform": platform}
+            return {
+                "action": "update_platform_metadata",
+                "status": "ok",
+                "clip_id": clip_id,
+                "platform": platform,
+            }
 
-    return {"action": "update_platform_metadata", "status": "error", "detail": f"Clip {clip_id} not found"}
+    return {
+        "action": "update_platform_metadata",
+        "status": "error",
+        "detail": f"Clip {clip_id} not found",
+    }
 
 
 def _action_delete_clip(action: dict, ep_dir: Path) -> dict:
@@ -744,7 +932,11 @@ def _action_delete_clip(action: dict, ep_dir: Path) -> dict:
     clips = [c for c in clips if c.get("id") != clip_id]
 
     if len(clips) == original_len:
-        return {"action": "delete_clip", "status": "error", "detail": f"Clip {clip_id} not found"}
+        return {
+            "action": "delete_clip",
+            "status": "error",
+            "detail": f"Clip {clip_id} not found",
+        }
 
     _save_clips(clips, clips_file)
     return {"action": "delete_clip", "status": "ok", "clip_id": clip_id}
@@ -762,12 +954,20 @@ def _action_update_longform_metadata(action: dict, ep_dir: Path) -> dict:
             updated.append(field)
 
     if not updated:
-        return {"action": "update_longform_metadata", "status": "error", "detail": "No fields to update"}
+        return {
+            "action": "update_longform_metadata",
+            "status": "error",
+            "detail": "No fields to update",
+        }
 
     with open(episode_file, "w") as f:
         json.dump(episode_data, f, indent=2)
 
-    return {"action": "update_longform_metadata", "status": "ok", "updated_fields": updated}
+    return {
+        "action": "update_longform_metadata",
+        "status": "ok",
+        "updated_fields": updated,
+    }
 
 
 def _action_update_episode_info(action: dict, ep_dir: Path) -> dict:
@@ -782,7 +982,11 @@ def _action_update_episode_info(action: dict, ep_dir: Path) -> dict:
             updated.append(field)
 
     if not updated:
-        return {"action": "update_episode_info", "status": "error", "detail": "No fields to update"}
+        return {
+            "action": "update_episode_info",
+            "status": "error",
+            "detail": "No fields to update",
+        }
 
     with open(episode_file, "w") as f:
         json.dump(episode_data, f, indent=2)
@@ -794,7 +998,11 @@ def _action_edit_longform(action: dict, ep_dir: Path) -> dict:
     """Add a cut or trim edit to the longform video."""
     edit_type = action.get("type")
     if edit_type not in ("cut", "trim_start", "trim_end"):
-        return {"action": "edit_longform", "status": "error", "detail": f"Unknown edit type: {edit_type}"}
+        return {
+            "action": "edit_longform",
+            "status": "error",
+            "detail": f"Unknown edit type: {edit_type}",
+        }
 
     episode_file = ep_dir / "episode.json"
     episode_data = _load_json_safe(episode_file) or {}
@@ -804,21 +1012,50 @@ def _action_edit_longform(action: dict, ep_dir: Path) -> dict:
         start = action.get("start_seconds")
         end = action.get("end_seconds")
         if start is None or end is None:
-            return {"action": "edit_longform", "status": "error", "detail": "Missing start_seconds or end_seconds"}
+            return {
+                "action": "edit_longform",
+                "status": "error",
+                "detail": "Missing start_seconds or end_seconds",
+            }
         if end <= start:
-            return {"action": "edit_longform", "status": "error", "detail": "end_seconds must be > start_seconds"}
-        edit = {"type": "cut", "start_seconds": start, "end_seconds": end,
-                "reason": action.get("reason", ""), "duration_removed": round(end - start, 2)}
+            return {
+                "action": "edit_longform",
+                "status": "error",
+                "detail": "end_seconds must be > start_seconds",
+            }
+        edit = {
+            "type": "cut",
+            "start_seconds": start,
+            "end_seconds": end,
+            "reason": action.get("reason", ""),
+            "duration_removed": round(end - start, 2),
+        }
     elif edit_type == "trim_start":
         seconds = action.get("seconds")
         if seconds is None:
-            return {"action": "edit_longform", "status": "error", "detail": "Missing seconds"}
-        edit = {"type": "trim_start", "seconds": seconds, "reason": action.get("reason", "")}
+            return {
+                "action": "edit_longform",
+                "status": "error",
+                "detail": "Missing seconds",
+            }
+        edit = {
+            "type": "trim_start",
+            "seconds": seconds,
+            "reason": action.get("reason", ""),
+        }
     elif edit_type == "trim_end":
         seconds = action.get("seconds")
         if seconds is None:
-            return {"action": "edit_longform", "status": "error", "detail": "Missing seconds"}
-        edit = {"type": "trim_end", "seconds": seconds, "reason": action.get("reason", "")}
+            return {
+                "action": "edit_longform",
+                "status": "error",
+                "detail": "Missing seconds",
+            }
+        edit = {
+            "type": "trim_end",
+            "seconds": seconds,
+            "reason": action.get("reason", ""),
+        }
 
     edits.append(edit)
     episode_data["longform_edits"] = edits
@@ -826,23 +1063,35 @@ def _action_edit_longform(action: dict, ep_dir: Path) -> dict:
     with open(episode_file, "w") as f:
         json.dump(episode_data, f, indent=2)
 
-    return {"action": "edit_longform", "status": "ok", "edit": edit, "total_edits": len(edits)}
+    return {
+        "action": "edit_longform",
+        "status": "ok",
+        "edit": edit,
+        "total_edits": len(edits),
+    }
 
 
 def _action_auto_trim(action: dict, ep_dir: Path) -> dict:
     """Auto-detect fluff at start/end and create trim edits using Claude."""
-    import httpx
 
     # Load transcript
     transcribe_file = ep_dir / "transcribe.json"
     if not transcribe_file.exists():
-        return {"action": "auto_trim", "status": "error", "detail": "No transcript available. Run transcribe first."}
+        return {
+            "action": "auto_trim",
+            "status": "error",
+            "detail": "No transcript available. Run transcribe first.",
+        }
 
     transcribe_data = _load_json_safe(transcribe_file) or {}
     diarized = transcribe_data.get("diarized", {})
     utterances = diarized.get("utterances", [])
     if not utterances:
-        return {"action": "auto_trim", "status": "error", "detail": "No utterances in transcript."}
+        return {
+            "action": "auto_trim",
+            "status": "error",
+            "detail": "No utterances in transcript.",
+        }
 
     episode_data = _load_json_safe(ep_dir / "episode.json") or {}
     duration = episode_data.get("duration_seconds", 0)
@@ -872,7 +1121,7 @@ def _action_auto_trim(action: dict, ep_dir: Path) -> dict:
 ## Last 5 minutes of transcript:
 {chr(10).join(last_lines[-100:])}
 
-## Total episode duration: {duration:.1f} seconds ({duration/60:.1f} minutes)
+## Total episode duration: {duration:.1f} seconds ({duration / 60:.1f} minutes)
 
 Find:
 1. **trim_start**: The timestamp (in seconds) where the actual substantive conversation/interview begins. Skip past any: mic checks, "are we rolling?", "let me adjust this", greetings before the interview actually starts, test claps, setup talk. Find where the host's first real question or introduction begins.
@@ -884,40 +1133,50 @@ Respond with ONLY a JSON object, no other text:
 
 If the episode starts or ends cleanly (no fluff to trim), use 0 for trim_start or the full duration for trim_end."""
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return {"action": "auto_trim", "status": "error", "detail": "ANTHROPIC_API_KEY not set"}
-
     try:
-        resp = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=30.0,
+        content = _call_claude(
+            system_prompt="",
+            messages=[{"role": "user", "content": prompt}],
+            model="sonnet",
+            timeout=60.0,
         )
-        resp.raise_for_status()
-        content = resp.json()["content"][0]["text"]
-        # Extract JSON from response
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
         if not json_match:
-            return {"action": "auto_trim", "status": "error", "detail": f"Could not parse AI response: {content[:200]}"}
+            return {
+                "action": "auto_trim",
+                "status": "error",
+                "detail": f"Could not parse AI response: {content[:200]}",
+            }
         trim_data = json.loads(json_match.group())
     except Exception as e:
-        return {"action": "auto_trim", "status": "error", "detail": f"AI analysis failed: {e}"}
+        return {
+            "action": "auto_trim",
+            "status": "error",
+            "detail": f"AI analysis failed: {e}",
+        }
 
     edits = episode_data.get("longform_edits", [])
     results = []
 
     ts = trim_data.get("trim_start", {})
     if ts and ts.get("seconds", 0) > 5:  # Only trim if more than 5s of fluff
-        edit = {"type": "trim_start", "seconds": ts["seconds"], "reason": ts.get("reason", "Auto-detected start")}
+        edit = {
+            "type": "trim_start",
+            "seconds": ts["seconds"],
+            "reason": ts.get("reason", "Auto-detected start"),
+        }
         edits.append(edit)
         results.append(edit)
 
     te = trim_data.get("trim_end", {})
-    if te and te.get("seconds", duration) < duration - 5:  # Only trim if more than 5s of fluff
-        edit = {"type": "trim_end", "seconds": te["seconds"], "reason": te.get("reason", "Auto-detected end")}
+    if (
+        te and te.get("seconds", duration) < duration - 5
+    ):  # Only trim if more than 5s of fluff
+        edit = {
+            "type": "trim_end",
+            "seconds": te["seconds"],
+            "reason": te.get("reason", "Auto-detected end"),
+        }
         edits.append(edit)
         results.append(edit)
 
@@ -925,7 +1184,12 @@ If the episode starts or ends cleanly (no fluff to trim), use 0 for trim_start o
     with open(ep_dir / "episode.json", "w") as f:
         json.dump(episode_data, f, indent=2)
 
-    return {"action": "auto_trim", "status": "ok", "edits": results, "total_edits": len(edits)}
+    return {
+        "action": "auto_trim",
+        "status": "ok",
+        "edits": results,
+        "total_edits": len(edits),
+    }
 
 
 def _action_rerender_longform(action: dict, ep_dir: Path) -> dict:
@@ -939,6 +1203,7 @@ def _action_rerender_longform(action: dict, ep_dir: Path) -> dict:
     try:
         from agents.pipeline import load_config
         from agents import AGENT_REGISTRY
+
         config = load_config()
         agent_cls = AGENT_REGISTRY["longform_render"]
         agent = agent_cls(ep_dir, config)
@@ -951,6 +1216,7 @@ def _action_rerender_longform(action: dict, ep_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Metadata completeness checker
 # ---------------------------------------------------------------------------
+
 
 def _check_metadata_completeness(ep_dir: Path) -> dict:
     """Check what metadata fields are missing for the episode and its clips.
@@ -970,7 +1236,17 @@ def _check_metadata_completeness(ep_dir: Path) -> dict:
             missing_longform.append(field)
 
     # Check per-clip metadata (only non-rejected clips)
-    platforms = ["youtube", "tiktok", "instagram", "linkedin", "x", "facebook", "threads", "pinterest", "bluesky"]
+    platforms = [
+        "youtube",
+        "tiktok",
+        "instagram",
+        "linkedin",
+        "x",
+        "facebook",
+        "threads",
+        "pinterest",
+        "bluesky",
+    ]
     missing_clips = {}
     for clip in clips:
         if clip.get("status") == "rejected":
@@ -1005,6 +1281,7 @@ def _check_metadata_completeness(ep_dir: Path) -> dict:
 # Parse action blocks from AI response
 # ---------------------------------------------------------------------------
 
+
 def _parse_actions(text: str) -> list:
     """Extract action JSON blocks from ```action ... ``` fences in AI response."""
     pattern = r"```action\s*\n(.*?)\n```"
@@ -1029,6 +1306,7 @@ def _strip_action_blocks(text: str) -> str:
 # Chat endpoint
 # ---------------------------------------------------------------------------
 
+
 @router.get("/chat/history")
 async def get_chat_history(episode_id: str) -> dict:
     """Return persisted chat history for an episode."""
@@ -1041,49 +1319,44 @@ async def get_chat_history(episode_id: str) -> dict:
 async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
     """Chat with an AI assistant about the episode. The assistant can view and
     modify clips, suggest new ones, re-render shorts, and answer questions."""
-    logger.info("POST /api/episodes/%s/chat message_length=%d", episode_id, len(req.message))
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-
+    logger.info(
+        "POST /api/episodes/%s/chat message_length=%d", episode_id, len(req.message)
+    )
     ep_dir = _episode_dir(episode_id)
+    if not ep_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+
     ctx = _load_episode_context_cached(ep_dir, episode_id)
     system_prompt = _build_system_prompt(ctx)
 
-    # Call Anthropic API
-    try:
-        import anthropic
-    except ImportError:
-        raise HTTPException(status_code=500, detail="anthropic package is not installed")
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Load config for model selection
+    # Load config for model selection (accepts the existing config key, but maps
+    # the old API model string to a CLI tier keyword).
     from agents.pipeline import load_config
+
     config = load_config()
-    chat_model = config.get("chat", {}).get("model", "claude-sonnet-4-20250514")
+    chat_model = config.get("chat", {}).get("model", "sonnet")
+    # If config still has an API-style model string, coerce to a CLI tier.
+    if "opus" in chat_model:
+        chat_model = "opus"
+    elif "haiku" in chat_model:
+        chat_model = "haiku"
+    else:
+        chat_model = "sonnet"
 
     # Load conversation history for multi-turn context
     history = _load_chat_history(ep_dir)
     messages = history + [{"role": "user", "content": req.message}]
 
     try:
-        message = client.messages.create(
-            model=chat_model,
-            max_tokens=4096,
-            temperature=0.4,
-            system=system_prompt,
+        ai_text = _call_claude(
+            system_prompt=system_prompt,
             messages=messages,
+            model=chat_model,
+            timeout=180.0,
         )
-    except Exception as e:
-        logger.error("Anthropic API error for %s: %s", episode_id, e)
-        raise HTTPException(status_code=500, detail=f"Anthropic API error: {str(e)}")
-
-    # Extract text from response
-    ai_text = ""
-    for block in message.content:
-        if hasattr(block, "text"):
-            ai_text += block.text
+    except RuntimeError as e:
+        logger.error("claude CLI error for %s: %s", episode_id, e)
+        raise HTTPException(status_code=500, detail=f"claude CLI error: {str(e)}")
 
     # Save conversation history
     history.append({"role": "user", "content": req.message})
@@ -1110,6 +1383,7 @@ async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
 # Auto-complete metadata endpoint
 # ---------------------------------------------------------------------------
 
+
 class CompleteMetadataResponse(BaseModel):
     complete: bool
     iterations: int
@@ -1124,21 +1398,20 @@ async def complete_metadata(episode_id: str) -> dict:
     Loops up to 5 times: check what's missing, ask Claude to fill it, execute actions.
     """
     logger.info("POST /api/episodes/%s/complete-metadata", episode_id)
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-
     ep_dir = _episode_dir(episode_id)
+    if not ep_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
 
-    try:
-        import anthropic
-    except ImportError:
-        raise HTTPException(status_code=500, detail="anthropic package is not installed")
-
-    client = anthropic.Anthropic(api_key=api_key)
     from agents.pipeline import load_config
+
     config = load_config()
-    chat_model = config.get("chat", {}).get("model", "claude-sonnet-4-20250514")
+    chat_model = config.get("chat", {}).get("model", "sonnet")
+    if "opus" in chat_model:
+        chat_model = "opus"
+    elif "haiku" in chat_model:
+        chat_model = "haiku"
+    else:
+        chat_model = "sonnet"
 
     all_actions = []
     max_iterations = 5
@@ -1160,7 +1433,9 @@ async def complete_metadata(episode_id: str) -> dict:
 
         missing_parts = []
         if status["missing_longform"]:
-            missing_parts.append(f"Missing longform fields: {', '.join(status['missing_longform'])}")
+            missing_parts.append(
+                f"Missing longform fields: {', '.join(status['missing_longform'])}"
+            )
         if status["missing_clips"]:
             # Only list first 5 clips to keep prompt manageable
             clip_items = list(status["missing_clips"].items())[:5]
@@ -1168,7 +1443,9 @@ async def complete_metadata(episode_id: str) -> dict:
                 missing_parts.append(f"  {clip_id}: missing {', '.join(fields)}")
             remaining = len(status["missing_clips"]) - len(clip_items)
             if remaining > 0:
-                missing_parts.append(f"  ... and {remaining} more clips with missing metadata")
+                missing_parts.append(
+                    f"  ... and {remaining} more clips with missing metadata"
+                )
 
         user_prompt = (
             "Please fill in all the missing metadata listed below. "
@@ -1181,26 +1458,20 @@ async def complete_metadata(episode_id: str) -> dict:
         )
 
         try:
-            message = client.messages.create(
-                model=chat_model,
-                max_tokens=8192,
-                temperature=0.4,
-                system=system_prompt,
+            ai_text = _call_claude(
+                system_prompt=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
+                model=chat_model,
+                timeout=240.0,
             )
-        except Exception as e:
-            logger.error("Anthropic API error in complete-metadata: %s", e)
+        except RuntimeError as e:
+            logger.error("claude CLI error in complete-metadata: %s", e)
             return {
                 "complete": False,
                 "iterations": iteration + 1,
                 "actions_taken": all_actions,
-                "summary": f"API error on iteration {iteration + 1}: {str(e)}",
+                "summary": f"claude CLI error on iteration {iteration + 1}: {str(e)}",
             }
-
-        ai_text = ""
-        for block in message.content:
-            if hasattr(block, "text"):
-                ai_text += block.text
 
         # Parse and execute actions
         actions = _parse_actions(ai_text)

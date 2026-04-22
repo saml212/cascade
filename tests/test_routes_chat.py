@@ -4,20 +4,10 @@ from tests.test_routes_episodes import _create_episode, test_client  # noqa: F40
 
 
 class TestChatEndpoint:
-    def test_no_api_key(self, test_client, monkeypatch):  # noqa: F811
-        client, episodes_dir = test_client
-        _create_episode(episodes_dir, "ep_001")
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-        resp = client.post("/api/episodes/ep_001/chat", json={"message": "Hello"})
-        assert resp.status_code == 500
-        assert "ANTHROPIC_API_KEY" in resp.json()["detail"]
-
-    def test_episode_not_found(self, test_client, monkeypatch):  # noqa: F811
-        # The chat route's episode-existence check happens after client init,
-        # so when ANTHROPIC_API_KEY is missing we'd get 500 before 404. Set a
-        # fake key so the route reaches the 404 branch.
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    def test_episode_not_found(self, test_client):  # noqa: F811
+        # Chat route now talks to the claude CLI, not the paid Anthropic API,
+        # so it no longer requires ANTHROPIC_API_KEY. Missing episode should
+        # return 404 cleanly.
         client, _ = test_client
         resp = client.post("/api/episodes/nonexistent/chat", json={"message": "Hello"})
         assert resp.status_code == 404
