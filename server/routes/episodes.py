@@ -1,8 +1,10 @@
 """Episode endpoints."""
 
+import asyncio
 import json
 import logging
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -13,6 +15,22 @@ from pydantic import BaseModel
 
 from lib.atomic_write import atomic_write_json
 from lib.clips import normalize_clip as _normalize_clip
+
+
+async def _run_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Run an ffmpeg (or similar blocking subprocess) on a thread so the
+    asyncio event loop stays responsive. ffmpeg on large 32-bit float WAVs
+    can take minutes; calling subprocess.run inline wedges uvicorn and
+    starves every other request until it finishes.
+    """
+    return await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+
+
 from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
@@ -402,9 +420,12 @@ async def get_audio_preview(
 
     start/duration are in video time; the sync offset from episode.json is
     applied automatically so the audio lines up with what's on screen.
-    """
-    import subprocess
 
+    ffmpeg runs on a thread (via _run_ffmpeg) so the asyncio event loop
+    stays responsive. WAVs here are often 1-2GB 32-bit float and the
+    transcode can take 30-60s on first call; running sync would block
+    every other request for that duration.
+    """
     ep = read_episode(episode_id)
     ep_dir = EPISODES_DIR / episode_id
 
@@ -449,7 +470,7 @@ async def get_audio_preview(
             "128k",
             str(cache_file),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = await _run_ffmpeg(cmd)
         if result.returncode != 0:
             raise HTTPException(
                 status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
@@ -473,9 +494,10 @@ async def get_channel_preview(
     identify which speaker is on which side when setting up crop config.
 
     channel: "left" or "right"
-    """
-    import subprocess
 
+    ffmpeg runs on a thread (via _run_ffmpeg) so the event loop stays
+    responsive even if source_merged.mp4 seek + transcode takes seconds.
+    """
     if channel not in ("left", "right"):
         raise HTTPException(status_code=400, detail="channel must be 'left' or 'right'")
 
@@ -509,7 +531,7 @@ async def get_channel_preview(
             "128k",
             str(cache_file),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = await _run_ffmpeg(cmd)
         if result.returncode != 0:
             raise HTTPException(
                 status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"

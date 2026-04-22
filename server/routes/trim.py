@@ -1,5 +1,6 @@
 """Trim endpoint — trim source and longform video files."""
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ EPISODES_DIR = get_episodes_dir()
 # Request / response models
 # ---------------------------------------------------------------------------
 
+
 class TrimRequest(BaseModel):
     trim_start_seconds: float = 0.0
     trim_end_seconds: float = 0.0
@@ -38,6 +40,7 @@ class TrimResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _episode_dir(episode_id: str) -> Path:
     ep_dir = EPISODES_DIR / episode_id
@@ -88,12 +91,18 @@ def _fix_track_durations(mp4_path: Path) -> Path:
     shorter = min(v_dur, a_dur)
     fixed_path = mp4_path.with_suffix(".fixed.mp4")
     fix_cmd = [
-        "ffmpeg", "-y",
-        "-i", str(mp4_path),
-        "-t", str(shorter),
-        "-c", "copy",
-        "-use_editlist", "0",
-        "-movflags", "+faststart",
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(mp4_path),
+        "-t",
+        str(shorter),
+        "-c",
+        "copy",
+        "-use_editlist",
+        "0",
+        "-movflags",
+        "+faststart",
         str(fixed_path),
     ]
     try:
@@ -110,14 +119,25 @@ def _fix_track_durations(mp4_path: Path) -> Path:
 # Trim endpoint
 # ---------------------------------------------------------------------------
 
+
 @router.post("/trim")
 async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
     """Trim the source_merged.mp4 by cutting off the beginning and/or end.
 
     Creates a backup of the original before replacing it.
+
+    Short-circuits when the trim is a no-op (trim_start=0 and
+    trim_end=0 or equal to full duration) — a 1.6GB ffmpeg copy for zero
+    trim was wedging the endpoint for 10+ minutes on accidental calls.
+    ffmpeg runs on a thread so the asyncio event loop stays responsive.
     """
-    logger.info("POST /api/episodes/%s/trim start=%.1f end=%.1f",
-                episode_id, req.trim_start_seconds, req.trim_end_seconds)
+
+    logger.info(
+        "POST /api/episodes/%s/trim start=%.1f end=%.1f",
+        episode_id,
+        req.trim_start_seconds,
+        req.trim_end_seconds,
+    )
     ep_dir = _episode_dir(episode_id)
     source_path = ep_dir / "source_merged.mp4"
 
@@ -140,30 +160,54 @@ async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
     if trim_end > current_duration:
         trim_end = current_duration
     if trim_start >= trim_end:
-        raise HTTPException(status_code=400, detail="Trim start must be before trim end")
+        raise HTTPException(
+            status_code=400, detail="Trim start must be before trim end"
+        )
+
+    # Short-circuit: if the trim is effectively a no-op (both ends match the
+    # current bounds within 0.05s), skip the 1.6GB ffmpeg copy entirely.
+    epsilon = 0.05
+    if trim_start < epsilon and abs(current_duration - trim_end) < epsilon:
+        return {
+            "status": "noop",
+            "message": "Trim matched existing bounds — nothing to do.",
+            "duration_seconds": current_duration,
+        }
 
     new_duration = trim_end - trim_start
 
     # Render trimmed version
     trimmed_path = ep_dir / "source_merged_trimmed.mp4"
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(trim_start),
-        "-to", str(trim_end),
-        "-i", str(source_path),
-        "-c", "copy",
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(trim_start),
+        "-to",
+        str(trim_end),
+        "-i",
+        str(source_path),
+        "-c",
+        "copy",
         "-shortest",
-        "-avoid_negative_ts", "make_zero",
-        "-use_editlist", "0",
-        "-movflags", "+faststart",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-use_editlist",
+        "0",
+        "-movflags",
+        "+faststart",
         str(trimmed_path),
     ]
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, check=True
+        )
     except subprocess.CalledProcessError as e:
         logger.error("ffmpeg trim failed for %s: %s", episode_id, e.stderr[:500])
-        raise HTTPException(status_code=500, detail=f"ffmpeg trim failed: {e.stderr[:500]}")
+        raise HTTPException(
+            status_code=500, detail=f"ffmpeg trim failed: {e.stderr[:500]}"
+        )
 
     # Backup original and replace
     backup_path = ep_dir / "source_merged_original.mp4"
@@ -182,21 +226,35 @@ async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
         longform_backup = ep_dir / "longform_original.mp4"
         longform_trimmed = ep_dir / "longform_trimmed.mp4"
         lf_cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(trim_start),
-            "-to", str(trim_end),
-            "-i", str(longform_path),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            "-use_editlist", "0",
-            "-movflags", "+faststart",
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(trim_start),
+            "-to",
+            str(trim_end),
+            "-i",
+            str(longform_path),
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-use_editlist",
+            "0",
+            "-movflags",
+            "+faststart",
             str(longform_trimmed),
         ]
         try:
-            subprocess.run(lf_cmd, capture_output=True, text=True, check=True)
+            await asyncio.to_thread(
+                subprocess.run, lf_cmd, capture_output=True, text=True, check=True
+            )
         except subprocess.CalledProcessError as e:
-            logger.error("ffmpeg longform trim failed for %s: %s", episode_id, e.stderr[:500])
-            raise HTTPException(status_code=500, detail=f"ffmpeg longform trim failed: {e.stderr[:500]}")
+            logger.error(
+                "ffmpeg longform trim failed for %s: %s", episode_id, e.stderr[:500]
+            )
+            raise HTTPException(
+                status_code=500, detail=f"ffmpeg longform trim failed: {e.stderr[:500]}"
+            )
 
         # Verify audio/video track durations match; fix if they diverge
         longform_trimmed = _fix_track_durations(longform_trimmed)
