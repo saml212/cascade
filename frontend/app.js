@@ -324,6 +324,28 @@ function showToast(message, type) {
   }, 3000);
 }
 
+function showToastLong(message, type, ms = 7000) {
+  const existing = document.getElementById('cascade-toast');
+  if (existing) existing.remove();
+
+  const colors = {
+    success: 'bg-green-800 border-green-700 text-green-200',
+    error: 'bg-red-900 border-red-800 text-red-200',
+    info: 'bg-zinc-800 border-zinc-700 text-zinc-200',
+  };
+
+  const toast = document.createElement('div');
+  toast.id = 'cascade-toast';
+  toast.className = `fixed bottom-6 right-6 z-50 px-4 py-3 rounded-lg border text-sm font-medium shadow-lg toast-enter ${colors[type] || colors.info}`;
+  toast.style.whiteSpace = 'pre-line';
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add('toast-exit');
+    setTimeout(() => toast.remove(), 300);
+  }, ms);
+}
+
 
 // ════════════════════════════════════════════════════════════════════
 //  DASHBOARD VIEW
@@ -2639,7 +2661,7 @@ async function renderCropSetup(episodeId) {
           <button onclick="toggleTrackSolo(${i})" id="mixer-solo-${i}" class="w-6 h-6 text-[10px] font-bold rounded bg-zinc-800 text-zinc-500 hover:text-yellow-400 transition-colors" title="Solo">S</button>
           <button onclick="toggleTrackMute(${i})" id="mixer-mute-${i}" class="w-6 h-6 text-[10px] font-bold rounded bg-zinc-800 text-zinc-500 hover:text-red-400 transition-colors" title="Mute">M</button>
           <canvas id="mixer-meter-${i}" width="200" height="16" class="rounded" style="background:#111;min-width:100px;height:16px;flex:2;"></canvas>
-          <input type="range" id="mixer-vol-${i}" min="0" max="200" value="${Math.round(t.volume * 100)}" oninput="setMixerTrackVolume(${i},this.value)" class="w-16 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+          <input type="range" id="mixer-vol-${i}" min="0" max="200" value="${Math.round(t.volume * 100)}" oninput="setMixerTrackVolume(${i},this.value)" class="w-48 h-2 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
           <span id="mixer-vol-label-${i}" class="text-xs text-zinc-400 w-8 text-right font-mono">${Math.round(t.volume * 100)}%</span>
           <select id="mixer-assign-${i}" onchange="assignMixerTrack(${i},this.value)" class="bg-zinc-800 border border-zinc-700 rounded text-xs text-zinc-300 px-1.5 py-1 w-24">
             <option value="">—</option>
@@ -3064,7 +3086,28 @@ async function saveCropConfig(episodeId) {
 
     if (mixerState.playing) stopMixerPlayback();
     try { await api(`/episodes/${episodeId}/resume-pipeline`, { method: 'POST' }); } catch {}
-    showToast('Crop config saved. Pipeline resuming.', 'success');
+
+    // Build a summary of what was persisted to crop_config
+    const volumeLines = [];
+    for (const s of cropState.speakers) {
+      let vol = 100;
+      if (mixerState.tracks.length > 0 && s.track) {
+        const mt = mixerState.tracks.find(t => t.trackNumber === s.track);
+        if (mt) vol = Math.round(mt.volume * 100);
+      }
+      volumeLines.push(`  • ${escapeHtml(s.label)}: ${vol}%`);
+    }
+    for (const at of ambientTracks) {
+      const mt = mixerState.tracks.find(t => (t.stem && t.stem === at.stem) || (t.trackNumber && t.trackNumber === at.track_number));
+      const vol = mt ? Math.round(mt.volume * 100) : Math.round(at.volume * 100);
+      const lbl = mt ? mt.label : (at.stem || 'Ambient');
+      volumeLines.push(`  • Ambient (${escapeHtml(lbl)}): ${vol}%`);
+    }
+    const toastMsg = volumeLines.length > 0
+      ? `Crop saved. Volumes persisted:\n${volumeLines.join('\n')}\naudio_mix.wav regenerating in background.`
+      : 'Crop config saved. Pipeline resuming.';
+    showToastLong(toastMsg, 'success', 7000);
+
     window.location.hash = `#/episodes/${episodeId}`;
   } catch (err) {
     showToast('Failed to save crop config: ' + err.message, 'error');
@@ -3233,7 +3276,7 @@ function renderAudioTab(episodeId, ep) {
             <canvas id="mixer-meter-${i}" width="200" height="16" class="rounded" style="background:#111;min-width:80px;height:16px;flex:2;"></canvas>
             <input type="range" id="mixer-vol-${i}" data-mix-stem="${escapeHtml(t.stem)}" min="0" max="300" value="${pct}"
               oninput="setMixerTrackVolume(${i},this.value)"
-              class="w-20 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
+              class="w-48 h-2 bg-zinc-700 rounded-lg appearance-none cursor-pointer">
             <span id="mixer-vol-label-${i}" class="text-xs text-zinc-400 w-10 text-right font-mono">${pct}%</span>
           </div>`;
           }).join('')}

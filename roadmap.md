@@ -87,7 +87,25 @@ Longer-term workstreams captured during the 2026-04-21 session. Ordered roughly 
 
 **Size:** long-running.
 
-### 10. pebbleml.com (Sam's research blog)
+### 10. Audio quality + EQ production-level tuning
+
+**What:** The `audio_enhance.py` filter chain is functional (DFN denoise → highpass → lowpass → compressor → deesser → two-pass loudnorm -14 LUFS) but has not had a dedicated research pass for "production podcast sound" — the level Sam expects from channels like Huberman / Acquired / Dwarkesh. Current state: the pipeline makes audio listenable; it doesn't make it sound like a high-end podcast.
+
+**Why:** Bad audio is the single biggest reason viewers bounce. Even mediocre video + great audio performs better than the inverse. The mixer UI is in place but Sam can hear that the current chain isn't at the bar.
+
+**How:** Use `/autoresearch` on the audio-enhance filter graph. Benchmark against a reference set (a PJ clip, a Tug Life clip), using a rubric: speech clarity, breath/plosive control, room-tone reduction, background-music bleed, perceived loudness match. Explore: DFN wet/dry curves, adding a de-reverb stage, multi-band compression, final limiter, sibilance management, headroom choice.
+
+**Size:** Focused 1-2 sessions of research + tuning, then iterate per-episode as Sam's ear catches new issues.
+
+### 11. Preview-vs-final audio parity in crop mixer
+
+**What:** The Audio Track Mixer's Play button previews audio using Web Audio API with client-side gain nodes. When Sam saves, `audio_mix.wav` regenerates server-side using the same volumes BUT also applies the full `audio_enhance` chain (DFN denoise, compression, loudnorm, etc). So preview ≠ final output. This destroys Sam's confidence in the mixer ("I haven't seen any this work").
+
+**Fix:** Either (a) after save, offer a 30s preview of the newly-generated `audio_mix.wav` so Sam hears the real output, or (b) move the mixer preview to use the server-generated `audio_mix.wav` (slower, more accurate).
+
+**Size:** 1 session.
+
+### 12. pebbleml.com (Sam's research blog)
 
 **What:** Promote pebbleml.com separately from the podcast. Add to `thelocalpod.link` bio. Separate Reddit + Substack posting cadence.
 
