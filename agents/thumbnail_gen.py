@@ -31,15 +31,46 @@ class ThumbnailGenAgent(BaseAgent):
     name = "thumbnail_gen"
 
     def execute(self) -> dict:
+        # Same safety pattern as clip_miner + metadata_gen:
+        # 1. If thumbnail.png already exists, skip the agent (idempotent).
+        # 2. If missing AND CASCADE_ALLOW_API_THUMBNAIL_GEN is not "1", raise
+        #    rather than silently consuming paid API tokens (this agent hits
+        #    BOTH Anthropic for prompt generation AND OpenAI for image
+        #    generation). The long-term fix is to dispatch a
+        #    thumbnail-prompt-writer subagent via /produce; for now, the gate
+        #    makes accidental API consumption structurally impossible.
+        if (self.episode_dir / "thumbnail.png").exists():
+            self.logger.info(
+                "thumbnail.png already exists — skipping programmatic thumbnail_gen."
+            )
+            return {"_status": "skipped", "reason": "thumbnail.png already present"}
+
+        if os.getenv("CASCADE_ALLOW_API_THUMBNAIL_GEN") != "1":
+            raise RuntimeError(
+                "thumbnail.png is missing and paid-API thumbnail generation is "
+                "disabled. This agent hits both Anthropic (for the image prompt) "
+                "AND OpenAI (for the image itself). Set "
+                "CASCADE_ALLOW_API_THUMBNAIL_GEN=1 to explicitly opt in, or "
+                "generate the thumbnail via a subagent-driven flow (not yet built)."
+            )
+
         diarized = self.load_json("diarized_transcript.json")
         episode_data = self.load_json_safe("episode.json")
         episode_info = self.load_json_safe("episode_info.json")
 
         # Merge episode context
-        guest_name = episode_data.get("guest_name") or episode_info.get("guest_name", "")
-        guest_title = episode_data.get("guest_title") or episode_info.get("guest_title", "")
-        episode_name = episode_data.get("episode_name") or episode_info.get("episode_name", "")
-        episode_description = episode_data.get("episode_description") or episode_info.get("episode_description", "")
+        guest_name = episode_data.get("guest_name") or episode_info.get(
+            "guest_name", ""
+        )
+        guest_title = episode_data.get("guest_title") or episode_info.get(
+            "guest_title", ""
+        )
+        episode_name = episode_data.get("episode_name") or episode_info.get(
+            "episode_name", ""
+        )
+        episode_description = episode_data.get(
+            "episode_description"
+        ) or episode_info.get("episode_description", "")
 
         # Build a condensed transcript for Claude to analyze
         transcript_text = self._build_transcript_summary(diarized)
@@ -56,14 +87,16 @@ class ThumbnailGenAgent(BaseAgent):
         import anthropic
 
         client = anthropic.Anthropic(api_key=anthropic_key)
-        model = self.get_config("clip_mining", "llm_model", default="claude-sonnet-4-20250514")
+        model = self.get_config(
+            "clip_mining", "llm_model", default="claude-sonnet-4-20250514"
+        )
 
         self.report_progress(1, 3, "Analyzing transcript for thumbnail concept")
 
         analysis_prompt = f"""You are a creative director creating a podcast episode thumbnail.
 
 EPISODE CONTEXT:
-- Guest: {guest_name}{f' — {guest_title}' if guest_title else ''}
+- Guest: {guest_name}{f" — {guest_title}" if guest_title else ""}
 - Episode name: {episode_name}
 - Description: {episode_description}
 
@@ -126,11 +159,14 @@ Return ONLY the JSON object, no other text."""
         self.report_progress(3, 3, "Thumbnail saved")
 
         # Save the analysis and prompt for potential re-generation
-        self.save_json("thumbnail_gen.json", {
-            "analysis": analysis,
-            "image_prompt": image_prompt,
-            "thumbnail_path": str(thumbnail_path),
-        })
+        self.save_json(
+            "thumbnail_gen.json",
+            {
+                "analysis": analysis,
+                "image_prompt": image_prompt,
+                "thumbnail_path": str(thumbnail_path),
+            },
+        )
 
         return {
             "thumbnail_path": str(thumbnail_path),
@@ -164,8 +200,8 @@ Return ONLY the JSON object, no other text."""
         # Take first 5000 chars + last 3000 chars
         first = full_text[:5000]
         last = full_text[-3000:]
-        first = first[:first.rfind("\n")]
-        last = last[last.find("\n") + 1:]
+        first = first[: first.rfind("\n")]
+        last = last[last.find("\n") + 1 :]
         return f"{first}\n\n... [middle of conversation omitted] ...\n\n{last}"
 
     @staticmethod
@@ -213,6 +249,8 @@ Return ONLY the JSON object, no other text."""
             with open(dest, "wb") as f:
                 f.write(img_resp.content)
         else:
-            raise RuntimeError(f"Unexpected OpenAI response format: {list(image_data.keys())}")
+            raise RuntimeError(
+                f"Unexpected OpenAI response format: {list(image_data.keys())}"
+            )
 
         self.logger.info("Saved thumbnail to %s (%d bytes)", dest, dest.stat().st_size)
