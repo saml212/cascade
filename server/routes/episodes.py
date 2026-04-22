@@ -62,18 +62,20 @@ async def list_episodes() -> list[dict]:
         try:
             with open(ep_file) as f:
                 ep = json.load(f)
-            episodes.append({
-                "episode_id": ep.get("episode_id", ep_dir.name),
-                "title": ep.get("title", ep_dir.name),
-                "status": ep.get("status", "processing"),
-                "duration_seconds": ep.get("duration_seconds"),
-                "created_at": ep.get("created_at"),
-                "clips": ep.get("clips", []),
-                "guest_name": ep.get("guest_name", ""),
-                "guest_title": ep.get("guest_title", ""),
-                "episode_name": ep.get("episode_name", ""),
-                "episode_description": ep.get("episode_description", ""),
-            })
+            episodes.append(
+                {
+                    "episode_id": ep.get("episode_id", ep_dir.name),
+                    "title": ep.get("title", ep_dir.name),
+                    "status": ep.get("status", "processing"),
+                    "duration_seconds": ep.get("duration_seconds"),
+                    "created_at": ep.get("created_at"),
+                    "clips": ep.get("clips", []),
+                    "guest_name": ep.get("guest_name", ""),
+                    "guest_title": ep.get("guest_title", ""),
+                    "episode_name": ep.get("episode_name", ""),
+                    "episode_description": ep.get("episode_description", ""),
+                }
+            )
         except (json.JSONDecodeError, OSError):
             continue
 
@@ -126,7 +128,11 @@ async def get_episode(episode_id: str) -> dict:
         try:
             with open(clips_file) as f:
                 clips_data = json.load(f)
-            clips = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+            clips = (
+                clips_data.get("clips", clips_data)
+                if isinstance(clips_data, dict)
+                else clips_data
+            )
             ep["clips"] = [_normalize_clip(c) for c in clips]
         except (json.JSONDecodeError, OSError):
             pass
@@ -189,6 +195,7 @@ async def delete_episode(episode_id: str) -> dict:
 
     # Check if pipeline is actively running (allow delete if cancelled)
     from server.routes.pipeline import _running, _cancel_requested
+
     if episode_id in _running and _running[episode_id].is_alive():
         # If already cancelled, force-allow deletion
         ep_file = ep_dir / "episode.json"
@@ -198,7 +205,7 @@ async def delete_episode(episode_id: str) -> dict:
             if ep_data.get("status") != "cancelled":
                 raise HTTPException(
                     status_code=409,
-                    detail="Cannot delete episode while pipeline is running. Cancel the pipeline first."
+                    detail="Cannot delete episode while pipeline is running. Cancel the pipeline first.",
                 )
         # Signal cancellation and clean up tracking
         _cancel_requested.add(episode_id)
@@ -226,7 +233,11 @@ async def approve_episode(episode_id: str) -> dict:
         try:
             with open(clips_file) as f:
                 clips_data = json.load(f)
-            clips_list = clips_data.get("clips", clips_data) if isinstance(clips_data, dict) else clips_data
+            clips_list = (
+                clips_data.get("clips", clips_data)
+                if isinstance(clips_data, dict)
+                else clips_data
+            )
             for clip in clips_list:
                 if clip.get("status", "pending") == "pending":
                     clip["status"] = "approved"
@@ -244,7 +255,9 @@ async def get_crop_frame(episode_id: str):
     """Serve the crop_frame.jpg extracted by the stitch agent."""
     frame_path = EPISODES_DIR / episode_id / "crop_frame.jpg"
     if not frame_path.exists():
-        raise HTTPException(status_code=404, detail="Crop frame not found. Run stitch first.")
+        raise HTTPException(
+            status_code=404, detail="Crop frame not found. Run stitch first."
+        )
     return FileResponse(frame_path, media_type="image/jpeg")
 
 
@@ -254,7 +267,9 @@ async def get_video_preview(episode_id: str):
     ep_dir = EPISODES_DIR / episode_id
     merged = ep_dir / "source_merged.mp4"
     if not merged.exists():
-        raise HTTPException(status_code=404, detail="source_merged.mp4 not found. Run stitch first.")
+        raise HTTPException(
+            status_code=404, detail="source_merged.mp4 not found. Run stitch first."
+        )
     return FileResponse(merged, media_type="video/mp4")
 
 
@@ -289,8 +304,25 @@ async def get_sync_preview(episode_id: str, duration: float = 120.0):
     pps = 100  # peaks per second for the waveform
 
     def extract_rms(path, seek=0, dur=120):
-        cmd = ["ffmpeg", "-y", "-ss", str(seek), "-i", str(path), "-t", str(dur),
-               "-ar", str(sr), "-ac", "1", "-f", "s16le", "-acodec", "pcm_s16le", "-"]
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(seek),
+            "-i",
+            str(path),
+            "-t",
+            str(dur),
+            "-ar",
+            str(sr),
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-",
+        ]
         r = subprocess.run(cmd, capture_output=True)
         if r.returncode != 0:
             return []
@@ -300,8 +332,8 @@ async def get_sync_preview(episode_id: str, duration: float = 120.0):
         n = len(data) // win
         if n == 0:
             return []
-        frames = data[:n * win].reshape(n, win)
-        rms = np.sqrt(np.mean(frames ** 2, axis=1))
+        frames = data[: n * win].reshape(n, win)
+        rms = np.sqrt(np.mean(frames**2, axis=1))
         # Normalize to 0-1
         mx = np.max(rms)
         if mx > 0:
@@ -345,8 +377,14 @@ async def save_sync_offset(episode_id: str, req: SyncOffsetRequest):
 
     # Delete ALL stale cached files that depend on sync offset
     work = EPISODES_DIR / episode_id / "work"
-    for pattern in ["audio_mix.wav", "speaker_*_channel.npy", "speaker_*_rms_db.npy",
-                     "transcript_audio.*", "longform_seg_*.mp4", "audio_preview/*.mp3"]:
+    for pattern in [
+        "audio_mix.wav",
+        "speaker_*_channel.npy",
+        "speaker_*_rms_db.npy",
+        "transcript_audio.*",
+        "longform_seg_*.mp4",
+        "audio_preview/*.mp3",
+    ]:
         for f in work.glob(pattern):
             f.unlink()
 
@@ -395,16 +433,27 @@ async def get_audio_preview(
 
     if not cache_file.exists():
         cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(audio_start),
-            "-i", str(wav_path),
-            "-t", str(duration),
-            "-ac", "1", "-ar", "44100", "-b:a", "128k",
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(audio_start),
+            "-i",
+            str(wav_path),
+            "-t",
+            str(duration),
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-b:a",
+            "128k",
             str(cache_file),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}")
+            raise HTTPException(
+                status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
+            )
 
     return FileResponse(cache_file, media_type="audio/mpeg")
 
@@ -443,30 +492,49 @@ async def get_channel_preview(
         # Use channelsplit to extract just the requested channel
         ch_idx = "FL" if channel == "left" else "FR"
         cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-i", str(source),
-            "-t", str(duration),
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start),
+            "-i",
+            str(source),
+            "-t",
+            str(duration),
             "-vn",
-            "-af", f"pan=mono|c0={ch_idx}",
-            "-ar", "44100", "-b:a", "128k",
+            "-af",
+            f"pan=mono|c0={ch_idx}",
+            "-ar",
+            "44100",
+            "-b:a",
+            "128k",
             str(cache_file),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}")
+            raise HTTPException(
+                status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
+            )
 
     return FileResponse(cache_file, media_type="audio/mpeg")
 
 
 class SpeakerCropConfig(BaseModel):
     label: str
+    # Shorts (9:16) center point — required. This is the primary anchor.
     center_x: int
     center_y: int
-    zoom: float = 1.0            # Shorts zoom (9:16 portrait crop)
-    longform_zoom: float = 0.75  # Longform zoom (16:9) — lower = wider. Default shows ~2/3 frame.
+    zoom: float = 1.0  # Shorts zoom (9:16 portrait crop)
+    # Longform (16:9) center point — optional. If unset, falls back to the
+    # shorts center. Sam can place the longform crop independently of the
+    # shorts crop (useful when a tight portrait frame isn't the same region
+    # that looks good in landscape).
+    longform_center_x: Optional[int] = None
+    longform_center_y: Optional[int] = None
+    longform_zoom: float = (
+        0.75  # Longform zoom (16:9) — lower = wider. Default shows ~2/3 frame.
+    )
     track: Optional[int] = None  # H6E track number (1-based) mapped to this speaker
-    volume: float = 1.0          # Audio volume for this speaker's track (0.0-2.0)
+    volume: float = 1.0  # Audio volume for this speaker's track (0.0-2.0)
 
 
 class AmbientTrackConfig(BaseModel):
@@ -508,14 +576,20 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
         output_path = stitch_data.get("output_path", "")
         if output_path:
             import subprocess
+
             try:
                 probe_cmd = [
-                    "ffprobe", "-v", "quiet",
-                    "-print_format", "json",
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
                     "-show_streams",
                     output_path,
                 ]
-                result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                result = subprocess.run(
+                    probe_cmd, capture_output=True, text=True, check=True
+                )
                 probe = json.loads(result.stdout)
                 for s in probe.get("streams", []):
                     if s.get("codec_type") == "video":
@@ -533,7 +607,9 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
             "speakers": [s.model_dump() for s in req.speakers],
         }
         if req.ambient_tracks:
-            ep["crop_config"]["ambient_tracks"] = [t.model_dump() for t in req.ambient_tracks]
+            ep["crop_config"]["ambient_tracks"] = [
+                t.model_dump() for t in req.ambient_tracks
+            ]
         if req.wide_center_x is not None:
             ep["crop_config"]["wide_center_x"] = req.wide_center_x
             ep["crop_config"]["wide_center_y"] = req.wide_center_y
@@ -566,10 +642,18 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
             "speaker_r_zoom": req.speaker_r_zoom,
             "zoom": req.zoom,
             "speakers": [
-                {"label": "Speaker L", "center_x": req.speaker_l_center_x,
-                 "center_y": req.speaker_l_center_y, "zoom": req.speaker_l_zoom},
-                {"label": "Speaker R", "center_x": req.speaker_r_center_x,
-                 "center_y": req.speaker_r_center_y, "zoom": req.speaker_r_zoom},
+                {
+                    "label": "Speaker L",
+                    "center_x": req.speaker_l_center_x,
+                    "center_y": req.speaker_l_center_y,
+                    "zoom": req.speaker_l_zoom,
+                },
+                {
+                    "label": "Speaker R",
+                    "center_x": req.speaker_r_center_x,
+                    "center_y": req.speaker_r_center_y,
+                    "zoom": req.speaker_r_zoom,
+                },
             ],
         }
 
@@ -594,8 +678,13 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
     #   metadata_gen                     (Claude LLM, ~$0.10-0.20)
     #   thumbnail_gen                    (OpenAI caricature, ~$0.10)
     CROP_DEPENDENT_AGENTS = {
-        "speaker_cut", "longform_render", "shorts_render",
-        "qa", "podcast_feed", "publish", "backup",
+        "speaker_cut",
+        "longform_render",
+        "shorts_render",
+        "qa",
+        "podcast_feed",
+        "publish",
+        "backup",
     }
 
     pipeline_state = ep.setdefault("pipeline", {})
@@ -603,13 +692,14 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
     had_crop_dependent_work = any(a in completed for a in CROP_DEPENDENT_AGENTS)
 
     # Remove crop-dependent agents from completed list so resume_pipeline will re-run them
-    pipeline_state["agents_completed"] = [a for a in completed if a not in CROP_DEPENDENT_AGENTS]
+    pipeline_state["agents_completed"] = [
+        a for a in completed if a not in CROP_DEPENDENT_AGENTS
+    ]
 
     # Clear any errors from those agents so the pipeline doesn't refuse to continue
     errors = pipeline_state.get("errors", {})
     pipeline_state["errors"] = {
-        name: msg for name, msg in errors.items()
-        if name not in CROP_DEPENDENT_AGENTS
+        name: msg for name, msg in errors.items() if name not in CROP_DEPENDENT_AGENTS
     }
 
     # If we actually invalidated downstream work, nuke the artifacts so they
@@ -646,7 +736,7 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
                 "speaker_*_channel.npy",
                 "speaker_*_rms_db.npy",
                 "rms_meta.json",
-                "audio_mix.wav",              # forces re-mix with new audio chain too
+                "audio_mix.wav",  # forces re-mix with new audio chain too
                 "audio_mix_enhanced.wav",
                 "audio_mix_denoised.wav",
             ]:
@@ -655,8 +745,13 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
 
     # Transition from awaiting_crop_setup or error back to processing so the
     # pipeline can run again.
-    if ep.get("status") in ("awaiting_crop_setup", "error", "ready_for_review",
-                             "awaiting_backup_approval", "awaiting_longform_approval"):
+    if ep.get("status") in (
+        "awaiting_crop_setup",
+        "error",
+        "ready_for_review",
+        "awaiting_backup_approval",
+        "awaiting_longform_approval",
+    ):
         ep["status"] = "processing"
 
     write_episode(episode_id, ep)
@@ -681,11 +776,11 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
                 # Invalidate ALL cached files that depend on crop/audio config
                 work_dir = ep_dir / "work"
                 for pattern in [
-                    "longform_seg_*.mp4",   # rendered video segments
-                    "speaker_*_channel.npy", # cached speaker audio extractions
+                    "longform_seg_*.mp4",  # rendered video segments
+                    "speaker_*_channel.npy",  # cached speaker audio extractions
                     "speaker_*_rms_db.npy",  # cached RMS data
-                    "transcript_audio.*",    # multichannel transcript audio
-                    "audio_preview/*.mp3",   # cached audio previews
+                    "transcript_audio.*",  # multichannel transcript audio
+                    "audio_preview/*.mp3",  # cached audio previews
                 ]:
                     for f in work_dir.glob(pattern):
                         f.unlink(missing_ok=True)

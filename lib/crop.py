@@ -38,9 +38,11 @@ def resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=False):
     Returns (cx, cy, zoom, mode) where mode is "speaker", "wide", or None.
     None means BOTH/NONE with zoom <= 1.0 (passthrough, no crop needed).
 
-    Each speaker can have separate zoom values:
-      zoom          — used for shorts (9:16 portrait)
-      longform_zoom — used for longform (16:9). Falls back to zoom if not set.
+    Each speaker can have separate center + zoom values per aspect ratio:
+      center_x, center_y       — shorts (9:16) anchor, required
+      zoom                     — shorts (9:16) zoom
+      longform_center_x/y      — longform (16:9) anchor, optional (falls back to shorts)
+      longform_zoom            — longform (16:9) zoom, falls back to shorts zoom if not set
     """
     speakers = crop_config.get("speakers", [])
 
@@ -56,9 +58,14 @@ def resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=False):
             spk = speakers[idx]
             if for_shorts:
                 zoom = spk.get("zoom", 1.0)
+                cx = spk["center_x"]
+                cy = spk.get("center_y", src_h // 2)
             else:
                 zoom = spk.get("longform_zoom", spk.get("zoom", 1.0))
-            return spk["center_x"], spk.get("center_y", src_h // 2), zoom, "speaker"
+                # Longform center falls back to shorts center if not explicitly set.
+                cx = spk.get("longform_center_x") or spk["center_x"]
+                cy = spk.get("longform_center_y") or spk.get("center_y", src_h // 2)
+            return cx, cy, zoom, "speaker"
 
         # Fallback: legacy speaker_l/speaker_r fields for 2-speaker setups
         if idx <= 1:

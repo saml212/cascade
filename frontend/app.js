@@ -57,11 +57,12 @@ const SPEAKER_COLORS = [
 
 const cropState = {
   activeIdx: 0,       // which speaker index we're placing
+  placeMode: 'shorts', // 'shorts' | 'longform' — which rect a canvas click sets
   image: null,        // HTMLImageElement
   scaleFactor: 1,     // canvas-to-source ratio
   sourceWidth: 1920,
   sourceHeight: 1080,
-  speakers: [],       // [{label, x, y, zoom, track}]
+  speakers: [],       // [{label, x, y, zoom, longform_x, longform_y, longform_zoom, track}]
   // Legacy compat
   get mode() { return this.activeIdx === 0 ? 'L' : 'R'; },
   get speakerL() { return this.speakers[0] || { x: 480, y: 540 }; },
@@ -2467,13 +2468,15 @@ async function renderCropSetup(episodeId) {
     cropState.speakers = existing.speakers.map(s => ({
       label: s.label, x: s.center_x, y: s.center_y, zoom: s.zoom || 1.0,
       longform_zoom: s.longform_zoom || 0.75,
+      longform_x: s.longform_center_x != null ? s.longform_center_x : null,
+      longform_y: s.longform_center_y != null ? s.longform_center_y : null,
       track: hasH6ETracks ? (s.track || null) : null,
     }));
   } else if (existing && existing.speaker_l_center_x != null) {
     // Legacy L/R format
     cropState.speakers = [
-      { label: hasH6ETracks ? 'Speaker 0' : 'Speaker 0 (Left)', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, track: hasH6ETracks ? 1 : null },
-      { label: hasH6ETracks ? 'Speaker 1' : 'Speaker 1 (Right)', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, track: hasH6ETracks ? 2 : null },
+      { label: hasH6ETracks ? 'Speaker 0' : 'Speaker 0 (Left)', x: existing.speaker_l_center_x, y: existing.speaker_l_center_y, zoom: existing.speaker_l_zoom || 1.0, longform_x: null, longform_y: null, track: hasH6ETracks ? 1 : null },
+      { label: hasH6ETracks ? 'Speaker 1' : 'Speaker 1 (Right)', x: existing.speaker_r_center_x, y: existing.speaker_r_center_y, zoom: existing.speaker_r_zoom || 1.0, longform_x: null, longform_y: null, track: hasH6ETracks ? 2 : null },
     ];
   } else {
     // Defaults: spread speakers evenly across the frame
@@ -2491,11 +2494,14 @@ async function renderCropSetup(episodeId) {
         y: Math.round(cropState.sourceHeight / 2),
         zoom: 1.0,
         longform_zoom: 0.75,
+        longform_x: null,
+        longform_y: null,
         track: hasH6ETracks ? (i + 1) : null,
       });
     }
   }
   cropState.activeIdx = 0;
+  cropState.placeMode = 'shorts';
 
   // Initialize wide shot (all-speakers) crop
   cropState.wide = {
@@ -2723,7 +2729,16 @@ async function renderCropSetup(episodeId) {
             }).join('')}
             <button id="crop-mode-wide" onclick="setCropSpeaker(-1)" class="flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700">Wide</button>
           </div>
-          <p class="text-xs text-zinc-600 mt-2">Click the frame to set the selected speaker's center point.</p>
+          <div class="mt-3">
+            <span class="text-xs text-zinc-500 block mb-1.5">Placing for</span>
+            <div class="flex gap-2">
+              <button id="crop-placemode-shorts" onclick="setCropPlaceMode('shorts')"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-brand-600 text-white">9:16 Shorts</button>
+              <button id="crop-placemode-longform" onclick="setCropPlaceMode('longform')"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors bg-zinc-800 text-zinc-400 hover:bg-zinc-700">16:9 Longform</button>
+            </div>
+          </div>
+          <p class="text-xs text-zinc-600 mt-2">Click the frame to set the selected speaker's center point for the active format.</p>
         </div>
 
         <!-- Positions & zoom per speaker -->
@@ -2787,11 +2802,12 @@ async function renderCropSetup(episodeId) {
         <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
           <h3 class="text-sm font-semibold text-zinc-300 mb-2">How it works</h3>
           <ul class="text-xs text-zinc-500 space-y-1 list-disc list-inside">
-            <li>Select a speaker number above</li>
-            <li>Click on the frame where that speaker's face is centered</li>
-            <li>Use zoom sliders to adjust how tight the crop is</li>
-            <li>Dashed rect = 9:16 shorts crop</li>
-            <li>Inner rect = 16:9 longform crop</li>
+            <li>Select a speaker number, then choose 9:16 or 16:9</li>
+            <li>Click the frame to set that speaker's center for the active format</li>
+            <li>Dashed rect (+) = 9:16 shorts crop and center</li>
+            <li>Dotted rect (x) = 16:9 longform crop and center</li>
+            <li>Dimmed dotted rect = longform not placed yet, inherits shorts center</li>
+            <li>Use zoom sliders to adjust how tight the crop is per format</li>
             ${inputTracks.length > 0 ? '<li>Map each speaker to their H6E audio track</li>' : ''}
           </ul>
         </div>
@@ -2847,10 +2863,17 @@ async function renderCropSetup(episodeId) {
     } else {
       const spk = cropState.speakers[cropState.activeIdx];
       if (spk) {
-        spk.x = srcX;
-        spk.y = srcY;
-        const posEl = document.getElementById(`crop-pos-${cropState.activeIdx}`);
-        if (posEl) posEl.textContent = `${srcX}, ${srcY}`;
+        if (cropState.placeMode === 'longform') {
+          spk.longform_x = srcX;
+          spk.longform_y = srcY;
+          const posEl = document.getElementById(`crop-lf-pos-${cropState.activeIdx}`);
+          if (posEl) posEl.textContent = `${srcX}, ${srcY}`;
+        } else {
+          spk.x = srcX;
+          spk.y = srcY;
+          const posEl = document.getElementById(`crop-pos-${cropState.activeIdx}`);
+          if (posEl) posEl.textContent = `${srcX}, ${srcY}`;
+        }
       }
     }
     redrawCropCanvas();
@@ -3090,6 +3113,15 @@ function setCropSpeaker(idx) {
   if (wideBtn) wideBtn.className = `flex-1 min-w-[60px] px-3 py-2 rounded-lg text-sm font-medium transition-colors ${idx === -1 ? 'bg-zinc-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`;
 }
 
+function setCropPlaceMode(mode) {
+  cropState.placeMode = mode;
+  const shortsBtn = document.getElementById('crop-placemode-shorts');
+  const lfBtn = document.getElementById('crop-placemode-longform');
+  if (shortsBtn) shortsBtn.className = `flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'shorts' ? 'bg-brand-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`;
+  if (lfBtn) lfBtn.className = `flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'longform' ? 'bg-brand-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`;
+  redrawCropCanvas();
+}
+
 function setCropWideZoom(value) {
   cropState.wide.zoom = parseFloat(value);
   const valEl = document.getElementById('crop-zoom-wide-val');
@@ -3156,48 +3188,76 @@ function redrawCropCanvas() {
 
   cropState.speakers.forEach(function(spk, idx) {
     const color = SPEAKER_COLORS[idx % SPEAKER_COLORS.length].css;
+    const isActive = idx === cropState.activeIdx;
+
+    // Shorts (9:16) — dashed rect anchored at spk.x/y
     const cx = spk.x / sf;
     const cy = spk.y / sf;
     const zoom = spk.zoom;
-
-    // 9:16 shorts crop rect
     const shortsCropH = Math.round((srcH / zoom) / sf);
-    const shortsCropW = Math.round((shortsCropH * 9 / 16));
+    const shortsCropW = Math.round(shortsCropH * 9 / 16);
     const shortsX = Math.max(0, Math.min(cx - shortsCropW / 2, canvas.width - shortsCropW));
     const shortsY = Math.max(0, Math.min(cy - shortsCropH / 2, canvas.height - shortsCropH));
+
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = (isActive && cropState.placeMode === 'shorts') ? 3 : 1.5;
     ctx.setLineDash([8, 4]);
     ctx.strokeRect(shortsX, shortsY, shortsCropW, shortsCropH);
-
-    // 16:9 longform crop rect (uses longform_zoom, independent of shorts zoom)
-    const lfZoom = spk.longform_zoom || 0.75;
-    const lfCropW = Math.round((srcW / (2 * lfZoom)) / sf);
-    const lfCropH = Math.round(lfCropW * 9 / 16);
-    const lfX = Math.max(0, Math.min(cx - lfCropW / 2, canvas.width - lfCropW));
-    const lfY = Math.max(0, Math.min(cy - lfCropH / 2, canvas.height - lfCropH));
-    ctx.setLineDash([4, 4]);
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(lfX, lfY, lfCropW, lfCropH);
-
-    ctx.fillStyle = color.replace('0.8', '0.08');
-    ctx.fillRect(lfX, lfY, lfCropW, lfCropH);
     ctx.setLineDash([]);
 
-    // Crosshair
-    const crossSize = 12;
+    // "9:16" label at top-left of shorts rect
+    ctx.fillStyle = color;
+    ctx.font = 'bold 11px system-ui';
+    ctx.fillText('9:16', shortsX + 3, shortsY + 13);
+
+    // Shorts center crosshair — plus sign (+)
+    const crossSize = 10;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(cx - crossSize, cy); ctx.lineTo(cx + crossSize, cy);
     ctx.moveTo(cx, cy - crossSize); ctx.lineTo(cx, cy + crossSize);
-    ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.stroke();
+    ctx.stroke();
 
-    // Label
+    // Longform (16:9) — dotted rect anchored at longform_x/y (fallback to shorts center)
+    const lfExplicit = spk.longform_x != null && spk.longform_y != null;
+    const lfCx = (lfExplicit ? spk.longform_x : spk.x) / sf;
+    const lfCy = (lfExplicit ? spk.longform_y : spk.y) / sf;
+    const lfZoom = spk.longform_zoom || 0.75;
+    const lfCropW = Math.round((srcW / (2 * lfZoom)) / sf);
+    const lfCropH = Math.round(lfCropW * 9 / 16);
+    const lfX = Math.max(0, Math.min(lfCx - lfCropW / 2, canvas.width - lfCropW));
+    const lfY = Math.max(0, Math.min(lfCy - lfCropH / 2, canvas.height - lfCropH));
+
+    ctx.save();
+    if (!lfExplicit) ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = (isActive && cropState.placeMode === 'longform') ? 3 : 1.5;
+    ctx.setLineDash([2, 3]);
+    ctx.strokeRect(lfX, lfY, lfCropW, lfCropH);
+    ctx.setLineDash([]);
+
+    // "16:9" label at top-left of longform rect
+    ctx.fillStyle = color;
+    ctx.font = 'bold 11px system-ui';
+    ctx.fillText('16:9', lfX + 3, lfY + 13);
+
+    // Longform center crosshair — cross (×)
+    const lfCross = 8;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(lfCx - lfCross, lfCy - lfCross); ctx.lineTo(lfCx + lfCross, lfCy + lfCross);
+    ctx.moveTo(lfCx + lfCross, lfCy - lfCross); ctx.lineTo(lfCx - lfCross, lfCy + lfCross);
+    ctx.stroke();
+    ctx.restore();
+
+    // Speaker index label near shorts crosshair
     ctx.fillStyle = color;
     ctx.font = 'bold 14px system-ui';
-    ctx.fillText(`${idx} ${zoom.toFixed(1)}x`, cx + crossSize + 4, cy - crossSize + 4);
+    ctx.fillText(`${idx}`, cx + crossSize + 4, cy - crossSize + 4);
 
-    // Highlight active speaker
-    if (idx === cropState.activeIdx) {
+    // Highlight active speaker with arc
+    if (isActive) {
       ctx.strokeStyle = color;
       ctx.lineWidth = 3;
       ctx.setLineDash([]);
@@ -3233,7 +3293,7 @@ async function saveCropConfig(episodeId) {
             const mt = mixerState.tracks.find(t => t.trackNumber === s.track);
             if (mt) volume = mt.volume;
           }
-          return {
+          const entry = {
             label: s.label,
             center_x: s.x,
             center_y: s.y,
@@ -3242,6 +3302,9 @@ async function saveCropConfig(episodeId) {
             track: s.track,
             volume: volume,
           };
+          if (s.longform_x != null) entry.longform_center_x = s.longform_x;
+          if (s.longform_y != null) entry.longform_center_y = s.longform_y;
+          return entry;
         }),
         ambient_tracks: ambientTracks.length > 0 ? ambientTracks : undefined,
         wide_center_x: cropState.wide ? cropState.wide.x : undefined,
