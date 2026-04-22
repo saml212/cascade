@@ -1,8 +1,6 @@
 """Tests for the clip miner agent."""
 
 import json
-import pytest
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from agents.clip_miner import ClipMinerAgent
@@ -13,9 +11,27 @@ class TestClipMinerAgent:
         """Create required input files."""
         diarized = {
             "utterances": [
-                {"speaker": 0, "start": 0.0, "end": 30.0, "text": "Welcome to the show", "words": []},
-                {"speaker": 1, "start": 30.0, "end": 90.0, "text": "Thanks for having me, let me tell you about nuclear power", "words": []},
-                {"speaker": 0, "start": 90.0, "end": 120.0, "text": "That's amazing!", "words": []},
+                {
+                    "speaker": 0,
+                    "start": 0.0,
+                    "end": 30.0,
+                    "text": "Welcome to the show",
+                    "words": [],
+                },
+                {
+                    "speaker": 1,
+                    "start": 30.0,
+                    "end": 90.0,
+                    "text": "Thanks for having me, let me tell you about nuclear power",
+                    "words": [],
+                },
+                {
+                    "speaker": 0,
+                    "start": 90.0,
+                    "end": 120.0,
+                    "text": "That's amazing!",
+                    "words": [],
+                },
             ]
         }
         segments = {
@@ -73,7 +89,9 @@ class TestClipMinerAgent:
         assert result[0]["start_seconds"] == 30.0
 
     @patch("anthropic.Anthropic")
-    def test_execute_integration(self, mock_anthropic_cls, tmp_episode_dir, sample_config, monkeypatch):
+    def test_execute_integration(
+        self, mock_anthropic_cls, tmp_episode_dir, sample_config, monkeypatch
+    ):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setenv("CASCADE_ALLOW_API_CLIP_MINER", "1")
         self._setup_inputs(tmp_episode_dir)
@@ -83,16 +101,30 @@ class TestClipMinerAgent:
         mock_anthropic_cls.return_value = mock_client
 
         combined_response = MagicMock()
-        combined_response.content = [MagicMock(text=json.dumps({
-            "episode_info": {"guest_name": "John", "guest_title": "Engineer", "episode_title": "Test", "episode_description": "A test"},
-            "clips": [
-                {
-                    "start_seconds": 30.0, "end_seconds": 90.0,
-                    "title": "Nuclear Power", "hook_text": "Let me tell you",
-                    "compelling_reason": "Great story", "virality_score": 8,
-                }
-            ]
-        }))]
+        combined_response.content = [
+            MagicMock(
+                text=json.dumps(
+                    {
+                        "episode_info": {
+                            "guest_name": "John",
+                            "guest_title": "Engineer",
+                            "episode_title": "Test",
+                            "episode_description": "A test",
+                        },
+                        "clips": [
+                            {
+                                "start_seconds": 30.0,
+                                "end_seconds": 90.0,
+                                "title": "Nuclear Power",
+                                "hook_text": "Let me tell you",
+                                "compelling_reason": "Great story",
+                                "virality_score": 8,
+                            }
+                        ],
+                    }
+                )
+            )
+        ]
 
         mock_client.messages.create.return_value = combined_response
 
@@ -109,13 +141,38 @@ class TestClipMinerAgent:
 
         mock_client = MagicMock()
         combined_response = MagicMock()
-        combined_response.content = [MagicMock(text=json.dumps({
-            "episode_info": {"guest_name": "", "guest_title": "", "episode_title": "", "episode_description": ""},
-            "clips": [
-                {"start_seconds": 30.0, "end_seconds": 60.0, "title": "A", "hook_text": "", "compelling_reason": "", "virality_score": 7},
-                {"start_seconds": 60.0, "end_seconds": 90.0, "title": "B", "hook_text": "", "compelling_reason": "", "virality_score": 6},
-            ]
-        }))]
+        combined_response.content = [
+            MagicMock(
+                text=json.dumps(
+                    {
+                        "episode_info": {
+                            "guest_name": "",
+                            "guest_title": "",
+                            "episode_title": "",
+                            "episode_description": "",
+                        },
+                        "clips": [
+                            {
+                                "start_seconds": 30.0,
+                                "end_seconds": 60.0,
+                                "title": "A",
+                                "hook_text": "",
+                                "compelling_reason": "",
+                                "virality_score": 7,
+                            },
+                            {
+                                "start_seconds": 60.0,
+                                "end_seconds": 90.0,
+                                "title": "B",
+                                "hook_text": "",
+                                "compelling_reason": "",
+                                "virality_score": 6,
+                            },
+                        ],
+                    }
+                )
+            )
+        ]
         mock_client.messages.create.return_value = combined_response
 
         with patch("anthropic.Anthropic", return_value=mock_client):
@@ -128,7 +185,9 @@ class TestClipMinerAgent:
         assert clips[1]["id"] == "clip_02"
         assert clips[1]["rank"] == 2
 
-    def test_markdown_code_block_parsing(self, tmp_episode_dir, sample_config, monkeypatch):
+    def test_markdown_code_block_parsing(
+        self, tmp_episode_dir, sample_config, monkeypatch
+    ):
         """Test that Claude responses wrapped in markdown code blocks are parsed correctly."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setenv("CASCADE_ALLOW_API_CLIP_MINER", "1")
@@ -136,10 +195,32 @@ class TestClipMinerAgent:
 
         mock_client = MagicMock()
         combined_response = MagicMock()
-        combined_response.content = [MagicMock(text='```json\n' + json.dumps({
-            "episode_info": {"guest_name": "", "guest_title": "", "episode_title": "", "episode_description": ""},
-            "clips": [{"start_seconds": 30.0, "end_seconds": 60.0, "title": "A", "hook_text": "", "compelling_reason": "", "virality_score": 7}]
-        }) + '\n```')]
+        combined_response.content = [
+            MagicMock(
+                text="```json\n"
+                + json.dumps(
+                    {
+                        "episode_info": {
+                            "guest_name": "",
+                            "guest_title": "",
+                            "episode_title": "",
+                            "episode_description": "",
+                        },
+                        "clips": [
+                            {
+                                "start_seconds": 30.0,
+                                "end_seconds": 60.0,
+                                "title": "A",
+                                "hook_text": "",
+                                "compelling_reason": "",
+                                "virality_score": 7,
+                            }
+                        ],
+                    }
+                )
+                + "\n```"
+            )
+        ]
         mock_client.messages.create.return_value = combined_response
 
         with patch("anthropic.Anthropic", return_value=mock_client):
