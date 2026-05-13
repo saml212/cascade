@@ -224,13 +224,21 @@ export function createAudioGraph(bindings: TrackBinding[]): AudioGraph {
       const t = tracks.get(key);
       if (!t || !t.buffer || !playing) return 0;
       t.analyser.getByteTimeDomainData(t.analyserBuf);
-      // Compute peak deviation from the 128 mid-line (unsigned 8-bit PCM).
+      // Peak deviation from the 128 mid-line (unsigned 8-bit PCM) → linear 0..1.
       let peak = 0;
       for (let i = 0; i < t.analyserBuf.length; i++) {
         const d = Math.abs(t.analyserBuf[i] - 128);
         if (d > peak) peak = d;
       }
-      return Math.min(1, peak / 128);
+      const linear = peak / 128;
+      // Map dBFS → 0..1 bar fill. Linear is useless: speech peaks around
+      // -16 dBFS (≈0.16 linear), so a linear bar reads under 20% the whole
+      // time. Gate below -45 dBFS (room noise sits ~-42 dBFS on our H6E)
+      // and map -45..0 dB to 0..1 so the active speaker's track visibly
+      // lights up without the noise floor faking a baseline.
+      if (linear < 0.0056) return 0;
+      const db = 20 * Math.log10(linear);
+      return Math.max(0, Math.min(1, (db + 45) / 45));
     },
     dispose(): void {
       stopSources();
