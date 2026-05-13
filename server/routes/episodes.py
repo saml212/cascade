@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -105,11 +106,40 @@ async def list_episodes() -> list[dict]:
     return episodes
 
 
+_DJI_TIMESTAMP_RE = re.compile(r"^DJI_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_")
+
+
+def _derive_filming_timestamp(source_path: Optional[str]) -> Optional[datetime]:
+    """Pull the filming date+time off the first DJI MP4 in source_path.
+    DJI filenames carry the recording start as DJI_YYYYMMDDhhmmss_NNNN_D.MP4,
+    so the episode id (and the user-facing date label downstream) matches the
+    actual shoot rather than whenever the ingest happened to fire. Returns
+    None if nothing parseable is found — callers fall back to now()."""
+    if not source_path:
+        return None
+    p = Path(source_path)
+    if not p.exists():
+        return None
+    candidates = sorted(p.glob("DJI_*.MP4")) if p.is_dir() else [p]
+    for f in candidates:
+        if f.name.startswith("._"):
+            continue
+        m = _DJI_TIMESTAMP_RE.match(f.name)
+        if m:
+            y, mo, d, hh, mm, ss = (int(x) for x in m.groups())
+            try:
+                return datetime(y, mo, d, hh, mm, ss, tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
 @router.post("/")
 async def create_episode(req: NewEpisodeRequest) -> dict:
     """Trigger a new episode ingest."""
     logger.info("POST /api/episodes/ source_path=%s", req.source_path)
-    now = datetime.now(timezone.utc)
+    filming = _derive_filming_timestamp(req.source_path)
+    now = filming or datetime.now(timezone.utc)
     episode_id = f"ep_{now.strftime('%Y-%m-%d')}_{now.strftime('%H%M%S')}"
 
     episode = {
