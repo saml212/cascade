@@ -33,6 +33,10 @@ class RunPipelineRequest(BaseModel):
     agents: Optional[list[str]] = None
 
 
+class ResumePipelineRequest(BaseModel):
+    agents: Optional[list[str]] = None
+
+
 class RunAgentRequest(BaseModel):
     source_path: Optional[str] = None
 
@@ -226,8 +230,19 @@ async def cancel_pipeline(episode_id: str) -> PipelineActionResponse:
 
 
 @router.post("/{episode_id}/resume-pipeline")
-async def resume_pipeline(episode_id: str) -> ResumePipelineResponse:
-    """Resume pipeline after crop setup — runs remaining agents."""
+async def resume_pipeline(
+    episode_id: str, req: Optional[ResumePipelineRequest] = None
+) -> ResumePipelineResponse:
+    """Resume pipeline — runs the agents the caller requests, in PIPELINE_ORDER.
+
+    If `agents` is provided in the body, we run only those (filtered to ones
+    not already completed). This is what /produce relies on to gate
+    paid-API stages: it dispatches subagents to produce clips.json /
+    metadata.json, then resumes with an explicit list so the cost-locked
+    agents never run automatically. If `agents` is omitted we fall back to
+    'every remaining agent in order' for compatibility with the older UI
+    Save & Continue path.
+    """
     logger.info("POST /api/episodes/%s/resume-pipeline", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
@@ -249,7 +264,20 @@ async def resume_pipeline(episode_id: str) -> ResumePipelineResponse:
 
         from agents import PIPELINE_ORDER
 
-        remaining = [a for a in PIPELINE_ORDER if a not in completed]
+        requested = req.agents if req and req.agents else None
+        if requested:
+            unknown = [a for a in requested if a not in PIPELINE_ORDER]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown agent(s): {unknown}",
+                )
+            # Preserve canonical pipeline order, drop already-completed.
+            remaining = [
+                a for a in PIPELINE_ORDER if a in requested and a not in completed
+            ]
+        else:
+            remaining = [a for a in PIPELINE_ORDER if a not in completed]
 
         if not remaining:
             return {"status": "already_complete", "episode_id": episode_id}
