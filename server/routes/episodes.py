@@ -175,6 +175,15 @@ async def get_episode(episode_id: str) -> dict:
     logger.info("GET /api/episodes/%s", episode_id)
     ep = read_episode(episode_id)
 
+    # Stamp the actual longform.mp4 mtime so the UI shows when the file was
+    # last written (after a re-mux the mtime is fresh even if pipeline
+    # completed_at is weeks old).
+    longform_path = EPISODES_DIR / episode_id / "longform.mp4"
+    if longform_path.exists():
+        ep["longform_rendered_at"] = datetime.fromtimestamp(
+            longform_path.stat().st_mtime, tz=timezone.utc
+        ).isoformat()
+
     # clips.json is the source of truth — it's what the clip action handlers
     # (approve, reject, update_metadata) write to. episode.json often carries
     # a stale snapshot from initial clip-mining. Always prefer clips.json if

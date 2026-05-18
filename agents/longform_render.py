@@ -11,15 +11,14 @@ Config:
     - processing.video_crf, processing.audio_bitrate
 """
 
-import json
 import os
-import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
+from lib.loudness import measure_loudness
 from lib.encoding import (
     get_video_encoder_args,
     get_color_metadata_args,
@@ -44,7 +43,9 @@ class LongformRenderAgent(BaseAgent):
         edits = episode_data.get("longform_edits", [])
         if edits:
             segments = self._apply_edits(segments, edits)
-            self.logger.info(f"Applied {len(edits)} edits, {len(segments)} segments remaining")
+            self.logger.info(
+                f"Applied {len(edits)} edits, {len(segments)} segments remaining"
+            )
 
         merged_path = self.episode_dir / "source_merged.mp4"
         work_dir = self.episode_dir / "work"
@@ -76,9 +77,7 @@ class LongformRenderAgent(BaseAgent):
 
         # Get source video dimensions
         probe = ffprobe(merged_path)
-        video_stream = next(
-            s for s in probe["streams"] if s["codec_type"] == "video"
-        )
+        video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
 
@@ -111,7 +110,9 @@ class LongformRenderAgent(BaseAgent):
         encoder_args = get_video_encoder_args(self.config)
         lut_filter = get_lut_filter(self.config)
         if lut_filter:
-            self.logger.info(f"LUT enabled: {self.config['processing'].get('lut_path')}")
+            self.logger.info(
+                f"LUT enabled: {self.config['processing'].get('lut_path')}"
+            )
 
         # Pre-generate per-segment SRT files
         self.logger.info("Generating per-segment subtitles...")
@@ -134,7 +135,9 @@ class LongformRenderAgent(BaseAgent):
             else:
                 to_render.append((i, seg))
         if skipped:
-            self.logger.info(f"Resuming: {skipped} segments already rendered, {len(to_render)} remaining")
+            self.logger.info(
+                f"Resuming: {skipped} segments already rendered, {len(to_render)} remaining"
+            )
 
         with ThreadPoolExecutor(max_workers=min(os.cpu_count() // 2, 6)) as executor:
             futures = {}
@@ -143,9 +146,18 @@ class LongformRenderAgent(BaseAgent):
                 srt_path = srt_dir / f"seg_{i:04d}.srt"
                 future = executor.submit(
                     self._render_segment,
-                    merged_path, seg_path, seg, src_w, src_h,
-                    crop_config, srt_path, encoder_args, lut_filter,
-                    source_fps_int, out_w, out_h,
+                    merged_path,
+                    seg_path,
+                    seg,
+                    src_w,
+                    src_h,
+                    crop_config,
+                    srt_path,
+                    encoder_args,
+                    lut_filter,
+                    source_fps_int,
+                    out_w,
+                    out_h,
                 )
                 futures[future] = (i, seg_path)
 
@@ -153,8 +165,9 @@ class LongformRenderAgent(BaseAgent):
                 i, seg_path = futures[future]
                 future.result()  # Raise any exception
                 segment_files.append((i, seg_path))
-                self.report_progress(len(segment_files), len(segments),
-                    f"Rendered segment {i}")
+                self.report_progress(
+                    len(segment_files), len(segments), f"Rendered segment {i}"
+                )
                 self.logger.info(f"  Segment {i} rendered")
 
         # Sort by index
@@ -173,33 +186,67 @@ class LongformRenderAgent(BaseAgent):
 
         # Step 1: Concat all segments (stream-copy, fast)
         concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+            "-c",
+            "copy",
             str(raw_concat),
         ]
-        timed_ffmpeg(concat_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        timed_ffmpeg(
+            concat_cmd,
+            agent_logger=self.logger,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
 
         # Step 2: Mux video with audio_mix.wav directly.
         # Per-segment audio encoding is skipped entirely — each AAC segment
         # adds ~21ms of padding (1024 samples at 48kHz) which accumulates
         # to seconds of drift over hundreds of segments. Using audio_mix.wav
         # as a single audio source eliminates this completely.
-        audio_source = audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else merged_path
+        audio_source = (
+            audio_mix_path
+            if (audio_mix_path and audio_mix_path.exists())
+            else merged_path
+        )
         mux_cmd = [
-            "ffmpeg", "-y",
-            "-i", str(raw_concat),
-            "-i", str(audio_source),
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", audio_bitrate,
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(raw_concat),
+            "-i",
+            str(audio_source),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
             "-shortest",
-            "-use_editlist", "0",
-            "-movflags", "+faststart",
+            "-use_editlist",
+            "0",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
-        timed_ffmpeg(mux_cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        timed_ffmpeg(
+            mux_cmd,
+            agent_logger=self.logger,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         raw_concat.unlink(missing_ok=True)
 
         # Clean up intermediate segment files (~400+ files, gigabytes)
@@ -214,12 +261,36 @@ class LongformRenderAgent(BaseAgent):
         probe = ffprobe(output_path)
         output_duration = float(probe["format"]["duration"])
 
-        return {
+        # Measure loudness of the final muxed file.
+        # ebur128 on a 90-min file takes 30-60 seconds — run it here so the
+        # result is immediately persisted into episode.json via the pipeline
+        # merge in _on_agent_complete.
+        audio_loudness = None
+        try:
+            audio_loudness = measure_loudness(output_path)
+            if audio_loudness:
+                self.logger.info(
+                    "Loudness: %.1f LUFS / %.1f dBFS peak / %.1f LU range",
+                    audio_loudness["integrated_lufs"],
+                    audio_loudness["true_peak_dbfs"],
+                    audio_loudness["loudness_range_lu"],
+                )
+            else:
+                self.logger.warning(
+                    "Loudness measurement returned None for %s", output_path
+                )
+        except Exception:
+            self.logger.exception("Loudness measurement failed — continuing without it")
+
+        result = {
             "output_path": str(output_path),
             "duration_seconds": round(output_duration, 3),
             "segment_count": len(segments),
             "file_size_mb": round(output_path.stat().st_size / 1e6, 1),
         }
+        if audio_loudness:
+            result["audio_loudness"] = audio_loudness
+        return result
 
     def _render_segment(
         self,
@@ -251,7 +322,9 @@ class LongformRenderAgent(BaseAgent):
         vf_parts = []
         if lut_filter:
             vf_parts.append(lut_filter)
-        vf_parts.append(self._get_crop_filter(speaker, src_w, src_h, crop_config, out_w, out_h))
+        vf_parts.append(
+            self._get_crop_filter(speaker, src_w, src_h, crop_config, out_w, out_h)
+        )
         vf_parts.append("format=yuv420p")
         polish = get_video_polish_filters(self.config)
         if polish:
@@ -274,23 +347,42 @@ class LongformRenderAgent(BaseAgent):
         # Audio is muxed once at the end from audio_mix.wav to avoid
         # AAC frame padding accumulation (21ms per segment = seconds of drift).
         cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start), "-i", str(source),
-            "-t", str(duration),
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start),
+            "-i",
+            str(source),
+            "-t",
+            str(duration),
             "-an",  # no audio
-            "-vf", vf,
+            "-vf",
+            vf,
             *encoder_args,
             *get_color_metadata_args(),
-            "-r", str(fps), "-g", str(fps), "-bf", "0",
-            "-vsync", "cfr",
-            "-video_track_timescale", str(fps * 1000),
-            "-use_editlist", "0",
-            "-movflags", "+faststart",
+            "-r",
+            str(fps),
+            "-g",
+            str(fps),
+            "-bf",
+            "0",
+            "-vsync",
+            "cfr",
+            "-video_track_timescale",
+            str(fps * 1000),
+            "-use_editlist",
+            "0",
+            "-movflags",
+            "+faststart",
             str(output),
         ]
-        timed_ffmpeg(cmd, agent_logger=self.logger, capture_output=True, text=True, check=True)
+        timed_ffmpeg(
+            cmd, agent_logger=self.logger, capture_output=True, text=True, check=True
+        )
 
-    def _get_crop_filter(self, speaker, src_w, src_h, crop_config, out_w=1920, out_h=1080):
+    def _get_crop_filter(
+        self, speaker, src_w, src_h, crop_config, out_w=1920, out_h=1080
+    ):
         """Get ffmpeg crop+scale filter with high-quality lanczos+dither.
         Crop math in lib/crop.py. out_w/out_h is the target output resolution
         (typically the source resolution for full-quality preservation)."""
@@ -326,9 +418,7 @@ class LongformRenderAgent(BaseAgent):
             text = " ".join(w.get("word", "") for w in chunk)
 
             srt_lines.append(
-                f"{idx}\n"
-                f"{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n"
-                f"{text}\n"
+                f"{idx}\n{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n{text}\n"
             )
             idx += 1
             i += 4
@@ -401,4 +491,3 @@ class LongformRenderAgent(BaseAgent):
         # Filter out tiny segments (< 0.1s)
         result = [s for s in result if s.get("duration", s["end"] - s["start"]) >= 0.1]
         return result
-

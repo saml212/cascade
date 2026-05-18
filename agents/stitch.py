@@ -71,9 +71,12 @@ class StitchAgent(BaseAgent):
                 f"Duration mismatch: expected {expected_duration:.1f}s, got {output_duration:.1f}s"
             )
 
-        # Extract a frame at ~5s for crop setup UI
+        # Extract a frame for crop setup UI. The first few seconds are often
+        # before everyone is seated / before the conversation starts (Christopher
+        # Apr 8 had only one of two guests at t=5s), so pull from ~10% in —
+        # capped at 5 min so we don't seek halfway through a 4-hour test record.
         crop_frame_path = self.episode_dir / "crop_frame.jpg"
-        frame_time = min(5.0, output_duration / 2)
+        frame_time = min(300.0, max(5.0, output_duration * 0.10))
         try:
             frame_cmd = [
                 "ffmpeg",
