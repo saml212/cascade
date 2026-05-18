@@ -190,12 +190,17 @@ export function ClipReview(target: HTMLElement, episodeId: string): void {
       return;
     }
 
+    const ep = episode();
+    const pipeline = (ep?.pipeline as Record<string, unknown>) ?? {};
+    const agentsCompleted = (pipeline.agents_completed as string[]) ?? [];
+    const shortsRendered = agentsCompleted.includes('shorts_render');
+
     body.replaceChildren(
       h(
         'div',
         { class: 'flex flex-col gap-4 pb-4' },
         ...cs.map((c) =>
-          clipCard(episodeId, c, expandedId, async () => load())
+          clipCard(episodeId, c, expandedId, shortsRendered, async () => load())
         )
       )
     );
@@ -342,6 +347,7 @@ function clipCard(
   episodeId: string,
   clip: UnknownRecord,
   expandedId: Signal<string | null>,
+  shortsRendered: boolean,
   reload: () => Promise<void>
 ): HTMLElement {
   const id = (clip.id as string) ?? (clip.clip_id as string);
@@ -380,6 +386,7 @@ function clipCard(
       speaker,
       status,
       expanded,
+      shortsRendered,
       () => expandedId.set((prev) => (prev === id ? null : id))
     );
     const children: Node[] = [head];
@@ -408,6 +415,7 @@ function clipHead(
   speaker: string,
   status: StatusDescriptor,
   expanded: boolean,
+  shortsRendered: boolean,
   toggle: () => void
 ): HTMLElement {
   return h(
@@ -417,7 +425,7 @@ function clipHead(
         'p-5 grid grid-cols-[140px_1fr_auto] gap-5 items-start cursor-pointer hover:bg-surface-2/40',
       onclick: toggle,
     },
-    clipThumb(episodeId, id, duration),
+    clipThumb(episodeId, id, duration, shortsRendered),
     h(
       'div',
       { class: 'min-w-0' },
@@ -481,30 +489,47 @@ function clipHead(
 function clipThumb(
   episodeId: string,
   clipId: string,
-  duration: number
+  duration: number,
+  shortsRendered: boolean
 ): HTMLElement {
-  const url = `/media/episodes/${episodeId}/shorts/${clipId}.mp4`;
-  const video = h('video', {
-    src: url,
-    muted: true,
-    playsinline: true,
-    preload: 'metadata',
-    class: 'w-full h-full object-cover bg-surface-inset',
-  }) as HTMLVideoElement;
+  // Only set a src when the shorts MP4 actually exists on disk.
+  // Without this guard every card fires a 404 for the missing file.
+  let innerEl: HTMLElement;
+  let hoverHandlers: Record<string, unknown> = {};
+
+  if (shortsRendered) {
+    const url = `/media/episodes/${episodeId}/shorts/${clipId}.mp4`;
+    const video = h('video', {
+      src: url,
+      muted: true,
+      playsinline: true,
+      preload: 'metadata',
+      class: 'w-full h-full object-cover bg-surface-inset',
+    }) as HTMLVideoElement;
+    innerEl = video;
+    hoverHandlers = {
+      onmouseenter: () => video.play().catch(() => {}),
+      onmouseleave: () => {
+        video.pause();
+        video.currentTime = 0;
+      },
+    };
+  } else {
+    // Placeholder — no network request, no 404
+    innerEl = h('div', {
+      class: 'w-full h-full bg-surface-inset',
+    });
+  }
 
   return h(
     'div',
     {
       class:
         'w-[140px] aspect-[9/16] rounded-md overflow-hidden bg-surface-inset relative',
-      onmouseenter: () => video.play().catch(() => {}),
-      onmouseleave: () => {
-        video.pause();
-        video.currentTime = 0;
-      },
+      ...hoverHandlers,
       onclick: (e: MouseEvent) => e.stopPropagation(),
     },
-    video,
+    innerEl,
     h(
       'div',
       {

@@ -8,6 +8,10 @@ export function renderClips(
   ep: Record<string, unknown>,
   episodeId: string
 ): void {
+  const pipeline = (ep.pipeline as Record<string, unknown>) ?? {};
+  const agentsCompleted = (pipeline.agents_completed as string[]) ?? [];
+  const shortsRendered = agentsCompleted.includes('shorts_render');
+
   const clips = ((ep.clips as Array<Record<string, unknown>>) ?? []).slice();
   // Sort by rank if available, else by start time, to mirror the review surface
   clips.sort((a, b) => {
@@ -81,12 +85,24 @@ export function renderClips(
             { class: 'text-heading-sm uppercase text-ink-tertiary' },
             `${pluralize(clips.length, 'clip')} in order`
           ),
-          h(
-            'span',
-            { class: 'text-body-sm text-ink-tertiary' },
-            'Hover a tile to preview. Click to open the review surface.'
-          )
+          shortsRendered
+            ? h(
+                'span',
+                { class: 'text-body-sm text-ink-tertiary' },
+                'Hover a tile to preview. Click to open the review surface.'
+              )
+            : null
         ),
+        !shortsRendered
+          ? h(
+              'div',
+              {
+                class:
+                  'mb-4 px-4 py-3 rounded-md bg-status-warning/10 border border-status-warning/30 text-body-sm text-ink-secondary',
+              },
+              'Clip data is ready, but the short videos haven’t been rendered yet. Approve the longform first — clip mining and short rendering happen after YouTube finishes processing the longform.'
+            )
+          : null,
         h(
           'div',
           {
@@ -97,7 +113,7 @@ export function renderClips(
                 'repeat(auto-fill, minmax(132px, 1fr))',
             },
           },
-          ...clips.map((c) => renderTile(c, episodeId))
+          ...clips.map((c) => renderTile(c, episodeId, shortsRendered))
         )
       )
     )
@@ -125,7 +141,8 @@ function statBlock(label: string, value: string, tone: string): HTMLElement {
 
 function renderTile(
   clip: Record<string, unknown>,
-  episodeId: string
+  episodeId: string,
+  shortsRendered: boolean
 ): HTMLElement {
   const id = (clip.id as string) ?? (clip.clip_id as string);
   const title = (clip.title as string) || 'Untitled';
@@ -133,15 +150,6 @@ function renderTile(
   const rank = (clip.rank as number) ?? null;
   const score = (clip.virality_score as number) ?? null;
   const status = (clip.status as string) ?? 'pending';
-  const url = `/media/episodes/${episodeId}/shorts/${id}.mp4`;
-
-  const video = h('video', {
-    src: url,
-    muted: true,
-    playsinline: true,
-    preload: 'metadata',
-    class: 'w-full h-full object-cover',
-  }) as HTMLVideoElement;
 
   const statusTone =
     status === 'approved' || status === 'published'
@@ -150,15 +158,40 @@ function renderTile(
       ? 'bg-status-danger'
       : 'bg-status-warning';
 
-  return h(
-    'button',
-    {
-      onclick: () => navigate(`/episodes/${episodeId}/clips/review`),
+  // Only create a <video> element when the shorts MP4 actually exists on disk.
+  // Without this guard every tile fires a 404 request for the missing file.
+  let previewEl: HTMLElement;
+  let hoverHandlers: Record<string, unknown> = {};
+  if (shortsRendered) {
+    const url = `/media/episodes/${episodeId}/shorts/${id}.mp4`;
+    const video = h('video', {
+      src: url,
+      muted: true,
+      playsinline: true,
+      preload: 'metadata',
+      class: 'w-full h-full object-cover',
+    }) as HTMLVideoElement;
+    previewEl = video;
+    hoverHandlers = {
       onmouseenter: () => video.play().catch(() => {}),
       onmouseleave: () => {
         video.pause();
         video.currentTime = 0;
       },
+    };
+  } else {
+    // Placeholder div — no network request, no 404
+    previewEl = h('div', {
+      class:
+        'w-full h-full bg-surface-inset flex items-center justify-center',
+    });
+  }
+
+  return h(
+    'button',
+    {
+      onclick: () => navigate(`/episodes/${episodeId}/clips/review`),
+      ...hoverHandlers,
       class:
         'group text-left flex flex-col gap-1.5 focus:outline-none',
     },
@@ -168,7 +201,7 @@ function renderTile(
         class:
           'relative aspect-[9/16] w-full rounded-md overflow-hidden bg-surface-inset border border-border-subtle group-hover:border-border-strong transition-colors',
       },
-      video,
+      previewEl,
       h(
         'div',
         {
