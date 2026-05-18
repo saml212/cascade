@@ -19,7 +19,9 @@ logger = logging.getLogger("cascade")
 _audio_mix_lock = threading.Lock()
 
 
-def generate_audio_mix(episode_dir: Path, episode_data: dict, config: dict = None) -> Path | None:
+def generate_audio_mix(
+    episode_dir: Path, episode_data: dict, config: dict = None
+) -> Path | None:
     """Generate work/audio_mix.wav, the canonical audio source for renders.
 
     Two modes:
@@ -93,13 +95,23 @@ def _generate_audio_mix_locked(
     if not mix_tracks:
         merged_path = episode_dir / "source_merged.mp4"
         if not merged_path.exists():
-            logger.warning("No H6E tracks and no source_merged.mp4 — cannot generate audio mix")
+            logger.warning(
+                "No H6E tracks and no source_merged.mp4 — cannot generate audio mix"
+            )
             return None
         return _generate_camera_audio_mix(merged_path, output_path, config)
 
     stem_to_path = _map_track_stems(episode_dir, episode_data)
     entries = [
-        (stem_to_path[t["stem"]], t.get("volume", 1.0) * master_vol)
+        {
+            "path": stem_to_path[t["stem"]],
+            "volume": t.get("volume", 1.0) * master_vol,
+            # Default to "speaker" when the role isn't set — preserves
+            # behavior for legacy episodes whose audio_mix.tracks list was
+            # written before role tagging existed; all such tracks were
+            # speaker tracks in practice.
+            "role": t.get("role", "speaker"),
+        }
         for t in mix_tracks
         if t.get("volume", 1.0) * master_vol > 0 and t["stem"] in stem_to_path
     ]
@@ -108,18 +120,35 @@ def _generate_audio_mix_locked(
         return None
 
     # Video duration for trimming — sync data > stitch.json > episode duration
-    video_duration = audio_sync.get("video_duration") \
-        or episode_data.get("duration_seconds")
+    video_duration = audio_sync.get("video_duration") or episode_data.get(
+        "duration_seconds"
+    )
 
     if tempo_factor != 1.0:
-        logger.info(f"Tempo correction: {tempo_factor:.8f} ({audio_sync.get('drift_rate_ppm', 0):.1f} ppm)")
+        logger.info(
+            f"Tempo correction: {tempo_factor:.8f} ({audio_sync.get('drift_rate_ppm', 0):.1f} ppm)"
+        )
+
+    # Per-track leveling: each speaker's mono mic gets dynaudnorm + loudnorm
+    # to a per-track target BEFORE the mix sums them. This is the Adobe
+    # Podcast trick — quiet guests and loud hosts both land at the same
+    # level before they meet at the bus, instead of normalizing the final
+    # mix and burying the quieter voice forever. Ambient/room mics skip
+    # this so they stay at their fader level.
+    processing = (config or {}).get("processing", {})
+    per_speaker_target = processing.get("audio_per_speaker_lufs", -19)
+    enable_per_speaker = processing.get("audio_per_speaker_leveling", True)
 
     # Build ffmpeg filter graph
     inputs = []
     filters = []
     labels = []
 
-    for i, (path, vol) in enumerate(entries):
+    for i, entry in enumerate(entries):
+        path = entry["path"]
+        vol = entry["volume"]
+        role = entry["role"]
+
         if offset >= 0:
             inputs += ["-ss", str(offset), "-i", str(path)]
         else:
@@ -131,6 +160,18 @@ def _generate_audio_mix_locked(
             f += f",adelay={delay_ms}|{delay_ms}"
         if abs(tempo_factor - 1.0) > 1e-7:
             f += f",atempo={tempo_factor:.8f}"
+        if enable_per_speaker and role == "speaker":
+            # dynaudnorm: continuous gain-riding ("invisible fader engineer").
+            #   f=300ms frame, g=11 frames gauss window (~3.3s) = Adobe-style
+            #   responsive but not pumping. p=0.9 keeps loud peaks anchored.
+            #   m=20 dB max gain protects from amplifying silence into noise.
+            # loudnorm I=-19: per-track LUFS target so 3 voices summing leaves
+            #   the bus near -14 LUFS without the master loudnorm having to
+            #   apply heroic amounts of gain.
+            f += (
+                ",dynaudnorm=f=300:g=11:p=0.9:m=20:r=0.0:s=12"
+                f",loudnorm=I={per_speaker_target}:TP=-1.5:LRA=7"
+            )
         f += f",volume={vol:.3f}[t{i}]"
         filters.append(f)
         labels.append(f"[t{i}]")
@@ -145,10 +186,17 @@ def _generate_audio_mix_locked(
         fc += "; [mono]pan=stereo|c0=c0|c1=c0[out]"
 
     cmd = [
-        "ffmpeg", "-y", *inputs,
-        "-filter_complex", fc,
-        "-map", "[out]",
-        "-c:a", "pcm_s16le", "-ar", "48000",
+        "ffmpeg",
+        "-y",
+        *inputs,
+        "-filter_complex",
+        fc,
+        "-map",
+        "[out]",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "48000",
     ]
 
     # Trim output to video duration so H6E doesn't extend past the video
@@ -168,6 +216,7 @@ def _generate_audio_mix_locked(
     # Apply audio enhancement (EQ, compression, loudness normalization)
     if config:
         from lib.audio_enhance import enhance_audio
+
         enhanced_path = work_dir / "audio_mix_enhanced.wav"
         result_path = enhance_audio(output_path, enhanced_path, config)
         if result_path != output_path and result_path.exists():
@@ -191,11 +240,15 @@ def _generate_camera_audio_mix(
     """
     logger.info("Extracting camera audio to %s...", output_path.name)
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(merged_path),
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(merged_path),
         "-vn",  # video not needed
-        "-c:a", "pcm_s16le",
-        "-ar", "48000",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "48000",
         str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -209,6 +262,7 @@ def _generate_camera_audio_mix(
     # Apply enhancement (DeepFilterNet + ffmpeg chain) — same as H6E path
     if config:
         from lib.audio_enhance import enhance_audio
+
         enhanced_path = output_path.parent / "audio_mix_enhanced.wav"
         result_path = enhance_audio(output_path, enhanced_path, config)
         if result_path != output_path and result_path.exists():
@@ -218,7 +272,12 @@ def _generate_camera_audio_mix(
 
 
 def _build_from_crop_config(episode_dir: Path, episode_data: dict) -> list[dict]:
-    """Build track list from crop_config speaker/ambient track assignments."""
+    """Build track list from crop_config speaker/ambient track assignments.
+
+    Tags each entry with role="speaker" or role="ambient" so the mix builder
+    knows whether to run per-speaker leveling (voices) or pass through at
+    fader level (room-mic / built-in ambient).
+    """
     crop = episode_data.get("crop_config", {})
     audio_tracks = _get_audio_tracks(episode_dir, episode_data)
 
@@ -232,15 +291,33 @@ def _build_from_crop_config(episode_dir: Path, episode_data: dict) -> list[dict]
     for spk in crop.get("speakers", []):
         tn = spk.get("track")
         if tn and tn in num_to_stem:
-            result.append({"stem": num_to_stem[tn], "volume": spk.get("volume", 1.0)})
+            result.append(
+                {
+                    "stem": num_to_stem[tn],
+                    "volume": spk.get("volume", 1.0),
+                    "role": "speaker",
+                }
+            )
 
     for amb in crop.get("ambient_tracks", []):
         tn = amb.get("track_number")
         stem = amb.get("stem")
         if tn and tn in num_to_stem:
-            result.append({"stem": num_to_stem[tn], "volume": amb.get("volume", 0.2)})
+            result.append(
+                {
+                    "stem": num_to_stem[tn],
+                    "volume": amb.get("volume", 0.2),
+                    "role": "ambient",
+                }
+            )
         elif stem:
-            result.append({"stem": stem, "volume": amb.get("volume", 0.2)})
+            result.append(
+                {
+                    "stem": stem,
+                    "volume": amb.get("volume", 0.2),
+                    "role": "ambient",
+                }
+            )
 
     return result
 

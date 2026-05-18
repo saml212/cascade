@@ -41,8 +41,8 @@ video_gamma = 1.01                        # eq gamma (very subtle brightness lif
 
 # Audio enhancement (Spotify/Apple/YouTube compliant — single master)
 audio_enhance = true                     # Enable audio enhancement pipeline
-audio_target_lufs = -16                  # Target loudness LUFS (-16 = Apple ±1 gate; Spotify/YT normalize down)
-audio_target_lra = 7                     # Target loudness range (6-8 = tight spoken dialogue)
+audio_target_lufs = -14                  # Master target LUFS (-14 = Spotify/YouTube/Amazon; -16 only when Apple Podcasts is the primary platform)
+audio_target_lra = 6                     # Target loudness range (6 = tight spoken dialogue)
 audio_target_tp = -1.0                   # True peak ceiling dBTP (-1.0 safe for AAC/Vorbis transcode)
 audio_highpass_hz = 80                   # Highpass cutoff Hz (4-pole Butterworth)
 audio_lowpass_hz = 16000                 # Lowpass cutoff Hz (16k preserves "air" for headphones)
@@ -50,6 +50,14 @@ audio_afftdn = true                      # FFT-based stationary noise removal (l
 audio_declick = true                     # Autoregressive declicking (mouth clicks, chair squeaks)
 audio_deesser = true                     # Sibilance control at 5-8 kHz
 audio_denoise_model = "deepfilternet"    # ML denoise: "deepfilternet" (default), "none", or "MossFormer2_SE_48K"
+
+# Per-speaker leveling — runs on each role=speaker mic BEFORE the mix sums
+# them. Adobe Podcast AI-style continuous gain riding + per-track loudnorm
+# so quiet guests / loud hosts both land at the same level pre-mix, and
+# within-speaker volume drift (someone trailing off) gets ridden up.
+# Ambient/room mics pass through untouched.
+audio_per_speaker_leveling = true        # Run dynaudnorm + per-track loudnorm on each speaker mic
+audio_per_speaker_lufs = -19             # Per-track LUFS target (3 voices @ -19 ≈ -14 LUFS at mix bus)
 
 [transcription]
 provider = "deepgram"                     # Transcription provider
