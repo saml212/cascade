@@ -188,6 +188,16 @@ def run_pipeline(
                 episode["audio_sync"] = result["audio_sync"]
             if "audio" in result:
                 episode["audio_tracks"] = result["audio"].get("tracks", [])
+            # Stitch reports virtual audio_tracks for camera-audio episodes
+            # (L/R channel split when no H6E recorder was used). Only merged
+            # when ingest didn't already populate audio_tracks — H6E always
+            # wins if present.
+            if (
+                agent_name == "stitch"
+                and result.get("audio_tracks")
+                and not episode.get("audio_tracks")
+            ):
+                episode["audio_tracks"] = result["audio_tracks"]
             if "source_properties" in result and result["source_properties"]:
                 episode["source_properties"] = result["source_properties"]
             _save_episode(mutable["episode_file"], episode)

@@ -10,9 +10,7 @@ Dependencies:
     - ffmpeg (concat + frame extraction), ffprobe (validation)
 """
 
-import json
 import subprocess
-from pathlib import Path
 
 from agents.base import BaseAgent
 from lib.ffprobe import probe as ffprobe
@@ -33,6 +31,7 @@ class StitchAgent(BaseAgent):
         if len(files) == 1:
             # Single file — symlink to avoid duplicating 10-20GB
             import os
+
             os.symlink(files[0]["dest_path"], output_path)
         else:
             # Write ffmpeg concat list
@@ -46,10 +45,16 @@ class StitchAgent(BaseAgent):
 
             # Stream-copy merge (files must have uniform codec/resolution)
             cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_list),
-                "-c", "copy",
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list),
+                "-c",
+                "copy",
                 str(output_path),
             ]
             self.logger.info(f"Stitching {len(files)} files...")
@@ -71,22 +76,48 @@ class StitchAgent(BaseAgent):
         frame_time = min(5.0, output_duration / 2)
         try:
             frame_cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(frame_time),
-                "-i", str(output_path),
-                "-frames:v", "1",
-                "-q:v", "2",
+                "ffmpeg",
+                "-y",
+                "-ss",
+                str(frame_time),
+                "-i",
+                str(output_path),
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
                 str(crop_frame_path),
             ]
             subprocess.run(frame_cmd, capture_output=True, text=True, check=True)
-            self.logger.info(f"Extracted crop frame at {frame_time:.1f}s → crop_frame.jpg")
+            self.logger.info(
+                f"Extracted crop frame at {frame_time:.1f}s → crop_frame.jpg"
+            )
         except subprocess.CalledProcessError as e:
             self.logger.warning(f"Failed to extract crop frame: {e}")
 
-        return {
+        result = {
             "output_path": str(output_path),
             "input_count": len(files),
             "duration_seconds": round(output_duration, 3),
             "expected_duration_seconds": round(expected_duration, 3),
         }
 
+        # ── Camera-audio fallback ──────────────────────────────────────────
+        # When no external recorder was used (DJI mics → camera direct), the
+        # two wireless mics land on L/R of the camera's stereo audio. Demux
+        # them into per-mic mono WAVs so speaker_cut / audio_mix / the crop
+        # UI mixer see them like the H6E inputs they're standing in for.
+        # Skipped when ingest already produced audio_tracks (H6E mode), and
+        # gated on episode.json existing so unit tests with mocked subprocess
+        # / ffprobe don't trigger the real extractor.
+        if (self.episode_dir / "episode.json").exists():
+            episode_data = self.load_json_safe("episode.json")
+            if not episode_data.get("audio_tracks"):
+                from lib.camera_audio import extract_camera_channels
+
+                audio_dir = self.episode_dir / "audio"
+                extracted = extract_camera_channels(output_path, audio_dir)
+                if extracted:
+                    result["audio_tracks"] = extracted
+
+        return result
