@@ -14,25 +14,22 @@ const KIND_STYLE: Record<PipelineEvent['kind'], { dot: string; text: string }> =
 
 const MAX_EVENTS = 50;
 
-export function EventFeed(episodeId: string): HTMLElement {
+/**
+ * Returns the feed element plus a dispose function.
+ * Callers MUST call dispose() when replacing the element to cancel the poll
+ * immediately, before any async MutationObserver callback could fire.
+ */
+export function EventFeed(episodeId: string): { el: HTMLElement; dispose: () => void } {
   const events = signal<PipelineEvent[]>([]);
 
   const unsubscribe = subscribe(episodeId, (e) => {
+    // Guard: only accept events that belong to this feed's episode.
+    if (e.episode_id !== episodeId) return;
     events.set((prev) => [e, ...prev].slice(0, MAX_EVENTS));
   });
 
   const container = h('div', {
     class: 'flex flex-col gap-2',
-    ref: (el: Element) => {
-      // Clean up when removed from DOM.
-      const observer = new MutationObserver(() => {
-        if (!el.isConnected) {
-          unsubscribe();
-          observer.disconnect();
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-    },
   });
 
   const empty = h(
@@ -93,5 +90,5 @@ export function EventFeed(episodeId: string): HTMLElement {
     );
   });
 
-  return container;
+  return { el: container, dispose: unsubscribe };
 }

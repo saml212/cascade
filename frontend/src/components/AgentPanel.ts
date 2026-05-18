@@ -85,8 +85,17 @@ export function AgentPanel(): HTMLElement {
 
   function feedSection(): HTMLElement {
     const inner = h('div', null);
+    let currentDispose: (() => void) | null = null;
+
     effect(() => {
       const id = episodeDetailId();
+
+      // Synchronously cancel the previous feed's poll before replacing.
+      if (currentDispose) {
+        currentDispose();
+        currentDispose = null;
+      }
+
       if (!id) {
         inner.replaceChildren(
           h(
@@ -96,7 +105,9 @@ export function AgentPanel(): HTMLElement {
           )
         );
       } else {
-        inner.replaceChildren(EventFeed(id));
+        const { el, dispose } = EventFeed(id);
+        currentDispose = dispose;
+        inner.replaceChildren(el);
       }
     });
     return inner;

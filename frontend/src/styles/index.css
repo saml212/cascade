@@ -96,6 +96,21 @@
 }
 
 @layer components {
+  /* Hero spotlight — container-query-based responsive layout */
+  .hero-spotlight-inner {
+    container-type: inline-size;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+    align-items: start;
+  }
+  @container (min-width: 640px) {
+    .hero-spotlight-inner {
+      grid-template-columns: 1fr auto;
+      gap: 1.5rem;
+    }
+  }
+
   .tabular {
     font-variant-numeric: tabular-nums;
   }

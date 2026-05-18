@@ -105,24 +105,24 @@ export function renderMetadata(
   target.replaceChildren(
     h(
       'div',
-      { class: 'grid grid-cols-2 gap-6 pb-24' },
+      { class: 'grid grid-cols-2 gap-6 pb-32' },
       h(
         'section',
-        { class: 'panel p-6 flex flex-col gap-5' },
+        { class: 'panel p-6 flex flex-col gap-5 min-w-0' },
         sectionHeader('Guest'),
         fieldText(draft, 'guest_name', 'Name'),
         fieldText(draft, 'guest_title', 'Title / role')
       ),
       h(
         'section',
-        { class: 'panel p-6 flex flex-col gap-5' },
+        { class: 'panel p-6 flex flex-col gap-5 min-w-0' },
         sectionHeader('Episode'),
         fieldText(draft, 'episode_name', 'Short name'),
         fieldTextarea(draft, 'episode_description', 'Short description')
       ),
       h(
         'section',
-        { class: 'panel p-6 flex flex-col gap-5 col-span-2' },
+        { class: 'panel p-6 flex flex-col gap-5 col-span-2 min-w-0' },
         sectionHeader('Longform'),
         fieldText(draft, 'title', 'Full title (YouTube / Spotify)'),
         fieldTextarea(draft, 'description', 'Full description', 6),
@@ -130,7 +130,7 @@ export function renderMetadata(
       ),
       h(
         'section',
-        { class: 'panel p-6 flex flex-col gap-5 col-span-2' },
+        { class: 'panel p-6 flex flex-col gap-5 col-span-2 min-w-0' },
         sectionHeader('Links'),
         fieldText(
           draft,
@@ -188,7 +188,7 @@ function fieldText(
   }) as HTMLInputElement;
   return h(
     'div',
-    { class: 'flex flex-col gap-1.5' },
+    { class: 'flex flex-col gap-1.5 min-w-0' },
     h(
       'label',
       { class: 'text-body-sm text-ink-secondary font-medium' },

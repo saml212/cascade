@@ -181,13 +181,13 @@ function renderHeader(
         ),
         h(
           'h1',
-          { class: 'font-display text-display-lg text-ink-primary mt-2 truncate' },
+          { class: 'font-display text-display-lg text-ink-primary mt-2 break-words' },
           title
         ),
         subtitle
           ? h(
               'p',
-              { class: 'text-body-lg text-ink-secondary mt-1 truncate' },
+              { class: 'text-body-lg text-ink-secondary mt-1 break-words' },
               subtitle
             )
           : null

@@ -420,8 +420,14 @@ def run_pipeline(
     # do — don't pretend clips are ready for review.
     episode["pipeline"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     episode["pipeline"].pop("current_agent", None)
+    agents_done = set(episode["pipeline"].get("agents_completed", []))
     if not episode.get("crop_config"):
         episode["status"] = "awaiting_crop_setup"
+    elif "publish" in agents_done and (
+        episode.get("youtube_longform_url") or episode.get("spotify_longform_url")
+    ):
+        # publish ran AND longform URLs are recorded — the episode is live
+        episode["status"] = "published"
     else:
         episode["status"] = "ready_for_review"
     progress_file = mutable["episode_dir"] / "progress.json"

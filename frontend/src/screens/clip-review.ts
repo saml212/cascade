@@ -210,7 +210,7 @@ export function ClipReview(target: HTMLElement, episodeId: string): void {
       h(
         'div',
         { class: 'flex-1 min-h-0 overflow-y-auto' },
-        h('div', { class: 'max-w-[1080px] mx-auto px-10 py-6' }, body)
+        h('div', { class: 'max-w-[1080px] mx-auto px-10 py-6 pb-32' }, body)
       ),
       renderChatDock(chatMessages, chatSending, sendChat)
     )
@@ -488,7 +488,7 @@ function clipThumb(
     src: url,
     muted: true,
     playsinline: true,
-    preload: 'none',
+    preload: 'metadata',
     class: 'w-full h-full object-cover bg-surface-inset',
   }) as HTMLVideoElement;
 

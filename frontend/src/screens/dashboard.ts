@@ -188,13 +188,13 @@ function heroSpotlight(ep: EpisodeSummary): HTMLElement {
     },
     h(
       'div',
-      { class: 'flex gap-10 items-start' },
+      { class: 'hero-spotlight-inner' },
       h(
         'div',
-        { class: 'flex-1 min-w-0' },
+        { class: 'min-w-0' },
         h(
           'div',
-          { class: 'flex items-center gap-3 mb-4' },
+          { class: 'flex items-center gap-3 mb-4 flex-wrap' },
           StatusPill({ descriptor: status, size: 'md' }),
           h(
             'span',
@@ -219,7 +219,7 @@ function heroSpotlight(ep: EpisodeSummary): HTMLElement {
           : null,
         h(
           'div',
-          { class: 'flex items-center gap-6 mt-6 text-body-sm text-ink-secondary' },
+          { class: 'flex flex-wrap items-center gap-x-6 gap-y-1 mt-6 text-body-sm text-ink-secondary' },
           meta('Duration', formatDuration(ep.duration_seconds)),
           meta('Created', formatRelative(ep.created_at)),
           meta('Clips', clipCountOf(ep) > 0 ? String(clipCountOf(ep)) : '—')

@@ -16,6 +16,7 @@ export interface PipelineEvent {
   detail?: string;
   status?: string;
   agent?: string | null;
+  episode_id: string;
 }
 
 type Unsubscribe = () => void;
@@ -60,8 +61,9 @@ export function subscribe(
   };
 }
 
-function emit(sub: Subscription, e: PipelineEvent): void {
-  for (const fn of sub.listeners) fn(e);
+function emit(sub: Subscription, e: Omit<PipelineEvent, 'episode_id'>): void {
+  const tagged: PipelineEvent = { ...e, episode_id: sub.episodeId };
+  for (const fn of sub.listeners) fn(tagged);
 }
 
 async function tick(sub: Subscription): Promise<void> {

@@ -83,7 +83,7 @@ export function Publish(target: HTMLElement, episodeId: string): void {
         'div',
         {
           class:
-            'max-w-[1200px] mx-auto w-full px-8 py-6 flex flex-col gap-6',
+            'max-w-[1200px] mx-auto w-full px-8 py-6 flex flex-col gap-6 pb-32',
         },
         renderOverview(approved.length, pending.length, rejected.length, ep),
         renderPlatforms(cs),
