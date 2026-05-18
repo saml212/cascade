@@ -1,5 +1,5 @@
 import { h } from '../../lib/dom';
-import { formatOffsetMs } from '../../lib/format';
+import { formatOffsetMs, formatRelative } from '../../lib/format';
 
 export function renderAudio(
   target: HTMLElement,
@@ -7,6 +7,7 @@ export function renderAudio(
   _episodeId: string
 ): void {
   const sync = ep.audio_sync as Record<string, unknown> | undefined;
+  const loudness = ep.audio_loudness as Record<string, unknown> | undefined;
   const cropConfig = ep.crop_config as Record<string, unknown> | undefined;
   const speakers = (cropConfig?.speakers as Array<Record<string, unknown>>) ?? [];
   const ambient = (cropConfig?.ambient_tracks as Array<Record<string, unknown>>) ?? [];
@@ -39,6 +40,7 @@ export function renderAudio(
             )
           )
         : null,
+      loudnessPanel(loudness),
       speakers.length > 0
         ? h(
             'div',
@@ -120,5 +122,86 @@ function syncStat(label: string, value: string): HTMLElement {
     null,
     h('div', { class: 'text-heading-sm uppercase text-ink-tertiary mb-1' }, label),
     h('div', { class: 'text-body-lg text-ink-primary font-mono tabular' }, value)
+  );
+}
+
+function loudnessPanel(loudness: Record<string, unknown> | undefined): HTMLElement | null {
+  if (!loudness) {
+    return h(
+      'div',
+      { class: 'panel p-6' },
+      h('h3', { class: 'text-heading-md text-ink-primary mb-3' }, 'Loudness'),
+      h(
+        'p',
+        { class: 'text-body text-ink-tertiary italic' },
+        'Loudness measurement pending — will appear after longform render.'
+      )
+    );
+  }
+
+  const integrated = loudness.integrated_lufs as number;
+  const truePeak = loudness.true_peak_dbfs as number;
+  const lra = loudness.loudness_range_lu as number;
+  const target = loudness.target_lufs as number;
+  const measuredAt = loudness.measured_at as string | undefined;
+
+  const delta = Math.abs(integrated - target);
+  const lufsColorClass =
+    delta <= 1
+      ? 'text-status-success'
+      : delta <= 3
+      ? 'text-status-warning'
+      : 'text-status-danger';
+
+  const integratedStr = integrated.toFixed(1);
+  const truePeakStr = (truePeak >= 0 ? '+' : '') + truePeak.toFixed(1);
+  const lraStr = lra.toFixed(1);
+  // target.toFixed already carries the sign — don't double-prefix below.
+  const targetStr = target.toFixed(0);
+
+  return h(
+    'div',
+    { class: 'panel p-6' },
+    h('h3', { class: 'text-heading-md text-ink-primary mb-4' }, 'Loudness'),
+    // Big headline number
+    h(
+      'div',
+      { class: 'flex items-baseline gap-2 mb-1' },
+      h(
+        'span',
+        { class: `font-display text-display-xl font-semibold tabular ${lufsColorClass}` },
+        integratedStr
+      ),
+      h(
+        'span',
+        { class: 'text-heading-md text-ink-tertiary' },
+        'LUFS'
+      )
+    ),
+    // Secondary stats row
+    h(
+      'div',
+      { class: 'flex gap-6 mt-3 mb-4' },
+      miniStat('True peak', `${truePeakStr} dBFS`),
+      miniStat('LRA', `${lraStr} LU`),
+      miniStat('Target', `${targetStr} LUFS`)
+    ),
+    // Footer
+    measuredAt
+      ? h(
+          'div',
+          { class: 'text-body-sm text-ink-tertiary border-t border-border-subtle pt-3' },
+          `Measured ${formatRelative(measuredAt)}`
+        )
+      : null
+  );
+}
+
+function miniStat(label: string, value: string): HTMLElement {
+  return h(
+    'div',
+    null,
+    h('div', { class: 'text-heading-sm uppercase text-ink-tertiary mb-0.5' }, label),
+    h('div', { class: 'text-body text-ink-secondary font-mono tabular' }, value)
   );
 }

@@ -7,7 +7,7 @@
  */
 
 import { api } from './api';
-import { describeAgent } from './format';
+import { describeAgent, describeStatus } from './format';
 
 export interface PipelineEvent {
   at: number;
@@ -80,7 +80,7 @@ async function tick(sub: Subscription): Promise<void> {
     emit(sub, {
       at: Date.now(),
       kind: 'status',
-      label: `Status: ${status}`,
+      label: `Status: ${describeStatus(status).label}`,
       status,
     });
     sub.lastStatus = status;

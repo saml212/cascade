@@ -131,7 +131,7 @@ export function NewEpisode(target: HTMLElement): void {
       ),
       formRow(
         'Audio path (optional)',
-        'Zoom H6E folder. Leave blank for 2-speaker Canon episodes.',
+        'Zoom H6E folder. Leave blank for 2-speaker DJI-mic-direct episodes — cascade will split the camera stereo into per-mic tracks automatically.',
         audioInput
       ),
       formRow('Speaker count', 'Includes the host.', speakerControls),

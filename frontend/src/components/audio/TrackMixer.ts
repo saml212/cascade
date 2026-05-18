@@ -1,11 +1,17 @@
 /**
- * Track mixer — shows each of the six H6E tracks with its assignment, lets
- * Sam adjust per-speaker volume (saved into crop_config), mute / solo
- * individual tracks live through a Web Audio graph.
+ * Track mixer — shows every audio track found in episode.audio_tracks with
+ * its assignment, lets Sam adjust per-speaker volume (saved into crop_config),
+ * mute / solo individual tracks live through a Web Audio graph.
  *
  * Playback is an in-panel affordance separate from the SyncVerifier's
- * camera+H6E preview — here each of the six stems is loaded individually
- * so Sam can A/B tracks without crop setup getting in his way.
+ * camera+H6E preview — here each stem is loaded individually so Sam can
+ * A/B tracks without crop setup getting in his way.
+ *
+ * Rows are derived from the actual audio_tracks array rather than a
+ * hardcoded list, so this works for:
+ *   - H6E episodes (Tr1-Tr4, TrLR, TrMic, potentially multiple sessions)
+ *   - Camera-stereo episodes (camera_Tr1, camera_Tr2)
+ *   - Any future track type
  */
 
 import { h } from '../../lib/dom';
@@ -16,22 +22,19 @@ import { Icon } from '../icons';
 import { showToast } from '../../state/ui';
 import { episodeDetail } from '../../state/episodes';
 
+/** One row in the mixer, derived from a real audio_tracks entry. */
 interface TrackRow {
+  /** Stable key for DOM id / audio graph. Derived from filename without extension. */
   key: string;
+  /** Human-readable label shown in the row header. */
   label: string;
-  /** H6E stem convention (what appears in the WAV filename). */
-  stem: 'Tr1' | 'Tr2' | 'Tr3' | 'Tr4' | 'TrLR' | 'TrMic';
+  /** Stem name passed to /api/episodes/:id/audio-preview/:stem */
+  stem: string;
+  /** track_number from the audio_tracks entry (1-based for input tracks, null for mix/mic). */
   trackNumber: number | null;
+  /** Session prefix when multiple H6E sessions exist, e.g. "260429_105232". Empty string = no disambig needed. */
+  sessionLabel: string;
 }
-
-const ROWS: TrackRow[] = [
-  { key: 'tr1', label: 'Track 1', stem: 'Tr1', trackNumber: 1 },
-  { key: 'tr2', label: 'Track 2', stem: 'Tr2', trackNumber: 2 },
-  { key: 'tr3', label: 'Track 3', stem: 'Tr3', trackNumber: 3 },
-  { key: 'tr4', label: 'Track 4', stem: 'Tr4', trackNumber: 4 },
-  { key: 'mix', label: 'Stereo Mix', stem: 'TrLR', trackNumber: null },
-  { key: 'mic', label: 'Built-in Mic', stem: 'TrMic', trackNumber: null },
-];
 
 const SPEAKER_VARS = [
   'var(--speaker-1)',
@@ -51,7 +54,7 @@ interface MixerAmbient {
   volume: number;
 }
 
-interface TrackMixerProps {
+export interface TrackMixerProps {
   episodeId: string;
   /** Re-read per render so live assignment changes in the speaker panel
    *  flow through without rebuilding the audio graph. */
@@ -61,7 +64,7 @@ interface TrackMixerProps {
   /** Called when the assignment dropdown on a mixer row changes. Lets Sam
    *  reassign "Track N plays Host/Guest 1/etc." inline while auditioning
    *  tracks via solo — without leaving the mixer to hit the speaker panel.
-   *  trackNumber is the H6E track (1-based) being assigned; speakerIdx is
+   *  trackKey is the stem key of the row being assigned; speakerIdx is
    *  the target speaker (-1 = unassign). */
   onAssignTrack?: (trackNumber: number, speakerIdx: number) => void;
 }
@@ -75,6 +78,76 @@ interface MixerState {
   muted: Record<string, boolean>;
 }
 
+/**
+ * Build TrackRow array from the current episode's audio_tracks.
+ *
+ * Groups tracks by the session prefix (the timestamp portion of filenames
+ * like 260429_105232_Tr1.WAV). When multiple sessions exist the session
+ * timestamp is prepended to the label for disambiguation.
+ *
+ * For camera-channel tracks (camera_Tr1.WAV / camera_Tr2.WAV) we emit a
+ * "Camera L" / "Camera R" style label based on track_number.
+ */
+function buildRows(): TrackRow[] {
+  const ep = episodeDetail.peek();
+  const tracks =
+    (ep?.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
+  if (tracks.length === 0) return [];
+
+  // Detect whether multiple sessions exist (for H6E disambiguation).
+  // Session prefix = everything before the last underscore-stem, e.g.
+  // "260429_105232" from "260429_105232_Tr1.WAV".
+  const sessionPrefixes = new Set<string>();
+  for (const t of tracks) {
+    const fn = (t.filename as string) ?? '';
+    const m = fn.match(/^(\d{6}_\d{6})_/);
+    if (m) sessionPrefixes.add(m[1]);
+  }
+  const multiSession = sessionPrefixes.size > 1;
+
+  const rows: TrackRow[] = [];
+
+  for (const t of tracks) {
+    const fn = (t.filename as string) ?? '';
+    if (!fn) continue;
+    const stem = fn.replace(/\.[^./]+$/, ''); // strip extension
+    const trackType = (t.track_type as string) ?? '';
+    const trackNumber = (t.track_number as number | null | undefined) ?? null;
+
+    // Session prefix, e.g. "260429_105232" — present only for H6E-style names.
+    const sessionMatch = fn.match(/^(\d{6}_\d{6})_/);
+    const sessionLabel = multiSession && sessionMatch ? sessionMatch[1] : '';
+
+    // Human-readable label for the stem part (after the session prefix).
+    let stemLabel: string;
+    if (trackType === 'camera_channel') {
+      // camera_Tr1.WAV → Camera L / Camera R
+      if (trackNumber === 1) stemLabel = 'Camera L';
+      else if (trackNumber === 2) stemLabel = 'Camera R';
+      else stemLabel = `Camera Ch${trackNumber ?? '?'}`;
+    } else if (trackType === 'input') {
+      stemLabel = `Track ${trackNumber ?? '?'}`;
+    } else if (trackType === 'stereo_mix') {
+      stemLabel = 'Stereo Mix';
+    } else if (trackType === 'builtin_mic') {
+      stemLabel = 'Built-in Mic';
+    } else {
+      // Fallback: use the stem name itself
+      stemLabel = stem.replace(/^(\d{6}_\d{6})_/, '');
+    }
+
+    rows.push({
+      key: stem,
+      label: stemLabel,
+      stem,
+      trackNumber,
+      sessionLabel,
+    });
+  }
+
+  return rows;
+}
+
 export function TrackMixer(props: TrackMixerProps): HTMLElement {
   const state = signal<MixerState>({
     graph: null,
@@ -85,10 +158,28 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
     muted: {},
   });
 
+  // Snapshot rows once on mount — the set of tracks doesn't change during
+  // a crop-setup session, so we don't need to rebuild the graph structure.
+  // If the episode detail isn't loaded yet, we fall back to [] and the
+  // effect below will re-run when it arrives.
+  const rows = signal<TrackRow[]>(buildRows());
+
   const host = h('div', { class: 'panel p-5' });
+
+  // Re-derive rows when episodeDetail first loads (it may arrive after mount).
+  effect(() => {
+    const ep = episodeDetail();
+    if (ep) {
+      const built = buildRows();
+      if (built.length !== rows.peek().length) {
+        rows.set(built);
+      }
+    }
+  });
 
   effect(() => {
     const s = state();
+    const currentRows = rows();
     host.replaceChildren(
       h(
         'div',
@@ -98,17 +189,17 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
           { class: 'text-heading-sm uppercase text-ink-tertiary' },
           'Track mixer'
         ),
-        playButton(props.episodeId, state, s)
+        playButton(props.episodeId, state, s, currentRows)
       ),
       h(
         'p',
         { class: 'text-body-sm text-ink-tertiary mb-3' },
-        'H6E tracks — this is what will land in the final longform. Hit Play, watch the level meters to see who is on which track, then assign in the dropdowns. Solo / mute to A/B before saving.'
+        'Hit Play, watch the level meters to see who is on which track, then assign in the dropdowns. Solo / mute to A/B before saving.'
       ),
       h(
         'div',
         { class: 'flex flex-col divide-y divide-border-subtle' },
-        ...ROWS.map((row) =>
+        ...currentRows.map((row) =>
           renderRow(row, props, state, s, props.getSpeakers(), props.getAmbient())
         )
       )
@@ -118,13 +209,12 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
   // Level-meter RAF loop. Reads analyser peak per track and writes the
   // bar width directly to each #mixer-meter-<key> element. Does NOT
   // touch the state signal — we don't want the whole mixer row tree
-  // rebuilding every frame (that bug bit us on the scrub-bar play
-  // button in the crop-setup screen).
+  // rebuilding every frame.
   let rafId: number | null = null;
   function levelLoop(): void {
     const g = state.peek().graph;
     if (g && state.peek().playing) {
-      for (const row of ROWS) {
+      for (const row of rows.peek()) {
         const level = g.getTrackLevel(row.key);
         const el = document.getElementById(`mixer-meter-${row.key}`);
         if (el) el.style.width = `${Math.round(level * 100)}%`;
@@ -152,7 +242,8 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
 function playButton(
   episodeId: string,
   state: Signal<MixerState>,
-  s: MixerState
+  s: MixerState,
+  currentRows: TrackRow[]
 ): HTMLElement {
   const toggle = async (): Promise<void> => {
     const cur = state.peek();
@@ -166,26 +257,22 @@ function playButton(
       state.set({ ...cur, playing: true });
       return;
     }
-    // First play — lazy load every available stem. The backend's
-    // audio-preview endpoint matches by filename stem, and H6E stems
-    // carry the recorder's timestamp prefix (e.g. 260311_162356_Tr1).
-    // We resolve each logical row to its actual stem via episode.audio_tracks.
-    const stems = resolveStems();
-    if (stems.length === 0) {
+    // First play — lazy load every available stem.
+    if (currentRows.length === 0) {
       state.set({
         ...cur,
         loading: false,
         error:
-          'No H6E audio tracks on this episode — mixer preview needs the multi-track recorder.',
+          'No audio tracks on this episode — mixer preview is not available.',
       });
-      showToast('No H6E stems to preview.', 'error');
+      showToast('No audio stems to preview.', 'error');
       return;
     }
     state.set({ ...cur, loading: true, error: null });
     const graph = createAudioGraph(
-      stems.map((s) => ({
-        key: s.key,
-        url: `/api/episodes/${episodeId}/audio-preview/${encodeURIComponent(s.stem)}`,
+      currentRows.map((r) => ({
+        key: r.key,
+        url: `/api/episodes/${episodeId}/audio-preview/${encodeURIComponent(r.stem)}`,
       }))
     );
     try {
@@ -194,7 +281,7 @@ function playButton(
       for (const [k, n] of graph.tracks.entries()) {
         if (n.error) errors.push(`${k}: ${n.error}`);
       }
-      if (errors.length === ROWS.length) {
+      if (errors.length === currentRows.length) {
         state.set({
           ...state.peek(),
           loading: false,
@@ -229,30 +316,6 @@ function playButton(
   });
 }
 
-/**
- * Map each logical TrackRow to the actual filename stem for this episode.
- * Returns only stems that have a matching filename on disk.
- */
-function resolveStems(): Array<{ key: string; stem: string }> {
-  const ep = episodeDetail.peek();
-  const tracks =
-    (ep?.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
-  if (tracks.length === 0) return [];
-  const out: Array<{ key: string; stem: string }> = [];
-  for (const row of ROWS) {
-    // Match by filename ending (e.g. _Tr1.WAV, _TrLR.WAV, _TrMic.WAV)
-    const needle = new RegExp(`_${row.stem}\\.`, 'i');
-    const match = tracks.find((t) =>
-      typeof t.filename === 'string' && needle.test(t.filename)
-    );
-    if (match) {
-      const name = (match.filename as string).replace(/\.[^./]+$/, '');
-      out.push({ key: row.key, stem: name });
-    }
-  }
-  return out;
-}
-
 function renderRow(
   row: TrackRow,
   props: TrackMixerProps,
@@ -261,7 +324,11 @@ function renderRow(
   speakers: MixerSpeaker[],
   ambientTracks: MixerAmbient[]
 ): HTMLElement {
-  const speakerIdx = row.trackNumber
+  // Match speaker by track_number. For multi-session H6E episodes the same
+  // track_number (e.g. 1) appears in each session — we match the first speaker
+  // that has this track assigned. The Track dropdown's value is the numeric
+  // track_number so the existing speaker.track field still works.
+  const speakerIdx = row.trackNumber != null
     ? speakers.findIndex((spk) => spk.track === row.trackNumber)
     : -1;
   const speaker = speakerIdx >= 0 ? speakers[speakerIdx] : null;
@@ -272,15 +339,15 @@ function renderRow(
   );
 
   let assignment: HTMLElement;
-  // Inline-editable speaker picker for numbered input tracks (Tr1-Tr4). Lets
-  // Sam audition via solo, hear a voice, and reassign in one click without
-  // leaving the mixer. TrLR/TrMic (ambient) stay as static chips.
+  // Inline-editable speaker picker for numbered input tracks. Lets Sam
+  // audition via solo, hear a voice, and reassign in one click without
+  // leaving the mixer. Mix/mic tracks (trackNumber===null) stay as static chips.
   if (
     row.trackNumber != null &&
     props.onAssignTrack &&
     props.getSpeakers().length > 0
   ) {
-    const speakers = props.getSpeakers();
+    const spks = props.getSpeakers();
     assignment = h(
       'select',
       {
@@ -293,7 +360,7 @@ function renderRow(
         },
       },
       h('option', { value: '' }, '— Unassigned —'),
-      ...speakers.map((spk, i) =>
+      ...spks.map((spk, i) =>
         h(
           'option',
           {
@@ -392,9 +459,7 @@ function renderRow(
 
   // Live level meter — filled by RAF loop in the mixer component. Pre-gain
   // tap (see audio-graph.ts), so the meter shows the underlying track
-  // activity even when Sam mutes or solos. This is how Sam SEES which
-  // speaker is on which track without having to solo-audition each one:
-  // whoever is talking lights up a meter.
+  // activity even when Sam mutes or solos.
   const meter = h(
     'div',
     {
@@ -409,26 +474,37 @@ function renderRow(
     })
   );
 
+  // Build the label cell. Show session label as a secondary line when
+  // multiple sessions exist, so Sam can tell 260429_105232_Tr1 from
+  // 260429_122543_Tr1.
+  const labelCell = h(
+    'div',
+    null,
+    h(
+      'div',
+      { class: 'text-body text-ink-primary font-medium' },
+      row.label
+    ),
+    row.sessionLabel
+      ? h(
+          'div',
+          { class: 'text-code-sm text-ink-tertiary font-mono tabular' },
+          row.sessionLabel
+        )
+      : h(
+          'div',
+          { class: 'text-code-sm text-ink-tertiary font-mono tabular' },
+          row.stem
+        )
+  );
+
   return h(
     'div',
     {
       class:
         'grid grid-cols-[100px_60px_150px_80px_1fr_56px] gap-3 items-center py-3',
     },
-    h(
-      'div',
-      null,
-      h(
-        'div',
-        { class: 'text-body text-ink-primary font-medium' },
-        row.label
-      ),
-      h(
-        'div',
-        { class: 'text-code-sm text-ink-tertiary font-mono tabular' },
-        row.stem
-      )
-    ),
+    labelCell,
     h(
       'div',
       { class: 'flex gap-1' },

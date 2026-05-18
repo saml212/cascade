@@ -115,12 +115,12 @@ export function Dashboard(target: HTMLElement): void {
           h(
             'h1',
             { class: 'font-display text-display-xl leading-none' },
-            'Today’s episode'
+            'On deck'
           ),
           h(
             'p',
             { class: 'text-body text-ink-secondary mt-3' },
-            'What’s on deck, what needs you, what’s already live.'
+            'What needs you next, and everything else in flight.'
           )
         ),
         Button({

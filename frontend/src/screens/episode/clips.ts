@@ -139,7 +139,7 @@ function renderTile(
     src: url,
     muted: true,
     playsinline: true,
-    preload: 'none',
+    preload: 'metadata',
     class: 'w-full h-full object-cover',
   }) as HTMLVideoElement;
 

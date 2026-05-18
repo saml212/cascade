@@ -213,9 +213,7 @@ export function describeStatus(
 const AGENT_LABELS: Record<string, string> = {
   ingest: 'Reading SD card',
   stitch: 'Stitching source clips',
-  audio_sync: 'Syncing H6E to camera',
   audio_analysis: 'Analyzing audio',
-  audio_enhance: 'Enhancing audio',
   speaker_cut: 'Splitting by speaker',
   transcribe: 'Transcribing',
   clip_miner: 'Mining clips',
@@ -233,8 +231,7 @@ const AGENT_LABELS: Record<string, string> = {
 export const CANONICAL_AGENTS: string[] = [
   'ingest',
   'stitch',
-  'audio_sync',
-  'audio_enhance',
+  'audio_analysis',
   'speaker_cut',
   'transcribe',
   'clip_miner',

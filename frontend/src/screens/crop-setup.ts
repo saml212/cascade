@@ -70,13 +70,37 @@ const SPEAKER_CSS_VARS = [
   'var(--speaker-4)',
 ];
 
-const TRACK_OPTIONS: Array<{ value: number | null; label: string }> = [
-  { value: null, label: 'No track' },
-  { value: 1, label: 'Track 1' },
-  { value: 2, label: 'Track 2' },
-  { value: 3, label: 'Track 3' },
-  { value: 4, label: 'Track 4' },
-];
+/**
+ * Build the Track dropdown options from the episode's actual audio_tracks.
+ * Only includes numbered input tracks (track_number != null) because
+ * those are the tracks that map to individual speakers. Mix/mic tracks
+ * are ambient and are never assigned to a speaker.
+ */
+function buildTrackOptions(
+  ep: Record<string, unknown> | null
+): Array<{ value: number | null; label: string }> {
+  const base: Array<{ value: number | null; label: string }> = [
+    { value: null, label: 'No track' },
+  ];
+  if (!ep) return base;
+  const tracks = (ep.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
+  // Deduplicate by track_number (multiple sessions share the same track slot).
+  const seen = new Set<number>();
+  for (const t of tracks) {
+    const tn = t.track_number as number | null | undefined;
+    if (tn == null || seen.has(tn)) continue;
+    seen.add(tn);
+    const tt = (t.track_type as string) ?? '';
+    let label: string;
+    if (tt === 'camera_channel') {
+      label = tn === 1 ? 'Camera L' : tn === 2 ? 'Camera R' : `Camera Ch${tn}`;
+    } else {
+      label = `Track ${tn}`;
+    }
+    base.push({ value: tn, label });
+  }
+  return base;
+}
 
 export function CropSetup(target: HTMLElement, episodeId: string): void {
   watchEpisode(episodeId);
@@ -275,6 +299,9 @@ function renderHeader(
   const speakers = (cfg.speakers as unknown[] | undefined) ?? [];
   const speakerCount = Math.max(speakers.length || 2, (ep?.speaker_count as number) ?? 2);
   const isH6E = !!ep?.audio_sync;
+  const audioTracks = (ep?.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
+  const hasCameraChannels = audioTracks.some((t) => t.track_type === 'camera_channel');
+  const mixSource = isH6E ? 'H6E multi-track' : hasCameraChannels ? 'Camera stereo' : 'Camera stereo';
   const status = ep ? describeStatus(ep.status as string) : null;
 
   return h(
@@ -320,7 +347,7 @@ function renderHeader(
       // NOT "what you're hearing right now" — that's camera audio during
       // scrub and H6E tracks in the mixer below. This tag describes what
       // the FINAL longform mix will use as its source.
-      metaTag('Final mix source', isH6E ? 'H6E multi-track' : 'Camera stereo'),
+      metaTag('Final mix source', mixSource),
       metaTag('ID', episodeId)
     )
   );
@@ -365,21 +392,31 @@ function renderBody(
 ): HTMLElement {
   const audioHost = h('div', { class: 'flex flex-col gap-6' });
 
-  // The H6E sync + mixer sections render lazily: we need episodeDetail()
-  // loaded to know whether this episode even has H6E audio. The editor
-  // and sidebar render once (they're stable, re-rendering would tear the
-  // canvas); the audio section rebuilds when isH6E flips.
+  // The audio sections render lazily: we need episodeDetail() loaded to
+  // know what tracks this episode has. The editor and sidebar render once
+  // (they're stable, re-rendering would tear the canvas); the audio
+  // section rebuilds when the presence of audio tracks changes.
+  //
+  // H6E episodes also get the SyncVerifier (camera-vs-recorder waveform
+  // alignment). Camera-stereo episodes skip the SyncVerifier but DO get
+  // the TrackMixer so Sam can A/B the L and R channels.
   let audioMounted = false;
   effect(() => {
     const ep = episodeDetail();
     const isH6E = !!(ep && ep.audio_sync);
-    if (isH6E && !audioMounted) {
+    const hasAudioTracks = !!(ep &&
+      (ep.audio_tracks as Array<unknown> | undefined)?.length);
+    if (hasAudioTracks && !audioMounted) {
       audioMounted = true;
-      audioHost.replaceChildren(
-        SyncVerifier(episodeId),
-        renderMixer(state, episodeId)
-      );
-    } else if (!isH6E && audioMounted) {
+      if (isH6E) {
+        audioHost.replaceChildren(
+          SyncVerifier(episodeId),
+          renderMixer(state, episodeId)
+        );
+      } else {
+        audioHost.replaceChildren(renderMixer(state, episodeId));
+      }
+    } else if (!hasAudioTracks && audioMounted) {
       audioMounted = false;
       audioHost.replaceChildren();
     }
@@ -945,7 +982,7 @@ function renderScrubBar(
     h(
       'div',
       { class: 'text-caption text-ink-tertiary pl-12' },
-      'Playing camera audio (for speaker identification). Use the Track mixer below to audition H6E tracks.'
+      'Playing camera audio (for speaker identification). Use the Track mixer below to audition individual audio tracks.'
     )
   );
 }
@@ -1041,9 +1078,13 @@ function renderSidebar(
   effect(() => {
     const s = state();
     const ep = episodeDetail();
-    const isH6E = !!(ep && ep.audio_sync);
+    // Show track dropdown for ANY episode that has audio tracks, not just H6E.
+    const hasAudioTracks = !!(ep &&
+      (ep.audio_tracks as Array<unknown> | undefined)?.length);
     host.replaceChildren(
-      ...s.speakers.map((spk, i) => renderSpeakerCard(state, s, i, spk, isH6E)),
+      ...s.speakers.map((spk, i) =>
+        renderSpeakerCard(state, s, i, spk, hasAudioTracks, ep)
+      ),
       renderWideCard(state, s),
       renderSaveCard(episodeId, state, s)
     );
@@ -1057,7 +1098,8 @@ function renderSpeakerCard(
   s: CropState,
   idx: number,
   spk: SpeakerState,
-  isH6E: boolean
+  hasAudioTracks: boolean,
+  ep: Record<string, unknown> | null
 ): HTMLElement {
   const color = SPEAKER_CSS_VARS[idx % SPEAKER_CSS_VARS.length];
   const active = idx === s.activeIdx;
@@ -1135,7 +1177,7 @@ function renderSpeakerCard(
           { class: 'text-body-sm text-ink-tertiary' },
           '16:9 crop inherits from the 9:16 center.'
         ),
-    isH6E
+    hasAudioTracks
       ? h(
           'div',
           { class: 'flex items-center gap-2' },
@@ -1144,7 +1186,11 @@ function renderSpeakerCard(
             { class: 'text-body-sm text-ink-tertiary' },
             'Track'
           ),
-          trackSelect(spk.track, (v) => updateSpeaker(state, idx, { track: v }))
+          trackSelect(
+            spk.track,
+            (v) => updateSpeaker(state, idx, { track: v }),
+            buildTrackOptions(ep)
+          )
         )
       : null
   );
@@ -1169,7 +1215,8 @@ function labelInput(
 
 function trackSelect(
   value: number | null,
-  onChange: (v: number | null) => void
+  onChange: (v: number | null) => void,
+  options: Array<{ value: number | null; label: string }>
 ): HTMLElement {
   const sel = h('select', {
     class:
@@ -1179,7 +1226,7 @@ function trackSelect(
       onChange(raw === '' ? null : Number(raw));
     },
   }) as HTMLSelectElement;
-  for (const opt of TRACK_OPTIONS) {
+  for (const opt of options) {
     const o = document.createElement('option');
     o.value = opt.value == null ? '' : String(opt.value);
     o.textContent = opt.label;

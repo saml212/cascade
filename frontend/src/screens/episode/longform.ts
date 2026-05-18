@@ -24,7 +24,10 @@ export function renderLongform(
   const youtubeUrl = (ep.youtube_longform_url as string) ?? '';
   const spotifyUrl = (ep.spotify_longform_url as string) ?? '';
   const pipeline = ep.pipeline as Record<string, unknown> | undefined;
-  const renderedAt = (pipeline?.completed_at as string) ?? '';
+  const renderedAt =
+    (ep?.longform_rendered_at as string) ??
+    (pipeline?.completed_at as string) ??
+    '';
 
   target.replaceChildren(
     h(
@@ -87,7 +90,7 @@ export function renderLongform(
                 size: 'md',
                 label:
                   status.key === 'awaiting_longform_review'
-                    ? 'Open full review'
+                    ? 'Watch & review'
                     : 'Open review surface',
                 icon: Icon.chevronRight(),
                 onClick: () =>
@@ -98,7 +101,7 @@ export function renderLongform(
                 ? Button({
                     variant: 'secondary',
                     size: 'md',
-                    label: 'Approve here',
+                    label: 'Approve without watching',
                     onClick: async () => {
                       try {
                         await api.approveLongform(episodeId);
