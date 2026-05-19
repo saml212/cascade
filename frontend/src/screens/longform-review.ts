@@ -121,6 +121,8 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
   const edits = signal<Edit[]>([]);
   const utterances = signal<Utterance[]>([]);
   const speakerMap = signal<SpeakerInfo[]>([]);
+  /* Dict-form speaker_map from transcript: { "0": "Host", "1": "Guest 1", ... } */
+  const speakerDictMap = signal<Record<string, string>>({});
   const chatSending = signal<boolean>(false);
   const loadError = signal<string | null>(null);
 
@@ -156,7 +158,16 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
     try {
       const data = await api.getTranscript(episodeId);
       utterances.set(data.utterances ?? []);
-      speakerMap.set(data.speaker_map ?? []);
+
+      /* speaker_map may arrive as an array ({index,label,track}[]) from older
+         speaker_cut runs, or as a string-keyed dict {"0":"Host",...} from newer
+         runs. Handle both shapes. */
+      const rawMap = (data as unknown as { speaker_map?: unknown }).speaker_map;
+      if (Array.isArray(rawMap)) {
+        speakerMap.set(rawMap as SpeakerInfo[]);
+      } else if (rawMap && typeof rawMap === 'object') {
+        speakerDictMap.set(rawMap as Record<string, string>);
+      }
     } catch {
       /* Transcript not yet available — degrades gracefully */
     }
@@ -496,6 +507,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
     effect(() => {
       const utts = utterances();
       const sm = speakerMap();
+      const dictMap = speakerDictMap();
       const editList = edits();
 
       rowRegistry.clear();
@@ -511,9 +523,32 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         return;
       }
 
+      /* Resolve crop_config speakers for fallback label lookup (index → label). */
+      const cropSpeakers = (
+        (ep.crop_config as { speakers?: Array<{ label: string }> } | undefined)
+          ?.speakers ?? []
+      );
+
+      /* Build labelMap using three-priority order:
+         1. dict-form speaker_map from transcript (newer agent output)
+         2. crop_config.speakers[index].label (Sam's named speakers)
+         3. array-form speaker_map from transcript (older agent output)
+         4. final fallback: "Speaker N" (handled at call site) */
       const labelMap = new Map<number, string>();
-      for (const s of sm) {
-        labelMap.set(s.index, s.label);
+      const allSpeakerIds = new Set<number>([
+        ...sm.map((s) => s.index),
+        ...utts.map((u) => u.speaker),
+      ]);
+      for (const id of allSpeakerIds) {
+        const key = String(id);
+        if (dictMap[key] !== undefined) {
+          labelMap.set(id, dictMap[key]);
+        } else if (cropSpeakers[id]?.label !== undefined) {
+          labelMap.set(id, cropSpeakers[id].label);
+        } else {
+          const fromArray = sm.find((s) => s.index === id);
+          if (fromArray) labelMap.set(id, fromArray.label);
+        }
       }
 
       /* Snapshot current time/in/out so initial states are correct */
