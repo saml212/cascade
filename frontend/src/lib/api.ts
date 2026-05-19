@@ -187,10 +187,27 @@ export const api = {
       'GET',
       `/api/episodes/${id}/edits`
     ),
+  addEdit: (
+    id: string,
+    edit: { type: 'cut'; start_seconds: number; end_seconds: number; reason?: string }
+  ) => request<UnknownRecord>('POST', `/api/episodes/${id}/edits`, edit),
   removeEdit: (id: string, index: number) =>
     request<UnknownRecord>('DELETE', `/api/episodes/${id}/edits/${index}`),
   applyEdits: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/edits/apply`),
+
+  /* Transcript */
+  getTranscript: (id: string): Promise<{
+    utterances: Array<{ speaker: number; start: number; end: number; text: string }>;
+    speaker_map?: Array<{ index: number; label: string; track?: number }>;
+  }> =>
+    fetch(`/media/episodes/${id}/diarized_transcript.json`).then((r) => {
+      if (!r.ok) throw new Error(`Transcript not available (status ${r.status})`);
+      return r.json() as Promise<{
+        utterances: Array<{ speaker: number; start: number; end: number; text: string }>;
+        speaker_map?: Array<{ index: number; label: string; track?: number }>;
+      }>;
+    }),
 
   /* Schedule */
   schedule: () => request<UnknownRecord>('GET', '/api/schedule'),
