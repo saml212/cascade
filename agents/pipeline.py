@@ -171,7 +171,13 @@ def run_pipeline(
     def _on_agent_complete(agent_name, result):
         """Handle successful agent completion — update episode state."""
         with episode_lock:
-            episode["pipeline"]["agents_completed"].append(agent_name)
+            # De-dup: re-runs of the same agent (resume-pipeline, chat-driven
+            # rerenders) would otherwise stack duplicate entries — PJ's
+            # episode.json had speaker_cut x3, transcribe x3, clip_miner x3
+            # from prior re-runs before this guard was added.
+            completed_list = episode["pipeline"]["agents_completed"]
+            if agent_name not in completed_list:
+                completed_list.append(agent_name)
             if "duration_seconds" in result and result["duration_seconds"]:
                 episode["duration_seconds"] = result["duration_seconds"]
             if "clips" in result:

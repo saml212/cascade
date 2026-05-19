@@ -319,6 +319,22 @@ def _build_from_crop_config(episode_dir: Path, episode_data: dict) -> list[dict]
                 }
             )
 
+    # Legacy 2-speaker crop_config (pre-N-speaker migration): if no speakers
+    # array but legacy speaker_l_/speaker_r_ fields exist, synthesize a
+    # 2-entry speakers list. Speaker L maps to track 1, Speaker R to track 2 —
+    # matching the convention used by camera-stereo episodes (camera_Tr1/Tr2)
+    # and old 2-speaker H6E episodes (Tr1/Tr2 were always the two mics).
+    if not result and "speaker_l_center_x" in crop:
+        for track_number in (1, 2):
+            stem = num_to_stem.get(track_number)
+            result.append(
+                {
+                    "stem": stem,
+                    "volume": 1.0,
+                    "role": "speaker",
+                }
+            )
+
     return result
 
 
