@@ -20,6 +20,11 @@ from lib.crop import compute_crop, resolve_speaker
 
 DOMINANCE_DB = 6.0
 SPEAKER_CUT_VERSION = "source-clock-v3"
+TRANSCRIPT_ALIGNMENT_VERSION = "source-clock-v1"
+_ALIGNMENT_MAX_SHIFT_SECONDS = 3.0
+_ALIGNMENT_MAX_GAP_SECONDS = 1.25
+_ALIGNMENT_MIN_WORDS = 3
+_ALIGNMENT_MIN_TURN_SECONDS = 0.6
 
 
 def strict_bool(value: object) -> bool:
@@ -91,6 +96,202 @@ def speaker_cut_fingerprint(
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def transcript_alignment_fingerprint(episode_dir: Path, segments: dict) -> str | None:
+    """Identify the canonical transcript used to refine camera boundaries."""
+    transcript_path = episode_dir / "diarized_transcript.json"
+    provenance_path = episode_dir / "transcript_provenance.json"
+    if not transcript_path.is_file() or not provenance_path.is_file():
+        return None
+    payload = {
+        "version": TRANSCRIPT_ALIGNMENT_VERSION,
+        "clock": "source",
+        "speaker_cut_fingerprint": segments.get("fingerprint"),
+        "transcript_sha256": _file_sha256(transcript_path),
+        "transcript_provenance_sha256": _file_sha256(provenance_path),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _speaker_identity(mapping: dict) -> list[tuple[str, object]]:
+    identities = []
+    logical_track = mapping.get("logical_track")
+    if isinstance(logical_track, int) and not isinstance(logical_track, bool):
+        identities.append(("logical_track", logical_track))
+    camera_channel = mapping.get("camera_channel")
+    if isinstance(camera_channel, str) and camera_channel:
+        identities.append(("camera_channel", camera_channel.casefold()))
+    for field in ("person", "label"):
+        value = mapping.get(field)
+        if isinstance(value, str) and value.strip():
+            identities.append(("person", value.strip().casefold()))
+    return identities
+
+
+def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dict]:
+    target_by_identity = {}
+    for mapping in segments.get("track_mapping", []):
+        target = mapping.get("speaker")
+        if not str(target).startswith("speaker_"):
+            continue
+        for identity in _speaker_identity(mapping):
+            target_by_identity.setdefault(identity, target)
+
+    source_to_target = {}
+    for mapping in transcript.get("speaker_map", []):
+        source = mapping.get("index")
+        if not isinstance(source, int) or isinstance(source, bool):
+            continue
+        if float(mapping.get("mapping_confidence", 1.0) or 0) < 0.6:
+            continue
+        for identity in _speaker_identity(mapping):
+            target = target_by_identity.get(identity)
+            if target:
+                source_to_target[source] = target
+                break
+
+    turns = []
+    for utterance in transcript.get("utterances", []):
+        target = source_to_target.get(utterance.get("speaker"))
+        if target is None:
+            continue
+        reliable_words = [
+            word
+            for word in utterance.get("words", [])
+            if not word.get("suspect") or word.get("corrected")
+        ]
+        if len(reliable_words) < _ALIGNMENT_MIN_WORDS:
+            continue
+        start = min(float(word.get("start", 0)) for word in reliable_words)
+        end = max(float(word.get("end", start)) for word in reliable_words)
+        if end - start < _ALIGNMENT_MIN_TURN_SECONDS:
+            continue
+        turns.append(
+            {
+                "speaker": target,
+                "start": start,
+                "end": end,
+                "word_count": len(reliable_words),
+            }
+        )
+    return turns
+
+
+def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
+    """Refine sustained speaker handoffs with canonical source-clock words.
+
+    Short reactions and uncertain ASR words do not move camera cuts. The base
+    microphone analysis remains intact and every applied boundary adjustment is
+    stored with a transcript fingerprint for render-time currentness checks.
+    """
+    episode_dir = Path(episode_dir)
+    try:
+        segments = json.loads((episode_dir / "segments.json").read_text())
+        transcript = json.loads((episode_dir / "diarized_transcript.json").read_text())
+        provenance = json.loads(
+            (episode_dir / "transcript_provenance.json").read_text()
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        segments.get("clock") != "source"
+        or transcript.get("clock") != "source"
+        or provenance.get("clock") != "source"
+    ):
+        return None
+    fingerprint = transcript_alignment_fingerprint(episode_dir, segments)
+    if fingerprint is None:
+        return None
+
+    turns = _transcript_turns_for_segments(transcript, segments)
+    decisions = [dict(segment) for segment in segments.get("segments", [])]
+    adjustments = []
+    for index in range(1, len(decisions)):
+        left = decisions[index - 1]
+        right = decisions[index]
+        left_speaker = left.get("speaker")
+        right_speaker = right.get("speaker")
+        if (
+            not str(left_speaker).startswith("speaker_")
+            or not str(right_speaker).startswith("speaker_")
+            or left_speaker == right_speaker
+        ):
+            continue
+        boundary = (float(left["end"]) + float(right["start"])) / 2
+        candidates = []
+        for left_turn in turns:
+            if left_turn["speaker"] != left_speaker:
+                continue
+            for right_turn in turns:
+                if (
+                    right_turn["speaker"] != right_speaker
+                    or right_turn["start"] < left_turn["start"]
+                ):
+                    continue
+                gap = right_turn["start"] - left_turn["end"]
+                if abs(gap) > _ALIGNMENT_MAX_GAP_SECONDS:
+                    continue
+                candidate = (left_turn["end"] + right_turn["start"]) / 2
+                if abs(candidate - boundary) > _ALIGNMENT_MAX_SHIFT_SECONDS:
+                    continue
+                if candidate <= float(left["start"]) or candidate >= float(
+                    right["end"]
+                ):
+                    continue
+                candidates.append(
+                    (
+                        abs(candidate - boundary),
+                        abs(gap),
+                        -(left_turn["word_count"] + right_turn["word_count"]),
+                        candidate,
+                        left_turn,
+                        right_turn,
+                    )
+                )
+        if not candidates:
+            continue
+        _, _, _, candidate, left_turn, right_turn = min(candidates)
+        new_boundary = round(candidate, 3)
+        if abs(new_boundary - boundary) < 0.1:
+            continue
+        left["end"] = new_boundary
+        left["duration"] = round(new_boundary - float(left["start"]), 3)
+        right["start"] = new_boundary
+        right["duration"] = round(float(right["end"]) - new_boundary, 3)
+        adjustments.append(
+            {
+                "left_speaker": left_speaker,
+                "right_speaker": right_speaker,
+                "from": round(boundary, 3),
+                "to": new_boundary,
+                "shift_seconds": round(new_boundary - boundary, 3),
+                "left_evidence": left_turn,
+                "right_evidence": right_turn,
+            }
+        )
+
+    segments["segments"] = decisions
+    segments["segment_count"] = len(decisions)
+    segments["transcript_alignment"] = {
+        "version": TRANSCRIPT_ALIGNMENT_VERSION,
+        "clock": "source",
+        "fingerprint": fingerprint,
+        "status": "aligned" if adjustments else "current_no_adjustments",
+        "adjustment_count": len(adjustments),
+        "adjustments": adjustments,
+    }
+    atomic_write_json(episode_dir / "segments.json", segments)
+    return segments
+
+
 def current_speaker_segments(
     episode_dir: Path, episode: dict, config: dict
 ) -> dict | None:
@@ -108,6 +309,18 @@ def current_speaker_segments(
         or segments.get("crop_validation", {}).get("distinct") is not True
     ):
         return None
+    transcript_artifacts_exist = any(
+        (episode_dir / filename).exists()
+        for filename in ("diarized_transcript.json", "transcript_provenance.json")
+    )
+    if transcript_artifacts_exist:
+        expected_alignment = transcript_alignment_fingerprint(episode_dir, segments)
+        if (
+            expected_alignment is None
+            or segments.get("transcript_alignment", {}).get("fingerprint")
+            != expected_alignment
+        ):
+            return None
     return segments
 
 

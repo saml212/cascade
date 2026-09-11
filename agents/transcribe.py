@@ -1434,6 +1434,9 @@ class TranscribeAgent(BaseAgent):
         self.save_json("diarized_transcript.json", diarized)
         atomic_write_json(self.episode_dir / "transcript_provenance.json", provenance)
         srt_path = self._generate_srt(diarized)
+        from agents.speaker_cut import align_speaker_segments_to_transcript
+
+        aligned_segments = align_speaker_segments_to_transcript(self.episode_dir)
         utterances = diarized["utterances"]
         return {
             "transcript_path": str(raw_path),
@@ -1445,4 +1448,9 @@ class TranscribeAgent(BaseAgent):
             ),
             "canonicalization": diarized["canonicalization"],
             "provenance_path": str(self.episode_dir / "transcript_provenance.json"),
+            "speaker_alignment": (
+                aligned_segments.get("transcript_alignment")
+                if aligned_segments is not None
+                else None
+            ),
         }

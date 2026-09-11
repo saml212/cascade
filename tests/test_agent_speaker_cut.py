@@ -7,8 +7,10 @@ import pytest
 from agents.audio_analysis import audio_analysis_fingerprint
 from agents.speaker_cut import (
     SpeakerCutAgent,
+    align_speaker_segments_to_transcript,
     current_speaker_segments,
     strict_bool,
+    transcript_alignment_fingerprint,
     validate_speaker_crops,
 )
 
@@ -296,4 +298,124 @@ def test_current_segments_invalidates_when_crop_changes(tmp_episode_dir, sample_
     assert result["crop_validation"]["distinct"] is True
     assert current_speaker_segments(tmp_episode_dir, episode, sample_config)
     episode["crop_config"]["speakers"][0]["longform_center_x"] = 1000
+    assert current_speaker_segments(tmp_episode_dir, episode, sample_config) is None
+
+
+def _write_alignment_transcript(ep_dir, left_words=3, suffix=""):
+    def words(speaker, start, count):
+        return [
+            {
+                "word": f"word{index}{suffix}",
+                "start": start + index * 0.3,
+                "end": start + index * 0.3 + 0.25,
+                "speaker": speaker,
+                "suspect": False,
+            }
+            for index in range(count)
+        ]
+
+    transcript = {
+        "clock": "source",
+        "speaker_map": [
+            {"index": 10, "logical_track": 1},
+            {"index": 20, "logical_track": 2},
+        ],
+        "utterances": [
+            {"speaker": 10, "words": words(10, 7.0, left_words)},
+            {"speaker": 20, "words": words(20, 7.7, 4)},
+        ],
+    }
+    _write(ep_dir / "diarized_transcript.json", transcript)
+    _write(ep_dir / "transcript_provenance.json", {"clock": "source"})
+
+
+def test_transcript_alignment_moves_sustained_speaker_handoff(tmp_episode_dir):
+    _write(
+        tmp_episode_dir / "segments.json",
+        {
+            "clock": "source",
+            "fingerprint": "microphone-analysis",
+            "track_mapping": [
+                {"speaker": "speaker_0", "logical_track": 1},
+                {"speaker": "speaker_1", "logical_track": 2},
+            ],
+            "segments": [
+                {"speaker": "speaker_0", "start": 0.0, "end": 10.0},
+                {"speaker": "speaker_1", "start": 10.0, "end": 20.0},
+            ],
+        },
+    )
+    _write_alignment_transcript(tmp_episode_dir)
+
+    result = align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    assert result is not None
+    assert result["segments"][0]["end"] == 7.775
+    assert result["segments"][1]["start"] == 7.775
+    alignment = result["transcript_alignment"]
+    assert alignment["adjustment_count"] == 1
+    assert alignment["adjustments"][0]["shift_seconds"] == -2.225
+    assert alignment["fingerprint"] == transcript_alignment_fingerprint(
+        tmp_episode_dir, result
+    )
+
+
+def test_transcript_alignment_ignores_one_word_reaction(tmp_episode_dir):
+    _write(
+        tmp_episode_dir / "segments.json",
+        {
+            "clock": "source",
+            "fingerprint": "microphone-analysis",
+            "track_mapping": [
+                {"speaker": "speaker_0", "logical_track": 1},
+                {"speaker": "speaker_1", "logical_track": 2},
+            ],
+            "segments": [
+                {"speaker": "speaker_0", "start": 0.0, "end": 10.0},
+                {"speaker": "speaker_1", "start": 10.0, "end": 20.0},
+            ],
+        },
+    )
+    _write_alignment_transcript(tmp_episode_dir, left_words=1)
+
+    result = align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    assert result is not None
+    assert result["segments"][0]["end"] == 10.0
+    assert result["segments"][1]["start"] == 10.0
+    assert result["transcript_alignment"]["adjustment_count"] == 0
+
+
+def test_current_segments_rejects_changed_transcript(tmp_episode_dir, sample_config):
+    episode = {
+        "source_properties": {"width": 1920, "height": 1080},
+        "crop_config": {
+            "speakers": [
+                {
+                    "label": "Host",
+                    "longform_center_x": 400,
+                    "longform_center_y": 500,
+                    "longform_zoom": 1.2,
+                },
+                {
+                    "label": "Guest",
+                    "longform_center_x": 1400,
+                    "longform_center_y": 500,
+                    "longform_zoom": 1.2,
+                },
+            ]
+        },
+    }
+    _write(tmp_episode_dir / "episode.json", episode)
+    with patch.object(
+        SpeakerCutAgent,
+        "_load_tracks",
+        return_value=(_tracks(2, 20000, [[(0.1, 0.5)], [(0.5, 0.9)]]), "lr"),
+    ):
+        _agent(tmp_episode_dir, sample_config).execute()
+    _write_alignment_transcript(tmp_episode_dir)
+    align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    assert current_speaker_segments(tmp_episode_dir, episode, sample_config)
+    _write_alignment_transcript(tmp_episode_dir, suffix="changed")
     assert current_speaker_segments(tmp_episode_dir, episode, sample_config) is None
