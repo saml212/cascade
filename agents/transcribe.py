@@ -8,6 +8,7 @@ canonical transcript removes cross-microphone bleed for captions and agents.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -261,10 +262,16 @@ def _asr_config_fingerprint(config: dict, multichannel: bool) -> str:
 
 
 def _raw_is_multichannel(raw: dict) -> bool:
-    return any(
-        isinstance(utterance.get("channel"), int)
+    channels = raw.get("metadata", {}).get("channels")
+    if isinstance(channels, int):
+        return channels > 1
+    utterance_channels = {
+        utterance.get("channel")
         for utterance in raw.get("results", {}).get("utterances", [])
-    )
+        if isinstance(utterance.get("channel"), int)
+        and not isinstance(utterance.get("channel"), bool)
+    }
+    return len(utterance_channels) > 1
 
 
 def _load_corrections(episode_dir: Path) -> dict | None:
@@ -334,6 +341,9 @@ def current_diarized_transcript(
         return None
     corrections = _load_corrections(agent.episode_dir)
     corrections_fingerprint = _stable_hash(corrections) if corrections else None
+    speaker_map = (
+        channel_map if multichannel else agent._infer_diarized_speaker_map(raw)
+    )
     if (
         diarized.get("clock") != "source"
         or diarized.get("algorithm_version") != TRANSCRIPT_CANONICAL_VERSION
@@ -343,6 +353,7 @@ def current_diarized_transcript(
         or provenance.get("asr_config_fingerprint") != expected_config
         or provenance.get("raw_transcript_sha256") != raw_hash
         or provenance.get("channel_map") != (channel_map or [])
+        or provenance.get("speaker_map") != (speaker_map or [])
         or provenance.get("canonical_activity_fingerprint")
         != (activity.fingerprint if activity else None)
         or provenance.get("corrections_fingerprint") != corrections_fingerprint
@@ -573,6 +584,90 @@ class TranscribeAgent(BaseAgent):
     def _resolve_channel_map(self, episode: dict) -> list[dict]:
         historic = self.load_json_safe("diarized_transcript.json").get("speaker_map")
         return _channel_map_from_episode(self.episode_dir, episode, historic)
+
+    def _infer_diarized_speaker_map(self, raw: dict) -> list[dict]:
+        """Match mono diarization IDs to source-clock microphone decisions."""
+        try:
+            segments = self.load_json("segments.json")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        if segments.get("clock") != "source":
+            return []
+        sources = [
+            mapping
+            for mapping in segments.get("track_mapping", [])
+            if str(mapping.get("speaker", "")).startswith("speaker_")
+        ]
+        diarized_ids = sorted(
+            {
+                utterance.get("speaker")
+                for utterance in raw.get("results", {}).get("utterances", [])
+                if isinstance(utterance.get("speaker"), int)
+                and not isinstance(utterance.get("speaker"), bool)
+            }
+        )
+        if not diarized_ids or not sources:
+            return []
+        scores = {diarized_id: [0.0] * len(sources) for diarized_id in diarized_ids}
+        source_index = {
+            mapping["speaker"]: index for index, mapping in enumerate(sources)
+        }
+        source_segments = [
+            segment
+            for segment in segments.get("segments", [])
+            if segment.get("speaker") in source_index
+        ]
+        for utterance in raw.get("results", {}).get("utterances", []):
+            diarized_id = utterance.get("speaker")
+            if diarized_id not in scores:
+                continue
+            start = float(utterance.get("start", 0))
+            end = float(utterance.get("end", start))
+            for segment in source_segments:
+                overlap = min(end, float(segment["end"])) - max(
+                    start, float(segment["start"])
+                )
+                if overlap > 0:
+                    scores[diarized_id][source_index[segment["speaker"]]] += overlap
+        if len(diarized_ids) <= len(sources):
+            best_assignment = max(
+                itertools.permutations(range(len(sources)), len(diarized_ids)),
+                key=lambda assignment: sum(
+                    scores[diarized_id][source]
+                    for diarized_id, source in zip(diarized_ids, assignment)
+                ),
+            )
+            mapping_method = "diarization_segment_overlap"
+        else:
+            best_assignment = tuple(
+                max(range(len(sources)), key=lambda source: scores[diarized_id][source])
+                for diarized_id in diarized_ids
+            )
+            mapping_method = "diarization_segment_overlap_many_to_one"
+        collision_counts = {
+            source: best_assignment.count(source) for source in set(best_assignment)
+        }
+        result = []
+        for diarized_id, assigned_source in zip(diarized_ids, best_assignment):
+            mapping = sources[assigned_source]
+            row = scores[diarized_id]
+            total = sum(row)
+            result.append(
+                {
+                    "index": diarized_id,
+                    "label": mapping.get("person") or f"Speaker {diarized_id}",
+                    "person": mapping.get("person"),
+                    "logical_track": mapping.get("logical_track"),
+                    "camera_channel": mapping.get("camera_channel"),
+                    "clock": "source",
+                    "mapping_method": mapping_method,
+                    "mapping_collision": collision_counts[assigned_source] > 1,
+                    "mapping_confidence": (
+                        round(row[assigned_source] / total, 4) if total else 0.0
+                    ),
+                }
+            )
+        return result
 
     def _can_prepare_multichannel(self, episode: dict, channel_map: list[dict]) -> bool:
         if not channel_map:
@@ -1299,10 +1394,13 @@ class TranscribeAgent(BaseAgent):
         reused_raw: bool,
     ) -> dict:
         activity = self._load_source_activity(channel_map)
+        speaker_map = (
+            channel_map if multichannel else self._infer_diarized_speaker_map(raw)
+        )
         diarized = self._build_diarized_transcript(
             raw,
             multichannel=multichannel,
-            channel_map=channel_map,
+            channel_map=speaker_map,
             activity=activity,
         )
         raw_path = self.episode_dir / "transcript.json"
@@ -1329,6 +1427,7 @@ class TranscribeAgent(BaseAgent):
             ),
             "corrections_fingerprint": corrections_fingerprint,
             "channel_map": channel_map or [],
+            "speaker_map": speaker_map or [],
             "raw_reused_without_api": reused_raw,
         }
         diarized["provenance"] = provenance

@@ -11,6 +11,7 @@ import pytest
 from agents.transcribe import (
     CAMERA_AUDIO_CACHE_VERSION,
     TranscribeAgent,
+    _raw_is_multichannel,
     current_diarized_transcript,
     remap_transcript_timestamps,
     repair_existing_transcript,
@@ -189,6 +190,13 @@ MC_CHANNEL_MAP = [
 
 
 class TestBuildDiarizedTranscript:
+    def test_single_channel_field_is_still_mono(self):
+        raw = {
+            "metadata": {"channels": 1},
+            "results": {"utterances": [{"channel": 0, "speaker": 0}]},
+        }
+        assert _raw_is_multichannel(raw) is False
+
     def test_piecewise_timestamp_remap_updates_nested_timing_and_metadata(self):
         raw = {
             "metadata": {"duration": 20.0},
@@ -399,6 +407,56 @@ def _multichannel_episode(ep_dir):
 
 
 class TestCanonicalRepair:
+    def test_maps_mono_diarization_ids_to_source_speakers(
+        self, tmp_episode_dir, sample_config
+    ):
+        (tmp_episode_dir / "segments.json").write_text(
+            json.dumps(
+                {
+                    "clock": "source",
+                    "track_mapping": [
+                        {
+                            "speaker": "speaker_0",
+                            "person": "Host",
+                            "camera_channel": "left",
+                        },
+                        {
+                            "speaker": "speaker_1",
+                            "person": "Guest",
+                            "camera_channel": "right",
+                        },
+                    ],
+                    "segments": [
+                        {"speaker": "speaker_0", "start": 0.0, "end": 4.0},
+                        {"speaker": "speaker_1", "start": 4.0, "end": 10.0},
+                    ],
+                }
+            )
+        )
+        raw = {
+            "results": {
+                "utterances": [
+                    {"speaker": 7, "start": 0.5, "end": 3.5},
+                    {"speaker": 5, "start": 4.5, "end": 9.5},
+                    {"speaker": 9, "start": 6.0, "end": 7.0},
+                ]
+            }
+        }
+
+        speaker_map = TranscribeAgent(
+            tmp_episode_dir, sample_config
+        )._infer_diarized_speaker_map(raw)
+
+        assert [entry["index"] for entry in speaker_map] == [5, 7, 9]
+        assert [entry["label"] for entry in speaker_map] == [
+            "Guest",
+            "Host",
+            "Guest",
+        ]
+        assert all(entry["mapping_confidence"] == 1.0 for entry in speaker_map)
+        assert speaker_map[0]["mapping_collision"] is True
+        assert speaker_map[1]["mapping_collision"] is False
+
     def test_deduplicates_bleed_by_source_activity_and_preserves_real_overlap(
         self, tmp_episode_dir, sample_config
     ):
