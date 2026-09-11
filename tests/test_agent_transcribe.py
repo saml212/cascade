@@ -831,11 +831,42 @@ class TestMultichannelPreparation:
             "atrim=start=5.000000:end=12.000000"
         )
         assert first_result["source_window"]["duration_seconds"] == 7.0
+        assert first_result["source"] == {"kind": "recorder", "logical_track": 1}
         assert first_result["source_files"][0]["path"] == str(first.resolve())
         assert (
             first_result["audio"]["sha256"]
             == hashlib.sha256(b"bounded flac").hexdigest()
         )
+
+    @patch("agents.transcribe.subprocess.run")
+    def test_exports_camera_channel_from_timestamped_source(self, run, tmp_episode_dir):
+        source = tmp_episode_dir / "source_merged.mp4"
+        source.write_bytes(b"camera")
+        episode = {"duration_seconds": 30.0}
+
+        def create_audio(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"camera channel flac")
+            return MagicMock(returncode=0, stderr="")
+
+        run.side_effect = create_audio
+        result = export_logical_track_window(
+            tmp_episode_dir,
+            episode,
+            None,
+            5.0,
+            12.0,
+            tmp_episode_dir / "qa/camera-right.flac",
+            source_kind="camera",
+            channel="right",
+        )
+
+        graph = run.call_args.args[0][
+            run.call_args.args[0].index("-filter_complex") + 1
+        ]
+        assert graph.index("aresample=async=1000") < graph.index("pan=mono|c0=c1")
+        assert graph.index("pan=mono|c0=c1") < graph.index("atrim=start=5.000000")
+        assert result["source"] == {"kind": "camera", "channel": "right"}
+        assert result["source_files"][0]["path"] == str(source.resolve())
 
     def test_reports_untranscribed_logical_mic_activity(
         self, tmp_episode_dir, sample_config

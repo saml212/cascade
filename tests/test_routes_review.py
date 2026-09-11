@@ -130,3 +130,188 @@ def test_review_distinguishes_missing_short_from_stale(test_client):
         "url": None,
         "download_url": None,
     }
+
+
+def test_inspection_preview_maps_output_across_source_cut(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    media = episode_dir / "upload_video.mp4"
+    media.write_bytes(b"render")
+
+    import lib.media_inspection as inspection
+    from lib.media_inspection import InspectionTarget
+    from lib.timeline import Timeline
+    from server.routes import review
+
+    target = InspectionTarget(
+        path=media,
+        timeline=Timeline.from_edits(
+            100, [{"type": "cut", "start_seconds": 10, "end_seconds": 20}]
+        ),
+        source_duration=100,
+        media_duration=90,
+        fingerprint="sha256:current",
+        preserve_audio_timestamps=False,
+    )
+    monkeypatch.setattr(review, "resolve_target", lambda *_args, **_kwargs: target)
+
+    def render(_target, cache_dir, **_kwargs):
+        asset = cache_dir / ("a" * 64 + ".mp4")
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_bytes(b"preview")
+        return asset, False
+
+    monkeypatch.setattr(inspection, "render_cached_inspection", render)
+    response = client.get(
+        "/api/episodes/ep_001/inspection/preview",
+        params={
+            "target": "longform",
+            "clock": "output",
+            "seconds": 5,
+            "duration_seconds": 10,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mapping"] == {
+        "source_seconds": 5.0,
+        "output_seconds": 5.0,
+        "source_ranges": [
+            {"start_seconds": 5.0, "end_seconds": 10.0},
+            {"start_seconds": 20.0, "end_seconds": 25.0},
+        ],
+    }
+    assert payload["artifact"]["fingerprint"] == "sha256:current"
+    assert client.get(payload["asset"]["url"]).content == b"preview"
+
+
+def test_inspection_rejects_nonfinite_and_unbounded_windows(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    media = episode_dir / "source_merged.mp4"
+    media.write_bytes(b"source")
+
+    from lib.media_inspection import InspectionTarget
+    from lib.timeline import Timeline
+    from server.routes import review
+
+    target = InspectionTarget(
+        path=media,
+        timeline=Timeline.from_edits(100),
+        source_duration=100,
+        media_duration=100,
+        fingerprint="source",
+        preserve_audio_timestamps=True,
+    )
+    monkeypatch.setattr(review, "resolve_target", lambda *_args, **_kwargs: target)
+
+    for seconds in ("nan", "inf", "-inf", "-1"):
+        response = client.get(
+            "/api/episodes/ep_001/inspection/frame", params={"seconds": seconds}
+        )
+        assert response.status_code == 422
+    response = client.get(
+        "/api/episodes/ep_001/inspection/preview",
+        params={"seconds": 1, "duration_seconds": 30.01},
+    )
+    assert response.status_code == 422
+
+
+def test_inspection_rejects_a_stale_render_input(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    _create_episode(episodes_dir, "ep_001")
+
+    from server.routes import review
+
+    def stale(*_args, **_kwargs):
+        raise ValueError("Selected audio is stale")
+
+    monkeypatch.setattr(review, "resolve_target", stale)
+    response = client.get(
+        "/api/episodes/ep_001/inspection/frame",
+        params={"target": "longform", "seconds": 2},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Selected audio is stale"
+
+
+def test_audio_inspection_names_camera_channel_and_uncertainty(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    _create_episode(episodes_dir, "ep_001")
+
+    import lib.media_inspection as inspection
+
+    def export(_dir, _episode, _track, start, end, output, **_selector):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"channel")
+        return {
+            "source": {"kind": "camera", "channel": "right"},
+            "source_window": {
+                "start": start,
+                "end": end,
+                "duration_seconds": end - start,
+            },
+            "fingerprint": "window-fingerprint",
+            "audio": {"sha256": "b" * 64, "size_bytes": 7},
+        }
+
+    monkeypatch.setattr(inspection, "export_logical_track_window", export)
+    monkeypatch.setattr(
+        inspection,
+        "camera_channel_evidence",
+        lambda *_args: {
+            "analysis_current": False,
+            "relationship": "unknown",
+            "usable_for_speaker_separation": None,
+        },
+    )
+    response = client.get(
+        "/api/episodes/ep_001/inspection/audio-preview",
+        params={
+            "source_kind": "camera",
+            "channel": "right",
+            "start_seconds": 5,
+            "duration_seconds": 7,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == {"kind": "camera", "channel": "right"}
+    assert payload["channel_evidence"]["relationship"] == "unknown"
+    assert client.get(payload["asset"]["url"]).content == b"channel"
+
+
+def test_inspection_exposes_only_current_transcript_and_shot_plan(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    transcript = {"clock": "source", "utterances": [{"text": "Hello"}]}
+    shot_plan = {"clock": "source", "segments": [{"speaker": "speaker_0"}]}
+    (episode_dir / "diarized_transcript.json").write_text(json.dumps(transcript))
+    (episode_dir / "segments.json").write_text(json.dumps(shot_plan))
+
+    from server.routes import review
+
+    monkeypatch.setattr(
+        review, "current_diarized_transcript", lambda *_args: transcript
+    )
+    monkeypatch.setattr(review, "current_speaker_segments", lambda *_args: shot_plan)
+
+    transcript_response = client.get("/api/episodes/ep_001/inspection/transcript")
+    shot_response = client.get("/api/episodes/ep_001/inspection/shot-plan")
+
+    assert transcript_response.status_code == 200
+    assert transcript_response.json()["transcript"] == transcript
+    assert transcript_response.json()["revision"].startswith("sha256:")
+    assert shot_response.status_code == 200
+    assert shot_response.json()["shot_plan"] == shot_plan
+    assert shot_response.json()["revision"].startswith("sha256:")
+
+    monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: None)
+    assert client.get("/api/episodes/ep_001/inspection/transcript").status_code == 409

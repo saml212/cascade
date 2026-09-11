@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+import subprocess
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
@@ -16,6 +20,7 @@ from agents.qa import (
     editorial_revision,
 )
 from agents.speaker_cut import current_speaker_segments
+from agents.transcribe import current_diarized_transcript
 from lib.audio_mix import selected_audio_source
 from lib.delivery_video import (
     current_longform_render,
@@ -24,6 +29,13 @@ from lib.delivery_video import (
     read_render_manifest,
     render_artifact_state,
     short_render_fingerprint,
+)
+from lib.media_inspection import (
+    InspectionTarget,
+    file_revision,
+    inspect_audio_window,
+    inspect_media_window,
+    resolve_target,
 )
 from lib.paths import get_episodes_dir
 from server.routes.clips import render_job_state
@@ -36,6 +48,7 @@ PLATFORM_LABELS = {
     "instagram": "Instagram Reels",
     "x": "X",
 }
+_CLIP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 def _read_json(path: Path, default):
@@ -291,3 +304,211 @@ async def review_state(episode_id: str) -> dict:
         },
         "clips": reviewed_clips,
     }
+
+
+def _stored_clips(episode_dir: Path) -> list[dict]:
+    payload = _read_json(episode_dir / "clips.json", {"clips": []})
+    clips = payload.get("clips", []) if isinstance(payload, dict) else payload
+    return [clip for clip in clips if isinstance(clip, dict) and clip.get("id")]
+
+
+async def _inspection_target(
+    episode_id: str,
+    target: Literal["source", "longform", "short"],
+    clip_id: str | None,
+) -> tuple[Path, InspectionTarget]:
+    episode_dir = _episode_dir(episode_id)
+    episode = _read_json(episode_dir / "episode.json", {})
+    clip = None
+    if target == "short":
+        if not clip_id or not _CLIP_ID.fullmatch(clip_id):
+            raise HTTPException(status_code=422, detail="A valid clip_id is required")
+        clip = next(
+            (item for item in _stored_clips(episode_dir) if item["id"] == clip_id),
+            None,
+        )
+        if clip is None:
+            raise HTTPException(status_code=404, detail=f"Unknown clip: {clip_id}")
+    elif clip_id is not None:
+        raise HTTPException(
+            status_code=422, detail="clip_id is only valid for a short target"
+        )
+    try:
+        resolved = await asyncio.to_thread(
+            resolve_target,
+            episode_dir,
+            episode,
+            load_config(),
+            target,
+            clip=clip,
+        )
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return episode_dir, resolved
+
+
+async def _create_inspection_asset(
+    episode_id: str,
+    target: Literal["source", "longform", "short"],
+    clip_id: str | None,
+    clock: Literal["source", "output"],
+    seconds: float,
+    *,
+    kind: Literal["frame", "preview"],
+    duration: float = 0.0,
+) -> dict:
+    episode_dir, resolved = await _inspection_target(episode_id, target, clip_id)
+    try:
+        result = await asyncio.to_thread(
+            inspect_media_window,
+            resolved,
+            episode_dir / "work" / "media_inspection",
+            kind=kind,
+            clock=clock,
+            seconds=seconds,
+            duration=duration,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not generate inspection media"
+        ) from exc
+    return {
+        "schema": "cascade.media-inspection/v1",
+        "episode_id": episode_id,
+        "target": target,
+        "clip_id": clip_id,
+        **result.payload,
+        "asset": {
+            **result.payload["asset"],
+            "url": _inspection_url(episode_id, result.path),
+        },
+    }
+
+
+@router.get("/{episode_id}/inspection/frame")
+async def inspection_frame(
+    episode_id: str,
+    target: Literal["source", "longform", "short"] = "source",
+    clock: Literal["source", "output"] = "source",
+    seconds: float = 0.0,
+    clip_id: str | None = None,
+) -> dict:
+    return await _create_inspection_asset(
+        episode_id, target, clip_id, clock, seconds, kind="frame"
+    )
+
+
+@router.get("/{episode_id}/inspection/preview")
+async def inspection_preview(
+    episode_id: str,
+    target: Literal["source", "longform", "short"] = "source",
+    clock: Literal["source", "output"] = "source",
+    seconds: float = 0.0,
+    duration_seconds: float = 10.0,
+    clip_id: str | None = None,
+) -> dict:
+    return await _create_inspection_asset(
+        episode_id,
+        target,
+        clip_id,
+        clock,
+        seconds,
+        kind="preview",
+        duration=duration_seconds,
+    )
+
+
+@router.get("/{episode_id}/inspection/audio-preview")
+async def inspection_audio_preview(
+    episode_id: str,
+    source_kind: Literal["recorder", "camera"],
+    start_seconds: float,
+    duration_seconds: float = 10.0,
+    logical_track: int | None = None,
+    channel: Literal["left", "right"] | None = None,
+) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    episode = _read_json(episode_dir / "episode.json", {})
+    try:
+        result = await asyncio.to_thread(
+            inspect_audio_window,
+            episode_dir,
+            episode,
+            load_config(),
+            source_kind=source_kind,
+            start=start_seconds,
+            duration=duration_seconds,
+            logical_track=logical_track,
+            channel=channel,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not export audio window"
+        ) from exc
+    return {
+        "schema": "cascade.audio-inspection/v1",
+        "episode_id": episode_id,
+        **result.payload,
+        "asset": {
+            **result.payload["asset"],
+            "url": _inspection_url(episode_id, result.path),
+        },
+    }
+
+
+@router.get("/{episode_id}/inspection/transcript")
+async def inspection_transcript(episode_id: str) -> dict:
+    return await _current_inspection_document(
+        episode_id,
+        "diarized_transcript.json",
+        "cascade.transcript/v1",
+        "transcript",
+        current_diarized_transcript,
+    )
+
+
+@router.get("/{episode_id}/inspection/shot-plan")
+async def inspection_shot_plan(episode_id: str) -> dict:
+    return await _current_inspection_document(
+        episode_id,
+        "segments.json",
+        "cascade.shot-plan/v1",
+        "shot_plan",
+        current_speaker_segments,
+    )
+
+
+async def _current_inspection_document(
+    episode_id: str,
+    filename: str,
+    schema: str,
+    key: str,
+    loader,
+) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    episode = _read_json(episode_dir / "episode.json", {})
+    document = await asyncio.to_thread(loader, episode_dir, episode, load_config())
+    if document is None:
+        label = key.replace("_", " ")
+        raise HTTPException(status_code=409, detail=f"Current {label} is unavailable")
+    return {
+        "schema": schema,
+        "episode_id": episode_id,
+        "clock": "source",
+        "current": True,
+        "revision": await asyncio.to_thread(file_revision, episode_dir / filename),
+        key: document,
+    }
+
+
+def _inspection_url(episode_id: str, path: Path) -> str:
+    return (
+        f"/media/episodes/{quote(episode_id, safe='')}/work/media_inspection/"
+        f"{quote(path.name, safe='')}"
+    )

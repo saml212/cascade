@@ -14,10 +14,11 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import numpy as np
@@ -42,7 +43,7 @@ _AUDIO_CONTENT_TYPES = {
 CAMERA_AUDIO_CACHE_VERSION = "source-clock-v3"
 TRANSCRIPT_CANONICAL_VERSION = "source-clock-v3"
 _TRANSCRIPT_AUDIO_VERSION = "logical-tracks-v3"
-_TRACK_WINDOW_VERSION = "logical-track-window-v1"
+_TRACK_WINDOW_VERSION = "source-track-window-v2"
 _TRANSCRIPT_COVERAGE_VERSION = "source-clock-v1"
 _SOURCE_ACTIVITY_FINGERPRINT_VERSION = "source-activity-v2"
 _WORD_TIME_TOLERANCE = 0.12
@@ -338,42 +339,47 @@ def _validated_source_window(
 def export_logical_track_window(
     episode_dir: Path,
     episode: dict,
-    logical_track: int,
+    logical_track: int | None,
     start: float,
     end: float,
     output_path: Path,
+    *,
+    source_kind: Literal["recorder", "camera"] = "recorder",
+    channel: Literal["left", "right"] | None = None,
 ) -> dict:
-    """Export one bounded logical microphone track on the source-video clock.
+    """Export one bounded recorder track or camera channel on the source clock.
 
     Repeated recorder sessions are concatenated before the episode sync trim,
-    delay, and drift correction. The returned manifest binds the small FLAC to
-    its source files, sync settings, logical track, and exact source interval.
+    delay, and drift correction. Camera channels decode source_merged.mp4 with
+    AAC gap correction before channel selection.
     """
     episode_dir = Path(episode_dir)
     output_path = Path(output_path)
-    if not isinstance(logical_track, int) or isinstance(logical_track, bool):
-        raise TypeError("logical_track must be an integer")
     if output_path.suffix.casefold() != ".flac":
-        raise ValueError("Logical track review audio must use a .flac destination")
+        raise ValueError("Track review audio must use a .flac destination")
     start, end = _validated_source_window(episode, start, end)
-    groups = logical_track_groups(
-        episode_dir, episode, recorder_only=True, existing_only=True
-    )
-    tracks = groups.get(logical_track, [])
-    if not tracks:
-        raise FileNotFoundError(f"Logical track {logical_track} is unavailable")
-    paths = [Path(track["dest_path"]) for track in tracks]
-    sync = episode.get("audio_sync", {})
-    offset = float(sync.get("offset_seconds", 0))
-    tempo = (
-        float(sync.get("tempo_factor", 1.0))
-        if float(sync.get("r_squared", 0)) > 0.5
-        else 1.0
-    )
-    if not math.isfinite(offset) or not math.isfinite(tempo) or tempo <= 0:
-        raise ValueError("Episode audio sync values are invalid")
-    fingerprint = _stable_hash(
-        {
+    if source_kind == "recorder":
+        if not isinstance(logical_track, int) or isinstance(logical_track, bool):
+            raise TypeError("logical_track must be an integer")
+        if channel is not None:
+            raise ValueError("channel is only valid for camera audio")
+        groups = logical_track_groups(
+            episode_dir, episode, recorder_only=True, existing_only=True
+        )
+        tracks = groups.get(logical_track, [])
+        if not tracks:
+            raise FileNotFoundError(f"Logical track {logical_track} is unavailable")
+        paths = [Path(track["dest_path"]) for track in tracks]
+        sync = episode.get("audio_sync", {})
+        offset = float(sync.get("offset_seconds", 0))
+        tempo = (
+            float(sync.get("tempo_factor", 1.0))
+            if float(sync.get("r_squared", 0)) > 0.5
+            else 1.0
+        )
+        if not math.isfinite(offset) or not math.isfinite(tempo) or tempo <= 0:
+            raise ValueError("Episode audio sync values are invalid")
+        fingerprint_state = {
             "version": _TRACK_WINDOW_VERSION,
             "clock": "source",
             "logical_track": logical_track,
@@ -382,7 +388,28 @@ def export_logical_track_window(
             "sources": [_file_identity(path) for path in paths],
             "codec": {"name": "flac", "sample_rate": 16000, "channels": 1},
         }
-    )
+    elif source_kind == "camera":
+        if logical_track is not None:
+            raise ValueError("logical_track is only valid for recorder audio")
+        if channel not in {"left", "right"}:
+            raise ValueError("camera channel must be left or right")
+        paths = [episode_dir / "source_merged.mp4"]
+        if not paths[0].is_file():
+            raise FileNotFoundError("Camera source is unavailable")
+        sync = {}
+        fingerprint_state = {
+            "version": _TRACK_WINDOW_VERSION,
+            "clock": "source",
+            "source_kind": "camera",
+            "channel": channel,
+            "source_window": {"start": start, "end": end},
+            "timeline_filter": CAMERA_AUDIO_TIMELINE_FILTER,
+            "sources": [_file_identity(paths[0])],
+            "codec": {"name": "flac", "sample_rate": 16000, "channels": 1},
+        }
+    else:
+        raise ValueError(f"Unsupported audio source kind: {source_kind}")
+    fingerprint = _stable_hash(fingerprint_state)
     manifest_path = output_path.with_suffix(f"{output_path.suffix}.json")
     try:
         cached = json.loads(manifest_path.read_text())
@@ -399,29 +426,44 @@ def export_logical_track_window(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     inputs: list[str] = []
     filters: list[str] = []
-    labels: list[str] = []
-    for index, path in enumerate(paths):
-        inputs.extend(["-i", str(path)])
-        label = f"part{index}"
-        filters.append(f"[{index}:a]aformat=channel_layouts=mono[{label}]")
-        labels.append(f"[{label}]")
-    if len(labels) > 1:
-        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[joined]")
+    if source_kind == "camera":
+        inputs.extend(["-i", str(paths[0])])
+        channel_index = 0 if channel == "left" else 1
+        filters.append(
+            f"[0:a]{CAMERA_AUDIO_TIMELINE_FILTER},pan=mono|c0=c{channel_index},"
+            f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,"
+            "aresample=16000[out]"
+        )
     else:
-        filters.append(f"{labels[0]}anull[joined]")
-    chain = "[joined]asetpts=PTS-STARTPTS"
-    if offset > 0:
-        chain += f",atrim=start={offset:.8f},asetpts=PTS-STARTPTS"
-    elif offset < 0:
-        chain += f",adelay={round(abs(offset) * 1000)}"
-    if abs(tempo - 1.0) > 1e-7:
-        chain += f",atempo={tempo:.8f}"
-    chain += (
-        f",atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
-        ",aresample=16000[out]"
-    )
-    filters.append(chain)
-    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.flac")
+        labels: list[str] = []
+        for index, path in enumerate(paths):
+            inputs.extend(["-i", str(path)])
+            label = f"part{index}"
+            filters.append(f"[{index}:a]aformat=channel_layouts=mono[{label}]")
+            labels.append(f"[{label}]")
+        if len(labels) > 1:
+            filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[joined]")
+        else:
+            filters.append(f"{labels[0]}anull[joined]")
+        chain = "[joined]asetpts=PTS-STARTPTS"
+        if offset > 0:
+            chain += f",atrim=start={offset:.8f},asetpts=PTS-STARTPTS"
+        elif offset < 0:
+            chain += f",adelay={round(abs(offset) * 1000)}"
+        if abs(tempo - 1.0) > 1e-7:
+            chain += f",atempo={tempo:.8f}"
+        chain += (
+            f",atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+            ",aresample=16000[out]"
+        )
+        filters.append(chain)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{output_path.stem}.",
+        suffix=".tmp.flac",
+        dir=output_path.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
     cmd = [
         "ffmpeg",
         "-y",
@@ -452,7 +494,15 @@ def export_logical_track_window(
         "version": _TRACK_WINDOW_VERSION,
         "clock": "source",
         "fingerprint": fingerprint,
-        "logical_track": logical_track,
+        "source": {
+            "kind": source_kind,
+            **(
+                {"logical_track": logical_track}
+                if source_kind == "recorder"
+                else {"channel": channel}
+            ),
+        },
+        **({"logical_track": logical_track} if source_kind == "recorder" else {}),
         "source_window": {
             "start": start,
             "end": end,
