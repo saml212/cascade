@@ -12,9 +12,12 @@ from agents.transcribe import (
     CAMERA_AUDIO_CACHE_VERSION,
     TranscribeAgent,
     _raw_is_multichannel,
+    analyze_transcript_coverage,
     current_diarized_transcript,
+    export_logical_track_window,
     remap_transcript_timestamps,
     repair_existing_transcript,
+    transcribe_logical_track_window,
 )
 
 # -- Fixtures ----------------------------------------------------------------
@@ -584,6 +587,7 @@ class TestCanonicalRepair:
                             "op": "replace_range",
                             "start": 0.25,
                             "end": 0.58,
+                            "replace_speakers": [1],
                             "reason": "independent close-mic ASR",
                             "words": [
                                 {
@@ -592,15 +596,7 @@ class TestCanonicalRepair:
                                     "end": 0.51,
                                     "speaker": 1,
                                     "confidence": 0.99,
-                                },
-                                {
-                                    "word": "yes",
-                                    "punctuated_word": "Yes.",
-                                    "start": 0.35,
-                                    "end": 0.55,
-                                    "speaker": 2,
-                                    "confidence": 0.98,
-                                },
+                                }
                             ],
                         }
                     ],
@@ -655,6 +651,178 @@ class TestCanonicalRepair:
 
 
 class TestMultichannelPreparation:
+    @patch.object(TranscribeAgent, "_request_deepgram")
+    @patch("agents.transcribe.subprocess.run")
+    def test_bounded_asr_is_source_clocked_and_cached(
+        self, run, request, tmp_episode_dir, sample_config
+    ):
+        episode = _multichannel_episode(tmp_episode_dir)
+        episode["duration_seconds"] = 30.0
+        episode["audio_sync"]["video_duration"] = 30.0
+        (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+
+        def create_audio(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"bounded flac")
+            return MagicMock(returncode=0, stderr="")
+
+        run.side_effect = create_audio
+        request.return_value = {
+            "metadata": {"duration": 5.0},
+            "results": {
+                "utterances": [
+                    {
+                        "start": 0.5,
+                        "end": 1.0,
+                        "words": [{"word": "hello", "start": 0.5, "end": 1.0}],
+                    }
+                ]
+            },
+        }
+        output_dir = tmp_episode_dir / "qa/bounded-asr"
+
+        first = transcribe_logical_track_window(
+            tmp_episode_dir, sample_config, 1, 10.0, 15.0, output_dir
+        )
+        second = transcribe_logical_track_window(
+            tmp_episode_dir, sample_config, 1, 10.0, 15.0, output_dir
+        )
+
+        assert first == second
+        request.assert_called_once()
+        source = json.loads(Path(first["source_response"]["path"]).read_text())
+        assert source["results"]["utterances"][0]["start"] == 10.5
+        assert source["results"]["utterances"][0]["words"][0]["end"] == 11.0
+        assert source["metadata"]["duration"] == 5.0
+        assert source["metadata"]["clock"] == "source"
+        assert first["review_only"] is True
+        assert first["applied_to_canonical"] is False
+
+    @patch("agents.transcribe.subprocess.run")
+    def test_exports_bounded_source_clock_logical_track(self, run, tmp_episode_dir):
+        episode = _multichannel_episode(tmp_episode_dir)
+        episode["duration_seconds"] = 30.0
+        episode["audio_sync"]["video_duration"] = 30.0
+        first = Path(episode["audio_tracks"][0]["dest_path"])
+        second = first.with_name("later_Tr1.WAV")
+        second.write_bytes(b"later")
+        episode["audio_tracks"].insert(
+            1,
+            {
+                "track_number": 1,
+                "track_type": "input",
+                "dest_path": str(second),
+                "filename": second.name,
+            },
+        )
+
+        def create_audio(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"bounded flac")
+            return MagicMock(returncode=0, stderr="")
+
+        run.side_effect = create_audio
+        output = tmp_episode_dir / "qa/review.flac"
+        first_result = export_logical_track_window(
+            tmp_episode_dir, episode, 1, 5.0, 12.0, output
+        )
+        second_result = export_logical_track_window(
+            tmp_episode_dir, episode, 1, 5.0, 12.0, output
+        )
+
+        assert first_result == second_result
+        assert run.call_count == 1
+        command = run.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        assert "[part0][part1]concat=n=2:v=0:a=1[joined]" in graph
+        assert graph.index("concat=n=2") < graph.index("adelay=200")
+        assert graph.index("atempo=1.00010000") < graph.index(
+            "atrim=start=5.000000:end=12.000000"
+        )
+        assert first_result["source_window"]["duration_seconds"] == 7.0
+        assert first_result["source_files"][0]["path"] == str(first.resolve())
+        assert (
+            first_result["audio"]["sha256"]
+            == hashlib.sha256(b"bounded flac").hexdigest()
+        )
+
+    def test_reports_untranscribed_logical_mic_activity(
+        self, tmp_episode_dir, sample_config
+    ):
+        episode = {
+            "duration_seconds": 10.0,
+            "crop_config": {"speakers": [{"label": "Guest", "track": 2}]},
+        }
+        (tmp_episode_dir / "segments.json").write_text(
+            json.dumps(
+                {
+                    "clock": "source",
+                    "fingerprint": "current-speaker-analysis",
+                    "track_mapping": [
+                        {
+                            "speaker": "speaker_0",
+                            "person": "Guest",
+                            "logical_track": 2,
+                        }
+                    ],
+                    "segments": [
+                        {
+                            "speaker": "speaker_0",
+                            "start": 0.0,
+                            "end": 10.0,
+                        }
+                    ],
+                }
+            )
+        )
+        (tmp_episode_dir / "work/rms_meta.json").write_text(
+            json.dumps(
+                {
+                    "clock": "source",
+                    "fingerprint": "current-speaker-analysis",
+                    "frame_seconds": 0.1,
+                }
+            )
+        )
+        levels = np.full(100, -70.0)
+        levels[20:40] = -20.0
+        levels[70:100] = -18.0
+        np.save(tmp_episode_dir / "work/speaker_0_rms_db.npy", levels)
+        words = [
+            {
+                "word": "covered",
+                "start": 2.0,
+                "end": 3.8,
+                "speaker": 7,
+            }
+        ]
+        (tmp_episode_dir / "diarized_transcript.json").write_text(
+            json.dumps(
+                {
+                    "clock": "source",
+                    "speaker_map": [
+                        {"index": 7, "person": "Guest", "logical_track": 2}
+                    ],
+                    "utterances": [{"speaker": 7, "words": words}],
+                }
+            )
+        )
+        (tmp_episode_dir / "transcript_provenance.json").write_text(
+            json.dumps({"clock": "source", "raw_transcript_sha256": "raw"})
+        )
+
+        report = analyze_transcript_coverage(tmp_episode_dir, episode, sample_config)
+
+        assert report["status"] == "review_required"
+        assert report["summary"]["finding_count"] == 1
+        finding = report["findings"][0]
+        assert finding["logical_track"] == 2
+        assert finding["people"] == ["Guest"]
+        assert finding["source_window"] == {
+            "start": 7.0,
+            "end": 10.0,
+            "duration_seconds": 3.0,
+        }
+        assert finding["evidence"]["active_seconds"] == 3.0
+
     @patch("agents.transcribe.subprocess.run")
     def test_concatenates_repeated_logical_track_before_sync(
         self, run, tmp_episode_dir, sample_config

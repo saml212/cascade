@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import subprocess
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,10 @@ DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 CAMERA_AUDIO_CACHE_VERSION = "source-clock-v3"
 TRANSCRIPT_CANONICAL_VERSION = "source-clock-v3"
 _TRANSCRIPT_AUDIO_VERSION = "logical-tracks-v3"
+_TRACK_WINDOW_VERSION = "logical-track-window-v1"
+_TRANSCRIPT_COVERAGE_VERSION = "source-clock-v1"
 _WORD_TIME_TOLERANCE = 0.12
+MAX_TRANSCRIPT_REVIEW_SECONDS = 120.0
 
 
 def _stable_hash(value: Any) -> str:
@@ -290,6 +295,465 @@ def _load_corrections(episode_dir: Path) -> dict | None:
     return corrections
 
 
+def _validated_source_window(
+    episode: dict, start: float, end: float
+) -> tuple[float, float]:
+    start = float(start)
+    end = float(end)
+    if not math.isfinite(start) or not math.isfinite(end):
+        raise ValueError("Source window bounds must be finite")
+    if start < 0 or end <= start:
+        raise ValueError(
+            "Source window must have non-negative start and positive duration"
+        )
+    if end - start > MAX_TRANSCRIPT_REVIEW_SECONDS:
+        raise ValueError(
+            f"Source window cannot exceed {MAX_TRANSCRIPT_REVIEW_SECONDS:g} seconds"
+        )
+    duration = episode.get("audio_sync", {}).get("video_duration") or episode.get(
+        "duration_seconds"
+    )
+    if duration is not None and end > float(duration) + 1e-3:
+        raise ValueError("Source window ends after the episode")
+    return start, end
+
+
+def export_logical_track_window(
+    episode_dir: Path,
+    episode: dict,
+    logical_track: int,
+    start: float,
+    end: float,
+    output_path: Path,
+) -> dict:
+    """Export one bounded logical microphone track on the source-video clock.
+
+    Repeated recorder sessions are concatenated before the episode sync trim,
+    delay, and drift correction. The returned manifest binds the small FLAC to
+    its source files, sync settings, logical track, and exact source interval.
+    """
+    episode_dir = Path(episode_dir)
+    output_path = Path(output_path)
+    if not isinstance(logical_track, int) or isinstance(logical_track, bool):
+        raise TypeError("logical_track must be an integer")
+    if output_path.suffix.casefold() != ".flac":
+        raise ValueError("Logical track review audio must use a .flac destination")
+    start, end = _validated_source_window(episode, start, end)
+    groups = logical_track_groups(
+        episode_dir, episode, recorder_only=True, existing_only=True
+    )
+    tracks = groups.get(logical_track, [])
+    if not tracks:
+        raise FileNotFoundError(f"Logical track {logical_track} is unavailable")
+    paths = [Path(track["dest_path"]) for track in tracks]
+    sync = episode.get("audio_sync", {})
+    offset = float(sync.get("offset_seconds", 0))
+    tempo = (
+        float(sync.get("tempo_factor", 1.0))
+        if float(sync.get("r_squared", 0)) > 0.5
+        else 1.0
+    )
+    if not math.isfinite(offset) or not math.isfinite(tempo) or tempo <= 0:
+        raise ValueError("Episode audio sync values are invalid")
+    fingerprint = _stable_hash(
+        {
+            "version": _TRACK_WINDOW_VERSION,
+            "clock": "source",
+            "logical_track": logical_track,
+            "source_window": {"start": start, "end": end},
+            "audio_sync": sync,
+            "sources": [_file_identity(path) for path in paths],
+            "codec": {"name": "flac", "sample_rate": 16000, "channels": 1},
+        }
+    )
+    manifest_path = output_path.with_suffix(f"{output_path.suffix}.json")
+    try:
+        cached = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    if (
+        cached.get("fingerprint") == fingerprint
+        and output_path.is_file()
+        and output_path.stat().st_size > 0
+        and cached.get("audio", {}).get("sha256") == _file_sha256(output_path)
+    ):
+        return cached
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs: list[str] = []
+    filters: list[str] = []
+    labels: list[str] = []
+    for index, path in enumerate(paths):
+        inputs.extend(["-i", str(path)])
+        label = f"part{index}"
+        filters.append(f"[{index}:a]aformat=channel_layouts=mono[{label}]")
+        labels.append(f"[{label}]")
+    if len(labels) > 1:
+        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[joined]")
+    else:
+        filters.append(f"{labels[0]}anull[joined]")
+    chain = "[joined]asetpts=PTS-STARTPTS"
+    if offset > 0:
+        chain += f",atrim=start={offset:.8f},asetpts=PTS-STARTPTS"
+    elif offset < 0:
+        chain += f",adelay={round(abs(offset) * 1000)}"
+    if abs(tempo - 1.0) > 1e-7:
+        chain += f",atempo={tempo:.8f}"
+    chain += (
+        f",atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+        ",aresample=16000[out]"
+    )
+    filters.append(chain)
+    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.flac")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        *inputs,
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[out]",
+        "-c:a",
+        "flac",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(temporary),
+    ]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Logical track export failed: {completed.stderr[-500:]}"
+            )
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    stat = output_path.stat()
+    manifest = {
+        "version": _TRACK_WINDOW_VERSION,
+        "clock": "source",
+        "fingerprint": fingerprint,
+        "logical_track": logical_track,
+        "source_window": {
+            "start": start,
+            "end": end,
+            "duration_seconds": end - start,
+        },
+        "audio_sync": sync,
+        "source_files": [_file_identity(path) for path in paths],
+        "audio": {
+            "path": str(output_path.resolve()),
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": _file_sha256(output_path),
+            "sample_rate": 16000,
+            "channels": 1,
+            "codec": "flac",
+        },
+    }
+    atomic_write_json(manifest_path, manifest)
+    return manifest
+
+
+def _shift_transcript_result(
+    raw: dict, source_start: float, logical_track: int
+) -> dict:
+    shifted = deepcopy(raw)
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"start", "end"} and isinstance(child, (int, float)):
+                    value[key] = float(child) + source_start
+                else:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(shifted.get("results", {}))
+    metadata = shifted.setdefault("metadata", {})
+    metadata["clock"] = "source"
+    metadata["source_window_start"] = source_start
+    metadata["logical_track"] = logical_track
+    return shifted
+
+
+def transcribe_logical_track_window(
+    episode_dir: Path,
+    config: dict,
+    logical_track: int,
+    start: float,
+    end: float,
+    output_dir: Path,
+) -> dict:
+    """Run cached review-only ASR for one bounded logical-track window."""
+    episode_dir = Path(episode_dir)
+    output_dir = Path(output_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    start, end = _validated_source_window(episode, start, end)
+    stem = f"track_{logical_track}_{start:.3f}_{end:.3f}"
+    audio_path = output_dir / f"{stem}.flac"
+    audio = export_logical_track_window(
+        episode_dir, episode, logical_track, start, end, audio_path
+    )
+    fingerprint = _stable_hash(
+        {
+            "version": _TRACK_WINDOW_VERSION,
+            "audio_fingerprint": audio["fingerprint"],
+            "asr_config_fingerprint": _asr_config_fingerprint(config, False),
+        }
+    )
+    raw_path = output_dir / f"{stem}.deepgram.json"
+    source_path = output_dir / f"{stem}.source.json"
+    manifest_path = output_dir / f"{stem}.evidence.json"
+    try:
+        cached = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    if (
+        cached.get("fingerprint") == fingerprint
+        and raw_path.is_file()
+        and source_path.is_file()
+        and cached.get("raw_response", {}).get("sha256") == _file_sha256(raw_path)
+        and cached.get("source_response", {}).get("sha256") == _file_sha256(source_path)
+    ):
+        return cached
+
+    agent = TranscribeAgent(episode_dir, config)
+    raw = agent._request_deepgram(audio_path, multichannel=False)
+    shifted = _shift_transcript_result(raw, start, logical_track)
+    atomic_write_json(raw_path, raw)
+    atomic_write_json(source_path, shifted)
+    manifest = {
+        "version": _TRACK_WINDOW_VERSION,
+        "clock": "source",
+        "fingerprint": fingerprint,
+        "logical_track": logical_track,
+        "source_window": {
+            "start": start,
+            "end": end,
+            "duration_seconds": end - start,
+        },
+        "audio": audio,
+        "provider": "deepgram",
+        "model": config.get("transcription", {}).get("model", "nova-3"),
+        "review_only": True,
+        "applied_to_canonical": False,
+        "raw_response": {
+            "path": str(raw_path.resolve()),
+            "sha256": _file_sha256(raw_path),
+        },
+        "source_response": {
+            "path": str(source_path.resolve()),
+            "sha256": _file_sha256(source_path),
+        },
+    }
+    atomic_write_json(manifest_path, manifest)
+    return manifest
+
+
+def _speaker_logical_tracks(transcript: dict) -> dict[int, int]:
+    result = {}
+    for mapping in transcript.get("speaker_map", []):
+        speaker = mapping.get("index")
+        track = mapping.get("logical_track")
+        if (
+            isinstance(speaker, int)
+            and not isinstance(speaker, bool)
+            and isinstance(track, int)
+            and not isinstance(track, bool)
+        ):
+            result[speaker] = track
+    return result
+
+
+def analyze_transcript_coverage(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    output_path: Path | None = None,
+) -> dict:
+    """Find logical-mic speech activity that has no canonical transcript words."""
+    episode_dir = Path(episode_dir)
+    transcript = json.loads((episode_dir / "diarized_transcript.json").read_text())
+    provenance = json.loads((episode_dir / "transcript_provenance.json").read_text())
+    segments = json.loads((episode_dir / "segments.json").read_text())
+    rms_metadata = json.loads((episode_dir / "work/rms_meta.json").read_text())
+    if (
+        transcript.get("clock") != "source"
+        or provenance.get("clock") != "source"
+        or segments.get("clock") != "source"
+        or rms_metadata.get("clock") != "source"
+        or rms_metadata.get("fingerprint") != segments.get("fingerprint")
+    ):
+        raise RuntimeError("Transcript or microphone activity is stale")
+    frame_seconds = float(rms_metadata.get("frame_seconds", 0))
+    if not math.isfinite(frame_seconds) or frame_seconds <= 0:
+        raise RuntimeError("Microphone activity frame size is invalid")
+    speaker_tracks = _speaker_logical_tracks(transcript)
+    people_by_track = {}
+    for mapping in transcript.get("speaker_map", []):
+        track = mapping.get("logical_track")
+        if isinstance(track, int) and mapping.get("person"):
+            people_by_track.setdefault(track, set()).add(mapping["person"])
+    speaker_index_by_track = {}
+    for mapping in segments.get("track_mapping", []):
+        speaker = str(mapping.get("speaker", ""))
+        track = mapping.get("logical_track")
+        if speaker.startswith("speaker_") and isinstance(track, int):
+            speaker_index_by_track[track] = int(speaker.rsplit("_", 1)[1])
+    words_by_track: dict[int, list[dict]] = {}
+    for utterance in transcript.get("utterances", []):
+        for word in utterance.get("words", []):
+            track = speaker_tracks.get(word.get("speaker", utterance.get("speaker")))
+            if track is not None:
+                words_by_track.setdefault(track, []).append(word)
+
+    processing = config.get("processing", {})
+    margin = float(
+        episode.get("speaker_cut_config", {}).get(
+            "speech_db_margin", processing.get("speech_db_margin", 6)
+        )
+    )
+    padding_seconds = 0.4
+    bridge_seconds = 0.8
+    minimum_active_seconds = 1.2
+    minimum_gap_seconds = 3.0
+    findings = []
+    track_summaries = []
+    array_identities = []
+    for track, speaker_index in sorted(speaker_index_by_track.items()):
+        rms_path = episode_dir / "work" / f"speaker_{speaker_index}_rms_db.npy"
+        try:
+            values = np.load(rms_path, mmap_mode="r")
+        except (OSError, ValueError):
+            continue
+        array_identities.append(_file_identity(rms_path))
+        finite_values = np.asarray(values[np.isfinite(values)])
+        if not len(finite_values):
+            continue
+        threshold = float(np.percentile(finite_values, 10) + margin)
+        owned = np.zeros(len(values), dtype=bool)
+        for segment in segments.get("segments", []):
+            if segment.get("speaker") != f"speaker_{speaker_index}":
+                continue
+            first = max(0, int(float(segment.get("start", 0)) / frame_seconds))
+            last = min(
+                len(owned),
+                math.ceil(float(segment.get("end", 0)) / frame_seconds),
+            )
+            owned[first:last] = True
+        active = np.asarray((values > threshold) & owned, dtype=bool)
+        covered = np.zeros(len(active), dtype=bool)
+        track_words = sorted(
+            words_by_track.get(track, []), key=lambda word: float(word.get("start", 0))
+        )
+        for word in track_words:
+            start = max(0.0, float(word.get("start", 0)) - padding_seconds)
+            end = max(start, float(word.get("end", start)) + padding_seconds)
+            first = max(0, int(start / frame_seconds))
+            last = min(len(covered), math.ceil(end / frame_seconds))
+            covered[first:last] = True
+        missing_indices = np.flatnonzero(active & ~covered)
+        groups: list[list[int]] = []
+        bridge_frames = max(1, round(bridge_seconds / frame_seconds))
+        for frame in missing_indices:
+            if groups and frame - groups[-1][-1] <= bridge_frames:
+                groups[-1].append(int(frame))
+            else:
+                groups.append([int(frame)])
+        track_count = 0
+        for group in groups:
+            active_seconds = len(group) * frame_seconds
+            span_seconds = (group[-1] - group[0] + 1) * frame_seconds
+            if (
+                active_seconds < minimum_active_seconds
+                or span_seconds < minimum_gap_seconds
+            ):
+                continue
+            first = group[0]
+            last = group[-1]
+            start = first * frame_seconds
+            end = (last + 1) * frame_seconds
+            levels = np.asarray(values[group], dtype=float)
+            finding_id = f"track_{track}_{start:.3f}_{end:.3f}"
+            findings.append(
+                {
+                    "id": finding_id,
+                    "kind": "untranscribed_mic_activity",
+                    "clock": "source",
+                    "logical_track": track,
+                    "people": sorted(people_by_track.get(track, [])),
+                    "source_window": {
+                        "start": round(start, 3),
+                        "end": round(end, 3),
+                        "duration_seconds": round(end - start, 3),
+                    },
+                    "review_window": {
+                        "start": round(max(0.0, start - 2.0), 3),
+                        "end": round(min(len(values) * frame_seconds, end + 2.0), 3),
+                    },
+                    "evidence": {
+                        "active_seconds": round(active_seconds, 3),
+                        "activity_fraction": round(
+                            active_seconds / max(end - start, frame_seconds), 4
+                        ),
+                        "threshold_db": round(threshold, 2),
+                        "median_db": round(float(np.median(levels)), 2),
+                        "peak_db": round(float(np.max(levels)), 2),
+                        "speaker_owned_frames_only": True,
+                    },
+                    "status": "review_required",
+                }
+            )
+            track_count += 1
+        track_summaries.append(
+            {
+                "logical_track": track,
+                "people": sorted(people_by_track.get(track, [])),
+                "word_count": len(track_words),
+                "finding_count": track_count,
+                "activity_threshold_db": round(threshold, 2),
+            }
+        )
+    report = {
+        "version": _TRANSCRIPT_COVERAGE_VERSION,
+        "clock": "source",
+        "status": "review_required" if findings else "pass",
+        "fingerprint": _stable_hash(
+            {
+                "version": _TRANSCRIPT_COVERAGE_VERSION,
+                "transcript_sha256": _file_sha256(
+                    episode_dir / "diarized_transcript.json"
+                ),
+                "transcript_provenance": provenance,
+                "speaker_cut_fingerprint": segments.get("fingerprint"),
+                "rms_metadata": rms_metadata,
+                "rms_arrays": array_identities,
+                "settings": {
+                    "speech_db_margin": margin,
+                    "word_padding_seconds": padding_seconds,
+                    "bridge_seconds": bridge_seconds,
+                    "minimum_active_seconds": minimum_active_seconds,
+                    "minimum_gap_seconds": minimum_gap_seconds,
+                    "speaker_owned_frames_only": True,
+                },
+            }
+        ),
+        "summary": {
+            "finding_count": len(findings),
+            "tracks": track_summaries,
+        },
+        "findings": findings,
+    }
+    destination = output_path or episode_dir / "qa/transcript-coverage.json"
+    atomic_write_json(Path(destination), report)
+    return report
+
+
 def repair_existing_transcript(episode_dir: Path, config: dict) -> dict:
     """Canonicalize a stored ASR response without uploading audio again.
 
@@ -484,10 +948,30 @@ class TranscribeAgent(BaseAgent):
             replacement = operation.get("words")
             if start < 0 or end <= start or not isinstance(replacement, list):
                 raise ValueError(f"Invalid range correction {correction_id}")
+            replace_speakers = operation.get("replace_speakers")
+            if replace_speakers is not None and (
+                not isinstance(replace_speakers, list)
+                or any(
+                    not isinstance(speaker, int) or isinstance(speaker, bool)
+                    for speaker in replace_speakers
+                )
+            ):
+                raise ValueError(
+                    f"Correction {correction_id} has invalid replace_speakers"
+                )
+            replace_speakers = (
+                set(replace_speakers) if replace_speakers is not None else None
+            )
             words = [
                 word
                 for word in words
-                if not (start <= (word["start"] + word["end"]) / 2 < end)
+                if not (
+                    start <= (word["start"] + word["end"]) / 2 < end
+                    and (
+                        replace_speakers is None
+                        or word.get("speaker") in replace_speakers
+                    )
+                )
             ]
             for replacement_index, item in enumerate(replacement):
                 word_start = float(item.get("start", -1))
