@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from lib.atomic_write import atomic_write_json
+
 
 def normalize_clip(clip: dict) -> dict:
     """Ensure clips have both start/end and start_seconds/end_seconds.
@@ -35,8 +37,7 @@ def load_clips(episode_dir: Path) -> list[dict]:
 
 
 def save_clips(episode_dir: Path, clips: list):
-    """Save clips list to clips.json in episode directory."""
+    """Atomically save the canonical clip list."""
     clips_file = episode_dir / "clips.json"
     clips_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(clips_file, "w") as f:
-        json.dump({"clips": clips}, f, indent=2)
+    atomic_write_json(clips_file, {"clips": clips})

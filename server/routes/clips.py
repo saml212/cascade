@@ -1,16 +1,21 @@
-"""Clip review endpoints."""
+"""Clip candidate editing, rendering, and final-review endpoints."""
 
+import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from lib.clips import (
-    normalize_clip as _normalize_clip,
     load_clips as _load_clips_from_dir,
+)
+from lib.clips import (
+    normalize_clip as _normalize_clip,
+)
+from lib.clips import (
     save_clips as _save_clips_to_dir,
 )
 from lib.paths import get_episodes_dir
@@ -28,12 +33,22 @@ class ManualClipRequest(BaseModel):
 
 
 class MetadataUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    hashtags: Optional[str] = None
-    start_seconds: Optional[float] = None
-    end_seconds: Optional[float] = None
-    metadata: Optional[dict] = None
+    title: str | None = None
+    description: str | None = None
+    hashtags: str | list[str] | None = None
+    hook_text: str | None = None
+    compelling_reason: str | None = None
+    virality_score: float | None = None
+    speaker: str | None = None
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+    metadata: dict | None = None
+
+
+class BulkClipRequest(BaseModel):
+    clip_ids: list[str] | None = None
+    min_score: float | None = None
+    max_score: float | None = None
 
 
 def load_clips(episode_id: str) -> tuple:
@@ -70,6 +85,80 @@ def find_clip(clips: list, clip_id: str) -> tuple[dict, int]:
     raise HTTPException(status_code=404, detail=f"Clip {clip_id} not found")
 
 
+def _clear_final_approval(clip: dict) -> None:
+    """Demote a changed clip until its current render is reviewed again."""
+    if clip.get("status") == "approved":
+        clip["status"] = "pending"
+        clip["selection_status"] = "selected"
+    for field in (
+        "approved_at",
+        "approved_revision",
+        "approved_render_fingerprint",
+    ):
+        clip.pop(field, None)
+
+
+def _metadata_entry(ep_dir: Path, clip_id: str) -> dict | None:
+    try:
+        metadata = json.loads((ep_dir / "metadata" / "metadata.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    for item in metadata.get("clips", []):
+        if isinstance(item, dict) and item.get("id") == clip_id:
+            return item
+    return None
+
+
+def _current_render(ep_dir: Path, clip: dict) -> dict | None:
+    """Return the current validated render record for one clip."""
+    from agents.pipeline import load_config
+    from lib.delivery_video import current_short_render
+
+    try:
+        episode = json.loads((ep_dir / "episode.json").read_text())
+        segments = json.loads((ep_dir / "segments.json").read_text()).get(
+            "segments", []
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    audio = ep_dir / "work" / "audio_mix.wav"
+    if not audio.exists() or not segments:
+        return None
+    return current_short_render(ep_dir, episode, load_config(), audio, segments, clip)
+
+
+def _approve_current_render(
+    ep_dir: Path, clip: dict, render: dict | None = None
+) -> dict:
+    """Bind final approval to the exact render and copy being reviewed."""
+    from agents.qa import clip_review_revision
+
+    render = render or _current_render(ep_dir, clip)
+    if not render:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Clip {clip.get('id')} needs a current render before final approval",
+        )
+    clip["selection_status"] = "selected"
+    clip["status"] = "approved"
+    clip["approved_render_fingerprint"] = render["fingerprint"]
+    clip["approved_revision"] = clip_review_revision(
+        clip, render, _metadata_entry(ep_dir, str(clip["id"]))
+    )
+    clip["approved_at"] = datetime.now(timezone.utc).isoformat()
+    return render
+
+
+def _matches_bulk(clip: dict, req: BulkClipRequest, *, approve: bool) -> bool:
+    if req.clip_ids:
+        return clip.get("id") in req.clip_ids
+    score = clip.get("virality_score", 0)
+    threshold = req.min_score if approve else req.max_score
+    if threshold is None:
+        return False
+    return score >= threshold if approve else score <= threshold
+
+
 @router.get("")
 @router.get("/")
 async def list_clips(episode_id: str) -> list[dict]:
@@ -87,16 +176,89 @@ async def get_clip(episode_id: str, clip_id: str) -> dict:
     return clip
 
 
+@router.post("/bulk/approve")
+async def approve_clips(episode_id: str, req: BulkClipRequest) -> dict:
+    """Approve selected current renders as one all-or-nothing decision."""
+    clips, clips_file = load_clips(episode_id)
+    targets = [
+        clip
+        for clip in clips
+        if _matches_bulk(clip, req, approve=True) and clip.get("status") != "rejected"
+    ]
+    renders = {
+        str(clip["id"]): _current_render(EPISODES_DIR / episode_id, clip)
+        for clip in targets
+    }
+    missing = [clip_id for clip_id, render in renders.items() if not render]
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Every clip needs a current render before final approval",
+                "clip_ids": missing,
+            },
+        )
+    for clip in targets:
+        _approve_current_render(
+            EPISODES_DIR / episode_id, clip, renders[str(clip["id"])]
+        )
+    if targets:
+        save_clips(clips, clips_file)
+    approved = [str(clip["id"]) for clip in targets]
+    return {"status": "approved", "approved": approved, "count": len(approved)}
+
+
+@router.post("/bulk/reject")
+async def reject_clips(episode_id: str, req: BulkClipRequest) -> dict:
+    """Reject matching candidates while preserving prior final approvals."""
+    clips, clips_file = load_clips(episode_id)
+    targets = [
+        clip
+        for clip in clips
+        if _matches_bulk(clip, req, approve=False) and clip.get("status") != "approved"
+    ]
+    for clip in targets:
+        _clear_final_approval(clip)
+        clip["selection_status"] = "rejected"
+        clip["status"] = "rejected"
+    if targets:
+        save_clips(clips, clips_file)
+    rejected = [str(clip["id"]) for clip in targets]
+    return {"status": "rejected", "rejected": rejected, "count": len(rejected)}
+
+
 @router.post("/{clip_id}/approve")
 async def approve_clip(episode_id: str, clip_id: str) -> dict:
-    """Approve a clip."""
+    """Finally approve the exact current render and copy for a clip."""
     logger.info("POST /api/episodes/%s/clips/%s/approve", episode_id, clip_id)
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)
-    clip["status"] = "approved"
+    render = _approve_current_render(EPISODES_DIR / episode_id, clip)
     clips[idx] = clip
     save_clips(clips, clips_file)
-    return {"status": "approved", "clip_id": clip_id}
+    return {
+        "status": "approved",
+        "clip_id": clip_id,
+        "approved_revision": clip["approved_revision"],
+        "render_fingerprint": render["fingerprint"],
+    }
+
+
+@router.post("/{clip_id}/select")
+async def select_clip(episode_id: str, clip_id: str) -> dict:
+    """Select a candidate without approving an unseen render for release."""
+    clips, clips_file = load_clips(episode_id)
+    clip, idx = find_clip(clips, clip_id)
+    clip["selection_status"] = "selected"
+    if clip.get("status") == "rejected":
+        clip["status"] = "pending"
+    clips[idx] = clip
+    save_clips(clips, clips_file)
+    return {
+        "status": clip.get("status", "pending"),
+        "selection_status": "selected",
+        "clip_id": clip_id,
+    }
 
 
 @router.post("/{clip_id}/reject")
@@ -105,6 +267,9 @@ async def reject_clip(episode_id: str, clip_id: str) -> dict:
     logger.info("POST /api/episodes/%s/clips/%s/reject", episode_id, clip_id)
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)
+    clip["status"] = "rejected"
+    clip["selection_status"] = "rejected"
+    _clear_final_approval(clip)
     clip["status"] = "rejected"
     clips[idx] = clip
     save_clips(clips, clips_file)
@@ -171,6 +336,8 @@ async def add_manual_clip(episode_id: str, req: ManualClipRequest) -> dict:
         "rank": len(clips) + 1,
         "start": req.start_seconds,
         "end": req.end_seconds,
+        "start_seconds": req.start_seconds,
+        "end_seconds": req.end_seconds,
         "duration": duration,
         "title": f"Custom clip ({int(req.start_seconds // 60)}:{int(req.start_seconds % 60):02d}–{int(req.end_seconds // 60)}:{int(req.end_seconds % 60):02d})",
         "hook_text": "",
@@ -178,6 +345,7 @@ async def add_manual_clip(episode_id: str, req: ManualClipRequest) -> dict:
         "virality_score": 0,
         "speaker": "BOTH",
         "status": "pending",
+        "selection_status": "selected",
         "manual": True,
     }
 
@@ -194,23 +362,107 @@ async def update_clip_metadata(
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)
 
-    if update.title is not None:
-        clip["title"] = update.title
-    if update.description is not None:
-        clip["description"] = update.description
-    if update.hashtags is not None:
-        clip["hashtags"] = update.hashtags
-    if update.start_seconds is not None:
-        clip["start"] = update.start_seconds
-    if update.end_seconds is not None:
-        clip["end"] = update.end_seconds
-    if update.start_seconds is not None or update.end_seconds is not None:
-        clip["duration"] = clip.get("end", 0) - clip.get("start", 0)
+    changed = False
+    for field in (
+        "title",
+        "description",
+        "hashtags",
+        "hook_text",
+        "compelling_reason",
+        "virality_score",
+        "speaker",
+    ):
+        value = getattr(update, field)
+        if value is not None and clip.get(field) != value:
+            clip[field] = value
+            changed = True
+
+    start = update.start_seconds
+    end = update.end_seconds
+    next_start = (
+        start if start is not None else clip.get("start_seconds", clip.get("start"))
+    )
+    next_end = end if end is not None else clip.get("end_seconds", clip.get("end"))
+    if (start is not None or end is not None) and (
+        next_start is None or next_end is None or next_end <= next_start
+    ):
+        raise HTTPException(
+            status_code=400, detail="end_seconds must be greater than start_seconds"
+        )
+    if start is not None:
+        changed = (
+            changed or clip.get("start") != start or clip.get("start_seconds") != start
+        )
+        clip["start"] = clip["start_seconds"] = start
+    if end is not None:
+        changed = changed or clip.get("end") != end or clip.get("end_seconds") != end
+        clip["end"] = clip["end_seconds"] = end
+    if start is not None or end is not None:
+        clip["duration"] = next_end - next_start
+
     if update.metadata is not None:
-        existing_meta = clip.get("metadata", {})
-        existing_meta.update(update.metadata)
-        clip["metadata"] = existing_meta
+        merged = dict(clip.get("metadata", {}))
+        for key, value in update.metadata.items():
+            if isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
+        if merged != clip.get("metadata", {}):
+            clip["metadata"] = merged
+            changed = True
+
+    if changed:
+        _clear_final_approval(clip)
 
     clips[idx] = clip
     save_clips(clips, clips_file)
     return clip
+
+
+@router.delete("/{clip_id}")
+async def delete_clip(episode_id: str, clip_id: str) -> dict:
+    """Remove one clip candidate from the canonical clip list."""
+    clips, clips_file = load_clips(episode_id)
+    _, index = find_clip(clips, clip_id)
+    del clips[index]
+    save_clips(clips, clips_file)
+    return {"status": "deleted", "clip_id": clip_id}
+
+
+@router.post("/{clip_id}/render")
+async def render_clip(episode_id: str, clip_id: str) -> dict:
+    """Render one exact clip through the public shorts-render adapter."""
+    clips, _ = load_clips(episode_id)
+    find_clip(clips, clip_id)
+    ep_dir = EPISODES_DIR / episode_id
+
+    from agents.pipeline import load_config
+    from agents.shorts_render import render_single_clip
+
+    try:
+        result = await asyncio.to_thread(
+            render_single_clip, ep_dir, load_config(), clip_id
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail=f"Clip {clip_id} not found"
+        ) from error
+    except (FileNotFoundError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (OSError, RuntimeError) as error:
+        logger.exception("single clip render failed for %s", clip_id)
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+    # Newly produced pixels need review. Reusing the exact current fingerprint
+    # keeps an existing final approval valid.
+    clips, clips_file = load_clips(episode_id)
+    clip, index = find_clip(clips, clip_id)
+    fingerprint = result.get("render", {}).get("fingerprint")
+    if (
+        clip.get("status") == "approved"
+        and clip.get("approved_render_fingerprint") != fingerprint
+    ):
+        _clear_final_approval(clip)
+        clips[index] = clip
+        save_clips(clips, clips_file)
+    return result
