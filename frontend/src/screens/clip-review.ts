@@ -8,7 +8,13 @@
  */
 
 import { h, mount } from '../lib/dom';
-import { signal, effect, type Signal } from '../lib/signals';
+import {
+  signal,
+  effect,
+  effectScope,
+  onCleanup,
+  type Signal,
+} from '../lib/signals';
 import {
   api,
   type ClipReviewState,
@@ -22,7 +28,9 @@ import {
   describeEpisodeStatus,
   episodeTitle,
   formatDuration,
+  formatEditableTimecode,
   formatTimecode,
+  parseTimecode,
   pluralize,
   type StatusDescriptor,
 } from '../lib/format';
@@ -94,24 +102,48 @@ export function ClipReview(
   const loadError = signal<string | null>(null);
   const chatMessages = signal<ChatMessage[]>([]);
   const chatSending = signal<boolean>(false);
+  let pollTimer: number | undefined;
+  let loadSequence = 0;
+
+  const hasActiveRender = (state: EpisodeReviewState | null): boolean =>
+    Boolean(
+      state?.clips.some((clip) => clip.review.render_job.status === 'rendering')
+    );
+
+  function schedulePoll(state: EpisodeReviewState | null): void {
+    if (pollTimer != null) window.clearTimeout(pollTimer);
+    pollTimer = undefined;
+    if (hasActiveRender(state)) {
+      pollTimer = window.setTimeout(() => void load(), 1500);
+    }
+  }
 
   async function load(): Promise<void> {
+    const sequence = ++loadSequence;
+    if (pollTimer != null) window.clearTimeout(pollTimer);
+    pollTimer = undefined;
     try {
       const [ep, state] = await Promise.all([
         api.getEpisode(episodeId),
         api.review(episodeId),
       ]);
+      if (sequence !== loadSequence) return;
       episode.set(ep);
       review.set(state);
       clips.set(state.clips);
       loadError.set(null);
-      if (state.clips.some((clip) => clip.review.render_job.status === 'rendering')) {
-        window.setTimeout(() => void load(), 1500);
-      }
+      schedulePoll(state);
     } catch (e) {
+      if (sequence !== loadSequence) return;
       loadError.set((e as Error).message);
+      schedulePoll(review.peek());
     }
   }
+
+  onCleanup(() => {
+    loadSequence += 1;
+    if (pollTimer != null) window.clearTimeout(pollTimer);
+  });
 
   async function loadChatHistory(): Promise<void> {
     try {
@@ -160,6 +192,24 @@ export function ClipReview(
   void loadChatHistory();
 
   const body = h('div');
+  const clipList = h('div', { class: 'flex flex-col gap-4 pb-4' });
+  const cardEntries = new Map<
+    string,
+    { element: HTMLElement; signature: string; dispose: () => void }
+  >();
+  const setExpanded = (nextId: string | null): void => {
+    expandedId.set(nextId);
+    const suffix = nextId ? `/${encodeURIComponent(nextId)}` : '';
+    window.history.replaceState(
+      null,
+      '',
+      `#/episodes/${episodeId}/clips/review${suffix}`
+    );
+  };
+  onCleanup(() => {
+    for (const entry of cardEntries.values()) entry.dispose();
+    cardEntries.clear();
+  });
 
   effect(() => {
     const cs = clips();
@@ -180,38 +230,62 @@ export function ClipReview(
       return;
     }
     if (cs.length === 0) {
+      for (const entry of cardEntries.values()) entry.dispose();
+      cardEntries.clear();
+      clipList.replaceChildren();
       body.replaceChildren(emptyClipsPanel());
       return;
     }
 
     const state = review();
     const platforms = enabledPlatforms(state?.enabled_destinations ?? []);
+    const desired: HTMLElement[] = [];
+    const present = new Set<string>();
 
-    body.replaceChildren(
-      h(
-        'div',
-        { class: 'flex flex-col gap-4 pb-4' },
-        ...cs.map((c) =>
-          clipCard(
-            episodeId,
-            c,
-            expandedId,
-            (c.review as ClipReviewState),
-            platforms,
-            async () => load(),
-            (nextId) => {
-              expandedId.set(nextId);
-              const suffix = nextId ? `/${encodeURIComponent(nextId)}` : '';
-              window.history.replaceState(
-                null,
-                '',
-                `#/episodes/${episodeId}/clips/review${suffix}`
-              );
-            }
-          )
-        )
-      )
-    );
+    for (const clip of cs) {
+      const id = String(clip.id ?? clip.clip_id);
+      present.add(id);
+      const signature = JSON.stringify({
+        clip,
+        platforms: platforms.map((platform) => platform.key),
+      });
+      let entry = cardEntries.get(id);
+      if (!entry || entry.signature !== signature) {
+        const next = clipCard(
+          episodeId,
+          clip,
+          expandedId,
+          clip.review as ClipReviewState,
+          platforms,
+          async () => load(),
+          setExpanded
+        );
+        if (entry?.element.parentNode === clipList) {
+          entry.element.replaceWith(next.element);
+        }
+        entry?.dispose();
+        entry = { ...next, signature };
+        cardEntries.set(id, entry);
+      }
+      desired.push(entry.element);
+    }
+
+    for (const [id, entry] of cardEntries) {
+      if (present.has(id)) continue;
+      entry.element.remove();
+      entry.dispose();
+      cardEntries.delete(id);
+    }
+
+    desired.forEach((element, index) => {
+      if (clipList.children[index] !== element) {
+        clipList.insertBefore(element, clipList.children[index] ?? null);
+      }
+    });
+    while (clipList.children.length > desired.length) {
+      clipList.lastElementChild?.remove();
+    }
+    if (body.firstElementChild !== clipList) body.replaceChildren(clipList);
   });
 
   mount(
@@ -400,7 +474,7 @@ function clipCard(
   platforms: PlatformSpec[],
   reload: () => Promise<void>,
   setExpanded: (clipId: string | null) => void
-): HTMLElement {
+): { element: HTMLElement; dispose: () => void } {
   const id = (clip.id as string) ?? (clip.clip_id as string);
   const title = (clip.title as string) || 'Untitled clip';
   const hook = (clip.hook_text as string) || (clip.hook as string) || '';
@@ -420,53 +494,62 @@ function clipCard(
     class:
       'panel scroll-mt-24 overflow-hidden transition-colors duration-[120ms]',
   });
+  let expandedScope: { element: HTMLElement; dispose: () => void } | null = null;
 
-  effect(() => {
-    const expanded = expandedId() === id;
-    card.classList.toggle('border-border-strong', expanded);
+  const dispose = effectScope(() => {
+    onCleanup(() => expandedScope?.dispose());
+    effect(() => {
+      const expanded = expandedId() === id;
+      card.classList.toggle('border-border-strong', expanded);
 
-    const head = clipHead(
-      id,
-      title,
-      hook,
-      reason,
-      duration,
-      start,
-      end,
-      score,
-      rank,
-      speaker,
-      status,
-      expanded,
-      review.render,
-      review.selection.status,
-      Boolean(clip.manual),
-      () => setExpanded(expanded ? null : id)
-    );
-    const children: Node[] = [head];
-    if (expanded) {
-      children.push(
-        clipExpanded(
-          episodeId,
-          id,
-          start,
-          end,
-          metadata,
-          review,
-          platforms,
-          reload
-        )
+      const head = clipHead(
+        id,
+        title,
+        hook,
+        reason,
+        duration,
+        start,
+        end,
+        score,
+        rank,
+        speaker,
+        status,
+        expanded,
+        review.render,
+        review.selection.status,
+        Boolean(clip.manual),
+        () => setExpanded(expanded ? null : id)
       );
-    }
-    card.replaceChildren(...children);
-    if (expanded) {
-      requestAnimationFrame(() =>
-        card.scrollIntoView({ behavior: 'smooth', block: 'start' })
-      );
-    }
+      expandedScope?.dispose();
+      expandedScope = null;
+      const children: Node[] = [head];
+      if (expanded) {
+        let element!: HTMLElement;
+        const disposeExpanded = effectScope(() => {
+          element = clipExpanded(
+            episodeId,
+            id,
+            start,
+            end,
+            metadata,
+            review,
+            platforms,
+            reload
+          );
+        });
+        expandedScope = { element, dispose: disposeExpanded };
+        children.push(element);
+      }
+      card.replaceChildren(...children);
+      if (expanded) {
+        requestAnimationFrame(() =>
+          card.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        );
+      }
+    });
   });
 
-  return card;
+  return { element: card, dispose };
 }
 
 function clipHead(
@@ -723,14 +806,17 @@ function renderReviewPlayer(
       : null,
     h(
       'div',
-      { class: 'w-full max-w-[390px] mx-auto' },
+      {
+        class: 'mx-auto max-w-full',
+        style: { width: 'min(390px, 30dvh)' },
+      },
       h('video', {
         src: url,
         controls: true,
         playsinline: true,
         preload: 'metadata',
         class:
-          'block w-full max-h-[68vh] aspect-[9/16] object-contain bg-black rounded-lg border border-border-strong shadow-lift-lg',
+          'block w-full aspect-[9/16] object-contain bg-black rounded-lg border border-border-strong shadow-lift-lg',
         'aria-label': `Review video for ${clipId}`,
       }),
       h(
@@ -848,8 +934,10 @@ function renderTrim(
   initialEnd: number,
   reload: () => Promise<void>
 ): HTMLElement {
-  const startStr = signal<string>(formatTimecode(initialStart));
-  const endStr = signal<string>(formatTimecode(initialEnd));
+  const initialStartText = formatEditableTimecode(initialStart);
+  const initialEndText = formatEditableTimecode(initialEnd);
+  const startStr = signal<string>(initialStartText);
+  const endStr = signal<string>(initialEndText);
 
   const startInput = h('input', {
     type: 'text',
@@ -897,10 +985,17 @@ function renderTrim(
       size: 'md',
       label: 'Save trim',
       onClick: async () => {
-        const s = parseTimecode(startStr.peek());
-        const e = parseTimecode(endStr.peek());
+        const startText = startStr.peek().trim();
+        const endText = endStr.peek().trim();
+        const s =
+          startText === initialStartText ? initialStart : parseTimecode(startText);
+        const e =
+          endText === initialEndText ? initialEnd : parseTimecode(endText);
         if (s == null || e == null || e <= s) {
-          showToast('Give me valid start/end times (mm:ss).', 'error');
+          showToast(
+            'Use finite, non-negative times such as 21:06.080, with seconds below 60.',
+            'error'
+          );
           return;
         }
         try {
@@ -919,16 +1014,7 @@ function renderTrim(
 }
 
 const trimInputClass =
-  'w-28 h-9 bg-surface-2 border border-border rounded-md px-2.5 text-body text-ink-primary font-mono tabular focus:border-accent focus:outline-none';
-
-function parseTimecode(s: string): number | null {
-  const parts = s.trim().split(':').map((p) => Number(p));
-  if (parts.some((p) => Number.isNaN(p))) return null;
-  if (parts.length === 1) return parts[0];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  return null;
-}
+  'w-32 h-9 bg-surface-2 border border-border rounded-md px-2.5 text-body text-ink-primary font-mono tabular focus:border-accent focus:outline-none';
 
 /* ------------------------- Per-platform metadata ------------------------- */
 

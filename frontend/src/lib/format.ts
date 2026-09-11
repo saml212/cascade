@@ -37,6 +37,48 @@ export function formatTimecode(seconds: number | null | undefined): string {
   return `${mm}:${ss}`;
 }
 
+/** Exact-enough timecode for editable source-clock clip boundaries. */
+export function formatEditableTimecode(
+  seconds: number | null | undefined
+): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) {
+    return '--:--.---';
+  }
+  const totalMilliseconds = Math.round(seconds * 1000);
+  const wholeSeconds = Math.floor(totalMilliseconds / 1000);
+  const milliseconds = totalMilliseconds % 1000;
+  const h = Math.floor(wholeSeconds / 3600);
+  const m = Math.floor((wholeSeconds % 3600) / 60);
+  const s = wholeSeconds % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  const ms = String(milliseconds).padStart(3, '0');
+  return h > 0 ? `${h}:${mm}:${ss}.${ms}` : `${mm}:${ss}.${ms}`;
+}
+
+/** Parse seconds, mm:ss, or hh:mm:ss without accepting ambiguous overflow. */
+export function parseTimecode(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  const parts = text.split(':');
+  if (parts.length < 1 || parts.length > 3) return null;
+  if (!parts.every((part) => /^\d+(?:\.\d+)?$/.test(part))) return null;
+  if (parts.slice(0, -1).some((part) => part.includes('.'))) return null;
+
+  const values = parts.map(Number);
+  if (values.some((part) => !Number.isFinite(part) || part < 0)) return null;
+  if (parts.length >= 2 && values.at(-1)! >= 60) return null;
+  if (parts.length === 3 && values[1] >= 60) return null;
+
+  const seconds =
+    parts.length === 1
+      ? values[0]
+      : parts.length === 2
+        ? values[0] * 60 + values[1]
+        : values[0] * 3600 + values[1] * 60 + values[2];
+  return Math.round(seconds * 1000) / 1000;
+}
+
 export function formatOffsetMs(seconds: number | null | undefined): string {
   if (seconds == null || !isFinite(seconds)) return '—';
   const ms = Math.round(seconds * 1000);
