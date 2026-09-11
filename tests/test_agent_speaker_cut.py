@@ -7,6 +7,7 @@ import pytest
 from agents.audio_analysis import audio_analysis_fingerprint
 from agents.speaker_cut import (
     SpeakerCutAgent,
+    _corrected_ownership_intervals,
     align_speaker_segments_to_transcript,
     current_speaker_segments,
     rebind_visual_crop_segments,
@@ -361,7 +362,14 @@ def test_current_segments_invalidates_when_crop_changes(tmp_episode_dir, sample_
     assert current_speaker_segments(tmp_episode_dir, episode, sample_config) is None
 
 
-def _write_alignment_transcript(ep_dir, left_words=3, suffix=""):
+def _write_alignment_transcript(
+    ep_dir,
+    left_words=3,
+    right_words=4,
+    right_start=7.7,
+    suffix="",
+    corrected=False,
+):
     def words(speaker, start, count):
         return [
             {
@@ -370,6 +378,8 @@ def _write_alignment_transcript(ep_dir, left_words=3, suffix=""):
                 "end": start + index * 0.3 + 0.25,
                 "speaker": speaker,
                 "suspect": False,
+                "corrected": corrected,
+                "correction_id": "reviewed-window" if corrected else None,
             }
             for index in range(count)
         ]
@@ -382,7 +392,7 @@ def _write_alignment_transcript(ep_dir, left_words=3, suffix=""):
         ],
         "utterances": [
             {"speaker": 10, "words": words(10, 7.0, left_words)},
-            {"speaker": 20, "words": words(20, 7.7, 4)},
+            {"speaker": 20, "words": words(20, right_start, right_words)},
         ],
     }
     _write(ep_dir / "diarized_transcript.json", transcript)
@@ -455,7 +465,135 @@ def test_transcript_alignment_ignores_one_word_reaction(tmp_episode_dir):
     assert result["transcript_alignment"]["adjustment_count"] == 0
 
 
-def test_current_segments_rejects_changed_transcript(tmp_episode_dir, sample_config):
+def test_reviewed_turn_resolves_lagging_speaker_and_ambiguous_segments(
+    tmp_episode_dir,
+):
+    _write(
+        tmp_episode_dir / "segments.json",
+        {
+            "clock": "source",
+            "fingerprint": "microphone-analysis",
+            "track_mapping": [
+                {"speaker": "speaker_0", "logical_track": 1},
+                {"speaker": "speaker_1", "logical_track": 2},
+            ],
+            "segments": [
+                {"speaker": "speaker_0", "start": 0.0, "end": 10.0},
+                {"speaker": "speaker_1", "start": 10.0, "end": 12.0},
+                {"speaker": "BOTH", "start": 12.0, "end": 16.0},
+                {"speaker": "speaker_1", "start": 16.0, "end": 20.0},
+            ],
+        },
+    )
+
+    _write_alignment_transcript(
+        tmp_episode_dir,
+        left_words=0,
+        right_words=37,
+        right_start=7.0,
+        corrected=True,
+    )
+    result = align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    assert [
+        (segment["speaker"], segment["start"], segment["end"])
+        for segment in result["segments"]
+    ] == [("speaker_0", 0.0, 7.0), ("speaker_1", 7.0, 20.0)]
+    alignment = result["transcript_alignment"]
+    assert alignment["version"] == "source-clock-v2"
+    assert alignment["adjustment_count"] == 2
+    assert {item["from_speaker"] for item in alignment["adjustments"]} == {
+        "speaker_0",
+        "BOTH",
+    }
+
+    _write_alignment_transcript(
+        tmp_episode_dir,
+        left_words=0,
+        right_words=37,
+        right_start=8.0,
+        suffix="changed",
+        corrected=True,
+    )
+    realigned = align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    assert [
+        (segment["speaker"], segment["start"], segment["end"])
+        for segment in realigned["segments"]
+    ] == [("speaker_0", 0.0, 8.0), ("speaker_1", 8.0, 20.0)]
+    assert len(realigned["transcript_alignment"]["base_segments"]) == 4
+
+
+def test_unreviewed_one_sided_turn_does_not_override_microphone_segments(
+    tmp_episode_dir,
+):
+    original = [
+        {"speaker": "speaker_0", "start": 0.0, "end": 10.0},
+        {"speaker": "BOTH", "start": 10.0, "end": 14.0},
+    ]
+    _write(
+        tmp_episode_dir / "segments.json",
+        {
+            "clock": "source",
+            "fingerprint": "microphone-analysis",
+            "track_mapping": [
+                {"speaker": "speaker_0", "logical_track": 1},
+                {"speaker": "speaker_1", "logical_track": 2},
+            ],
+            "segments": original,
+        },
+    )
+    _write_alignment_transcript(
+        tmp_episode_dir,
+        left_words=0,
+        right_words=37,
+        right_start=7.0,
+    )
+
+    result = align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    assert result["segments"] == original
+    assert result["transcript_alignment"]["adjustment_count"] == 0
+
+
+def test_reviewed_overlap_does_not_assert_competing_speaker_ownership():
+    turns = [
+        {
+            "speaker": "speaker_0",
+            "start": 1.0,
+            "end": 5.0,
+            "fully_corrected": True,
+            "correction_ids": ["host-review"],
+        },
+        {
+            "speaker": "speaker_1",
+            "start": 3.0,
+            "end": 7.0,
+            "fully_corrected": True,
+            "correction_ids": ["guest-review"],
+        },
+    ]
+
+    assert _corrected_ownership_intervals(turns) == [
+        {
+            "speaker": "speaker_0",
+            "start": 1.0,
+            "end": 3.0,
+            "correction_ids": ["host-review"],
+        },
+        {
+            "speaker": "speaker_1",
+            "start": 5.0,
+            "end": 7.0,
+            "correction_ids": ["guest-review"],
+        },
+    ]
+
+
+@pytest.mark.parametrize("alignment_version", ["source-clock-v1", "source-clock-v2"])
+def test_current_segments_rejects_changed_transcript(
+    tmp_episode_dir, sample_config, alignment_version
+):
     episode = {
         "source_properties": {"width": 1920, "height": 1080},
         "crop_config": {
@@ -483,7 +621,18 @@ def test_current_segments_rejects_changed_transcript(tmp_episode_dir, sample_con
     ):
         _agent(tmp_episode_dir, sample_config).execute()
     _write_alignment_transcript(tmp_episode_dir)
-    align_speaker_segments_to_transcript(tmp_episode_dir)
+    if alignment_version == "source-clock-v2":
+        align_speaker_segments_to_transcript(tmp_episode_dir)
+    else:
+        segments_path = tmp_episode_dir / "segments.json"
+        segments = json.loads(segments_path.read_text())
+        segments["transcript_alignment"] = {
+            "version": alignment_version,
+            "fingerprint": transcript_alignment_fingerprint(
+                tmp_episode_dir, segments, version=alignment_version
+            ),
+        }
+        _write(segments_path, segments)
 
     assert current_speaker_segments(tmp_episode_dir, episode, sample_config)
     _write_alignment_transcript(tmp_episode_dir, suffix="changed")

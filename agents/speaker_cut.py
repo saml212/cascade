@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -21,11 +22,12 @@ from lib.crop import compute_crop, resolve_speaker, speaker_crop_state
 
 DOMINANCE_DB = 6.0
 SPEAKER_CUT_VERSION = "source-clock-v3"
-TRANSCRIPT_ALIGNMENT_VERSION = "source-clock-v1"
+TRANSCRIPT_ALIGNMENT_VERSION = "source-clock-v2"
 _ALIGNMENT_MAX_SHIFT_SECONDS = 3.0
 _ALIGNMENT_MAX_GAP_SECONDS = 1.25
 _ALIGNMENT_MIN_WORDS = 3
 _ALIGNMENT_MIN_TURN_SECONDS = 0.6
+_CORRECTED_MIN_TURN_SECONDS = 2.0
 
 
 def strict_bool(value: object) -> bool:
@@ -105,14 +107,19 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def transcript_alignment_fingerprint(episode_dir: Path, segments: dict) -> str | None:
+def transcript_alignment_fingerprint(
+    episode_dir: Path,
+    segments: dict,
+    *,
+    version: str = TRANSCRIPT_ALIGNMENT_VERSION,
+) -> str | None:
     """Identify the canonical transcript used to refine camera boundaries."""
     transcript_path = episode_dir / "diarized_transcript.json"
     provenance_path = episode_dir / "transcript_provenance.json"
     if not transcript_path.is_file() or not provenance_path.is_file():
         return None
     payload = {
-        "version": TRANSCRIPT_ALIGNMENT_VERSION,
+        "version": version,
         "clock": "source",
         "speaker_cut_fingerprint": segments.get("fingerprint"),
         "transcript_sha256": _file_sha256(transcript_path),
@@ -161,12 +168,13 @@ def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dic
 
     turns = []
     for utterance in transcript.get("utterances", []):
+        utterance_words = utterance.get("words", [])
         target = source_to_target.get(utterance.get("speaker"))
         if target is None:
             continue
         reliable_words = [
             word
-            for word in utterance.get("words", [])
+            for word in utterance_words
             if not word.get("suspect") or word.get("corrected")
         ]
         if len(reliable_words) < _ALIGNMENT_MIN_WORDS:
@@ -181,9 +189,149 @@ def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dic
                 "start": start,
                 "end": end,
                 "word_count": len(reliable_words),
+                "fully_corrected": bool(utterance_words)
+                and len(reliable_words) == len(utterance_words)
+                and all(word.get("corrected") is True for word in utterance_words),
+                "correction_ids": sorted(
+                    {
+                        word["correction_id"]
+                        for word in reliable_words
+                        if isinstance(word.get("correction_id"), str)
+                    }
+                ),
             }
         )
     return turns
+
+
+def _corrected_ownership_intervals(turns: list[dict]) -> list[dict]:
+    """Return unambiguous spans backed entirely by reviewed correction words."""
+    corrected = [
+        turn
+        for turn in turns
+        if turn["fully_corrected"]
+        and turn["correction_ids"]
+        and turn["end"] - turn["start"] >= _CORRECTED_MIN_TURN_SECONDS
+    ]
+    boundaries = sorted(
+        {point for turn in corrected for point in (turn["start"], turn["end"])}
+    )
+    intervals = []
+    for start, end in pairwise(boundaries):
+        if end <= start:
+            continue
+        active = [
+            turn for turn in corrected if turn["start"] < end and turn["end"] > start
+        ]
+        speakers = {turn["speaker"] for turn in active}
+        if len(speakers) != 1:
+            continue
+        speaker = speakers.pop()
+        correction_ids = sorted(
+            {
+                correction_id
+                for turn in active
+                for correction_id in turn["correction_ids"]
+            }
+        )
+        if (
+            intervals
+            and intervals[-1]["speaker"] == speaker
+            and abs(intervals[-1]["end"] - start) < 1e-6
+            and intervals[-1]["correction_ids"] == correction_ids
+        ):
+            intervals[-1]["end"] = end
+            continue
+        intervals.append(
+            {
+                "speaker": speaker,
+                "start": start,
+                "end": end,
+                "correction_ids": correction_ids,
+            }
+        )
+    return intervals
+
+
+def _segment_piece(segment: dict, start: float, end: float, speaker: str) -> dict:
+    piece = dict(segment)
+    piece.update(
+        {
+            "start": round(start, 6),
+            "end": round(end, 6),
+            "duration": round(end - start, 3),
+            "speaker": speaker,
+        }
+    )
+    return piece
+
+
+def _merge_adjacent_segments(segments: list[dict]) -> list[dict]:
+    merged = []
+    for segment in segments:
+        if float(segment["end"]) - float(segment["start"]) <= 1e-6:
+            continue
+        if (
+            merged
+            and merged[-1].get("speaker") == segment.get("speaker")
+            and abs(float(merged[-1]["end"]) - float(segment["start"])) <= 1e-6
+        ):
+            merged[-1]["end"] = segment["end"]
+            merged[-1]["duration"] = round(
+                float(merged[-1]["end"]) - float(merged[-1]["start"]), 3
+            )
+        else:
+            merged.append(dict(segment))
+    return merged
+
+
+def _apply_corrected_ownership(
+    decisions: list[dict], turns: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Resolve ambiguous or lagging camera spans with reviewed close-mic turns."""
+    adjustments = []
+    for ownership in _corrected_ownership_intervals(turns):
+        updated = []
+        for segment in decisions:
+            segment_start = float(segment["start"])
+            segment_end = float(segment["end"])
+            overlap_start = max(segment_start, ownership["start"])
+            overlap_end = min(segment_end, ownership["end"])
+            current_speaker = segment.get("speaker")
+            if (
+                overlap_end - overlap_start <= 1e-6
+                or current_speaker == ownership["speaker"]
+            ):
+                updated.append(segment)
+                continue
+
+            if overlap_start > segment_start:
+                updated.append(
+                    _segment_piece(
+                        segment, segment_start, overlap_start, current_speaker
+                    )
+                )
+            updated.append(
+                _segment_piece(
+                    segment, overlap_start, overlap_end, ownership["speaker"]
+                )
+            )
+            if overlap_end < segment_end:
+                updated.append(
+                    _segment_piece(segment, overlap_end, segment_end, current_speaker)
+                )
+            adjustments.append(
+                {
+                    "kind": "corrected_turn_ownership",
+                    "from_speaker": current_speaker,
+                    "to_speaker": ownership["speaker"],
+                    "start": round(overlap_start, 6),
+                    "end": round(overlap_end, 6),
+                    "correction_ids": ownership["correction_ids"],
+                }
+            )
+        decisions = _merge_adjacent_segments(updated)
+    return decisions, adjustments
 
 
 def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
@@ -220,8 +368,8 @@ def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
     turns = _transcript_turns_for_segments(transcript, segments)
     stored_base = previous_alignment.get("base_segments")
     if (
-        isinstance(stored_base, list)
-        and len(stored_base) == len(segments.get("segments", []))
+        stored_base
+        and isinstance(stored_base, list)
         and all(isinstance(segment, dict) for segment in stored_base)
     ):
         base_segments = [dict(segment) for segment in stored_base]
@@ -293,6 +441,9 @@ def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
             }
         )
 
+    decisions, corrected_adjustments = _apply_corrected_ownership(decisions, turns)
+    adjustments.extend(corrected_adjustments)
+
     segments["segments"] = decisions
     segments["segment_count"] = len(decisions)
     segments["transcript_alignment"] = {
@@ -331,11 +482,17 @@ def current_speaker_segments(
     )
     if transcript_artifacts_exist:
         expected_alignment = transcript_alignment_fingerprint(episode_dir, segments)
-        if (
-            expected_alignment is None
-            or segments.get("transcript_alignment", {}).get("fingerprint")
-            != expected_alignment
-        ):
+        if expected_alignment is None:
+            return None
+        alignment = segments.get("transcript_alignment", {})
+        accepted_fingerprints = {expected_alignment}
+        if alignment.get("version") == "source-clock-v1":
+            legacy_fingerprint = transcript_alignment_fingerprint(
+                episode_dir, segments, version="source-clock-v1"
+            )
+            if legacy_fingerprint is not None:
+                accepted_fingerprints.add(legacy_fingerprint)
+        if alignment.get("fingerprint") not in accepted_fingerprints:
             return None
     return segments
 
@@ -363,7 +520,12 @@ def rebind_visual_crop_segments(
     )
     updated["crop_validation"] = validate_speaker_crops(new_episode)
     if isinstance(updated.get("transcript_alignment"), dict):
-        alignment_fingerprint = transcript_alignment_fingerprint(episode_dir, updated)
+        alignment_version = updated["transcript_alignment"].get(
+            "version", TRANSCRIPT_ALIGNMENT_VERSION
+        )
+        alignment_fingerprint = transcript_alignment_fingerprint(
+            episode_dir, updated, version=alignment_version
+        )
         if alignment_fingerprint is None:
             return None
         updated["transcript_alignment"]["fingerprint"] = alignment_fingerprint
