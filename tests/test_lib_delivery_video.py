@@ -28,6 +28,7 @@ from lib.delivery_video import (
     render_space_budget,
     render_space_status,
     render_video_segment,
+    short_render_fingerprint,
     source_fps,
 )
 from lib.srt import escape_srt_path
@@ -176,6 +177,40 @@ def test_longform_fingerprint_tracks_caption_choice_and_lut_contents(tmp_path):
     changed_lut = longform_render_fingerprint(tmp_path, episode, config, audio, [])
 
     assert len({first, burned, bounded, changed_lut}) == 4
+
+
+def test_short_fingerprint_marks_only_sustained_two_person_overlap(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    episode = {"crop_config": {"speakers": [{}, {}]}}
+    config = {"processing": {"shorts_hold_wide_seconds": 3}}
+    clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 20}
+
+    with patch(
+        "lib.delivery_video.render_fingerprint",
+        side_effect=lambda _paths, state: state,
+    ):
+        brief = short_render_fingerprint(
+            tmp_path,
+            episode,
+            config,
+            audio,
+            [{"start": 11, "end": 13, "speaker": "BOTH"}],
+            clip,
+        )
+        sustained = short_render_fingerprint(
+            tmp_path,
+            episode,
+            config,
+            audio,
+            [{"start": 11, "end": 15, "speaker": "BOTH"}],
+            clip,
+        )
+
+    assert "shorts_overlap_layout" not in brief
+    assert sustained["shorts_overlap_layout"] == "two-person-stack/v1"
 
 
 def test_fingerprint_marks_missing_inputs_without_raising(tmp_path):

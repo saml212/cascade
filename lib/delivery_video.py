@@ -33,6 +33,7 @@ from lib.timeline import (  # noqa: F401
 
 RENDER_MANIFEST_NAME = "render_manifest.json"
 RENDER_PIPELINE_VERSION = "source-clock/v3"
+SHORTS_TWO_PERSON_STACK_VERSION = "two-person-stack/v1"
 OUTPUT_RESERVE_BYTES = 1_000_000_000
 SCRATCH_RESERVE_BYTES = 10_000_000_000
 _manifest_lock = threading.Lock()
@@ -583,7 +584,30 @@ def short_render_fingerprint(
     }
     paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
     state["lut_sha256"] = lut_digest
+    if _uses_two_person_stack(episode, processing, segments, clip):
+        state["shorts_overlap_layout"] = SHORTS_TWO_PERSON_STACK_VERSION
     return render_fingerprint(paths, state)
+
+
+def _uses_two_person_stack(
+    episode: dict, processing: dict, segments: list[dict], clip: dict
+) -> bool:
+    """Return whether this clip can reach the sustained two-person layout."""
+    if len(episode.get("crop_config", {}).get("speakers", [])) != 2:
+        return False
+    try:
+        clip_start = float(clip["start_seconds"])
+        clip_end = float(clip["end_seconds"])
+        hold_seconds = float(processing.get("shorts_hold_wide_seconds", 3.0))
+        return any(
+            segment.get("speaker") == "BOTH"
+            and min(clip_end, float(segment["end"]))
+            - max(clip_start, float(segment["start"]))
+            > hold_seconds
+            for segment in segments
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def read_render_manifest(episode_dir: Path) -> dict:
