@@ -28,6 +28,17 @@ from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER, logical_track_groups
 from lib.srt import fmt_timecode
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+_AUDIO_CONTENT_TYPES = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".wave": "audio/wav",
+}
 CAMERA_AUDIO_CACHE_VERSION = "source-clock-v3"
 TRANSCRIPT_CANONICAL_VERSION = "source-clock-v3"
 _TRANSCRIPT_AUDIO_VERSION = "logical-tracks-v3"
@@ -60,6 +71,11 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _audio_content_type(path: Path) -> str:
+    """Return the upload MIME from the actual container, not ASR options."""
+    return _AUDIO_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -1369,7 +1385,7 @@ class TranscribeAgent(BaseAgent):
                 params=params,
                 headers={
                     "Authorization": f"Token {api_key}",
-                    "Content-Type": ("audio/flac" if multichannel else "audio/mp4"),
+                    "Content-Type": _audio_content_type(audio_path),
                 },
                 content=audio,
                 timeout=600.0,
@@ -1417,7 +1433,13 @@ class TranscribeAgent(BaseAgent):
                 arrays[channel] = np.load(path, mmap_mode="r")
             except (OSError, ValueError):
                 continue
-            identities.append(_file_identity(path))
+            identities.append(
+                {
+                    "path": str(path.resolve()),
+                    "size": path.stat().st_size,
+                    "sha256": _file_sha256(path),
+                }
+            )
             channel_by_speaker_index[speaker_index] = channel
         if not arrays:
             return None

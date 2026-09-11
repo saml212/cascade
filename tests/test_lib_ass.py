@@ -6,7 +6,6 @@ actually runs ffmpeg + libass against a synthetic video) lives in
 test_lib_ass_render.py — kept separate because it requires ffmpeg.
 """
 
-
 import pytest
 
 from lib.ass import (
@@ -17,7 +16,6 @@ from lib.ass import (
     generate_ass_from_diarized,
     group_words_into_phrases,
 )
-
 
 # ── timecode formatting ─────────────────────────────────────────────────────
 
@@ -262,6 +260,51 @@ class TestGenerateAssFromDiarized:
         assert out.exists()
         content = out.read_text()
         assert "[Events]" in content
+
+    def test_uses_punctuation_and_chronological_word_order(self, tmp_path):
+        diarized = {
+            "utterances": [
+                {
+                    "speaker": 0,
+                    "words": [
+                        {
+                            "word": "later",
+                            "punctuated_word": "Later.",
+                            "start": 102.0,
+                            "end": 102.3,
+                        }
+                    ],
+                },
+                {
+                    "speaker": 0,
+                    "words": [
+                        {
+                            "word": "hello",
+                            "punctuated_word": "Hello,",
+                            "start": 100.0,
+                            "end": 100.2,
+                        },
+                        {
+                            "word": "world",
+                            "punctuated_word": "world!",
+                            "start": 100.3,
+                            "end": 100.6,
+                        },
+                    ],
+                },
+            ]
+        }
+        out = tmp_path / "ordered.ass"
+
+        generate_ass_from_diarized(
+            diarized, start=100.0, end=103.0, ass_path=out
+        )
+
+        events = [
+            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+        ]
+        assert events[0].endswith("Hello, world!")
+        assert events[1].endswith("Later.")
 
     def test_only_words_in_range_included(self, tmp_path, diarized):
         # Range excludes "exactly" (102.4-102.9) only if end < 102.9. Use a

@@ -359,6 +359,15 @@ def test_transcript_alignment_moves_sustained_speaker_handoff(tmp_episode_dir):
         tmp_episode_dir, result
     )
 
+    repeated = align_speaker_segments_to_transcript(tmp_episode_dir)
+    assert repeated == result
+
+    _write_alignment_transcript(tmp_episode_dir, suffix="changed")
+    realigned = align_speaker_segments_to_transcript(tmp_episode_dir)
+    assert realigned["segments"][0]["end"] == 7.775
+    assert realigned["transcript_alignment"]["adjustment_count"] == 1
+    assert realigned["transcript_alignment"]["base_segments"][0]["end"] == 10.0
+
 
 def test_transcript_alignment_ignores_one_word_reaction(tmp_episode_dir):
     _write(

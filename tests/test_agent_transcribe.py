@@ -573,6 +573,14 @@ class TestCanonicalRepair:
             == repaired
         )
 
+        for rms_path in (tmp_episode_dir / "work").glob("speaker_*_rms_db.npy"):
+            values = np.load(rms_path)
+            np.save(rms_path, values)
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == repaired
+        )
+
         provenance_path = tmp_episode_dir / "transcript_provenance.json"
         provenance = json.loads(provenance_path.read_text())
         original_provenance = json.dumps(provenance)
@@ -667,6 +675,27 @@ class TestCanonicalRepair:
 
 
 class TestMultichannelPreparation:
+    @patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"})
+    @patch("agents.transcribe.httpx.post")
+    def test_bounded_flac_uses_container_mime_with_diarization(
+        self, post, tmp_episode_dir, sample_config
+    ):
+        audio = tmp_episode_dir / "bounded.flac"
+        audio.write_bytes(b"bounded flac")
+        response = MagicMock()
+        response.json.return_value = {"results": {"utterances": []}}
+        post.return_value = response
+
+        TranscribeAgent(tmp_episode_dir, sample_config)._request_deepgram(
+            audio, multichannel=False
+        )
+
+        request = post.call_args
+        assert request.kwargs["headers"]["Content-Type"] == "audio/flac"
+        assert request.kwargs["params"]["diarize"] == "true"
+        assert "multichannel" not in request.kwargs["params"]
+        response.raise_for_status.assert_called_once_with()
+
     @patch.object(TranscribeAgent, "_request_deepgram")
     @patch("agents.transcribe.subprocess.run")
     def test_bounded_asr_is_source_clocked_and_cached(

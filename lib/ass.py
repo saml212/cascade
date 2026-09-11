@@ -24,9 +24,9 @@ ffmpeg, the ASS format is plain text, and the only operation we need is
 python-ass or pysubs2 would be more dependency than code.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 # ── styling defaults ────────────────────────────────────────────────────────
 
@@ -102,7 +102,7 @@ def fmt_ass_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    cs = int(round((seconds - int(seconds)) * 100))
+    cs = round((seconds - int(seconds)) * 100)
     # Carry centisecond rollover (cs=100 → s+=1)
     if cs >= 100:
         cs -= 100
@@ -145,6 +145,12 @@ def _extract_words_in_range(diarized: dict, start: float, end: float) -> list[di
                 w_with_speaker = dict(w)
                 w_with_speaker.setdefault("speaker", utt_speaker)
                 out.append(w_with_speaker)
+    out.sort(
+        key=lambda word: (
+            float(word.get("start", 0.0)),
+            float(word.get("end", 0.0)),
+        )
+    )
     return out
 
 
@@ -171,7 +177,9 @@ def group_words_into_phrases(
         if not current:
             return
         first, last = current[0], current[-1]
-        text = " ".join(w.get("word", "") for w in current).strip()
+        text = " ".join(
+            w.get("punctuated_word") or w.get("word", "") for w in current
+        ).strip()
         if not text:
             current.clear()
             return

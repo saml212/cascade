@@ -210,9 +210,23 @@ def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
     fingerprint = transcript_alignment_fingerprint(episode_dir, segments)
     if fingerprint is None:
         return None
+    previous_alignment = segments.get("transcript_alignment")
+    if not isinstance(previous_alignment, dict):
+        previous_alignment = {}
+    if previous_alignment.get("fingerprint") == fingerprint:
+        return segments
 
     turns = _transcript_turns_for_segments(transcript, segments)
-    decisions = [dict(segment) for segment in segments.get("segments", [])]
+    stored_base = previous_alignment.get("base_segments")
+    if (
+        isinstance(stored_base, list)
+        and len(stored_base) == len(segments.get("segments", []))
+        and all(isinstance(segment, dict) for segment in stored_base)
+    ):
+        base_segments = [dict(segment) for segment in stored_base]
+    else:
+        base_segments = [dict(segment) for segment in segments.get("segments", [])]
+    decisions = [dict(segment) for segment in base_segments]
     adjustments = []
     for index in range(1, len(decisions)):
         left = decisions[index - 1]
@@ -287,6 +301,7 @@ def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
         "status": "aligned" if adjustments else "current_no_adjustments",
         "adjustment_count": len(adjustments),
         "adjustments": adjustments,
+        "base_segments": base_segments,
     }
     atomic_write_json(episode_dir / "segments.json", segments)
     return segments
