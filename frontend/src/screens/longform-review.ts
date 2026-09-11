@@ -51,6 +51,38 @@ interface SpeakerInfo {
   track?: number;
 }
 
+function removedRange(edit: Edit, sourceDuration: number): [number, number] | null {
+  if (sourceDuration <= 0) return null;
+  const start =
+    edit.type === 'trim_start'
+      ? 0
+      : edit.type === 'trim_end'
+        ? edit.seconds ?? sourceDuration
+        : edit.start_seconds ?? 0;
+  const end =
+    edit.type === 'trim_start'
+      ? edit.seconds ?? 0
+      : edit.type === 'trim_end'
+        ? sourceDuration
+        : edit.end_seconds ?? 0;
+  const boundedStart = Math.max(0, Math.min(start, sourceDuration));
+  const boundedEnd = Math.max(0, Math.min(end, sourceDuration));
+  return boundedEnd > boundedStart ? [boundedStart, boundedEnd] : null;
+}
+
+function utteranceIsRemoved(
+  utterance: Utterance,
+  editList: Edit[],
+  sourceDuration: number
+): boolean {
+  return editList.some((edit) => {
+    const range = removedRange(edit, sourceDuration);
+    return Boolean(
+      range && utterance.start >= range[0] && utterance.end <= range[1]
+    );
+  });
+}
+
 /* ─── Speaker colour ─────────────────────────────────────────────────────── */
 
 const SPEAKER_COLORS = [
@@ -353,17 +385,10 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       if (!row) continue;
       const u = utts[idx];
       const isPlaying = ct >= u.start && ct <= u.end + 0.1;
-      const inCut = editList.some(
-        (e) =>
-          e.type === 'cut' &&
-          e.start_seconds != null &&
-          e.end_seconds != null &&
-          u.start >= e.start_seconds &&
-          u.end <= e.end_seconds
-      );
+      const inRemoved = utteranceIsRemoved(u, editList, duration.peek());
       const inPending =
         inn != null && out != null && inn < out && u.start >= inn && u.end <= out;
-      applyRowState(row, { isPlaying, inCut, inPending });
+      applyRowState(row, { isPlaying, inCut: inRemoved, inPending });
     }
 
     lastHighlightedIdx = playingIdx;
@@ -552,6 +577,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       const sm = speakerMap();
       const dictMap = speakerDictMap();
       const editList = edits();
+      const sourceDuration = duration();
 
       rowRegistry.clear();
 
@@ -572,11 +598,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
           ?.speakers ?? []
       );
 
-      /* Build labelMap using three-priority order:
-         1. dict-form speaker_map from transcript (newer agent output)
-         2. crop_config.speakers[index].label (Sam's named speakers)
-         3. array-form speaker_map from transcript (older agent output)
-         4. final fallback: "Speaker N" (handled at call site) */
+      /* Transcript speaker IDs and crop indexes are separate namespaces. */
       const labelMap = new Map<number, string>();
       const allSpeakerIds = new Set<number>([
         ...sm.map((s) => s.index),
@@ -586,11 +608,13 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         const key = String(id);
         if (dictMap[key] !== undefined) {
           labelMap.set(id, dictMap[key]);
-        } else if (cropSpeakers[id]?.label !== undefined) {
-          labelMap.set(id, cropSpeakers[id].label);
         } else {
           const fromArray = sm.find((s) => s.index === id);
-          if (fromArray) labelMap.set(id, fromArray.label);
+          if (fromArray) {
+            labelMap.set(id, fromArray.label);
+          } else if (cropSpeakers[id]?.label !== undefined) {
+            labelMap.set(id, cropSpeakers[id].label);
+          }
         }
       }
 
@@ -600,7 +624,20 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       const out = outPoint.peek();
 
       const rows = utts.map((utt, i) =>
-        buildUtteranceRow(utt, i, labelMap, editList, ct, inn, out, videoRef, rowRegistry, inPoint, outPoint)
+        buildUtteranceRow(
+          utt,
+          i,
+          labelMap,
+          editList,
+          sourceDuration,
+          ct,
+          inn,
+          out,
+          videoRef,
+          rowRegistry,
+          inPoint,
+          outPoint
+        )
       );
 
       listHost.replaceChildren(...rows);
@@ -810,27 +847,18 @@ function renderTimeline(
   };
 
   const lanes = editList.map((e, i) => {
-    const start =
-      e.type === 'trim_start'
-        ? 0
-        : e.type === 'trim_end'
-        ? Math.max(0, dur - (e.seconds ?? 0))
-        : e.start_seconds ?? 0;
-    const end =
-      e.type === 'trim_start'
-        ? e.seconds ?? 0
-        : e.type === 'trim_end'
-        ? dur
-        : e.end_seconds ?? 0;
+    const [start, end] = removedRange(e, dur) ?? [0, 0];
     const leftPct = (start / dur) * 100;
     const widthPct = Math.max(0.6, ((end - start) / dur) * 100);
-    const tone =
-      e.type === 'cut'
-        ? 'bg-status-danger/70'
-        : 'bg-accent/60';
     return h('button', {
-      class: `absolute top-0 bottom-0 rounded ${tone} hover:brightness-125 transition-[filter] duration-[120ms]`,
-      style: { left: `${leftPct}%`, width: `${widthPct}%` },
+      class:
+        'absolute top-0 bottom-0 rounded hover:brightness-125 transition-[filter] duration-[120ms]',
+      style: {
+        left: `${leftPct}%`,
+        width: `${widthPct}%`,
+        backgroundColor:
+          e.type === 'cut' ? 'rgba(226, 109, 90, 0.82)' : 'rgba(245, 165, 36, 0.78)',
+      },
       title: `${e.type} · ${formatTimecode(start)}–${formatTimecode(end)}${
         e.reason ? ` · ${e.reason}` : ''
       }\nClick to seek`,
@@ -962,6 +990,7 @@ function buildUtteranceRow(
   i: number,
   labelMap: Map<number, string>,
   editList: Edit[],
+  sourceDuration: number,
   ct: number,
   inn: number | null,
   out: number | null,
@@ -971,14 +1000,7 @@ function buildUtteranceRow(
   outPoint: Signal<number | null>
 ): HTMLElement {
   const isPlaying = ct >= utt.start && ct <= utt.end + 0.1;
-  const inCut = editList.some(
-    (e) =>
-      e.type === 'cut' &&
-      e.start_seconds != null &&
-      e.end_seconds != null &&
-      utt.start >= e.start_seconds &&
-      utt.end <= e.end_seconds
-  );
+  const inCut = utteranceIsRemoved(utt, editList, sourceDuration);
   const inPending =
     inn != null && out != null && inn < out && utt.start >= inn && utt.end <= out;
 

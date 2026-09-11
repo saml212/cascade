@@ -51,12 +51,36 @@ function renderLongformState(
   const current = artifact.current;
   const approved = review.longform.approval.current;
   const quality = ep.quality as QualitySnapshot | null | undefined;
-  const duration =
-    (artifact.output_duration_seconds as number | undefined) ??
-    (ep.duration_seconds as number | undefined) ??
-    null;
+  const recordedDuration =
+    (artifact.output_duration_seconds as number | undefined) ?? null;
   const youtubeUrl = (ep.youtube_longform_url as string) ?? '';
   const spotifyUrl = (ep.spotify_longform_url as string) ?? '';
+
+  const durationRow = playable
+    ? detailRow(
+        'Duration',
+        recordedDuration == null ? 'Reading media…' : formatDuration(recordedDuration)
+      )
+    : null;
+  const player = playable
+    ? (h('video', {
+        src: artifact.url!,
+        poster: `/api/episodes/${episodeId}/crop-frame`,
+        controls: true,
+        preload: 'metadata',
+        class: 'w-full bg-black block',
+        style: { maxHeight: '64vh' },
+        'aria-label': 'Longform rendered video review',
+      }) as HTMLVideoElement)
+    : null;
+  if (player && durationRow && recordedDuration == null) {
+    player.addEventListener('loadedmetadata', () => {
+      const value = durationRow.lastElementChild as HTMLElement | null;
+      if (value && Number.isFinite(player.duration)) {
+        value.textContent = formatDuration(player.duration);
+      }
+    });
+  }
 
   target.replaceChildren(
     h(
@@ -78,15 +102,7 @@ function renderLongformState(
                   h('span', { class: 'block text-ink-secondary mt-1' }, artifact.detail)
                 )
               : null,
-            h('video', {
-              src: artifact.url!,
-              poster: `/api/episodes/${episodeId}/crop-frame`,
-              controls: true,
-              preload: 'metadata',
-              class: 'w-full bg-black block',
-              style: { maxHeight: '64vh' },
-              'aria-label': 'Longform rendered video review',
-            })
+            player
           )
         : h(
             'div',
@@ -120,7 +136,7 @@ function renderLongformState(
                 ? 'Previous review render'
                 : 'Render required'
           ),
-          playable ? detailRow('Duration', formatDuration(duration)) : null,
+          durationRow,
           artifact.completed_at
             ? detailRow('Rendered', formatRelative(artifact.completed_at))
             : null,
