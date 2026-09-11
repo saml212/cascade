@@ -5,12 +5,14 @@ import json
 import logging
 import math
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from lib.atomic_write import atomic_write_json
 from lib.clips import (
     load_clips as _load_clips_from_dir,
 )
@@ -28,6 +30,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/episodes/{episode_id}/clips", tags=["clips"])
 
 EPISODES_DIR = get_episodes_dir()
+_render_jobs_lock = threading.Lock()
+_active_render_jobs: set[str] = set()
+_RENDER_JOBS_PATH = Path("work/clip_render_jobs.json")
 
 
 class ManualClipRequest(BaseModel):
@@ -81,6 +86,69 @@ def _source_duration_seconds(ep_dir: Path) -> float | None:
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
         return None
     return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _render_job_key(ep_dir: Path, clip_id: str) -> str:
+    return f"{ep_dir.resolve()}:{clip_id}"
+
+
+def _read_render_jobs(ep_dir: Path) -> dict:
+    try:
+        data = json.loads((ep_dir / _RENDER_JOBS_PATH).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1, "jobs": {}}
+    if data.get("version") != 1 or not isinstance(data.get("jobs"), dict):
+        return {"version": 1, "jobs": {}}
+    return data
+
+
+def _write_render_job(ep_dir: Path, clip_id: str, state: dict) -> None:
+    with _render_jobs_lock:
+        data = _read_render_jobs(ep_dir)
+        data["jobs"][clip_id] = state
+        (ep_dir / _RENDER_JOBS_PATH).parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(ep_dir / _RENDER_JOBS_PATH, data)
+
+
+def render_job_state(ep_dir: Path, clip_id: str) -> dict:
+    """Return persisted single-clip render progress for review clients."""
+    key = _render_job_key(ep_dir, clip_id)
+    with _render_jobs_lock:
+        state = dict(_read_render_jobs(ep_dir).get("jobs", {}).get(clip_id, {}))
+        active = key in _active_render_jobs
+    if active:
+        state["status"] = "rendering"
+    elif state.get("status") == "rendering":
+        state.update(
+            status="interrupted",
+            error="The server stopped before this render reported completion.",
+        )
+    if not state:
+        return {"status": "idle"}
+    return state
+
+
+def _finish_render_job(
+    ep_dir: Path,
+    clip_id: str,
+    started_at: str,
+    *,
+    result: dict | None = None,
+    error: Exception | None = None,
+) -> None:
+    state = {
+        "status": "failed" if error else "succeeded",
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if error:
+        state["error"] = str(error)
+    elif result is not None:
+        state.update(
+            render_fingerprint=result.get("render", {}).get("fingerprint"),
+            reused=bool(result.get("reused")),
+        )
+    _write_render_job(ep_dir, clip_id, state)
 
 
 def _validate_clip_bounds(ep_dir: Path, start: float, end: float) -> float:
@@ -516,34 +584,55 @@ async def render_clip(episode_id: str, clip_id: str) -> dict:
     clips, _ = load_clips(episode_id)
     find_clip(clips, clip_id)
     ep_dir = EPISODES_DIR / episode_id
+    job_key = _render_job_key(ep_dir, clip_id)
+    with _render_jobs_lock:
+        if job_key in _active_render_jobs:
+            raise HTTPException(
+                status_code=409, detail=f"Clip {clip_id} is already rendering"
+            )
+        _active_render_jobs.add(job_key)
+    started_at = datetime.now(timezone.utc).isoformat()
+    _write_render_job(
+        ep_dir,
+        clip_id,
+        {"status": "rendering", "started_at": started_at},
+    )
 
     from agents.pipeline import load_config
     from agents.shorts_render import render_single_clip
 
     try:
-        result = await asyncio.to_thread(
-            render_single_clip, ep_dir, load_config(), clip_id
-        )
-    except KeyError as error:
-        raise HTTPException(
-            status_code=404, detail=f"Clip {clip_id} not found"
-        ) from error
-    except (FileNotFoundError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    except (OSError, RuntimeError) as error:
-        logger.exception("single clip render failed for %s", clip_id)
-        raise HTTPException(status_code=500, detail=str(error)) from error
+        try:
+            result = await asyncio.to_thread(
+                render_single_clip, ep_dir, load_config(), clip_id
+            )
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Clip {clip_id} not found"
+            ) from error
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (OSError, RuntimeError) as error:
+            logger.exception("single clip render failed for %s", clip_id)
+            raise HTTPException(status_code=500, detail=str(error)) from error
 
-    # Newly produced pixels need review. Reusing the exact current fingerprint
-    # keeps an existing final approval valid.
-    clips, clips_file = load_clips(episode_id)
-    clip, index = find_clip(clips, clip_id)
-    fingerprint = result.get("render", {}).get("fingerprint")
-    if (
-        clip.get("status") == "approved"
-        and clip.get("approved_render_fingerprint") != fingerprint
-    ):
-        _clear_final_approval(clip)
-        clips[index] = clip
-        save_clips(clips, clips_file)
-    return result
+        # Newly produced pixels need review. Reusing the exact current fingerprint
+        # keeps an existing final approval valid.
+        clips, clips_file = load_clips(episode_id)
+        clip, index = find_clip(clips, clip_id)
+        fingerprint = result.get("render", {}).get("fingerprint")
+        if (
+            clip.get("status") == "approved"
+            and clip.get("approved_render_fingerprint") != fingerprint
+        ):
+            _clear_final_approval(clip)
+            clips[index] = clip
+            save_clips(clips, clips_file)
+        _finish_render_job(ep_dir, clip_id, started_at, result=result)
+        return result
+    except Exception as error:
+        _finish_render_job(ep_dir, clip_id, started_at, error=error)
+        raise
+    finally:
+        with _render_jobs_lock:
+            _active_render_jobs.discard(job_key)

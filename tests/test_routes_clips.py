@@ -405,3 +405,27 @@ class TestClipMutation:
         stored = json.loads((ep_dir / "clips.json").read_text())["clips"][0]
         assert stored["status"] == "pending"
         assert "approved_revision" not in stored
+        job = json.loads((ep_dir / "work" / "clip_render_jobs.json").read_text())[
+            "jobs"
+        ]["clip_01"]
+        assert job["status"] == "succeeded"
+        assert job["render_fingerprint"] == "sha256:new"
+
+    def test_render_rejects_duplicate_active_job(self, test_client):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        import server.routes.clips as clips_mod
+
+        key = clips_mod._render_job_key(ep_dir, "clip_01")
+        with clips_mod._render_jobs_lock:
+            clips_mod._active_render_jobs.add(key)
+        try:
+            response = client.post("/api/episodes/ep_001/clips/clip_01/render")
+        finally:
+            with clips_mod._render_jobs_lock:
+                clips_mod._active_render_jobs.discard(key)
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Clip clip_01 is already rendering"

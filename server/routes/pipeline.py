@@ -5,16 +5,16 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
-
-from lib.atomic_write import atomic_write_json
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from lib.paths import get_episodes_dir
 from agents.qa import editorial_revision, quality_snapshot
+from lib.atomic_write import atomic_write_json
+from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,32 @@ OUTPUT_DIR = get_episodes_dir()
 _running = {}  # type: dict
 _cancel_requested = set()  # type: set
 _pipeline_lock = asyncio.Lock()
+
+
+def _current_longform_for_approval(episode_dir: Path, episode: dict) -> dict | None:
+    """Resolve the canonical current render required by editorial approval."""
+    from agents.pipeline import load_config
+    from agents.speaker_cut import current_speaker_segments
+    from lib.delivery_video import current_longform_render
+
+    config = load_config()
+    try:
+        segment_document = current_speaker_segments(episode_dir, episode, config)
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        return None
+    audio = episode_dir / "work" / "audio_mix.wav"
+    if not segment_document or not audio.is_file():
+        return None
+    try:
+        return current_longform_render(
+            episode_dir,
+            episode,
+            config,
+            audio,
+            segment_document.get("segments", []),
+        )
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 class RunPipelineRequest(BaseModel):
@@ -402,6 +428,12 @@ async def approve_longform(episode_id: str) -> PipelineActionResponse:
 
         with open(episode_file) as f:
             episode = json.load(f)
+
+        if not _current_longform_for_approval(episode_file.parent, episode):
+            raise HTTPException(
+                status_code=409,
+                detail="A current speaker-cut longform render is required before approval",
+            )
 
         now = datetime.now(timezone.utc).isoformat()
         episode["longform_approved"] = True

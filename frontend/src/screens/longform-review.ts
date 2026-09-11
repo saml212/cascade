@@ -21,7 +21,7 @@
 
 import { h, mount } from '../lib/dom';
 import { signal, effect, type Signal } from '../lib/signals';
-import { api, type UnknownRecord } from '../lib/api';
+import { api, type EpisodeReviewState, type UnknownRecord } from '../lib/api';
 import { describeStatus, episodeTitle, formatDuration, formatTimecode } from '../lib/format';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
@@ -118,6 +118,7 @@ function applyRowState(row: HTMLElement, state: RowState): void {
 export function LongformReview(target: HTMLElement, episodeId: string): void {
   /* Signals */
   const episode = signal<UnknownRecord | null>(null);
+  const review = signal<EpisodeReviewState | null>(null);
   const edits = signal<Edit[]>([]);
   const utterances = signal<Utterance[]>([]);
   const speakerMap = signal<SpeakerInfo[]>([]);
@@ -142,12 +143,14 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
   /* Load */
   async function load(): Promise<void> {
     try {
-      const [ep, es] = await Promise.all([
+      const [ep, es, state] = await Promise.all([
         api.getEpisode(episodeId),
         api.listEdits(episodeId),
+        api.review(episodeId),
       ]);
       episode.set(ep);
       edits.set((es.edits as unknown) as Edit[]);
+      review.set(state);
       loadError.set(null);
     } catch (e) {
       loadError.set((e as Error).message);
@@ -191,12 +194,13 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       return;
     }
 
-    if (!ep) {
+    const reviewState = review();
+    if (!ep || !reviewState) {
       page.replaceChildren(loadingState());
       return;
     }
 
-    const { header, body, footer } = buildPage(ep);
+    const { header, body, footer } = buildPage(ep, reviewState);
     page.replaceChildren(header, body, footer);
   });
 
@@ -367,51 +371,25 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
 
   /* ── Build the full page ─────────────────────────────────────────────── */
 
-  function buildPage(ep: UnknownRecord): {
+  function buildPage(ep: UnknownRecord, reviewState: EpisodeReviewState): {
     header: HTMLElement;
     body: HTMLElement;
     footer: HTMLElement;
   } {
     return {
       header: renderHeader(episodeId, ep),
-      body: renderBody(ep),
-      footer: renderFooter(episodeId, ep),
+      body: renderBody(ep, reviewState),
+      footer: renderFooter(episodeId, ep, reviewState),
     };
   }
 
-  function renderBody(ep: UnknownRecord): HTMLElement {
-    const status = describeStatus(ep.status as string);
-    const hasLongform =
-      status.key === 'awaiting_longform_review' ||
-      status.key === 'awaiting_clip_review' ||
-      status.key === 'awaiting_publish' ||
-      status.key === 'awaiting_backup' ||
-      status.key === 'live';
+  function renderBody(ep: UnknownRecord, reviewState: EpisodeReviewState): HTMLElement {
+    const artifact = reviewState.longform.render;
+    const sourceFallback = !artifact.playable;
+    const videoUrl = artifact.url ?? reviewState.longform.source_preview_url;
 
-    if (!hasLongform) {
-      return h(
-        'div',
-        { class: 'flex-1 px-8 py-8' },
-        h(
-          'div',
-          { class: 'panel p-16 text-center' },
-          h(
-            'div',
-            { class: 'font-display text-display-md text-ink-secondary mb-3' },
-            'Longform render isn\'t ready.'
-          ),
-          h(
-            'p',
-            { class: 'text-body text-ink-tertiary max-w-md mx-auto' },
-            'Cascade renders the longform after crop setup. You\'ll see the player here when it\'s done.'
-          )
-        )
-      );
-    }
-
-    /* Video */
     const video = h('video', {
-      src: `/media/episodes/${episodeId}/longform.mp4`,
+      src: videoUrl,
       poster: `/api/episodes/${episodeId}/crop-frame`,
       controls: true,
       preload: 'metadata',
@@ -477,7 +455,54 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
           alignSelf: 'flex-start',
         },
       },
-      h('div', { class: 'panel overflow-hidden' }, video),
+      h(
+        'div',
+        { class: 'panel overflow-hidden' },
+        video,
+        h(
+          'div',
+          {
+            class: `px-3 py-2 border-t border-border-subtle text-body-sm ${
+              artifact.current ? 'text-status-success' : 'text-status-warning'
+            }`,
+          },
+          sourceFallback
+            ? 'Source preview · no longform render exists yet'
+            : artifact.current
+              ? 'Current speaker-cut render'
+              : 'Previous longform render · current speaker-cut version pending',
+          !sourceFallback && !artifact.current
+            ? h('span', { class: 'block text-ink-tertiary mt-0.5' }, artifact.detail)
+            : null,
+          h(
+            'div',
+            { class: 'flex gap-3 mt-1.5' },
+            !sourceFallback && artifact.download_url
+              ? h(
+                  'a',
+                  {
+                    href: artifact.download_url,
+                    download: artifact.path.split('/').pop() ?? 'longform.mp4',
+                    class: 'text-ink-secondary hover:text-ink-primary underline underline-offset-4',
+                  },
+                  'Download this render'
+                )
+              : null,
+            !sourceFallback
+              ? h(
+                  'a',
+                  {
+                    href: reviewState.longform.source_preview_url,
+                    target: '_blank',
+                    rel: 'noreferrer',
+                    class: 'text-ink-secondary hover:text-ink-primary underline underline-offset-4',
+                  },
+                  'Open source preview'
+                )
+              : null
+          )
+        )
+      ),
       timecodeEl,
       timelineHost
     );
@@ -600,7 +625,11 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
     );
   }
 
-  function renderFooter(epId: string, ep: UnknownRecord): HTMLElement {
+  function renderFooter(
+    epId: string,
+    ep: UnknownRecord,
+    reviewState: EpisodeReviewState
+  ): HTMLElement {
     const footerEl = h(
       'footer',
       {
@@ -613,30 +642,30 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
     effect(() => {
       const editList = edits();
       const status = describeStatus(ep.status as string);
-      const pending = editList.length > 0;
-      const canApprove = status.key === 'awaiting_longform_review';
+      const renderCurrent = reviewState.longform.render.current;
+      const needsRender = !renderCurrent;
+      const canApprove =
+        renderCurrent &&
+        !reviewState.longform.approval.current &&
+        status.key === 'awaiting_longform_review';
       const alreadyPast =
         status.key === 'awaiting_clip_review' ||
         status.key === 'awaiting_publish' ||
         status.key === 'awaiting_backup' ||
         status.key === 'live';
 
-      const totalRemoved = editList.reduce((sum, e) => {
-        if (e.type === 'cut') return sum + ((e.end_seconds ?? 0) - (e.start_seconds ?? 0));
-        if (e.type === 'trim_start' || e.type === 'trim_end') return sum + (e.seconds ?? 0);
-        return sum;
-      }, 0);
-
-      const headline = pending
-        ? `${editList.length} cut${editList.length === 1 ? '' : 's'} marked · ${formatDuration(totalRemoved)} removed`
+      const headline = needsRender
+        ? `${editList.length} cut${editList.length === 1 ? '' : 's'} saved · current render required`
         : canApprove
         ? 'Happy with this cut?'
         : alreadyPast
         ? 'Longform is already approved'
         : status.label;
 
-      const sub = pending
-        ? 'Apply edits to re-render before approving.'
+      const sub = needsRender
+        ? reviewState.longform.render.playable
+          ? 'The previous file remains reviewable. Re-render before approving.'
+          : 'Prepare the speaker-cut video before approving.'
         : canApprove
         ? 'Approving uploads to YouTube, updates the RSS feed, and fires clip mining.'
         : alreadyPast
@@ -653,11 +682,13 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
             h('div', { class: 'text-body text-ink-primary font-medium' }, headline),
             h('div', { class: 'text-body-sm text-ink-secondary' }, sub)
           ),
-          pending
+          needsRender
             ? Button({
                 variant: 'secondary',
                 size: 'md',
-                label: 'Apply edits & re-render',
+                label: reviewState.longform.render.playable
+                  ? 'Re-render current version'
+                  : 'Prepare speaker-cut video',
                 onClick: async () => {
                   try {
                     await api.applyEdits(epId);
@@ -669,7 +700,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
                 },
               })
             : null,
-          !pending && canApprove
+          canApprove
             ? Button({
                 variant: 'primary',
                 size: 'md',

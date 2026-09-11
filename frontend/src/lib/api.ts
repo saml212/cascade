@@ -142,6 +142,66 @@ export interface QualitySnapshot extends UnknownRecord {
   };
 }
 
+export interface ReviewArtifact extends UnknownRecord {
+  status: 'missing' | 'untracked' | 'stale' | 'current';
+  current: boolean;
+  playable: boolean;
+  path: string;
+  url: string | null;
+  download_url: string | null;
+  reason_code: string | null;
+  detail: string;
+  fingerprint?: string;
+  completed_at?: string;
+}
+
+export interface ReviewDestination extends UnknownRecord {
+  key: string;
+  label: string;
+  required_fields: string[];
+}
+
+export interface ClipReviewState extends UnknownRecord {
+  selection: { status: 'selected' | 'unselected' | 'rejected' };
+  render: ReviewArtifact;
+  approval: { status: string; current: boolean };
+  metadata: {
+    complete: boolean;
+    enabled_destination_count: number;
+    complete_destination_count: number;
+    destinations: Array<
+      ReviewDestination & { complete: boolean; missing_fields: string[] }
+    >;
+  };
+  render_job: {
+    status: 'idle' | 'rendering' | 'succeeded' | 'failed' | 'interrupted';
+    started_at?: string;
+    completed_at?: string;
+    error?: string;
+  };
+}
+
+export interface EpisodeReviewState extends UnknownRecord {
+  schema: 'cascade.review/v1';
+  episode_id: string;
+  clock: 'source';
+  enabled_destinations: ReviewDestination[];
+  clip_summary: {
+    candidate_count: number;
+    selected_count: number;
+    unselected_count: number;
+    rejected_count: number;
+  };
+  longform: {
+    render: ReviewArtifact;
+    canonical_render: ReviewArtifact;
+    legacy_render: ReviewArtifact;
+    approval: { status: string; current: boolean; revision: string };
+    source_preview_url: string;
+  };
+  clips: Array<UnknownRecord & { review: ClipReviewState }>;
+}
+
 export interface NewEpisodeRequest {
   source_path?: string;
   audio_path?: string;
@@ -266,6 +326,8 @@ export const api = {
     }),
   quality: (id: string) =>
     request<QualitySnapshot>('GET', `/api/episodes/${id}/quality`),
+  review: (id: string) =>
+    request<EpisodeReviewState>('GET', `/api/episodes/${id}/review`),
   runQuality: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/run-agent/qa`, {}),
 

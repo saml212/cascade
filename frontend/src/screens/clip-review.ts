@@ -9,7 +9,14 @@
 
 import { h, mount } from '../lib/dom';
 import { signal, effect, type Signal } from '../lib/signals';
-import { api, type QualitySnapshot, type UnknownRecord } from '../lib/api';
+import {
+  api,
+  type ClipReviewState,
+  type EpisodeReviewState,
+  type ReviewArtifact,
+  type ReviewDestination,
+  type UnknownRecord,
+} from '../lib/api';
 import {
   describeStatus,
   describeEpisodeStatus,
@@ -62,35 +69,12 @@ const PLATFORMS: PlatformSpec[] = [
     label: 'X (Twitter)',
     fields: [{ name: 'text', label: 'Post text', multiline: true, hint: 'Max 280 chars' }],
   },
-  {
-    key: 'linkedin',
-    label: 'LinkedIn',
-    fields: [{ name: 'text', label: 'Post text', multiline: true }],
-  },
-  {
-    key: 'facebook',
-    label: 'Facebook',
-    fields: [{ name: 'caption', label: 'Caption', multiline: true }],
-  },
-  {
-    key: 'threads',
-    label: 'Threads',
-    fields: [{ name: 'caption', label: 'Caption', multiline: true, hint: 'Max 500 chars' }],
-  },
-  {
-    key: 'pinterest',
-    label: 'Pinterest',
-    fields: [
-      { name: 'title', label: 'Title' },
-      { name: 'description', label: 'Description', multiline: true },
-    ],
-  },
-  {
-    key: 'bluesky',
-    label: 'Bluesky',
-    fields: [{ name: 'text', label: 'Post text', multiline: true, hint: 'Max 300 chars' }],
-  },
 ];
+
+function enabledPlatforms(destinations: ReviewDestination[]): PlatformSpec[] {
+  const enabled = new Set(destinations.map((destination) => destination.key));
+  return PLATFORMS.filter((platform) => enabled.has(platform.key));
+}
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -105,6 +89,7 @@ export function ClipReview(
 ): void {
   const clips = signal<UnknownRecord[] | null>(null);
   const episode = signal<UnknownRecord | null>(null);
+  const review = signal<EpisodeReviewState | null>(null);
   const expandedId = signal<string | null>(initialClipId ?? null);
   const loadError = signal<string | null>(null);
   const chatMessages = signal<ChatMessage[]>([]);
@@ -112,13 +97,17 @@ export function ClipReview(
 
   async function load(): Promise<void> {
     try {
-      const [ep, cs] = await Promise.all([
+      const [ep, state] = await Promise.all([
         api.getEpisode(episodeId),
-        api.listClips(episodeId),
+        api.review(episodeId),
       ]);
       episode.set(ep);
-      clips.set(cs);
+      review.set(state);
+      clips.set(state.clips);
       loadError.set(null);
+      if (state.clips.some((clip) => clip.review.render_job.status === 'rendering')) {
+        window.setTimeout(() => void load(), 1500);
+      }
     } catch (e) {
       loadError.set((e as Error).message);
     }
@@ -195,9 +184,8 @@ export function ClipReview(
       return;
     }
 
-    const ep = episode();
-    const quality = ep?.quality as QualitySnapshot | null | undefined;
-    const renderedIds = new Set(quality?.artifacts.rendered_short_ids ?? []);
+    const state = review();
+    const platforms = enabledPlatforms(state?.enabled_destinations ?? []);
 
     body.replaceChildren(
       h(
@@ -208,7 +196,8 @@ export function ClipReview(
             episodeId,
             c,
             expandedId,
-            renderedIds.has(String(c.id ?? c.clip_id)),
+            (c.review as ClipReviewState),
+            platforms,
             async () => load(),
             (nextId) => {
               expandedId.set(nextId);
@@ -230,7 +219,7 @@ export function ClipReview(
     h(
       'div',
       { class: 'min-h-full flex flex-col' },
-      renderHeader(episodeId, clips, episode),
+      renderHeader(episodeId, clips, episode, review),
       h(
         'div',
         { class: 'flex-1 min-h-0 overflow-y-auto' },
@@ -248,7 +237,8 @@ export function ClipReview(
 function renderHeader(
   episodeId: string,
   clipsSig: Signal<UnknownRecord[] | null>,
-  episode: Signal<UnknownRecord | null>
+  episode: Signal<UnknownRecord | null>,
+  review: Signal<EpisodeReviewState | null>
 ): HTMLElement {
   const title = h('div', {
     class: 'flex-1 min-w-0',
@@ -257,9 +247,12 @@ function renderHeader(
   effect(() => {
     const ep = episode();
     const cs = clipsSig();
+    const counts = review()?.clip_summary;
     const name = episodeTitle(ep ?? undefined, episodeId);
-    const countLine = cs
-      ? `${pluralize(cs.length, 'clip')} · ${episodeId}`
+    const countLine = cs && counts
+      ? `${pluralize(counts.selected_count, 'selected clip')} · ${counts.unselected_count} unselected · ${counts.rejected_count} rejected`
+      : cs
+        ? `${pluralize(cs.length, 'clip')} · ${episodeId}`
       : episodeId;
     title.replaceChildren(
       h(
@@ -290,6 +283,47 @@ function renderHeader(
         { class: 'text-body-sm text-ink-tertiary font-mono tabular mt-0.5' },
         countLine
       )
+    );
+  });
+
+  const approveHost = h('div');
+  effect(() => {
+    const currentClips = clipsSig() ?? [];
+    const state = review();
+    const kept = currentClips.filter(
+      (clip) =>
+        (clip.review as ClipReviewState).selection.status === 'selected'
+    );
+    const byId = new Map(
+      (state?.clips ?? []).map((clip) => [String(clip.id), clip])
+    );
+    const ready =
+      kept.length > 0 &&
+      kept.every((clip) =>
+        Boolean(byId.get(String(clip.id ?? clip.clip_id))?.review.render.current)
+      );
+    approveHost.replaceChildren(
+      Button({
+        variant: 'primary',
+        size: 'md',
+        label: ready ? 'Final approve rendered clips' : 'Current renders required',
+        disabled: !ready,
+        title: ready
+          ? 'Approve each current rendered file and its current copy'
+          : 'Render or re-render every kept candidate first',
+        onClick: async () => {
+          try {
+            await api.approveClips(
+              episodeId,
+              kept.map((clip) => String(clip.id ?? clip.clip_id))
+            );
+            showToast('Rendered clips approved for the current files.', 'success');
+            navigate(`/episodes/${episodeId}`);
+          } catch (e) {
+            showToast((e as Error).message, 'error');
+          }
+        },
+      })
     );
   });
 
@@ -324,36 +358,7 @@ function renderHeader(
         }
       },
     }),
-    Button({
-      variant: 'primary',
-      size: 'md',
-      label: 'Final approve rendered clips',
-      onClick: async () => {
-        try {
-          const ep = episode.peek();
-          const quality = ep?.quality as QualitySnapshot | null | undefined;
-          const currentClips = clipsSig.peek() ?? [];
-          const keptIds = currentClips
-            .filter((clip) => clip.status !== 'rejected')
-            .map((clip) => String(clip.id ?? clip.clip_id));
-          const renderedIds = new Set(
-            quality?.artifacts.rendered_short_ids ?? []
-          );
-          if (!keptIds.length || keptIds.some((id) => !renderedIds.has(id))) {
-            showToast('Render every kept candidate before final clip approval.', 'error');
-            return;
-          }
-          await api.approveClips(episodeId, keptIds);
-          showToast(
-            'Rendered clips approved for the current files.',
-            'success'
-          );
-          navigate(`/episodes/${episodeId}`);
-        } catch (e) {
-          showToast((e as Error).message, 'error');
-        }
-      },
-    })
+    approveHost
   );
 }
 
@@ -391,7 +396,8 @@ function clipCard(
   episodeId: string,
   clip: UnknownRecord,
   expandedId: Signal<string | null>,
-  rendered: boolean,
+  review: ClipReviewState,
+  platforms: PlatformSpec[],
   reload: () => Promise<void>,
   setExpanded: (clipId: string | null) => void
 ): HTMLElement {
@@ -420,7 +426,6 @@ function clipCard(
     card.classList.toggle('border-border-strong', expanded);
 
     const head = clipHead(
-      episodeId,
       id,
       title,
       hook,
@@ -433,13 +438,24 @@ function clipCard(
       speaker,
       status,
       expanded,
-      rendered,
+      review.render,
+      review.selection.status,
+      Boolean(clip.manual),
       () => setExpanded(expanded ? null : id)
     );
     const children: Node[] = [head];
     if (expanded) {
       children.push(
-        clipExpanded(episodeId, id, start, end, metadata, rendered, reload)
+        clipExpanded(
+          episodeId,
+          id,
+          start,
+          end,
+          metadata,
+          review,
+          platforms,
+          reload
+        )
       );
     }
     card.replaceChildren(...children);
@@ -454,7 +470,6 @@ function clipCard(
 }
 
 function clipHead(
-  episodeId: string,
   id: string,
   title: string,
   hook: string,
@@ -467,7 +482,9 @@ function clipHead(
   speaker: string,
   status: StatusDescriptor,
   expanded: boolean,
-  rendered: boolean,
+  render: ReviewArtifact,
+  selection: ClipReviewState['selection']['status'],
+  manual: boolean,
   toggle: () => void
 ): HTMLElement {
   return h(
@@ -481,7 +498,7 @@ function clipHead(
         'w-full p-4 sm:p-5 grid grid-cols-[88px_1fr_auto] sm:grid-cols-[140px_1fr_auto] gap-3 sm:gap-5 items-start text-left hover:bg-surface-2/40',
       onclick: toggle,
     },
-    clipThumb(episodeId, id, duration, rendered),
+    clipThumb(duration, render),
     h(
       'div',
       { class: 'min-w-0' },
@@ -491,8 +508,10 @@ function clipHead(
         rank != null
           ? h('span', { class: 'chip font-mono tabular' }, `#${rank}`)
           : null,
-        score != null
+        score != null && !(manual && score === 0)
           ? h('span', { class: 'chip font-mono tabular' }, `Candidate score ${score}/10`)
+          : manual
+            ? h('span', { class: 'chip' }, 'Manual selection · unscored')
           : null,
         h(
           'span',
@@ -505,7 +524,33 @@ function clipHead(
           formatDuration(duration)
         ),
         speaker ? h('span', { class: 'chip' }, speaker) : null,
-        StatusPill({ descriptor: status, size: 'sm' })
+        h(
+          'span',
+          { class: 'chip' },
+          selection === 'selected'
+            ? 'Selected'
+            : selection === 'rejected'
+              ? 'Rejected'
+              : 'Unselected'
+        ),
+        StatusPill({ descriptor: status, size: 'sm' }),
+        h(
+          'span',
+          {
+            class: `chip ${
+              render.current
+                ? 'text-status-success'
+                : render.playable
+                  ? 'text-status-warning'
+                  : 'text-ink-tertiary'
+            }`,
+          },
+          render.current
+            ? 'Current render'
+            : render.playable
+              ? 'Render out of date'
+              : 'Not rendered'
+        )
       ),
       h(
         'h3',
@@ -544,18 +589,16 @@ function clipHead(
 }
 
 function clipThumb(
-  episodeId: string,
-  clipId: string,
   duration: number,
-  rendered: boolean
+  render: ReviewArtifact
 ): HTMLElement {
   // Only set a src when the shorts MP4 actually exists on disk.
   // Without this guard every card fires a 404 for the missing file.
   let innerEl: HTMLElement;
   let hoverHandlers: Record<string, unknown> = {};
 
-  if (rendered) {
-    const url = `/media/episodes/${episodeId}/shorts/${clipId}.mp4`;
+  if (render.playable && render.url) {
+    const url = render.url;
     const video = h('video', {
       src: url,
       muted: true,
@@ -612,25 +655,32 @@ function clipExpanded(
   start: number,
   end: number,
   metadata: Record<string, UnknownRecord>,
-  rendered: boolean,
+  review: ClipReviewState,
+  platforms: PlatformSpec[],
   reload: () => Promise<void>
 ): HTMLElement {
   return h(
     'div',
     { id: `clip-review-${clipId}`, class: 'border-t border-border-subtle' },
-    renderReviewPlayer(episodeId, clipId, rendered),
-    renderActions(episodeId, clipId, rendered, reload),
+    renderReviewPlayer(clipId, review.render),
+    renderActions(episodeId, clipId, review, reload),
     renderTrim(episodeId, clipId, start, end, reload),
-    renderMetadataAccordion(episodeId, clipId, metadata, reload)
+    renderMetadataAccordion(
+      episodeId,
+      clipId,
+      metadata,
+      platforms,
+      review.metadata,
+      reload
+    )
   );
 }
 
 function renderReviewPlayer(
-  episodeId: string,
   clipId: string,
-  rendered: boolean
+  render: ReviewArtifact
 ): HTMLElement {
-  if (!rendered) {
+  if (!render.playable || !render.url) {
     return h(
       'section',
       {
@@ -647,7 +697,7 @@ function renderReviewPlayer(
     );
   }
 
-  const url = `/media/episodes/${episodeId}/shorts/${clipId}.mp4`;
+  const url = render.url;
   return h(
     'section',
     {
@@ -655,6 +705,22 @@ function renderReviewPlayer(
         'px-5 py-5 bg-surface-inset/50 border-b border-border-subtle',
       'aria-label': 'Clip video review',
     },
+    !render.current
+      ? h(
+          'div',
+          {
+            class:
+              'max-w-[720px] mx-auto mb-4 rounded-md border border-status-warning/40 bg-status-warning/10 px-4 py-3',
+            role: 'status',
+          },
+          h(
+            'div',
+            { class: 'text-body font-medium text-status-warning' },
+            'Out of date · re-render before final approval'
+          ),
+          h('div', { class: 'text-body-sm text-ink-secondary mt-1' }, render.detail)
+        )
+      : null,
     h(
       'div',
       { class: 'w-full max-w-[390px] mx-auto' },
@@ -673,7 +739,7 @@ function renderReviewPlayer(
         h(
           'span',
           { class: 'text-body-sm text-ink-tertiary' },
-          'Current rendered file'
+          render.current ? 'Current rendered file' : 'Previous rendered file'
         ),
         h(
           'a',
@@ -693,33 +759,56 @@ function renderReviewPlayer(
 function renderActions(
   episodeId: string,
   clipId: string,
-  rendered: boolean,
+  review: ClipReviewState,
   reload: () => Promise<void>
 ): HTMLElement {
+  const rendering = signal(review.render_job.status === 'rendering');
+  const primary = h('span');
+  effect(() => {
+    const active = rendering();
+    const approved = review.approval.current;
+    primary.replaceChildren(
+      Button({
+        variant: 'primary',
+        size: 'sm',
+        label: approved
+          ? 'Approved'
+          : review.render.current
+            ? 'Final approve'
+            : active
+              ? 'Rendering…'
+              : review.render.playable
+                ? 'Re-render clip'
+                : 'Render clip',
+        disabled: approved || active,
+        loading: active,
+        onClick: async () => {
+          try {
+            if (review.render.current) {
+              await api.approveClip(episodeId, clipId);
+              showToast('Current render approved.', 'success');
+            } else {
+              rendering.set(true);
+              await api.selectClip(episodeId, clipId);
+              showToast('Rendering the selected clip locally…');
+              await api.renderClip(episodeId, clipId);
+              showToast('Clip rendered. Review it before final approval.', 'success');
+            }
+            await reload();
+          } catch (e) {
+            showToast((e as Error).message, 'error');
+          } finally {
+            rendering.set(false);
+          }
+        },
+      })
+    );
+  });
+
   return h(
     'div',
     { class: 'flex items-center gap-2 px-5 py-4 flex-wrap' },
-    Button({
-      variant: 'primary',
-      size: 'sm',
-      label: rendered ? 'Final approve' : 'Render clip',
-      onClick: async () => {
-        try {
-          if (rendered) {
-            await api.approveClip(episodeId, clipId);
-            showToast('Current render approved.', 'success');
-          } else {
-            await api.selectClip(episodeId, clipId);
-            showToast('Rendering the selected clip locally…');
-            await api.renderClip(episodeId, clipId);
-            showToast('Clip rendered. Review it before final approval.', 'success');
-          }
-          await reload();
-        } catch (e) {
-          showToast((e as Error).message, 'error');
-        }
-      },
-    }),
+    primary,
     Button({
       variant: 'destructive',
       size: 'sm',
@@ -847,6 +936,8 @@ function renderMetadataAccordion(
   episodeId: string,
   clipId: string,
   metadata: Record<string, UnknownRecord>,
+  platforms: PlatformSpec[],
+  metadataState: ClipReviewState['metadata'],
   reload: () => Promise<void>
 ): HTMLElement {
   const openPlatform = signal<string | null>(null);
@@ -871,10 +962,10 @@ function renderMetadataAccordion(
         h(
           'span',
           { class: 'text-body-sm text-ink-tertiary' },
-          `${countFilled(metadata)} of ${PLATFORMS.length} filled`
+          `${metadataState.complete_destination_count} of ${metadataState.enabled_destination_count} ready`
         )
       ),
-      ...PLATFORMS.map((spec) =>
+      ...platforms.map((spec) =>
         platformRow(
           episodeId,
           clipId,
@@ -890,13 +981,6 @@ function renderMetadataAccordion(
   });
 
   return host;
-}
-
-function countFilled(metadata: Record<string, UnknownRecord>): number {
-  return PLATFORMS.filter((spec) => {
-    const m = metadata[spec.key];
-    return m && Object.values(m).some((v) => typeof v === 'string' && v.length > 0);
-  }).length;
 }
 
 function platformRow(

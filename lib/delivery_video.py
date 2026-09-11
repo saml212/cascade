@@ -678,6 +678,109 @@ def record_short_render(
     return record
 
 
+def render_artifact_state(
+    episode_dir: Path,
+    output: Path,
+    record: dict | None,
+    *,
+    expected_fingerprint: str | None,
+    expected_mode: str | None,
+) -> dict:
+    """Describe an artifact for review without hiding an older usable file."""
+    path = output if output.is_absolute() else episode_dir / output
+    try:
+        relative_path = str(path.relative_to(episode_dir))
+    except ValueError:
+        relative_path = path.name
+    state = {
+        "status": "missing",
+        "current": False,
+        "playable": False,
+        "path": relative_path,
+        "reason_code": "artifact_missing",
+        "detail": "No rendered file exists yet.",
+    }
+    try:
+        stat = path.stat()
+    except OSError:
+        return state
+    if not path.is_file() or stat.st_size <= 0:
+        return state
+
+    state.update(
+        playable=True,
+        size_bytes=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    record = record if isinstance(record, dict) else {}
+    state.update(
+        render_mode=record.get("render_mode"),
+        recorded_fingerprint=record.get("fingerprint"),
+        fingerprint=record.get("fingerprint"),
+        completed_at=record.get("completed_at"),
+        output_duration_seconds=record.get("output_duration_seconds"),
+    )
+    if not record:
+        state.update(
+            status="untracked",
+            reason_code="manifest_missing",
+            detail="The previous render is reviewable, but has no render manifest.",
+        )
+        return state
+    if expected_mode and record.get("render_mode") != expected_mode:
+        state.update(
+            status="stale",
+            reason_code="render_mode_changed",
+            detail="The previous render used an older layout or render mode.",
+        )
+        return state
+    captions = record.get("captions")
+    if captions is not None and (
+        not isinstance(captions, dict)
+        or not captions.get("path")
+        or not (episode_dir / str(captions["path"])).is_file()
+    ):
+        state.update(
+            status="stale",
+            reason_code="caption_artifact_missing",
+            detail="The video is reviewable, but its recorded caption sidecar is missing.",
+        )
+        return state
+    recorded_output = record.get("output", {})
+    if (
+        not isinstance(recorded_output, dict)
+        or recorded_output.get("size_bytes") != stat.st_size
+        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
+    ):
+        state.update(
+            status="stale",
+            reason_code="artifact_changed",
+            detail="The rendered file changed after its manifest was recorded.",
+        )
+        return state
+    if expected_fingerprint is None:
+        state.update(
+            status="stale",
+            reason_code="verification_inputs_unavailable",
+            detail="The previous render is reviewable, but its current inputs cannot be verified.",
+        )
+        return state
+    if record.get("fingerprint") != expected_fingerprint:
+        state.update(
+            status="stale",
+            reason_code="render_inputs_changed",
+            detail="Render inputs changed after this file was produced.",
+        )
+        return state
+    state.update(
+        status="current",
+        current=True,
+        reason_code=None,
+        detail="This file matches the current render inputs.",
+    )
+    return state
+
+
 def current_longform_render(
     episode_dir: Path,
     episode: dict,
@@ -687,28 +790,18 @@ def current_longform_render(
 ) -> dict | None:
     """Return the speaker-cut manifest record only when inputs and output match."""
     output = episode_dir / "upload_video.mp4"
-    if not output.exists():
-        return None
     record = read_render_manifest(episode_dir).get("longform", {})
-    if record.get("render_mode") != "speaker_cut":
-        return None
-    captions = record.get("captions")
-    if captions is not None and not (
-        captions.get("path") and (episode_dir / captions["path"]).exists()
-    ):
-        return None
     expected = longform_render_fingerprint(
         episode_dir, episode, config, audio_path, segments
     )
-    stat = output.stat()
-    recorded_output = record.get("output", {})
-    if (
-        record.get("fingerprint") != expected
-        or recorded_output.get("size_bytes") != stat.st_size
-        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
-    ):
-        return None
-    return record
+    state = render_artifact_state(
+        episode_dir,
+        output,
+        record,
+        expected_fingerprint=expected,
+        expected_mode="speaker_cut",
+    )
+    return record if state["current"] else None
 
 
 def current_episode_longform_render(
@@ -739,27 +832,18 @@ def current_short_render(
     if not clip_id:
         return None
     output = episode_dir / "shorts" / f"{clip_id}.mp4"
-    if not output.exists():
-        return None
     record = read_render_manifest(episode_dir).get("shorts", {}).get(clip_id, {})
-    captions = record.get("captions")
-    if captions is not None and not (
-        captions.get("path") and (episode_dir / captions["path"]).exists()
-    ):
-        return None
     expected = short_render_fingerprint(
         episode_dir, episode, config, audio_path, segments, clip
     )
-    stat = output.stat()
-    recorded_output = record.get("output", {})
-    if (
-        record.get("render_mode") != "speaker_cut_short"
-        or record.get("fingerprint") != expected
-        or recorded_output.get("size_bytes") != stat.st_size
-        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
-    ):
-        return None
-    return record
+    state = render_artifact_state(
+        episode_dir,
+        output,
+        record,
+        expected_fingerprint=expected,
+        expected_mode="speaker_cut_short",
+    )
+    return record if state["current"] else None
 
 
 @contextmanager
