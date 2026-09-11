@@ -11,13 +11,68 @@ const { describeEpisodeStatus, episodeDisplayDuration } = await import(
   `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`
 );
 
-test('verified delivery status supersedes stale pipeline display status', () => {
+test('rendered delivery without a quality decision still requires review', () => {
   assert.equal(
     describeEpisodeStatus({
       status: 'awaiting_longform_review',
       delivery: { status: 'ready', video_status: 'ready' },
     }).key,
+    'quality_review_required'
+  );
+});
+
+test('only the current release gate presents rendered delivery as ready', () => {
+  assert.equal(
+    describeEpisodeStatus({
+      status: 'awaiting_longform_review',
+      delivery: { status: 'ready', video_status: 'ready' },
+      quality: {
+        quality: { status: 'passed' },
+        release_gate: { status: 'ready' },
+      },
+    }).key,
     'delivery_ready'
+  );
+});
+
+test('missing and stale quality reports stay in review', () => {
+  for (const qualityStatus of ['missing', 'stale']) {
+    assert.equal(
+      describeEpisodeStatus({
+        delivery: { status: 'ready', video_status: 'ready' },
+        quality: {
+          quality: { status: qualityStatus },
+          release_gate: { status: 'blocked' },
+        },
+      }).key,
+      'quality_review_required'
+    );
+  }
+});
+
+test('a current failed report presents rendered delivery as blocked', () => {
+  assert.equal(
+    describeEpisodeStatus({
+      delivery: { status: 'ready', video_status: 'ready' },
+      quality: {
+        quality: { status: 'blocked' },
+        release_gate: { status: 'blocked' },
+      },
+    }).key,
+    'quality_blocked'
+  );
+});
+
+test('passed quality still requires explicit publish approval', () => {
+  assert.equal(
+    describeEpisodeStatus({
+      delivery: { status: 'ready', video_status: 'ready' },
+      quality: {
+        quality: { status: 'passed' },
+        release_gate: { status: 'awaiting_publish_approval' },
+      },
+    }).key,
+    'awaiting_publish'
   );
 });
 
