@@ -87,7 +87,9 @@ def _validate_clip_bounds(ep_dir: Path, start: float, end: float) -> float:
     start = _finite_number("start_seconds", start)
     end = _finite_number("end_seconds", end)
     if start < 0:
-        raise HTTPException(status_code=422, detail="start_seconds must be non-negative")
+        raise HTTPException(
+            status_code=422, detail="start_seconds must be non-negative"
+        )
     if end <= start:
         raise HTTPException(
             status_code=400, detail="end_seconds must be greater than start_seconds"

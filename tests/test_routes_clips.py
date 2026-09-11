@@ -218,9 +218,7 @@ class TestManualClip:
         assert resp.status_code == 422
         assert not (episode_dir / "clips.json").exists()
 
-    def test_rejects_end_beyond_probed_source_duration(
-        self, test_client, monkeypatch
-    ):
+    def test_rejects_end_beyond_probed_source_duration(self, test_client, monkeypatch):
         client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
         (episode_dir / "source_merged.mp4").write_bytes(b"probe fixture")
