@@ -91,6 +91,49 @@ def _normalized_word(value: object) -> str:
     return re.sub(r"[^\w']+", "", str(value or "").casefold(), flags=re.UNICODE)
 
 
+def _utterances_from_words(words: list[dict]) -> list[dict]:
+    """Group a chronological public word stream without flattening overlap."""
+    ordered = sorted(
+        words,
+        key=lambda word: (
+            float(word.get("start", 0)),
+            float(word.get("end", 0)),
+            int(word.get("speaker", 0)),
+        ),
+    )
+    groups: list[list[dict]] = []
+    for word in ordered:
+        if (
+            groups
+            and groups[-1][-1]["_group"] == word["_group"]
+            and groups[-1][-1]["speaker"] == word["speaker"]
+        ):
+            groups[-1].append(word)
+        else:
+            groups.append([word])
+
+    utterances = []
+    for group in groups:
+        public_words = []
+        for word in group:
+            public_word = dict(word)
+            public_word.pop("_group")
+            public_words.append(public_word)
+        utterances.append(
+            {
+                "speaker": public_words[0]["speaker"],
+                "start": public_words[0]["start"],
+                "end": public_words[-1]["end"],
+                "text": " ".join(word["punctuated_word"] for word in public_words),
+                "confidence": sum(word.get("confidence", 0) for word in public_words)
+                / len(public_words),
+                "words": public_words,
+                "source_utterance": group[0]["_group"],
+            }
+        )
+    return utterances
+
+
 def remap_transcript_timestamps(data: dict, gaps: list[tuple[float, float]]) -> dict:
     """Map decoded-sample ASR times onto the source media timeline.
 
@@ -956,6 +999,7 @@ def _canonical_content_matches_activity(
         canonicalization = transcript.get("canonicalization")
         if isinstance(canonicalization, dict):
             canonicalization["activity_fingerprint"] = None
+        transcript["speaker_map"] = _speaker_map_identity(transcript.get("speaker_map"))
     return rebuilt == existing
 
 
@@ -1145,44 +1189,7 @@ class TranscribeAgent(BaseAgent):
                 )
             applied.append(correction_id)
 
-        words.sort(
-            key=lambda word: (
-                float(word.get("start", 0)),
-                float(word.get("end", 0)),
-                int(word.get("speaker", 0)),
-            )
-        )
-        groups: list[list[dict]] = []
-        for word in words:
-            if (
-                groups
-                and groups[-1][-1]["_group"] == word["_group"]
-                and groups[-1][-1]["speaker"] == word["speaker"]
-            ):
-                groups[-1].append(word)
-            else:
-                groups.append([word])
-        utterances = []
-        for group in groups:
-            public_words = []
-            for word in group:
-                public_word = dict(word)
-                public_word.pop("_group", None)
-                public_words.append(public_word)
-            utterances.append(
-                {
-                    "speaker": public_words[0]["speaker"],
-                    "start": public_words[0]["start"],
-                    "end": public_words[-1]["end"],
-                    "text": " ".join(word["punctuated_word"] for word in public_words),
-                    "confidence": sum(
-                        word.get("confidence", 0) for word in public_words
-                    )
-                    / len(public_words),
-                    "words": public_words,
-                    "source_utterance": group[0]["_group"],
-                }
-            )
+        utterances = _utterances_from_words(words)
         diarized = dict(diarized)
         diarized["utterances"] = utterances
         canonicalization = dict(diarized.get("canonicalization", {}))
@@ -1924,58 +1931,25 @@ class TranscribeAgent(BaseAgent):
         # Split an original utterance when a real overlapping interjection lands
         # inside it. Flattening the public utterances then remains source-time
         # ordered for API consumers that do not perform their own final sort.
-        word_groups: list[list[dict]] = []
+        public_words = []
         for word in selected:
-            if (
-                word_groups
-                and word_groups[-1][-1]["_utterance"] == word["_utterance"]
-                and word_groups[-1][-1]["speaker"] == word["speaker"]
-            ):
-                word_groups[-1].append(word)
-            else:
-                word_groups.append([word])
-        utterances = []
-        for chosen_words in word_groups:
-            public_words = []
-            for word in chosen_words:
-                public_word = {
-                    "id": word["_canonical_id"],
-                    "word": word["word"],
-                    "punctuated_word": word["punctuated_word"],
-                    "start": word["start"],
-                    "end": word["end"],
-                    "confidence": word["confidence"],
-                    "speaker": word["speaker"],
-                    "suspect": bool(word["_suspect_reasons"]),
-                    "suspect_reasons": word["_suspect_reasons"],
-                    "alternatives": word["_alternatives"],
-                }
-                if multichannel:
-                    public_word["asr_channel"] = word["asr_channel"]
-                public_words.append(public_word)
-            source = prepared[chosen_words[0]["_utterance"]]
-            speaker = public_words[0]["speaker"]
-            utterances.append(
-                {
-                    "speaker": speaker,
-                    "start": public_words[0]["start"],
-                    "end": public_words[-1]["end"],
-                    "text": " ".join(word["punctuated_word"] for word in public_words),
-                    "confidence": (
-                        sum(word["confidence"] for word in public_words)
-                        / len(public_words)
-                    ),
-                    "words": public_words,
-                    "source_utterance": source["id"],
-                }
-            )
-        utterances.sort(
-            key=lambda utterance: (
-                utterance["start"],
-                utterance["end"],
-                utterance["speaker"],
-            )
-        )
+            public_word = {
+                "id": word["_canonical_id"],
+                "word": word["word"],
+                "punctuated_word": word["punctuated_word"],
+                "start": word["start"],
+                "end": word["end"],
+                "confidence": word["confidence"],
+                "speaker": word["speaker"],
+                "suspect": bool(word["_suspect_reasons"]),
+                "suspect_reasons": word["_suspect_reasons"],
+                "alternatives": word["_alternatives"],
+                "_group": word["_utterance"],
+            }
+            if multichannel:
+                public_word["asr_channel"] = word["asr_channel"]
+            public_words.append(public_word)
+        utterances = _utterances_from_words(public_words)
         canonicalization["input_utterances"] = len(prepared)
         canonicalization["output_utterances"] = len(utterances)
         canonicalization["suspect_words"] = sum(

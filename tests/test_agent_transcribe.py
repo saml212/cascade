@@ -12,6 +12,7 @@ from agents.transcribe import (
     CAMERA_AUDIO_CACHE_VERSION,
     TranscribeAgent,
     _raw_is_multichannel,
+    _utterances_from_words,
     analyze_transcript_coverage,
     current_diarized_transcript,
     export_logical_track_window,
@@ -278,6 +279,44 @@ class TestGenerateSrtEmpty:
             {"results": {"channels": [{"alternatives": [{"words": []}]}]}}
         )
         assert (tmp_episode_dir / "subtitles" / "transcript.srt").read_text() == ""
+
+
+def test_public_utterance_grouping_preserves_overlap_and_word_provenance():
+    def word(group, speaker, start, value):
+        return {
+            "_group": group,
+            "id": f"{group}-{speaker}-{start}",
+            "word": value.casefold(),
+            "punctuated_word": value,
+            "speaker": speaker,
+            "start": start,
+            "end": start + 0.2,
+            "confidence": 0.9,
+            "correction_id": "reviewed-window",
+        }
+
+    result = _utterances_from_words(
+        [
+            word("story", 0, 1.0, "continues"),
+            word("reply", 1, 0.2, "First"),
+            word("story", 1, 0.8, "yes"),
+            word("story", 0, 0.6, "Story"),
+        ]
+    )
+
+    assert [utterance["start"] for utterance in result] == [0.2, 0.6, 0.8, 1.0]
+    assert [utterance["speaker"] for utterance in result] == [1, 0, 1, 0]
+    assert [utterance["source_utterance"] for utterance in result] == [
+        "reply",
+        "story",
+        "story",
+        "story",
+    ]
+    assert all(
+        word["correction_id"] == "reviewed-window" and "_group" not in word
+        for utterance in result
+        for word in utterance["words"]
+    )
 
 
 class TestExecute:
@@ -602,6 +641,7 @@ class TestCanonicalRepair:
         legacy_diarized = json.loads(original_diarized)
         legacy_provenance = json.loads(original_provenance)
         legacy_diarized["canonicalization"]["activity_fingerprint"] = "legacy"
+        legacy_diarized["speaker_map"][1]["mapping_confidence"] = 0.01
         legacy_diarized["provenance"]["canonical_activity_fingerprint"] = "legacy"
         legacy_provenance["canonical_activity_fingerprint"] = "legacy"
         diarized_path.write_text(json.dumps(legacy_diarized))
