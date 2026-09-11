@@ -18,15 +18,17 @@ max_channel_rms_ratio_delta = 3.0         # dB; below this = channels identical
 clip_min_seconds = 30                     # Minimum clip duration
 clip_max_seconds = 90                     # Maximum clip duration
 clip_count = 10                           # Number of clips to generate
-preserve_source_resolution = true         # Use source resolution for longform (4K stays 4K, 1080p stays 1080p)
-output_resolution = "1920x1080"           # Fallback when preserve_source_resolution=false
+output_resolution = "1920x1080"           # Canonical longform ceiling; never upscale smaller sources
 shorts_resolution = "1080x1920"           # Shorts output resolution (always portrait)
-video_crf = 22                            # CRF for longform
-shorts_crf = 20                           # CRF for shorts
+video_bitrate = "12M"                     # Longform target; bounded for predictable storage
+video_max_bitrate = "16M"
+video_buffer_size = "24M"
+shorts_video_bitrate = "10M"
+shorts_video_max_bitrate = "14M"
+shorts_video_buffer_size = "20M"
 audio_bitrate = "192k"                    # Audio bitrate for longform
 shorts_audio_bitrate = "192k"             # Audio bitrate for shorts
-use_hardware_accel = true                 # Use VideoToolbox (macOS) or VAAPI (Linux)
-videotoolbox_quality = 65                 # VideoToolbox H.264 quality (0-100, higher=better; 60-70 sweet spot)
+use_hardware_accel = true                 # Use VideoToolbox when available
 lut_path = ""                             # Path to .cube LUT file for color grading (optional)
 lut_interpolation = "tetrahedral"         # LUT interpolation: "tetrahedral" (accurate) or "trilinear" (fast)
 

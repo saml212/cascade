@@ -7,6 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from agents.shorts_render import ShortsRenderAgent, render_single_clip
+from lib.delivery_video import render_space_budget
+from lib.encoding import get_video_encoding_policy
 from lib.timeline import Timeline
 
 
@@ -136,7 +138,7 @@ def test_render_short_uses_each_retained_source_range_and_rebases_ass(
         }
 
     with (
-        patch("agents.shorts_render.require_output_space"),
+        patch("agents.shorts_render.require_render_space"),
         patch(
             "agents.shorts_render.render_scratch_dir",
             return_value=nullcontext(scratch),
@@ -223,6 +225,66 @@ def test_empty_clip_set_can_render_for_review_without_youtube_url(
 
     assert result["count"] == 0
     assert result["render_mode"] == "speaker_cut_short"
+
+
+def test_batch_preflights_all_outputs_and_two_concurrent_scratch_sets(
+    tmp_episode_dir, sample_config
+):
+    episode = {"crop_config": {"speakers": [{}]}, "longform_edits": []}
+    (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+    (tmp_episode_dir / "diarized_transcript.json").write_text('{"utterances": []}')
+    source = tmp_episode_dir / "source_merged.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    clips = [
+        {"id": "clip_01", "start_seconds": 0, "end_seconds": 5},
+        {"id": "clip_02", "start_seconds": 10, "end_seconds": 15},
+    ]
+    probe = {
+        "format": {"duration": "20"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 320,
+                "height": 180,
+                "r_frame_rate": "30/1",
+            }
+        ],
+    }
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+
+    with (
+        patch(
+            "agents.shorts_render.current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 20, "speaker": "A"}]},
+        ),
+        patch(
+            "agents.shorts_render.current_diarized_transcript",
+            return_value={"utterances": []},
+        ),
+        patch("agents.shorts_render.generate_audio_mix", return_value=audio),
+        patch("agents.shorts_render.ffprobe", return_value=probe),
+        patch("agents.shorts_render.current_short_render", return_value=None),
+        patch("agents.shorts_render.short_render_fingerprint", return_value="fp"),
+        patch("agents.shorts_render.require_render_space") as render_space,
+        patch.object(
+            agent,
+            "_render_short",
+            side_effect=lambda *_args, **_kwargs: {"fingerprint": "fp"},
+        ),
+    ):
+        result = agent._render_clips(clips)
+
+    one = render_space_budget(5, get_video_encoding_policy(sample_config, "shorts"))
+    render_space.assert_called_once_with(
+        tmp_episode_dir / "shorts",
+        {
+            "output_bytes": one["output_bytes"] * 2,
+            "scratch_bytes": one["scratch_bytes"] * 2,
+        },
+    )
+    assert result["rendered_clips"] == ["clip_01", "clip_02"]
 
 
 def test_public_single_clip_adapter_does_not_mutate_candidate_selection(

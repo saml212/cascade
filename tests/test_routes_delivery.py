@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -111,6 +112,14 @@ def test_video_prepare_persists_explicit_caption_and_color_choices(delivery):
 
     with (
         patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(
+            mod,
+            "current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 1, "speaker": "speaker_0"}]},
+        ),
+        patch.object(
+            mod, "current_diarized_transcript", return_value={"utterances": []}
+        ),
         patch.object(mod.threading.Thread, "start"),
     ):
         response = asyncio.run(
@@ -124,7 +133,67 @@ def test_video_prepare_persists_explicit_caption_and_color_choices(delivery):
     stored = json.loads((episode_dir / "episode.json").read_text())
     assert stored["delivery_apply_lut"] is False
     assert stored["delivery_burn_captions"] is True
+    assert response["video_preflight"]["encoding"]["video_max_bitrate"] == "16M"
     mod._video_running.clear()
+
+
+def test_video_prepare_rejects_unsafe_storage_before_starting_job(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["crop_config"] = {"speakers": [{"center_x": 10, "center_y": 10}]}
+    (episode_dir / "episode.json").write_text(json.dumps(episode))
+    audio = episode_dir / "work" / "audio_mix.wav"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    preflight = {
+        "schema": "cascade.video-preflight/v1",
+        "safe": False,
+        "budget": {"output_bytes": 12, "scratch_bytes": 24},
+    }
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod, "current_speaker_segments", return_value={"segments": [{}]}),
+        patch.object(
+            mod, "current_diarized_transcript", return_value={"utterances": []}
+        ),
+        patch.object(mod, "_video_preflight", return_value=preflight),
+        patch.object(
+            mod, "require_render_space", side_effect=RuntimeError("storage is full")
+        ),
+        patch.object(mod.threading, "Thread") as thread,
+        pytest.raises(HTTPException) as raised,
+    ):
+        asyncio.run(mod.prepare_delivery_video("ep_test"))
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail == "storage is full"
+    assert not thread.called
+    assert "ep_test" not in mod._video_running
+    stored = json.loads((episode_dir / "episode.json").read_text())
+    assert "delivery_burn_captions" not in stored
+
+
+def test_status_exposes_machine_readable_video_preflight(delivery):
+    client, mod, episodes_dir = delivery
+    make_episode(episodes_dir)
+    storage = {
+        "safe": True,
+        "same_filesystem": False,
+        "budget": {"output_bytes": 1, "scratch_bytes": 2},
+    }
+
+    with patch.object(mod, "render_space_status", return_value=storage):
+        response = client.get("/api/episodes/ep_test/delivery")
+
+    preflight = response.json()["video_preflight"]
+    assert preflight["schema"] == "cascade.video-preflight/v1"
+    assert preflight["safe"] is True
+    assert preflight["profile"] == "longform"
+    assert preflight["encoding"]["video_bitrate"] == "12M"
+    assert preflight["encoding"]["video_max_bitrate_bps"] == 16_000_000
+    assert preflight["duration_seconds"] == 3600.25
 
 
 def test_trim_saves_absolute_range_and_preserves_cuts(delivery):

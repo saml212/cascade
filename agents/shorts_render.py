@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
+from agents.speaker_cut import current_speaker_segments
+from agents.transcribe import current_diarized_transcript
 from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
@@ -14,14 +16,14 @@ from lib.delivery_video import (
     build_render_segments,
     concat_video_segments,
     current_short_render,
-    estimate_output_bytes,
     mux_timeline_audio,
     record_short_render,
     render_config_for_episode,
     render_output_lock,
     render_scratch_dir,
+    render_space_budget,
     render_video_segment,
-    require_output_space,
+    require_render_space,
     short_render_fingerprint,
     source_fps,
 )
@@ -29,6 +31,7 @@ from lib.encoding import (
     get_lut_filter,
     get_scale_filter,
     get_video_encoder_args,
+    get_video_encoding_policy,
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
@@ -66,8 +69,17 @@ class ShortsRenderAgent(BaseAgent):
         }
 
     def _render_clips(self, clips: list[dict]) -> dict:
-        segments = self.load_json("segments.json").get("segments", [])
-        diarized = self.load_json("diarized_transcript.json")
+        shorts_dir = self.episode_dir / "shorts"
+        if not clips:
+            shorts_dir.mkdir(exist_ok=True)
+            return {
+                "rendered_clips": [],
+                "count": 0,
+                "shorts_dir": str(shorts_dir),
+                "render_mode": "speaker_cut_short",
+                "clock": "source",
+                "renders": {},
+            }
         episode = self.load_json("episode.json")
         self.config = render_config_for_episode(episode, self.config)
         crop_config = episode.get("crop_config")
@@ -77,8 +89,19 @@ class ShortsRenderAgent(BaseAgent):
         source = self.episode_dir / "source_merged.mp4"
         if not source.exists():
             raise FileNotFoundError("source_merged.mp4 is required for shorts render")
+        segment_document = current_speaker_segments(
+            self.episode_dir, episode, self.config
+        )
+        segments = segment_document.get("segments", []) if segment_document else []
         if not segments:
-            raise ValueError("Speaker segments are required for speaker-cut shorts")
+            raise ValueError(
+                "Current source-clock speaker segments are required for shorts render"
+            )
+        diarized = current_diarized_transcript(self.episode_dir, episode, self.config)
+        if not diarized:
+            raise ValueError(
+                "Current source-clock transcript is required for shorts captions"
+            )
         audio = generate_audio_mix(self.episode_dir, episode, self.config)
         if not audio or not audio.exists():
             raise RuntimeError("Canonical work/audio_mix.wav is required")
@@ -97,62 +120,77 @@ class ShortsRenderAgent(BaseAgent):
         src_h = int(video_stream["height"])
         fps = source_fps(video_stream, episode)
         episode_timeline = episode_timeline.quantize(fps)
-        audio_bitrate = self.config.get("processing", {}).get(
-            "shorts_audio_bitrate", "192k"
-        )
-        encoder_args = get_video_encoder_args(self.config, crf_key="shorts_crf")
+        encoding = get_video_encoding_policy(self.config, "shorts")
+        encoder_args = get_video_encoder_args(self.config, "shorts")
         lut_filter = get_lut_filter(self.config)
 
-        shorts_dir = self.episode_dir / "shorts"
         subtitles_dir = self.episode_dir / "subtitles"
         shorts_dir.mkdir(exist_ok=True)
         subtitles_dir.mkdir(exist_ok=True)
 
         rendered = []
         records = {}
-        workers = min(max((os.cpu_count() or 2) // 4, 1), 2, max(1, len(clips)))
+        jobs = []
+        for clip in clips:
+            clip_id = clip["id"]
+            clip_timeline = episode_timeline.slice(
+                float(clip["start_seconds"]), float(clip["end_seconds"])
+            ).quantize(fps)
+            if clip_timeline.duration < 0.1:
+                raise ValueError(f"{clip_id} contains no retained source material")
+            fingerprint = short_render_fingerprint(
+                self.episode_dir,
+                episode,
+                self.config,
+                audio,
+                segments,
+                clip,
+            )
+            current = current_short_render(
+                self.episode_dir,
+                episode,
+                self.config,
+                audio,
+                segments,
+                clip,
+            )
+            if current:
+                records[clip_id] = {**current, "reused": True}
+                rendered.append(clip_id)
+                continue
+            jobs.append((clip, clip_timeline, fingerprint))
+
+        workers = min(max((os.cpu_count() or 2) // 4, 1), 2, max(1, len(jobs)))
+        budgets = [
+            render_space_budget(timeline.duration, encoding) for _, timeline, _ in jobs
+        ]
+        if budgets:
+            require_render_space(
+                shorts_dir,
+                {
+                    "output_bytes": sum(budget["output_bytes"] for budget in budgets),
+                    "scratch_bytes": sum(
+                        sorted(
+                            (budget["scratch_bytes"] for budget in budgets),
+                            reverse=True,
+                        )[:workers]
+                    ),
+                },
+            )
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {}
-            for clip in clips:
-                clip_id = clip["id"]
-                clip_timeline = episode_timeline.slice(
-                    float(clip["start_seconds"]), float(clip["end_seconds"])
-                ).quantize(fps)
-                if clip_timeline.duration < 0.1:
-                    raise ValueError(f"{clip_id} contains no retained source material")
-                fingerprint = short_render_fingerprint(
-                    self.episode_dir,
-                    episode,
-                    self.config,
-                    audio,
-                    segments,
-                    clip,
-                )
-                current = current_short_render(
-                    self.episode_dir,
-                    episode,
-                    self.config,
-                    audio,
-                    segments,
-                    clip,
-                )
-                if current:
-                    records[clip_id] = {**current, "reused": True}
-                    rendered.append(clip_id)
-                    continue
-                output = shorts_dir / f"{clip_id}.mp4"
-                caption_path = subtitles_dir / f"{clip_id}.ass"
-                future = executor.submit(
+            futures = {
+                executor.submit(
                     self._render_short,
                     source,
-                    output,
-                    caption_path,
+                    shorts_dir / f"{clip['id']}.mp4",
+                    subtitles_dir / f"{clip['id']}.ass",
                     float(clip["start_seconds"]),
                     float(clip["end_seconds"]),
                     segments,
                     src_w,
                     src_h,
-                    audio_bitrate,
+                    encoding["audio_bitrate"],
                     crop_config,
                     encoder_args,
                     lut_filter,
@@ -163,9 +201,10 @@ class ShortsRenderAgent(BaseAgent):
                     fingerprint=fingerprint,
                     episode=episode,
                     clip=clip,
-                )
-                futures[future] = clip_id
-
+                    encoding=encoding,
+                ): clip["id"]
+                for clip, clip_timeline, fingerprint in jobs
+            }
             for future in as_completed(futures):
                 clip_id = futures[future]
                 records[clip_id] = future.result()
@@ -207,6 +246,7 @@ class ShortsRenderAgent(BaseAgent):
         fingerprint=None,
         episode=None,
         clip=None,
+        encoding=None,
     ) -> dict:
         """Render one clip; positional arguments remain compatible with chat actions."""
         episode = episode or self.load_json("episode.json")
@@ -238,10 +278,11 @@ class ShortsRenderAgent(BaseAgent):
         caption_path.parent.mkdir(parents=True, exist_ok=True)
         generate_ass_from_diarized(captions, 0, timeline.duration, caption_path, style)
 
-        estimate = estimate_output_bytes(timeline.duration, video_mbps=10)
-        require_output_space(Path(output).parent, estimate)
+        encoding = encoding or get_video_encoding_policy(self.config, "shorts")
+        budget = render_space_budget(timeline.duration, encoding)
+        require_render_space(Path(output).parent, budget)
         with render_scratch_dir(
-            f"short-{Path(output).stem}", round(estimate * 2.2)
+            f"short-{Path(output).stem}", budget["scratch_bytes"]
         ) as scratch:
             paths = []
             for index, segment in enumerate(render_segments):
@@ -323,6 +364,7 @@ class ShortsRenderAgent(BaseAgent):
                 "overlap_hold_seconds": self.config.get("processing", {}).get(
                     "shorts_hold_wide_seconds", 3.0
                 ),
+                "encoding": {**encoding, "encoder": encoder_args[1]},
             },
         )
 

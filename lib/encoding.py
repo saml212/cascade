@@ -2,11 +2,90 @@
 
 import functools
 import logging
+import math
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 logger = logging.getLogger("cascade")
+
+_ENCODING_DEFAULTS = {
+    "longform": {
+        "video_bitrate": "12M",
+        "video_max_bitrate": "16M",
+        "video_buffer_size": "24M",
+        "audio_bitrate": "192k",
+    },
+    "shorts": {
+        "video_bitrate": "10M",
+        "video_max_bitrate": "14M",
+        "video_buffer_size": "20M",
+        "audio_bitrate": "192k",
+    },
+}
+
+
+def parse_bitrate(value: str | float, name: str) -> int:
+    """Parse an ffmpeg-style bitrate into positive bits per second."""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a positive bitrate")
+    if isinstance(value, (int, float)):
+        bitrate = float(value)
+    elif isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmMgG]?)\s*", value)
+        if not match:
+            raise ValueError(f"Invalid {name}: {value!r}")
+        multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000}[
+            match.group(2).lower()
+        ]
+        bitrate = float(match.group(1)) * multiplier
+    else:
+        raise TypeError(f"Invalid {name}: {value!r}")
+    if not math.isfinite(bitrate) or bitrate <= 0:
+        raise ValueError(f"{name} must be a positive finite bitrate")
+    return round(bitrate)
+
+
+def _format_bitrate(bits_per_second: int) -> str:
+    if bits_per_second % 1_000_000 == 0:
+        return f"{bits_per_second // 1_000_000}M"
+    if bits_per_second % 1_000 == 0:
+        return f"{bits_per_second // 1_000}k"
+    return str(bits_per_second)
+
+
+def get_video_encoding_policy(config: dict, profile: str = "longform") -> dict:
+    """Resolve the bounded bitrate policy shared by encoding and preflight."""
+    if profile not in _ENCODING_DEFAULTS:
+        raise ValueError(f"Unknown video encoding profile: {profile}")
+    defaults = _ENCODING_DEFAULTS[profile]
+    processing = config.get("processing", {})
+    prefix = "shorts_" if profile == "shorts" else ""
+    values = {
+        "video_bitrate": processing.get(
+            f"{prefix}video_bitrate", defaults["video_bitrate"]
+        ),
+        "video_max_bitrate": processing.get(
+            f"{prefix}video_max_bitrate", defaults["video_max_bitrate"]
+        ),
+        "video_buffer_size": processing.get(
+            f"{prefix}video_buffer_size", defaults["video_buffer_size"]
+        ),
+        "audio_bitrate": processing.get(
+            f"{prefix}audio_bitrate", defaults["audio_bitrate"]
+        ),
+    }
+    parsed = {key: parse_bitrate(value, key) for key, value in values.items()}
+    if parsed["video_max_bitrate"] < parsed["video_bitrate"]:
+        raise ValueError("video_max_bitrate must be at least video_bitrate")
+    if parsed["video_buffer_size"] < parsed["video_max_bitrate"]:
+        raise ValueError("video_buffer_size must be at least video_max_bitrate")
+    return {
+        "profile": profile,
+        **{key: _format_bitrate(value) for key, value in parsed.items()},
+        **{f"{key}_bps": value for key, value in parsed.items()},
+    }
 
 
 @functools.lru_cache(maxsize=1)
@@ -27,35 +106,25 @@ def has_videotoolbox() -> bool:
         return False
 
 
-def get_video_encoder_args(config: dict, crf_key: str = "video_crf") -> list:
-    """Return ffmpeg encoder arguments based on config and platform capabilities.
-
-    On Apple Silicon with VideoToolbox available, uses hardware H.264 encoding
-    (10-20x faster, dedicated Media Engine). Set use_hardware_accel=false
-    in config to force software encoding.
-
-    All output is H.264 for universal platform compatibility (YouTube, Spotify,
-    Apple Podcasts, Instagram, TikTok, X, LinkedIn, Facebook).
-
-    VideoToolbox path: ["-c:v", "h264_videotoolbox", "-q:v", "45", "-profile:v", "high"]
-    Software fallback: ["-c:v", "libx264", "-crf", "<value>", "-preset", "medium"]
-    """
+def get_video_encoder_args(config: dict, profile: str = "longform") -> list[str]:
+    """Return H.264 arguments constrained by the shared bitrate policy."""
     use_hw = config.get("processing", {}).get("use_hardware_accel", True)
+    policy = get_video_encoding_policy(config, profile)
 
     if use_hw and has_videotoolbox():
-        vt_quality = config.get("processing", {}).get("videotoolbox_quality", 45)
-        return [
-            "-c:v",
-            "h264_videotoolbox",
-            "-q:v",
-            str(vt_quality),
-            "-profile:v",
-            "high",
-        ]
-
-    crf = config.get("processing", {}).get(crf_key, 22)
-    preset = config.get("processing", {}).get("encode_preset", "medium")
-    return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
+        encoder = ["-c:v", "h264_videotoolbox", "-profile:v", "high"]
+    else:
+        preset = config.get("processing", {}).get("encode_preset", "medium")
+        encoder = ["-c:v", "libx264", "-preset", str(preset), "-profile:v", "high"]
+    return [
+        *encoder,
+        "-b:v",
+        policy["video_bitrate"],
+        "-maxrate",
+        policy["video_max_bitrate"],
+        "-bufsize",
+        policy["video_buffer_size"],
+    ]
 
 
 def get_color_metadata_args() -> list:

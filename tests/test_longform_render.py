@@ -7,6 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from agents.longform_render import LongformRenderAgent
+from lib.delivery_video import render_space_budget
+from lib.encoding import get_video_encoding_policy
 
 
 @pytest.fixture
@@ -324,17 +326,32 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
         }
 
     with (
+        patch(
+            "agents.longform_render.current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 2, "speaker": "speaker_0"}]},
+        ),
+        patch(
+            "agents.longform_render.current_diarized_transcript",
+            return_value={
+                "utterances": [
+                    {
+                        "speaker": 0,
+                        "words": [{"word": "hello", "start": 0.2, "end": 0.6}],
+                    }
+                ]
+            },
+        ),
         patch("agents.longform_render.generate_audio_mix", return_value=audio),
         patch("agents.longform_render.ffprobe", return_value=source_probe),
         patch(
             "agents.longform_render.get_video_encoder_args",
             return_value=["-c:v", "libx264"],
         ),
-        patch("agents.longform_render.require_output_space"),
+        patch("agents.longform_render.require_render_space") as render_space,
         patch(
             "agents.longform_render.render_scratch_dir",
             return_value=nullcontext(scratch),
-        ),
+        ) as scratch_space,
         patch.object(
             agent,
             "_render_segments",
@@ -350,3 +367,6 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     assert (render_segments.call_args.args[3] is not None) is burn_captions
     assert result["captions_burned_in"] is burn_captions
     assert result["filename"] == "upload_video.mp4"
+    budget = render_space_budget(2, get_video_encoding_policy(config, "longform"))
+    render_space.assert_called_once_with(tmp_episode_dir, budget)
+    assert scratch_space.call_args.args[1] == budget["scratch_bytes"]

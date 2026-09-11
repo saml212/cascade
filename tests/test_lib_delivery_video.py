@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -17,7 +18,6 @@ from lib.delivery_video import (
     build_render_segments,
     concat_video_segments,
     current_longform_render,
-    estimate_output_bytes,
     ffmpeg_executable,
     longform_render_fingerprint,
     mux_timeline_audio,
@@ -25,6 +25,8 @@ from lib.delivery_video import (
     record_short_render,
     render_config_for_episode,
     render_fingerprint,
+    render_space_budget,
+    render_space_status,
     render_video_segment,
     source_fps,
 )
@@ -102,8 +104,41 @@ def test_render_segments_fill_detection_gaps_with_wide_crop():
     assert sum(segment["duration"] for segment in rendered) == 5
 
 
-def test_disk_estimate_includes_video_audio_and_margin():
-    assert estimate_output_bytes(3600) > 3_600_000_000
+def test_disk_estimate_uses_bitrate_cap_and_accounts_for_intermediates():
+    encoding = {
+        "video_max_bitrate_bps": 16_000_000,
+        "audio_bitrate_bps": 192_000,
+    }
+
+    budget = render_space_budget(3600, encoding)
+
+    assert budget["output_bytes"] == 7_650_720_000
+    assert budget["scratch_bytes"] == 15_120_000_000
+
+
+def test_space_status_combines_output_and_scratch_on_one_filesystem(tmp_path):
+    output = tmp_path / "output"
+    scratch = tmp_path / "scratch"
+    output.mkdir()
+    scratch.mkdir()
+
+    with (
+        patch("lib.delivery_video.OUTPUT_RESERVE_BYTES", 1),
+        patch("lib.delivery_video.SCRATCH_RESERVE_BYTES", 10),
+        patch("lib.delivery_video.render_scratch_root", return_value=scratch),
+        patch(
+            "lib.delivery_video.shutil.disk_usage",
+            return_value=SimpleNamespace(free=15),
+        ),
+    ):
+        status = render_space_status(output, {"output_bytes": 4, "scratch_bytes": 4})
+
+    assert status["output"]["safe"] is True
+    assert status["scratch"]["safe"] is True
+    assert status["same_filesystem"] is True
+    assert status["combined_required_bytes"] == 18
+    assert status["safe"] is False
+    assert status["failures"] == ["combined_peak_exceeds_free_space"]
 
 
 def test_episode_render_config_preserves_source_color_without_explicit_opt_in(
@@ -135,10 +170,12 @@ def test_longform_fingerprint_tracks_caption_choice_and_lut_contents(tmp_path):
     first = longform_render_fingerprint(tmp_path, episode, config, audio, [])
     config["processing"]["longform_burn_captions"] = True
     burned = longform_render_fingerprint(tmp_path, episode, config, audio, [])
+    config["processing"]["video_max_bitrate"] = "12M"
+    bounded = longform_render_fingerprint(tmp_path, episode, config, audio, [])
     lut.write_text("other")
     changed_lut = longform_render_fingerprint(tmp_path, episode, config, audio, [])
 
-    assert len({first, burned, changed_lut}) == 3
+    assert len({first, burned, bounded, changed_lut}) == 4
 
 
 def test_fingerprint_marks_missing_inputs_without_raising(tmp_path):

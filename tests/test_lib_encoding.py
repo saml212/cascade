@@ -10,8 +10,10 @@ from lib.encoding import (
     get_lut_filter,
     get_scale_filter,
     get_video_encoder_args,
+    get_video_encoding_policy,
     get_video_polish_filters,
     has_videotoolbox,
+    parse_bitrate,
 )
 
 
@@ -83,24 +85,21 @@ class TestHasVideoToolbox:
 
 
 class TestGetVideoEncoderArgs:
-    def test_software_fallback_when_hw_disabled(self):
-        config = {"processing": {"use_hardware_accel": False, "video_crf": 22}}
-        args = get_video_encoder_args(config)
-        assert args[0:2] == ["-c:v", "libx264"]
-        assert "-crf" in args
-        assert "22" in args
-
-    def test_software_fallback_uses_crf_key(self):
-        config = {"processing": {"use_hardware_accel": False, "shorts_crf": 20}}
-        args = get_video_encoder_args(config, crf_key="shorts_crf")
-        assert "-crf" in args
-        assert "20" in args
-
-    def test_default_crf_22(self):
-        """Default CRF should be 22 when not configured."""
+    def test_software_fallback_uses_bounded_longform_policy(self):
         config = {"processing": {"use_hardware_accel": False}}
         args = get_video_encoder_args(config)
-        assert "22" in args
+        assert args[0:2] == ["-c:v", "libx264"]
+        assert args[args.index("-b:v") + 1] == "12M"
+        assert args[args.index("-maxrate") + 1] == "16M"
+        assert args[args.index("-bufsize") + 1] == "24M"
+        assert "-crf" not in args
+
+    def test_shorts_profile_has_independent_bound(self):
+        config = {"processing": {"use_hardware_accel": False}}
+        args = get_video_encoder_args(config, "shorts")
+        assert args[args.index("-b:v") + 1] == "10M"
+        assert args[args.index("-maxrate") + 1] == "14M"
+        assert args[args.index("-bufsize") + 1] == "20M"
 
     def test_default_preset_medium(self):
         """Default encode preset should be 'medium'."""
@@ -116,31 +115,13 @@ class TestGetVideoEncoderArgs:
         assert "ultrafast" in args
 
     def test_videotoolbox_when_hw_accel_enabled(self):
-        """VideoToolbox should use H.264 for universal platform compatibility."""
         config = {"processing": {"use_hardware_accel": True}}
         with patch("lib.encoding.has_videotoolbox", return_value=True):
             args = get_video_encoder_args(config)
             assert args[0:2] == ["-c:v", "h264_videotoolbox"]
-            assert "-q:v" in args
             assert "-profile:v" in args
             assert "high" in args
-
-    def test_videotoolbox_default_quality_45(self):
-        """Default VideoToolbox quality should be 45 (when not configured)."""
-        config = {"processing": {"use_hardware_accel": True}}
-        with patch("lib.encoding.has_videotoolbox", return_value=True):
-            args = get_video_encoder_args(config)
-            assert "45" in args  # default fallback in get_video_encoder_args
-
-    def test_videotoolbox_custom_quality(self):
-        """VideoToolbox quality should be configurable."""
-        config = {
-            "processing": {"use_hardware_accel": True, "videotoolbox_quality": 90}
-        }
-        with patch("lib.encoding.has_videotoolbox", return_value=True):
-            args = get_video_encoder_args(config)
-            assert args[0:2] == ["-c:v", "h264_videotoolbox"]
-            assert "90" in args
+            assert args[args.index("-maxrate") + 1] == "16M"
 
     def test_software_when_hw_accel_disabled(self):
         """Should use software encoding when use_hardware_accel is False."""
@@ -163,11 +144,44 @@ class TestGetVideoEncoderArgs:
             assert args[0:2] == ["-c:v", "h264_videotoolbox"]
 
     def test_empty_config_no_hw(self):
-        """Empty config without VideoToolbox should use software defaults."""
         with patch("lib.encoding.has_videotoolbox", return_value=False):
             args = get_video_encoder_args({})
             assert "-c:v" in args
             assert "libx264" in args
+
+
+class TestVideoEncodingPolicy:
+    def test_custom_policy_is_normalized_for_ffmpeg_and_budgeting(self):
+        policy = get_video_encoding_policy(
+            {
+                "processing": {
+                    "video_bitrate": "8m",
+                    "video_max_bitrate": 12_000_000,
+                    "video_buffer_size": "18M",
+                    "audio_bitrate": "256K",
+                }
+            }
+        )
+
+        assert policy["video_bitrate"] == "8M"
+        assert policy["video_max_bitrate_bps"] == 12_000_000
+        assert policy["audio_bitrate"] == "256k"
+
+    @pytest.mark.parametrize("value", [0, -1, "NaN", "12MB", float("inf")])
+    def test_invalid_bitrate_is_rejected(self, value):
+        with pytest.raises(ValueError):
+            parse_bitrate(value, "video_bitrate")
+
+    def test_target_cannot_exceed_cap(self):
+        with pytest.raises(ValueError, match="at least"):
+            get_video_encoding_policy(
+                {
+                    "processing": {
+                        "video_bitrate": "16M",
+                        "video_max_bitrate": "12M",
+                    }
+                }
+            )
 
 
 class TestGetColorMetadataArgs:

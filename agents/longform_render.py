@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
+from agents.speaker_cut import current_speaker_segments
+from agents.transcribe import current_diarized_transcript
 from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
@@ -15,21 +17,22 @@ from lib.delivery_video import (
     build_render_segments,
     concat_video_segments,
     current_longform_render,
-    estimate_output_bytes,
     longform_render_fingerprint,
     mux_timeline_audio,
     record_longform_render,
     render_config_for_episode,
     render_output_lock,
     render_scratch_dir,
+    render_space_budget,
     render_video_segment,
-    require_output_space,
+    require_render_space,
     source_fps,
 )
 from lib.encoding import (
     get_lut_filter,
     get_scale_filter,
     get_video_encoder_args,
+    get_video_encoding_policy,
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
@@ -64,10 +67,19 @@ class LongformRenderAgent(BaseAgent):
         source = self.episode_dir / "source_merged.mp4"
         if not source.exists():
             raise FileNotFoundError("source_merged.mp4 is required for longform render")
-        segments = self.load_json("segments.json").get("segments", [])
+        segment_document = current_speaker_segments(
+            self.episode_dir, episode, self.config
+        )
+        segments = segment_document.get("segments", []) if segment_document else []
         if not segments:
-            raise ValueError("Speaker segments are required for speaker-cut longform")
-        diarized = self.load_json("diarized_transcript.json")
+            raise ValueError(
+                "Current source-clock speaker segments are required for longform render"
+            )
+        diarized = current_diarized_transcript(self.episode_dir, episode, self.config)
+        if not diarized:
+            raise ValueError(
+                "Current source-clock transcript is required for longform captions"
+            )
 
         audio = generate_audio_mix(self.episode_dir, episode, self.config)
         if not audio or not audio.exists():
@@ -120,15 +132,15 @@ class LongformRenderAgent(BaseAgent):
             self.logger.info("Canonical speaker-cut longform is already current")
             return self._result(current, caption_path, reused=True)
 
-        encoder_args = get_video_encoder_args(self.config)
+        encoding = get_video_encoding_policy(self.config, "longform")
+        encoder_args = get_video_encoder_args(self.config, "longform")
         lut_filter = get_lut_filter(self.config)
-        audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
-        estimate = estimate_output_bytes(timeline.duration)
-        require_output_space(self.episode_dir, estimate)
+        budget = render_space_budget(timeline.duration, encoding)
+        require_render_space(self.episode_dir, budget)
         output = self.episode_dir / "upload_video.mp4"
 
         with render_scratch_dir(
-            f"longform-{self.episode_dir.name}", round(estimate * 2.2)
+            f"longform-{self.episode_dir.name}", budget["scratch_bytes"]
         ) as scratch:
             segment_paths = self._render_segments(
                 source,
@@ -152,7 +164,7 @@ class LongformRenderAgent(BaseAgent):
                 audio,
                 output,
                 timeline,
-                audio_bitrate=audio_bitrate,
+                audio_bitrate=encoding["audio_bitrate"],
                 runner=self._run_ffmpeg,
             )
 
@@ -175,7 +187,8 @@ class LongformRenderAgent(BaseAgent):
             provenance={
                 "color_grade": (
                     "lut" if episode.get("delivery_apply_lut", False) else "source"
-                )
+                ),
+                "encoding": {**encoding, "encoder": encoder_args[1]},
             },
         )
         return self._result(record, caption_path, reused=False)

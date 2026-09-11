@@ -18,13 +18,19 @@ from agents.longform_render import render_longform
 from agents.pipeline import load_config
 from agents.podcast_feed import PodcastFeedAgent
 from agents.qa import quality_snapshot
+from agents.speaker_cut import current_speaker_segments
+from agents.transcribe import current_diarized_transcript
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import generate_audio_mix
 from lib.delivery_video import (
     build_keep_intervals,
     longform_render_fingerprint,
     render_config_for_episode,
+    render_space_budget,
+    render_space_status,
+    require_render_space,
 )
+from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import get_duration
 from lib.loudness import measure_loudness
 from lib.paths import get_episodes_dir
@@ -136,20 +142,50 @@ def _source_fingerprint(
 
 def _video_fingerprint(
     episode_dir: Path, episode: dict, config: dict, audio: Path
-) -> str:
-    try:
-        segments = json.loads((episode_dir / "segments.json").read_text()).get(
-            "segments", []
-        )
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        segments = []
+) -> str | None:
+    segment_document = current_speaker_segments(episode_dir, episode, config)
+    if not segment_document:
+        return None
     return longform_render_fingerprint(
         episode_dir,
         episode,
         config,
         audio,
-        segments,
+        segment_document.get("segments", []),
     )
+
+
+def _video_preflight(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    source_duration: float | None = None,
+) -> dict:
+    """Return the exact encoding and peak-storage decision used by rendering."""
+    source_duration = source_duration or _source_duration(episode_dir, episode)
+    if not source_duration:
+        raise ValueError("Source duration is unavailable")
+    duration = sum(
+        end - start
+        for start, end in build_keep_intervals(
+            float(source_duration), episode.get("longform_edits", [])
+        )
+    )
+    if duration <= 0:
+        raise ValueError("No retained source material remains after edits")
+    resolved = render_config_for_episode(episode, config)
+    encoding = get_video_encoding_policy(resolved, "longform")
+    budget = render_space_budget(duration, encoding)
+    storage = render_space_status(episode_dir, budget)
+    return {
+        "schema": "cascade.video-preflight/v1",
+        "safe": storage["safe"],
+        "profile": "longform",
+        "duration_seconds": round(duration, 3),
+        "encoding": encoding,
+        "budget": budget,
+        "storage": storage,
+    }
 
 
 def _refresh_status(episode_dir: Path) -> dict:
@@ -170,6 +206,16 @@ def _refresh_status(episode_dir: Path) -> dict:
             delivery_apply_lut=bool(episode.get("delivery_apply_lut", False)),
             delivery_burn_captions=bool(episode.get("delivery_burn_captions", False)),
         )
+        try:
+            status["video_preflight"] = _video_preflight(
+                episode_dir, episode, config, source_duration
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            status["video_preflight"] = {
+                "schema": "cascade.video-preflight/v1",
+                "safe": False,
+                "error": str(exc),
+            }
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, config = {}, {}
     if status.get("status") == "preparing":
@@ -231,6 +277,7 @@ def _refresh_status(episode_dir: Path) -> dict:
             )
             video_stale = (
                 not video_path.exists()
+                or not expected_fingerprint
                 or status.get("video_output_stat") != _file_stat(video_path)
                 or status.get("video_source_fingerprint") != expected_fingerprint
             )
@@ -570,28 +617,29 @@ async def prepare_delivery_video(
     episode = json.loads((episode_dir / "episode.json").read_text())
     if not episode.get("crop_config"):
         raise HTTPException(status_code=422, detail="Complete crop setup first")
-    try:
-        segments = json.loads((episode_dir / "segments.json").read_text()).get(
-            "segments", []
-        )
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        segments = []
-    if not segments:
-        raise HTTPException(
-            status_code=422,
-            detail="Run speaker analysis before preparing speaker-cut video",
-        )
-    if not (episode_dir / "diarized_transcript.json").exists():
-        raise HTTPException(
-            status_code=422,
-            detail="Run transcription before preparing video subtitles",
-        )
     episode["delivery_apply_lut"] = request.apply_lut
     episode["delivery_burn_captions"] = request.burn_captions
     try:
-        render_config_for_episode(episode, load_config())
+        config = render_config_for_episode(episode, load_config())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not current_speaker_segments(episode_dir, episode, config):
+        raise HTTPException(
+            status_code=422,
+            detail="Run current speaker analysis before preparing speaker-cut video",
+        )
+    if not current_diarized_transcript(episode_dir, episode, config):
+        raise HTTPException(
+            status_code=422,
+            detail="Run current transcription before preparing video subtitles",
+        )
+    try:
+        preflight = _video_preflight(episode_dir, episode, config)
+        require_render_space(episode_dir, preflight["budget"])
+    except (OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     with _running_lock:
         if episode_id in _running:
             raise HTTPException(
@@ -612,6 +660,7 @@ async def prepare_delivery_video(
         video_started_at=_now(),
         delivery_apply_lut=request.apply_lut,
         delivery_burn_captions=request.burn_captions,
+        video_preflight=preflight,
     )
     _write_status(episode_dir, status)
     threading.Thread(

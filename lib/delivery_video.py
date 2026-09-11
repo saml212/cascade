@@ -21,6 +21,7 @@ from pathlib import Path
 from lib.atomic_write import atomic_write_json
 from lib.encoding import (
     get_color_metadata_args,
+    get_video_encoding_policy,
     resolve_lut_path,
 )
 from lib.ffprobe import probe
@@ -31,7 +32,9 @@ from lib.timeline import (  # noqa: F401
 )
 
 RENDER_MANIFEST_NAME = "render_manifest.json"
-RENDER_PIPELINE_VERSION = "source-clock/v2"
+RENDER_PIPELINE_VERSION = "source-clock/v3"
+OUTPUT_RESERVE_BYTES = 1_000_000_000
+SCRATCH_RESERVE_BYTES = 10_000_000_000
 _manifest_lock = threading.Lock()
 _render_locks_guard = threading.Lock()
 _render_locks: dict[str, threading.Lock] = {}
@@ -507,7 +510,6 @@ _VIDEO_PROCESSING_KEYS = (
     "video_saturation",
     "video_sharpen",
     "video_sharpen_strength",
-    "videotoolbox_quality",
 )
 
 
@@ -537,12 +539,11 @@ def longform_render_fingerprint(
         "processing": {
             key: processing.get(key)
             for key in (
-                "audio_bitrate",
                 "longform_burn_captions",
-                "video_crf",
                 *_VIDEO_PROCESSING_KEYS,
             )
         },
+        "encoding": get_video_encoding_policy(config, "longform"),
     }
     return render_fingerprint(paths, state)
 
@@ -574,12 +575,11 @@ def short_render_fingerprint(
         "processing": {
             key: processing.get(key)
             for key in (
-                "shorts_audio_bitrate",
-                "shorts_crf",
                 "shorts_hold_wide_seconds",
                 *_VIDEO_PROCESSING_KEYS,
             )
         },
+        "encoding": get_video_encoding_policy(config, "shorts"),
     }
     paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
     state["lut_sha256"] = lut_digest
@@ -849,28 +849,120 @@ def current_short_render(
 @contextmanager
 def render_scratch_dir(label: str, estimated_bytes: int):
     """Use bounded internal scratch while preserving 10 GB of free space."""
-    root = Path.home() / "Library" / "Caches" / "cascade" / "renders"
-    root.mkdir(parents=True, exist_ok=True)
-    reserve = 10_000_000_000
-    free = shutil.disk_usage(root).free
-    if free < estimated_bytes + reserve:
-        raise RuntimeError(
-            f"Not enough render scratch space: need about {estimated_bytes / 1e9:.1f} "
-            f"GB plus 10 GB reserve; {free / 1e9:.1f} GB available"
-        )
+    root = render_scratch_root()
+    require_scratch_space(estimated_bytes)
     with tempfile.TemporaryDirectory(prefix=f"{label}-", dir=root) as directory:
         yield Path(directory)
 
 
-def require_output_space(path: Path, estimated_bytes: int) -> None:
-    """Fail before encoding if the destination cannot retain a 1 GB reserve."""
-    free = shutil.disk_usage(path).free
-    if free < estimated_bytes + 1_000_000_000:
+def render_scratch_root() -> Path:
+    """Return the internal cache root used for temporary render intermediates."""
+    root = Path.home() / "Library" / "Caches" / "cascade" / "renders"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def require_scratch_space(estimated_bytes: int) -> None:
+    """Fail before encoding unless scratch can retain a 10 GB reserve."""
+    root = render_scratch_root()
+    free = shutil.disk_usage(root).free
+    if free < estimated_bytes + SCRATCH_RESERVE_BYTES:
         raise RuntimeError(
-            f"Not enough output space: need about {estimated_bytes / 1e9:.1f} GB plus "
-            f"1 GB reserve; {free / 1e9:.1f} GB available"
+            f"Not enough render scratch space: need about {estimated_bytes / 1e9:.1f} "
+            f"GB plus 10 GB reserve; {free / 1e9:.1f} GB available"
         )
 
 
-def estimate_output_bytes(duration: float, video_mbps: float = 8.0) -> int:
-    return int(duration * ((video_mbps * 1_000_000) + 192_000) / 8 * 1.2)
+def render_space_budget(duration: float, encoding: dict) -> dict[str, int]:
+    """Return conservative peak bytes for the output and segmented scratch."""
+    if not isinstance(duration, (int, float)) or not 0 < duration < float("inf"):
+        raise ValueError("Render duration must be positive and finite")
+    video_bytes = duration * encoding["video_max_bitrate_bps"] / 8
+    audio_bytes = duration * encoding["audio_bitrate_bps"] / 8
+    container_margin = 1.05
+    return {
+        "output_bytes": round((video_bytes + audio_bytes) * container_margin),
+        # All encoded segments and their concatenated video coexist before mux.
+        "scratch_bytes": round(video_bytes * container_margin * 2),
+    }
+
+
+def render_space_status(output_dir: Path, budget: dict[str, int]) -> dict:
+    """Describe whether output and scratch files fit at their simultaneous peak."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scratch_dir = render_scratch_root()
+    output_free = shutil.disk_usage(output_dir).free
+    scratch_free = shutil.disk_usage(scratch_dir).free
+    output_required = budget["output_bytes"] + OUTPUT_RESERVE_BYTES
+    scratch_required = budget["scratch_bytes"] + SCRATCH_RESERVE_BYTES
+    same_filesystem = output_dir.stat().st_dev == scratch_dir.stat().st_dev
+    combined_required = (
+        budget["output_bytes"]
+        + budget["scratch_bytes"]
+        + max(OUTPUT_RESERVE_BYTES, SCRATCH_RESERVE_BYTES)
+        if same_filesystem
+        else None
+    )
+    output_safe = output_free >= output_required
+    scratch_safe = scratch_free >= scratch_required
+    combined_safe = (
+        output_free >= combined_required if combined_required is not None else None
+    )
+    safe = combined_safe if combined_safe is not None else output_safe and scratch_safe
+    failures = []
+    if same_filesystem and not combined_safe:
+        failures.append("combined_peak_exceeds_free_space")
+    elif not same_filesystem:
+        if not output_safe:
+            failures.append("output_peak_exceeds_free_space")
+        if not scratch_safe:
+            failures.append("scratch_peak_exceeds_free_space")
+    return {
+        "safe": bool(safe),
+        "same_filesystem": same_filesystem,
+        "budget": dict(budget),
+        "output": {
+            "path": str(output_dir),
+            "free_bytes": output_free,
+            "required_bytes": output_required,
+            "reserve_bytes": OUTPUT_RESERVE_BYTES,
+            "safe": output_safe,
+        },
+        "scratch": {
+            "path": str(scratch_dir),
+            "free_bytes": scratch_free,
+            "required_bytes": scratch_required,
+            "reserve_bytes": SCRATCH_RESERVE_BYTES,
+            "safe": scratch_safe,
+        },
+        "combined_required_bytes": combined_required,
+        "failures": failures,
+    }
+
+
+def require_render_space(output_dir: Path, budget: dict[str, int]) -> dict:
+    """Fail before a render when its full output and scratch peak cannot fit."""
+    status = render_space_status(output_dir, budget)
+    if status["safe"]:
+        return status
+    if status["same_filesystem"]:
+        required = status["combined_required_bytes"]
+        free = status["output"]["free_bytes"]
+        raise RuntimeError(
+            "Not enough render space on the shared output/scratch filesystem: "
+            f"need about {required / 1e9:.1f} GB including the 10 GB reserve; "
+            f"{free / 1e9:.1f} GB available"
+        )
+    failures = []
+    if not status["output"]["safe"]:
+        failures.append(
+            f"output needs {status['output']['required_bytes'] / 1e9:.1f} GB "
+            f"but has {status['output']['free_bytes'] / 1e9:.1f} GB"
+        )
+    if not status["scratch"]["safe"]:
+        failures.append(
+            f"scratch needs {status['scratch']['required_bytes'] / 1e9:.1f} GB "
+            f"but has {status['scratch']['free_bytes'] / 1e9:.1f} GB"
+        )
+    raise RuntimeError("Not enough render space: " + "; ".join(failures))
