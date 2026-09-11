@@ -78,8 +78,10 @@ export function Episode(target: HTMLElement, episodeId: string): void {
 
     header.replaceChildren(renderHeader(ep, episodeId));
     const section = sectionFromPath(currentPath(), episodeId);
-    // Live status updates must not discard draft fields or restart playback.
-    if (mountedSection === section && (section === 'metadata' || section === 'audio')) return;
+    // Detail polling may refresh the header, but remounting a section discards
+    // drafts and restarts media playback. Each interactive section refreshes
+    // its own canonical data after mutations.
+    if (mountedSection === section && section !== 'overview') return;
     mountedSection = section;
     disposeContent?.();
     disposeContent = effectScope(() => renderSection(content, ep, episodeId, section));

@@ -1,24 +1,53 @@
-import { h } from '../../lib/dom';
 import { Button } from '../../components/Button';
-import { navigate } from '../../lib/router';
+import { h } from '../../lib/dom';
+import {
+  api,
+  type ClipReviewState,
+  type EpisodeReviewState,
+  type UnknownRecord,
+} from '../../lib/api';
 import { formatDuration, pluralize } from '../../lib/format';
-import type { QualitySnapshot } from '../../lib/api';
+import { currentPath, navigate } from '../../lib/router';
 
 export function renderClips(
   target: HTMLElement,
-  ep: Record<string, unknown>,
+  _ep: Record<string, unknown>,
   episodeId: string
 ): void {
-  const quality = ep.quality as QualitySnapshot | null | undefined;
-  const renderedIds = new Set(quality?.artifacts.rendered_short_ids ?? []);
+  target.replaceChildren(
+    h('div', { class: 'panel p-12 text-center text-ink-tertiary' }, 'Loading review state…')
+  );
+  void api
+    .review(episodeId)
+    .then((review) => {
+      if (currentPath() === `/episodes/${episodeId}/clips`) {
+        renderClipState(target, episodeId, review);
+      }
+    })
+    .catch((error: Error) => {
+      if (currentPath() === `/episodes/${episodeId}/clips`) {
+        target.replaceChildren(
+          h(
+            'div',
+            { class: 'panel p-8 text-status-danger border-status-danger/30' },
+            `Could not load review state: ${error.message}`
+          )
+        );
+      }
+    });
+}
 
-  const clips = ((ep.clips as Array<Record<string, unknown>>) ?? []).slice();
-  // Sort by rank if available, else by start time, to mirror the review surface
-  clips.sort((a, b) => {
-    const ra = (a.rank as number) ?? 99;
-    const rb = (b.rank as number) ?? 99;
-    if (ra !== rb) return ra - rb;
-    return ((a.start_seconds as number) ?? 0) - ((b.start_seconds as number) ?? 0);
+function renderClipState(
+  target: HTMLElement,
+  episodeId: string,
+  review: EpisodeReviewState
+): void {
+  const clips = review.clips.slice().sort((left, right) => {
+    const leftRank = (left.rank as number) ?? 99;
+    const rightRank = (right.rank as number) ?? 99;
+    return leftRank !== rightRank
+      ? leftRank - rightRank
+      : Number(left.start_seconds ?? 0) - Number(right.start_seconds ?? 0);
   });
 
   if (clips.length === 0) {
@@ -28,44 +57,44 @@ export function renderClips(
         { class: 'panel p-16 text-center' },
         h(
           'div',
-          {
-            class:
-              'font-display text-display-md text-ink-secondary mb-3',
-          },
+          { class: 'font-display text-display-md text-ink-secondary mb-3' },
           'Clips haven’t been mined yet.'
         ),
         h(
           'p',
           { class: 'text-body text-ink-tertiary max-w-md mx-auto' },
-          'The clip miner runs after longform approval. Once it finishes, clips will appear here for review.'
+          'The clip miner runs after longform approval. Candidates appear here for selection and review.'
         )
       )
     );
     return;
   }
 
-  const approved = clips.filter(
-    (c) => c.status === 'approved' || c.status === 'published'
-  ).length;
-  const rejected = clips.filter((c) => c.status === 'rejected').length;
-  const pending = clips.length - approved - rejected;
+  const selected = clips.filter(
+    (clip) => clip.review.selection.status === 'selected'
+  );
+  const currentRenders = selected.filter((clip) => clip.review.render.current);
+  const finalApproved = selected.filter((clip) => clip.review.approval.current);
+  const renderNeeded = selected.filter((clip) => !clip.review.render.current);
+  const previousPlayable = selected.filter(
+    (clip) => clip.review.render.playable && !clip.review.render.current
+  );
 
   target.replaceChildren(
     h(
       'div',
       { class: 'flex flex-col gap-6' },
-      // Header card — counts + CTA
       h(
         'div',
         { class: 'panel p-6 flex items-center justify-between flex-wrap gap-4' },
         h(
           'div',
-          { class: 'flex items-center gap-8' },
-          statBlock('Total', String(clips.length), 'ink-primary'),
-          statBlock('Rendered', String(renderedIds.size), 'ink-primary'),
-          statBlock('Final approved', String(approved), 'status-success'),
-          statBlock('Pending', String(pending), pending > 0 ? 'status-warning' : 'ink-secondary'),
-          statBlock('Rejected', String(rejected), 'ink-secondary')
+          { class: 'flex items-center gap-8 flex-wrap' },
+          statBlock('Candidates', String(review.clip_summary.candidate_count), 'ink-primary'),
+          statBlock('Selected', String(review.clip_summary.selected_count), 'ink-primary'),
+          statBlock('Current renders', String(currentRenders.length), 'ink-primary'),
+          statBlock('Final approved', String(finalApproved.length), 'status-success'),
+          statBlock('Rejected', String(review.clip_summary.rejected_count), 'ink-secondary')
         ),
         Button({
           variant: 'primary',
@@ -74,7 +103,6 @@ export function renderClips(
           onClick: () => navigate(`/episodes/${episodeId}/clips/review`),
         })
       ),
-      // Thumbnail strip
       h(
         'div',
         { class: 'panel p-5' },
@@ -84,39 +112,38 @@ export function renderClips(
           h(
             'span',
             { class: 'text-heading-sm uppercase text-ink-tertiary' },
-            `${pluralize(clips.length, 'clip')} in order`
+            `${pluralize(clips.length, 'candidate')} in editorial order`
           ),
-          renderedIds.size > 0
-            ? h(
-                'span',
-                { class: 'text-body-sm text-ink-tertiary' },
-                'Hover a tile to preview. Click to open the review surface.'
-              )
-            : null
+          h(
+            'span',
+            { class: 'text-body-sm text-ink-tertiary' },
+            'Hover playable media. Open a card for full review.'
+          )
         ),
-        renderedIds.size < clips.length
+        renderNeeded.length > 0
           ? h(
               'div',
               {
                 class:
                   'mb-4 px-4 py-3 rounded-md bg-status-warning/10 border border-status-warning/30 text-body-sm text-ink-secondary',
+                role: 'status',
               },
-              `${clips.length - renderedIds.size} candidate video(s) still need local rendering. Publishing stays locked until every kept clip has been rendered and reviewed.`
+              `${renderNeeded.length} selected ${pluralize(renderNeeded.length, 'clip')} ${
+                renderNeeded.length === 1 ? 'needs' : 'need'
+              } a current render.`,
+              previousPlayable.length > 0
+                ? ` ${previousPlayable.length} previous ${pluralize(previousPlayable.length, 'file')} remain reviewable.`
+                : '',
+              ' Final approval stays locked until current files are reviewed.'
             )
           : null,
         h(
           'div',
           {
-            class:
-              'grid gap-3',
-            style: {
-              gridTemplateColumns:
-                'repeat(auto-fill, minmax(132px, 1fr))',
-            },
+            class: 'grid gap-3',
+            style: { gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))' },
           },
-          ...clips.map((c) =>
-            renderTile(c, episodeId, renderedIds.has(String(c.id ?? c.clip_id)))
-          )
+          ...clips.map((clip) => renderTile(clip, episodeId))
         )
       )
     )
@@ -127,11 +154,7 @@ function statBlock(label: string, value: string, tone: string): HTMLElement {
   return h(
     'div',
     null,
-    h(
-      'div',
-      { class: 'text-heading-sm uppercase text-ink-tertiary mb-1' },
-      label
-    ),
+    h('div', { class: 'text-heading-sm uppercase text-ink-tertiary mb-1' }, label),
     h(
       'div',
       {
@@ -143,38 +166,37 @@ function statBlock(label: string, value: string, tone: string): HTMLElement {
 }
 
 function renderTile(
-  clip: Record<string, unknown>,
-  episodeId: string,
-  rendered: boolean
+  clip: UnknownRecord & { review: ClipReviewState },
+  episodeId: string
 ): HTMLElement {
-  const id = (clip.id as string) ?? (clip.clip_id as string);
+  const id = String(clip.id ?? clip.clip_id);
   const title = (clip.title as string) || 'Untitled';
-  const duration = (clip.duration as number) ?? 0;
+  const start = Number(clip.start_seconds ?? 0);
+  const end = Number(clip.end_seconds ?? start);
+  const duration = Number(clip.duration ?? end - start);
   const rank = (clip.rank as number) ?? null;
   const score = (clip.virality_score as number) ?? null;
-  const status = (clip.status as string) ?? 'pending';
-
-  const statusTone =
-    status === 'approved' || status === 'published'
-      ? 'bg-status-success'
-      : status === 'rejected'
+  const manual = Boolean(clip.manual);
+  const state = clip.review;
+  const statusTone = state.approval.current
+    ? 'bg-status-success'
+    : state.selection.status === 'rejected'
       ? 'bg-status-danger'
-      : 'bg-status-warning';
+      : state.selection.status === 'selected'
+        ? 'bg-status-warning'
+        : 'bg-ink-tertiary';
 
-  // Only create a <video> element when the shorts MP4 actually exists on disk.
-  // Without this guard every tile fires a 404 request for the missing file.
-  let previewEl: HTMLElement;
+  let preview: HTMLElement;
   let hoverHandlers: Record<string, unknown> = {};
-  if (rendered) {
-    const url = `/media/episodes/${episodeId}/shorts/${id}.mp4`;
+  if (state.render.playable && state.render.url) {
     const video = h('video', {
-      src: url,
+      src: state.render.url,
       muted: true,
       playsinline: true,
       preload: 'metadata',
       class: 'w-full h-full object-cover',
     }) as HTMLVideoElement;
-    previewEl = video;
+    preview = video;
     hoverHandlers = {
       onmouseenter: () => video.play().catch(() => {}),
       onmouseleave: () => {
@@ -183,21 +205,20 @@ function renderTile(
       },
     };
   } else {
-    // Placeholder div — no network request, no 404
-    previewEl = h('div', {
-      class:
-        'w-full h-full bg-surface-inset flex items-center justify-center',
+    preview = h('div', {
+      class: 'w-full h-full bg-surface-inset flex items-center justify-center',
     });
   }
 
   return h(
     'button',
     {
+      type: 'button',
       onclick: () =>
         navigate(`/episodes/${episodeId}/clips/review/${encodeURIComponent(id)}`),
       ...hoverHandlers,
-      class:
-        'group text-left flex flex-col gap-1.5 focus:outline-none',
+      class: 'group text-left flex flex-col gap-1.5 focus:outline-none',
+      'aria-label': `Review ${title}`,
     },
     h(
       'div',
@@ -205,12 +226,10 @@ function renderTile(
         class:
           'relative aspect-[9/16] w-full rounded-md overflow-hidden bg-surface-inset border border-border-subtle group-hover:border-border-strong transition-colors',
       },
-      previewEl,
+      preview,
       h(
         'div',
-        {
-          class: 'absolute top-1.5 left-1.5 flex items-center gap-1.5',
-        },
+        { class: 'absolute top-1.5 left-1.5 flex items-center gap-1.5' },
         rank != null
           ? h(
               'span',
@@ -225,6 +244,16 @@ function renderTile(
           class: `w-2 h-2 rounded-full ${statusTone} shadow-[0_0_4px_rgba(0,0,0,0.4)]`,
         })
       ),
+      state.render.playable
+        ? h(
+            'span',
+            {
+              class:
+                'absolute top-1.5 right-1.5 text-code-sm text-white bg-black/70 rounded px-1.5 py-0.5',
+            },
+            state.render.current ? 'Current' : 'Previous'
+          )
+        : null,
       h(
         'div',
         {
@@ -242,13 +271,19 @@ function renderTile(
         { class: 'text-body-sm text-ink-primary font-medium line-clamp-2' },
         title
       ),
-      score != null
+      score != null && !(manual && score === 0)
         ? h(
             'div',
             { class: 'text-code-sm text-ink-tertiary font-mono tabular mt-0.5' },
             `Candidate score ${score}/10`
           )
-        : null
+        : manual
+          ? h(
+              'div',
+              { class: 'text-code-sm text-ink-tertiary mt-0.5' },
+              'Manual selection · unscored'
+            )
+          : null
     )
   );
 }

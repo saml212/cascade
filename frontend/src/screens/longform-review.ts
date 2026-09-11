@@ -385,16 +385,15 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
 
   function renderBody(ep: UnknownRecord, reviewState: EpisodeReviewState): HTMLElement {
     const artifact = reviewState.longform.render;
-    const sourceFallback = !artifact.playable;
-    const videoUrl = artifact.url ?? reviewState.longform.source_preview_url;
 
     const video = h('video', {
-      src: videoUrl,
+      src: reviewState.longform.source_preview_url,
       poster: `/api/episodes/${episodeId}/crop-frame`,
       controls: true,
       preload: 'metadata',
       class: 'w-full bg-black',
       style: { maxHeight: '54vh', display: 'block' },
+      'aria-label': 'Source-clock editing video',
     }) as HTMLVideoElement;
     videoRef.el = video;
 
@@ -439,6 +438,56 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       }
     });
 
+    const renderedReview =
+      artifact.playable && artifact.url
+        ? h(
+            'details',
+            { class: 'panel mt-4 overflow-hidden' },
+            h(
+              'summary',
+              {
+                class:
+                  'cursor-pointer px-3 py-2 text-body-sm text-ink-secondary hover:text-ink-primary',
+              },
+              artifact.current
+                ? 'Review current rendered output'
+                : 'Review previous rendered output'
+            ),
+            h(
+              'div',
+              { class: 'border-t border-border-subtle' },
+              h('video', {
+                src: artifact.url,
+                controls: true,
+                preload: 'metadata',
+                class: 'w-full bg-black block',
+                style: { maxHeight: '42vh' },
+                'aria-label': 'Edited-clock rendered video',
+              }),
+              h(
+                'div',
+                { class: 'px-3 py-2 text-body-sm text-ink-tertiary' },
+                'Rendered output uses the edited clock. Set cuts only with the source player above.',
+                !artifact.current
+                  ? h('span', { class: 'block text-status-warning mt-1' }, artifact.detail)
+                  : null,
+                artifact.download_url
+                  ? h(
+                      'a',
+                      {
+                        href: artifact.download_url,
+                        download: artifact.path.split('/').pop() ?? 'longform.mp4',
+                        class:
+                          'inline-block mt-2 text-ink-secondary hover:text-ink-primary underline underline-offset-4',
+                      },
+                      'Download rendered output'
+                    )
+                  : null
+              )
+            )
+          )
+        : null;
+
     /* ── Left pane ─────────────────────────────────────────────────────── */
     const leftPane = h(
       'div',
@@ -462,49 +511,18 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         h(
           'div',
           {
-            class: `px-3 py-2 border-t border-border-subtle text-body-sm ${
-              artifact.current ? 'text-status-success' : 'text-status-warning'
-            }`,
+            class:
+              'px-3 py-2 border-t border-border-subtle text-body-sm text-ink-secondary',
           },
-          sourceFallback
-            ? 'Source preview · no longform render exists yet'
-            : artifact.current
-              ? 'Current speaker-cut render'
-              : 'Previous longform render · current speaker-cut version pending',
-          !sourceFallback && !artifact.current
-            ? h('span', { class: 'block text-ink-tertiary mt-0.5' }, artifact.detail)
-            : null,
-          h(
-            'div',
-            { class: 'flex gap-3 mt-1.5' },
-            !sourceFallback && artifact.download_url
-              ? h(
-                  'a',
-                  {
-                    href: artifact.download_url,
-                    download: artifact.path.split('/').pop() ?? 'longform.mp4',
-                    class: 'text-ink-secondary hover:text-ink-primary underline underline-offset-4',
-                  },
-                  'Download this render'
-                )
-              : null,
-            !sourceFallback
-              ? h(
-                  'a',
-                  {
-                    href: reviewState.longform.source_preview_url,
-                    target: '_blank',
-                    rel: 'noreferrer',
-                    class: 'text-ink-secondary hover:text-ink-primary underline underline-offset-4',
-                  },
-                  'Open source preview'
-                )
-              : null
+          'Source editing preview · source clock',
+          h('span', { class: 'block text-ink-tertiary mt-0.5' },
+            'Transcript rows, IN/OUT points, and saved cuts use this player’s timestamps.'
           )
         )
       ),
       timecodeEl,
-      timelineHost
+      timelineHost,
+      renderedReview
     );
 
     /* ── Pending-cut banner ─────────────────────────────────────────────── */
