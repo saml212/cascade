@@ -1,14 +1,18 @@
 """Tests for the transcribe agent — multichannel and mono fallback modes."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from agents.transcribe import (
     CAMERA_AUDIO_CACHE_VERSION,
     TranscribeAgent,
+    current_diarized_transcript,
     remap_transcript_timestamps,
+    repair_existing_transcript,
 )
 
 # -- Fixtures ----------------------------------------------------------------
@@ -277,7 +281,7 @@ class TestExecute:
         )
 
         def create_audio(cmd, **kwargs):
-            (tmp_episode_dir / "work" / "audio.m4a").write_bytes(b"aac")
+            Path(cmd[-1]).write_bytes(b"aac")
             return MagicMock(returncode=0)
 
         run.side_effect = create_audio
@@ -292,22 +296,27 @@ class TestExecute:
             cmd[cmd.index("-af") + 1]
             == "aresample=async=1000:min_hard_comp=0.001:first_pts=0"
         )
-        assert (
-            tmp_episode_dir / "work" / f"audio.m4a.{CAMERA_AUDIO_CACHE_VERSION}"
-        ).exists()
+        metadata = json.loads(
+            (tmp_episode_dir / "work" / "audio.m4a.fingerprint.json").read_text()
+        )
+        assert metadata["version"] == CAMERA_AUDIO_CACHE_VERSION
+        assert metadata["clock"] == "source"
 
+    @patch("agents.transcribe.subprocess.run")
     @patch("httpx.post")
     def test_mono_fallback(
-        self, mock_post, tmp_episode_dir, sample_config, monkeypatch
+        self, mock_post, run, tmp_episode_dir, sample_config, monkeypatch
     ):
         monkeypatch.setenv("DEEPGRAM_API_KEY", "test-key")
         (tmp_episode_dir / "source_merged.mp4").write_bytes(b"\x00" * 100)
-        (tmp_episode_dir / "work" / "audio.m4a").write_bytes(b"\x00" * 50)
-        (
-            tmp_episode_dir / "work" / f"audio.m4a.{CAMERA_AUDIO_CACHE_VERSION}"
-        ).write_text(CAMERA_AUDIO_CACHE_VERSION)
         with open(tmp_episode_dir / "episode.json", "w") as f:
             json.dump({"episode_id": "test", "duration_seconds": 60}, f)
+
+        def create_audio(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"audio")
+            return MagicMock(returncode=0)
+
+        run.side_effect = create_audio
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = MONO_RESPONSE
@@ -324,3 +333,266 @@ class TestExecute:
         )
         assert params["diarize"] == "true"
         assert "multichannel" not in params
+
+
+def _write_activity(ep_dir, channel_levels):
+    (ep_dir / "segments.json").write_text(
+        json.dumps(
+            {
+                "clock": "source",
+                "fingerprint": "segments-current",
+                "track_mapping": [
+                    {
+                        "speaker": f"speaker_{index}",
+                        "logical_track": track,
+                    }
+                    for index, track in enumerate((1, 3, 2))
+                ],
+            }
+        )
+    )
+    (ep_dir / "work" / "rms_meta.json").write_text(
+        json.dumps(
+            {
+                "clock": "source",
+                "fingerprint": "segments-current",
+                "frame_seconds": 0.1,
+            }
+        )
+    )
+    for index, level in enumerate(channel_levels):
+        np.save(ep_dir / "work" / f"speaker_{index}_rms_db.npy", np.full(30, level))
+
+
+def _multichannel_episode(ep_dir):
+    tracks = []
+    for track in (1, 3, 2):
+        source = ep_dir / "audio" / f"session_Tr{track}.WAV"
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(bytes([track]))
+        tracks.append(
+            {
+                "track_number": track,
+                "track_type": "input",
+                "dest_path": str(source),
+                "filename": source.name,
+            }
+        )
+    return {
+        "duration_seconds": 3.0,
+        "audio_sync": {
+            "video_duration": 3.0,
+            "offset_seconds": -0.2,
+            "tempo_factor": 1.0001,
+            "r_squared": 0.99,
+        },
+        "audio_tracks": tracks,
+        "crop_config": {
+            "speakers": [
+                {"label": "Host", "track": 1},
+                {"label": "Arnold", "track": 3},
+                {"label": "Guest", "track": 2},
+            ]
+        },
+    }
+
+
+class TestCanonicalRepair:
+    def test_deduplicates_bleed_by_source_activity_and_preserves_real_overlap(
+        self, tmp_episode_dir, sample_config
+    ):
+        episode = _multichannel_episode(tmp_episode_dir)
+        (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+        historic_map = [
+            {"index": 0, "label": "Speaker 0", "track": 1},
+            {"index": 1, "label": "Speaker 1", "track": 3},
+            {"index": 2, "label": "Speaker 2", "track": 2},
+        ]
+        (tmp_episode_dir / "diarized_transcript.json").write_text(
+            json.dumps({"speaker_map": historic_map, "utterances": []})
+        )
+        raw = {
+            "results": {
+                "utterances": [
+                    {
+                        "channel": 0,
+                        "start": 0.0,
+                        "end": 1.0,
+                        "transcript": "We row crew.",
+                        "confidence": 0.8,
+                        "words": [
+                            {"word": "we", "start": 0.0, "end": 0.2, "confidence": 0.9},
+                            {
+                                "word": "row",
+                                "start": 0.3,
+                                "end": 0.5,
+                                "confidence": 0.7,
+                            },
+                            {
+                                "word": "crew",
+                                "start": 0.6,
+                                "end": 1.0,
+                                "confidence": 0.9,
+                            },
+                        ],
+                    },
+                    {
+                        "channel": 1,
+                        "start": 0.01,
+                        "end": 1.01,
+                        "transcript": "We rode crew.",
+                        "confidence": 0.9,
+                        "words": [
+                            {
+                                "word": "we",
+                                "start": 0.01,
+                                "end": 0.21,
+                                "confidence": 0.95,
+                            },
+                            {
+                                "word": "rode",
+                                "start": 0.31,
+                                "end": 0.51,
+                                "confidence": 0.8,
+                            },
+                            {
+                                "word": "crew",
+                                "start": 0.61,
+                                "end": 1.01,
+                                "confidence": 0.95,
+                            },
+                        ],
+                    },
+                    {
+                        "channel": 2,
+                        "start": 0.35,
+                        "end": 0.55,
+                        "transcript": "Yes.",
+                        "confidence": 0.98,
+                        "words": [
+                            {
+                                "word": "yes",
+                                "start": 0.35,
+                                "end": 0.55,
+                                "confidence": 0.98,
+                            }
+                        ],
+                    },
+                ]
+            }
+        }
+        raw_text = json.dumps(raw, separators=(",", ":"))
+        (tmp_episode_dir / "transcript.json").write_text(raw_text)
+        _write_activity(tmp_episode_dir, (0.0, 20.0, 18.0))
+
+        result = repair_existing_transcript(tmp_episode_dir, sample_config)
+        repaired = json.loads(
+            (tmp_episode_dir / "diarized_transcript.json").read_text()
+        )
+        words = [
+            word for utterance in repaired["utterances"] for word in utterance["words"]
+        ]
+
+        assert [word["word"] for word in words] == ["we", "rode", "yes", "crew"]
+        assert [word["speaker"] for word in words] == [1, 1, 2, 1]
+        assert repaired["canonicalization"]["removed_duplicate_words"] == 3
+        assert repaired["canonicalization"]["ambiguous_variant_events"] == 0
+        assert words[1]["suspect"] is True
+        assert words[1]["suspect_reasons"] == ["channel_variant"]
+        assert words[1]["alternatives"][0]["word"] == "row"
+        assert words[0]["id"] == "word_000000"
+        assert repaired["speaker_map"][1]["label"] == "Arnold"
+        assert repaired["speaker_map"][1]["logical_track"] == 3
+        assert result["word_count"] == 4
+        assert (tmp_episode_dir / "transcript.json").read_text() == raw_text
+        assert "Yes." in (tmp_episode_dir / "subtitles" / "transcript.srt").read_text()
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == repaired
+        )
+
+        episode["audio_sync"]["offset_seconds"] = 0.5
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config) is None
+        )
+
+    @patch("agents.transcribe.httpx.post")
+    @patch("agents.transcribe.subprocess.run")
+    def test_repaired_response_is_reused_without_audio_or_network(
+        self, run, post, tmp_episode_dir, sample_config
+    ):
+        (tmp_episode_dir / "source_merged.mp4").write_bytes(b"source")
+        (tmp_episode_dir / "episode.json").write_text(
+            json.dumps({"duration_seconds": 2.0})
+        )
+        (tmp_episode_dir / "transcript.json").write_text(json.dumps(MONO_RESPONSE))
+        repair_existing_transcript(tmp_episode_dir, sample_config)
+
+        result = TranscribeAgent(tmp_episode_dir, sample_config).execute()
+
+        assert result["reused_raw"] is True
+        run.assert_not_called()
+        post.assert_not_called()
+
+
+class TestMultichannelPreparation:
+    @patch("agents.transcribe.subprocess.run")
+    def test_concatenates_repeated_logical_track_before_sync(
+        self, run, tmp_episode_dir, sample_config
+    ):
+        episode = _multichannel_episode(tmp_episode_dir)
+        first = Path(episode["audio_tracks"][0]["dest_path"])
+        second = first.with_name("later_Tr1.WAV")
+        second.write_bytes(b"later")
+        episode["audio_tracks"].insert(
+            1,
+            {
+                "track_number": 1,
+                "track_type": "input",
+                "dest_path": str(second),
+                "filename": second.name,
+            },
+        )
+        (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+
+        def create_audio(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"flac")
+            return MagicMock(returncode=0, stderr="")
+
+        run.side_effect = create_audio
+        agent = TranscribeAgent(tmp_episode_dir, sample_config)
+        output, channel_map = agent._prepare_multichannel_audio(episode)
+
+        assert output.is_file()
+        assert channel_map[0]["source_files"] == [first.name, second.name]
+        command = run.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        assert "[c0_0][c0_1]concat=n=2:v=0:a=1[joined0]" in graph
+        assert graph.index("concat=n=2") < graph.index("[joined0]asetpts")
+        assert "adelay=200" in graph
+        assert "atempo=1.00010000" in graph
+
+    def test_historic_asr_channel_order_wins_over_crop_reordering(
+        self, tmp_episode_dir, sample_config
+    ):
+        episode = _multichannel_episode(tmp_episode_dir)
+        episode["crop_config"]["speakers"].reverse()
+        (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+        (tmp_episode_dir / "diarized_transcript.json").write_text(
+            json.dumps(
+                {
+                    "speaker_map": [
+                        {"index": 0, "track": 1},
+                        {"index": 1, "track": 3},
+                        {"index": 2, "track": 2},
+                    ]
+                }
+            )
+        )
+
+        channel_map = TranscribeAgent(
+            tmp_episode_dir, sample_config
+        )._resolve_channel_map(episode)
+
+        assert [entry["logical_track"] for entry in channel_map] == [1, 3, 2]
+        assert [entry["label"] for entry in channel_map] == ["Host", "Arnold", "Guest"]
