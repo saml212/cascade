@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from agents.qa import editorial_revision, quality_snapshot
 from lib.atomic_write import atomic_write_json
+from lib.audio_mix import selected_audio_source
 from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,12 @@ def _current_longform_for_approval(episode_dir: Path, episode: dict) -> dict | N
         segment_document = current_speaker_segments(episode_dir, episode, config)
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         return None
-    audio = episode_dir / "work" / "audio_mix.wav"
+    try:
+        audio = selected_audio_source(episode_dir, episode, config) or (
+            episode_dir / "work" / "audio_mix.wav"
+        )
+    except ValueError:
+        return None
     if not segment_document or not audio.is_file():
         return None
     try:

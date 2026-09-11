@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 
@@ -22,10 +23,36 @@ logger = logging.getLogger("cascade")
 # end an AAC stream before its matching video segment; ordinary decode collapses
 # those gaps and shifts every later utterance earlier on the video timeline.
 CAMERA_AUDIO_TIMELINE_FILTER = "aresample=async=1000:min_hard_comp=0.001:first_pts=0"
+AUDIO_SELECTION_SCHEMA = "cascade.audio-selection/v1"
+AUDIO_SELECTION_PATH = Path("work/audio_selection.json")
+SELECTED_REPAIR_AUDIO_PATH = Path("work/audio_repair_selected.wav")
 
 # Serialize audio mix generation across threads — both render agents call
 # generate_audio_mix() and would otherwise race on the same output files.
 _audio_mix_lock = threading.Lock()
+
+
+def audio_selection_settings(episode_data: dict) -> dict:
+    """Return only episode fields that can change the selected audio mix."""
+    crop = episode_data.get("crop_config") or {}
+    return {
+        "audio_sync": episode_data.get("audio_sync") or {},
+        "audio_mix": episode_data.get("audio_mix") or {},
+        "speaker_tracks": [
+            {
+                "track": speaker.get("track"),
+                "volume": speaker.get("volume", 1.0),
+            }
+            for speaker in crop.get("speakers", [])
+        ],
+        "ambient_tracks": crop.get("ambient_tracks", []),
+    }
+
+
+def audio_processing_settings(config: dict | None) -> dict:
+    """Return processing settings that can change mastered audio bytes."""
+    processing = (config or {}).get("processing", {})
+    return {key: value for key, value in processing.items() if key.startswith("audio_")}
 
 
 def _mix_fingerprint(
@@ -43,14 +70,10 @@ def _mix_fingerprint(
             }
         )
     payload = {
-        "audio_sync": episode_data.get("audio_sync", {}),
-        "audio_mix": episode_data.get("audio_mix", {}),
-        "crop_config": episode_data.get("crop_config", {}),
-        "config": config or {},
+        "selection": audio_selection_settings(episode_data),
+        "processing": audio_processing_settings(config),
         "sources": sources,
-        # Version the render semantics so a code fix cannot reuse a WAV made
-        # by an older filter graph. Version 3 preserves embedded-audio PTS gaps.
-        "version": 3,
+        "version": 4,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -77,10 +100,129 @@ def _publish_mix(temp_path: Path, output_path: Path, fingerprint: str) -> None:
     os.replace(temp_fingerprint, fingerprint_path)
 
 
+def current_audio_selection(
+    episode_dir: str | Path,
+    episode_data: dict | None = None,
+    config: dict | None = None,
+) -> dict | None:
+    """Return a current fixed-path repair selection, or raise when it is stale."""
+    episode_dir = Path(episode_dir)
+    record_path = episode_dir / AUDIO_SELECTION_PATH
+    if not record_path.is_file():
+        return None
+    try:
+        record = json.loads(record_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Selected audio record is unreadable") from exc
+    if not isinstance(record, dict) or record.get("schema") != AUDIO_SELECTION_SCHEMA:
+        raise ValueError("Selected audio record is invalid")
+
+    selected = (episode_dir / SELECTED_REPAIR_AUDIO_PATH).resolve()
+    output = record.get("selected_output") or {}
+    try:
+        recorded_path = Path(output["path"]).resolve()
+        fingerprint = output["fingerprint"]
+        stat = selected.stat()
+    except (KeyError, TypeError, OSError) as exc:
+        raise ValueError("Selected repair audio is unavailable") from exc
+    if recorded_path != selected:
+        raise ValueError("Selected audio record points outside its canonical path")
+    if (
+        not fingerprint.get("id")
+        or fingerprint.get("size_bytes") != stat.st_size
+        or fingerprint.get("mtime_ns") != stat.st_mtime_ns
+    ):
+        raise ValueError("Selected repair audio has changed since review")
+
+    source = episode_dir / "source_merged.mp4"
+    recorded_source = record.get("source") or {}
+    try:
+        source_stat = source.stat()
+    except OSError as exc:
+        raise ValueError("Selected repair source media is unavailable") from exc
+    source_fingerprint = recorded_source.get("fingerprint") or {}
+    if (
+        Path(recorded_source.get("path", "")).resolve() != source.resolve()
+        or source_fingerprint.get("size_bytes") != source_stat.st_size
+        or source_fingerprint.get("mtime_ns") != source_stat.st_mtime_ns
+    ):
+        raise ValueError("Selected repair audio is stale for the source media")
+
+    if episode_data is not None and record.get("audio_selection_settings") != (
+        audio_selection_settings(episode_data)
+    ):
+        raise ValueError("Selected repair audio is stale for the audio mix settings")
+    if config is not None and record.get("audio_processing_settings") != (
+        audio_processing_settings(config)
+    ):
+        raise ValueError("Selected repair audio is stale for audio processing settings")
+    return record
+
+
+def selected_audio_source(
+    episode_dir: str | Path,
+    episode_data: dict | None = None,
+    config: dict | None = None,
+) -> Path | None:
+    """Resolve the reviewed repair selection used by renderers, when active."""
+    record = current_audio_selection(episode_dir, episode_data, config)
+    if record is None:
+        return None
+    return Path(record["selected_output"]["path"])
+
+
+def publish_audio_selection(
+    episode_dir: str | Path, staged_audio: str | Path, record: dict
+) -> dict:
+    """Atomically make a validated staged repair the renderer audio source."""
+    episode_dir = Path(episode_dir)
+    work_dir = episode_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    selected = (episode_dir / SELECTED_REPAIR_AUDIO_PATH).resolve()
+    record_path = episode_dir / AUDIO_SELECTION_PATH
+    staged_audio = Path(staged_audio).resolve()
+    if staged_audio.parent != work_dir.resolve() or staged_audio == selected:
+        raise ValueError("Selected audio must be staged in the episode work directory")
+    if (
+        record.get("schema") != AUDIO_SELECTION_SCHEMA
+        or Path(record.get("selected_output", {}).get("path", "")).resolve() != selected
+    ):
+        raise ValueError("Selected audio record is invalid")
+
+    fd, staged_record_name = tempfile.mkstemp(
+        prefix=".audio-selection-", suffix=".json", dir=work_dir
+    )
+    staged_record = Path(staged_record_name)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(record, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with _audio_mix_lock:
+            os.replace(staged_audio, selected)
+            os.replace(staged_record, record_path)
+    finally:
+        staged_audio.unlink(missing_ok=True)
+        staged_record.unlink(missing_ok=True)
+    return record
+
+
+def clear_audio_selection(episode_dir: str | Path) -> bool:
+    """Remove a repair selection while preserving the generated base master."""
+    episode_dir = Path(episode_dir)
+    record_path = episode_dir / AUDIO_SELECTION_PATH
+    selected = episode_dir / SELECTED_REPAIR_AUDIO_PATH
+    with _audio_mix_lock:
+        existed = record_path.exists() or selected.exists()
+        record_path.unlink(missing_ok=True)
+        selected.unlink(missing_ok=True)
+    return existed
+
+
 def generate_audio_mix(
     episode_dir: Path, episode_data: dict, config: dict | None = None
 ) -> Path | None:
-    """Generate work/audio_mix.wav, the canonical audio source for renders.
+    """Return selected repair audio or generate the base mix used by renders.
 
     Two modes:
     1. **H6E multi-track mode**: When `episode_data["audio_tracks"]` contains
@@ -107,6 +249,10 @@ def generate_audio_mix(
     # to skip regeneration entirely.
     _audio_mix_lock.acquire()
     try:
+        selected = selected_audio_source(episode_dir, episode_data, config)
+        if selected is not None:
+            logger.info("Using revision-bound selected repair audio")
+            return selected
         return _generate_audio_mix_locked(
             episode_dir, episode_data, config, work_dir, output_path
         )

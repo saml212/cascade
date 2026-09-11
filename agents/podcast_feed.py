@@ -26,6 +26,7 @@ from xml.dom import minidom
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from agents.base import BaseAgent
+from lib.audio_mix import selected_audio_source
 
 
 class PodcastFeedAgent(BaseAgent):
@@ -152,7 +153,10 @@ class PodcastFeedAgent(BaseAgent):
         """
         video_path = Path(video_path or self.episode_dir / "longform.mp4")
         audio_path = Path(audio_path or self.episode_dir / "podcast_audio.mp3")
-        mix_path = self.episode_dir / "work" / "audio_mix.wav"
+        episode = self.load_json_safe("episode.json")
+        mix_path = selected_audio_source(self.episode_dir, episode, self.config) or (
+            self.episode_dir / "work" / "audio_mix.wav"
+        )
         source_path = mix_path if mix_path.exists() else video_path
 
         if not source_path.exists():
@@ -160,7 +164,6 @@ class PodcastFeedAgent(BaseAgent):
                 "No podcast audio source found in %s" % self.episode_dir
             )
 
-        episode = self.load_json_safe("episode.json")
         edits = episode.get("longform_edits", [])
         source_stat = source_path.stat()
         fingerprint = hashlib.sha256(

@@ -103,6 +103,17 @@ export interface QualityFinding extends UnknownRecord {
   };
 }
 
+export interface AudioRepairCandidate extends UnknownRecord {
+  status?: string;
+  current: boolean;
+  fingerprint?: string;
+  verification_status?: string;
+  repaired_finding_count: number;
+  unresolved_finding_count: number;
+  perceptual_review?: { status?: string; claim?: string };
+  audio_url: string;
+}
+
 export interface QualitySnapshot extends UnknownRecord {
   episode_id: string;
   quality: {
@@ -139,6 +150,13 @@ export interface QualitySnapshot extends UnknownRecord {
     analysis: UnknownRecord;
     finding_count: number;
     findings: QualityFinding[];
+    repair_candidate?: AudioRepairCandidate | null;
+    repair_selection?: {
+      status?: string;
+      fingerprint?: string;
+      release_safe?: boolean;
+      detail?: string;
+    } | null;
   };
 }
 
@@ -330,6 +348,16 @@ export const api = {
     request<EpisodeReviewState>('GET', `/api/episodes/${id}/review`),
   runQuality: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/run-agent/qa`, {}),
+  selectAudioRepairCandidate: (id: string) =>
+    request<UnknownRecord>(
+      'POST',
+      `/api/episodes/${id}/audio-qc/repair-candidate/select`
+    ),
+  clearAudioRepairSelection: (id: string) =>
+    request<UnknownRecord>(
+      'DELETE',
+      `/api/episodes/${id}/audio-qc/repair-selection`
+    ),
 
   /* Pipeline */
   pipelineStatus: (id: string) =>

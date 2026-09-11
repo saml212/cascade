@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,13 +11,19 @@ import numpy as np
 import pytest
 
 from lib.audio_qa import (
+    PREVIEW_ALGORITHM_VERSION,
     WindowStats,
+    _apply_repair_resolutions,
     _mix_provenance,
+    _selected_repair_output_proof,
     analyze_windows,
     decode_audio_windows,
+    media_fingerprint,
     release_gate,
     render_finding_preview,
+    transcript_analysis_fingerprint,
 )
+from lib.audio_repair import build_audio_repair_plan
 from lib.ffprobe import probe as ffprobe
 from lib.timeline import Timeline
 
@@ -116,6 +123,15 @@ def test_expected_speaker_dropout_is_blocking_and_maps_to_edited_clock():
         ],
     }
     assert finding["evidence"]["expected_transcript_speakers"] == ["guest"]
+    assert finding["evidence"]["expected_speech_ranges"] == [
+        {
+            "start_seconds": 5.0,
+            "end_seconds": 6.5,
+            "duration_seconds": 1.5,
+        }
+    ]
+    assert finding["evidence"]["surviving_speech_ranges"] == []
+    assert finding["evidence"]["temporal_overlap_seconds"] == 0
     assert finding["preview"]["source"].startswith(
         "/api/episodes/ep_test/audio-qc/findings/"
     )
@@ -174,6 +190,44 @@ def test_intentional_two_channel_silence_is_not_a_dropout():
     assert analysis["suppressed_candidate_count"] == 0
 
 
+def test_channel_relationship_reports_mixed_distinct_and_duplicated_ranges():
+    stats = _stats(duration=15, default_db=-20)
+    delta = np.full(len(stats.rms_dbfs), 0.1)
+    delta[round(5 / FRAME_SECONDS) : round(10 / FRAME_SECONDS)] = 0
+    stats = WindowStats(
+        stats.frame_seconds,
+        stats.rms_dbfs,
+        stats.peak,
+        stats.zero_fraction,
+        delta,
+    )
+
+    _, analysis, _ = analyze_windows(stats)
+
+    relationship = analysis["channel_relationship"]
+    assert relationship["status"] == "mixed"
+    assert relationship["ranges"] == [
+        {
+            "status": "distinct_samples",
+            "start_seconds": 0.0,
+            "end_seconds": 5.0,
+            "duration_seconds": 5.0,
+        },
+        {
+            "status": "duplicated_samples",
+            "start_seconds": 5.0,
+            "end_seconds": 10.0,
+            "duration_seconds": 5.0,
+        },
+        {
+            "status": "distinct_samples",
+            "start_seconds": 10.0,
+            "end_seconds": 15.0,
+            "duration_seconds": 5.0,
+        },
+    ]
+
+
 def test_sharp_nonzero_level_collapse_is_detected_from_context():
     stats = _stats()
     _set_level(stats, 0, 1, 9, -20)
@@ -229,9 +283,7 @@ def test_release_gate_only_passes_with_current_successful_output_proof():
             "selected_mix_provenance": {
                 "uses_checked_source_audio": True,
                 "fingerprint": "sha256:selected-mix",
-                "selected_output": {
-                    "fingerprint": {"id": "sha256:current-output"}
-                },
+                "selected_output": {"fingerprint": {"id": "sha256:current-output"}},
             },
             "outputs_checked": [
                 {
@@ -302,6 +354,57 @@ def test_release_gate_does_not_trust_bare_resolution_statuses():
     assert release_gate(report)["status"] == "output_unverified"
 
 
+def test_selected_repair_proof_requires_current_finding_fingerprints():
+    selection = {
+        "fingerprint": "sha256:selection",
+        "candidate_manifest_fingerprint": "sha256:candidate",
+        "selected_output": {"fingerprint": {"id": "sha256:selected-output"}},
+        "repaired_findings": [{"id": "dropout", "fingerprint": "dropout-v1"}],
+        "verification": {
+            "status": "pass",
+            "checks": [{"name": "selected_copy", "pass": True}],
+        },
+    }
+    finding = {
+        "id": "dropout",
+        "fingerprint": "dropout-v1",
+        "severity": "error",
+        "edited_time": {"status": "retained"},
+        "resolution": {"status": "unresolved"},
+    }
+    report = {
+        "fingerprint": "sha256:report-v2",
+        "analysis": {"status": "complete"},
+        "scope": {
+            "selected_mix_provenance": {
+                "uses_checked_source_audio": True,
+                "fingerprint": "sha256:selected-mix",
+                "selected_output": selection["selected_output"],
+            },
+            "outputs_checked": [],
+        },
+        "findings": [finding],
+    }
+    _apply_repair_resolutions(report["findings"], selection)
+    report["scope"]["outputs_checked"] = [
+        _selected_repair_output_proof(report, selection)
+    ]
+
+    assert release_gate(report)["status"] == "pass"
+
+    changed = {**finding, "fingerprint": "dropout-v2", "resolution": {}}
+    stale_report = {**report, "findings": [changed]}
+    _apply_repair_resolutions(stale_report["findings"], selection)
+    stale_report["scope"] = {
+        **report["scope"],
+        "outputs_checked": [_selected_repair_output_proof(stale_report, selection)],
+    }
+
+    gate = release_gate(stale_report)
+    assert gate["status"] == "blocked"
+    assert gate["blocking_finding_ids"] == ["dropout"]
+
+
 def test_release_gate_never_claims_unchecked_or_unused_audio_is_safe():
     unchecked = release_gate(
         {
@@ -344,6 +447,44 @@ def test_mix_provenance_uses_selected_tracks_instead_of_inventory():
     assert unselected["uses_checked_source_audio"] is True
     assert selected["kind"] == "external_recorder"
     assert selected["uses_checked_source_audio"] is False
+
+
+def test_transcript_audio_fingerprint_ignores_copy_but_binds_timing_and_speaker(
+    tmp_path,
+):
+    path = tmp_path / "transcript.json"
+    transcript = {
+        "utterances": [
+            {
+                "speaker": 0,
+                "words": [
+                    {
+                        "word": "hello",
+                        "punctuated_word": "Hello,",
+                        "start": 1.0,
+                        "end": 1.4,
+                        "confidence": 0.99,
+                    }
+                ],
+            }
+        ]
+    }
+    path.write_text(json.dumps(transcript))
+    original = transcript_analysis_fingerprint(path, transcript, 0.55)
+
+    transcript["utterances"][0]["words"][0].update(
+        word="welcome", punctuated_word="Welcome!"
+    )
+    path.write_text(json.dumps(transcript))
+    copy_edit = transcript_analysis_fingerprint(path, transcript, 0.55)
+    transcript["utterances"][0]["words"][0]["speaker"] = 1
+    speaker_edit = transcript_analysis_fingerprint(path, transcript, 0.55)
+
+    assert copy_edit["id"] == original["id"]
+    assert (
+        copy_edit["content_fingerprint"]["id"] != original["content_fingerprint"]["id"]
+    )
+    assert speaker_edit["id"] != original["id"]
 
 
 @pytest.mark.skipif(not HAS_FFMPEG_FULL, reason="ffmpeg-full is not installed")
@@ -459,3 +600,94 @@ def test_grounded_preview_uses_only_surviving_source_channel(tmp_path):
     for start, end in ((0.1, 0.4), (1.6, 1.9)):
         section = slice(round(start * 8000), round(end * 8000))
         np.testing.assert_allclose(fallback[section], original[section], atol=2e-6)
+
+
+@pytest.mark.skipif(not HAS_FFMPEG_FULL, reason="ffmpeg-full is not installed")
+def test_repair_plan_is_explicit_bounded_and_checks_held_out_context(tmp_path):
+    source = tmp_path / "source.wav"
+    decoder = FFMPEG_FULL if FFMPEG_FULL.is_file() else "ffmpeg-full"
+    subprocess.run(
+        [
+            str(decoder),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            (
+                "aevalsrc='if(between(t,2,3),0,0.08*sin(2*PI*220*t))|"
+                "if(between(t,14,15),0,0.02*sin(2*PI*330*t))':s=8000:d=20"
+            ),
+            "-c:a",
+            "pcm_f32le",
+            str(source),
+        ],
+        check=True,
+    )
+    fingerprint = media_fingerprint(source)
+    finding = {
+        "id": "aq_repair",
+        "classification": "probable_dropout",
+        "kind": "digital_zero",
+        "severity": "error",
+        "confidence": 0.99,
+        "channel": 0,
+        "source_time": {
+            "start_seconds": 2,
+            "end_seconds": 3,
+            "duration_seconds": 1,
+        },
+        "edited_time": {"status": "retained", "ranges": []},
+        "evidence": {
+            "zero_sample_fraction": 1,
+            "expected_speech_seconds": 0.9,
+            "surviving_speech_seconds": 0,
+            "context_continuity": True,
+            "estimated_recovery_gain_db": 6,
+        },
+        "recovery": {"grounded": True, "synthetic_audio": False},
+        "preview": {"padding_seconds": 0.5},
+    }
+    control = {
+        "id": "aq_control",
+        "kind": "digital_zero",
+        "channel": 1,
+        "source_time": {
+            "start_seconds": 14,
+            "end_seconds": 15,
+            "duration_seconds": 1,
+        },
+        "edited_time": {"status": "retained", "ranges": []},
+        "evidence": {"estimated_recovery_gain_db": 0},
+        "preview": {"padding_seconds": 0.5},
+        "suppression_reason": "transcript_supports_surviving_channel",
+    }
+    report = {
+        "fingerprint": "sha256:report",
+        "source": {"path": str(source), "fingerprint": fingerprint},
+        "scope": {"selected_mix_provenance": {"fingerprint": "sha256:selected-mix"}},
+        "findings": [finding],
+        "analysis": {"suppressed_candidates": [control]},
+    }
+
+    with pytest.raises(ValueError, match="At least one"):
+        build_audio_repair_plan(report, [], tmp_path / "empty", ffmpeg_bin=decoder)
+
+    plan = build_audio_repair_plan(
+        report,
+        ["aq_repair"],
+        tmp_path / "plan",
+        ffmpeg_bin=decoder,
+        held_out_count=1,
+    )
+
+    assert plan["status"] == "preview_ready"
+    assert plan["policy"]["preview_algorithm_version"] == PREVIEW_ALGORITHM_VERSION
+    assert [entry["finding_ids"] for entry in plan["repairs"]] == [["aq_repair"]]
+    assert [entry["finding_ids"] for entry in plan["held_out_controls"]] == [
+        ["aq_control"]
+    ]
+    assert all(check["pass"] for check in plan["checks"])
+    assert (tmp_path / "plan" / "audio-repair-plan.json").is_file()

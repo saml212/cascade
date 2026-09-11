@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agents.base import BaseAgent
-from lib.audio_qa import analyze_episode_audio, release_gate as audio_release_gate
+from lib.audio_mix import current_audio_selection, selected_audio_source
+from lib.audio_qa import TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD, analyze_episode_audio
+from lib.audio_qa import release_gate as audio_release_gate
 from lib.delivery_video import (
     current_episode_longform_render,
     current_short_render,
@@ -145,9 +147,16 @@ def editorial_revision(episode_dir: str | Path, episode: dict | None = None) -> 
     episode = (
         episode if episode is not None else _load_json(episode_dir / "episode.json")
     )
+    try:
+        selected_audio = selected_audio_source(episode_dir, episode)
+        audio_signature: object = _file_signature(
+            selected_audio or episode_dir / "work" / "audio_mix.wav"
+        )
+    except ValueError as exc:
+        audio_signature = {"status": "invalid_selection", "reason": str(exc)}
     payload = {
         "source": _file_signature(episode_dir / "source_merged.mp4"),
-        "audio_master": _file_signature(episode_dir / "work" / "audio_mix.wav"),
+        "audio_master": audio_signature,
         "release_video": _file_signature(episode_dir / "upload_video.mp4"),
         "render_manifest": read_render_manifest(episode_dir).get("longform"),
         "audio_sync": episode.get("audio_sync"),
@@ -263,7 +272,9 @@ def _render_status(
         from agents.pipeline import load_config
 
         config = load_config()
-        audio = episode_dir / "work" / "audio_mix.wav"
+        audio = selected_audio_source(episode_dir, episode, config) or (
+            episode_dir / "work" / "audio_mix.wav"
+        )
         segments = _load_json(episode_dir / "segments.json", {}).get("segments", [])
         longform = current_episode_longform_render(episode_dir, episode, config, audio)
         shorts = {}
@@ -482,6 +493,25 @@ def quality_snapshot(episode_dir: str | Path, *, include_findings: bool = True) 
     audio_quality = report.get("audio_quality") or _load_json(
         episode_dir / AUDIO_REPORT_PATH
     )
+    repair_candidate = _load_json(
+        episode_dir / "qa" / "audio-repair" / "audio-repair-candidate.json"
+    )
+    repair_plan = _load_json(
+        episode_dir / "qa" / "audio-repair" / "audio-repair-plan.json"
+    )
+    repair_candidate_current = bool(
+        repair_candidate
+        and repair_candidate.get("source_report_fingerprint")
+        == audio_quality.get("fingerprint")
+        and repair_candidate.get("repair_plan_fingerprint")
+        == repair_plan.get("fingerprint")
+        and audio_quality.get("transcript", {}).get("fingerprint", {}).get("method")
+        == TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD
+    )
+    try:
+        audio_selection = current_audio_selection(episode_dir, episode)
+    except ValueError as exc:
+        audio_selection = {"status": "stale", "detail": str(exc)}
     findings = (
         audio_quality.get("findings", []) if isinstance(audio_quality, dict) else []
     )
@@ -560,6 +590,43 @@ def quality_snapshot(episode_dir: str | Path, *, include_findings: bool = True) 
             "analysis": analysis,
             "finding_count": len(findings),
             "findings": findings if include_findings else [],
+            "repair_candidate": (
+                {
+                    "status": repair_candidate.get("status"),
+                    "current": repair_candidate_current,
+                    "fingerprint": repair_candidate.get("fingerprint"),
+                    "verification_status": repair_candidate.get("verification", {}).get(
+                        "status"
+                    ),
+                    "repaired_finding_count": len(
+                        repair_candidate.get("repaired_finding_ids", [])
+                    ),
+                    "unresolved_finding_count": len(
+                        repair_candidate.get("unresolved_finding_ids", [])
+                    ),
+                    "perceptual_review": repair_candidate.get("perceptual_review"),
+                    "audio_url": (
+                        f"/api/episodes/{episode_dir.name}/audio-qc/"
+                        "repair-candidate/audio"
+                    ),
+                }
+                if repair_candidate
+                else None
+            ),
+            "repair_selection": (
+                {
+                    key: audio_selection.get(key)
+                    for key in (
+                        "status",
+                        "fingerprint",
+                        "release_safe",
+                        "detail",
+                    )
+                    if key in audio_selection
+                }
+                if audio_selection
+                else None
+            ),
         },
     }
 

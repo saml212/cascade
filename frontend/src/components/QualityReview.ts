@@ -95,9 +95,94 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
           metric('Audio findings', quality.audio_quality.finding_count)
         )
       : null,
+    !compact && quality?.audio_quality.repair_candidate
+      ? repairCandidate(
+          episodeId,
+          quality.audio_quality.repair_candidate,
+          quality.audio_quality.repair_selection,
+          controls,
+          onUpdated
+        )
+      : null,
     !compact && findings.length
       ? findingList(findings, revision, controls)
       : null
+  );
+}
+
+function repairCandidate(
+  episodeId: string,
+  candidate: NonNullable<QualitySnapshot['audio_quality']['repair_candidate']>,
+  selection: QualitySnapshot['audio_quality']['repair_selection'],
+  controls?: QualityReviewControls,
+  onUpdated?: () => void | Promise<void>
+): HTMLElement {
+  const selected = Boolean(selection && selection.status !== 'not_selected');
+  const selectable = candidate.current && candidate.verification_status === 'pass';
+  const action = Button({
+    variant: selected ? 'secondary' : 'primary',
+    size: 'sm',
+    disabled: !selected && !selectable,
+    label: selected ? 'Stop using repair draft' : 'Use draft for future renders',
+    onClick: async () => {
+      action.disabled = true;
+      try {
+        if (selected) {
+          await api.clearAudioRepairSelection(episodeId);
+          showToast('Repair draft selection cleared.', 'success');
+        } else {
+          await api.selectAudioRepairCandidate(episodeId);
+          showToast(
+            'Repair draft selected. Run quality review to bind the selected output.',
+            'success'
+          );
+        }
+        await onUpdated?.();
+      } catch (error) {
+        showToast((error as Error).message, 'error');
+      } finally {
+        action.disabled = false;
+      }
+    },
+  });
+  const status = selection?.status === 'stale'
+    ? `Selected repair is stale: ${selection.detail ?? 'inputs changed'}`
+    : selected
+      ? 'This repair draft is the audio source for future renders.'
+      : selectable
+        ? 'Objective signal checks passed; the draft still requires media review.'
+        : 'Candidate evidence is stale or incomplete. Rebuild it before selection.';
+
+  return h(
+    'div',
+    { class: 'rounded-md border border-border-subtle bg-surface-2 px-4 py-4 grid gap-3' },
+    h(
+      'div',
+      { class: 'flex items-start justify-between gap-4 flex-wrap' },
+      h(
+        'div',
+        null,
+        h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Grounded audio repair draft'),
+        h('p', { class: 'text-body-sm text-ink-secondary mt-1' }, status),
+        h(
+          'p',
+          { class: 'text-body-sm text-ink-tertiary mt-1' },
+          `${candidate.repaired_finding_count} findings repaired · ${candidate.unresolved_finding_count} unresolved · human listening ${candidate.perceptual_review?.status === 'not_performed' ? 'not performed' : 'not recorded'}`
+        )
+      ),
+      action
+    ),
+    previewPlayer(
+      'Full repair draft',
+      candidate.audio_url,
+      `repair-candidate:${candidate.fingerprint ?? 'unknown'}`,
+      controls
+    ),
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-tertiary' },
+      'Selecting this draft changes future render input. It does not approve publishing or mark unresolved findings safe.'
+    )
   );
 }
 

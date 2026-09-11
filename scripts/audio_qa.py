@@ -38,7 +38,16 @@ def main() -> int:
         action="store_true",
         help="With --preview-dir, also render non-blocking finding previews",
     )
+    parser.add_argument(
+        "--preview-limit",
+        type=int,
+        default=10,
+        help="Maximum previews to render in one run (default: 10)",
+    )
     args = parser.parse_args()
+
+    if args.preview_limit < 1 or args.preview_limit > 100:
+        parser.error("--preview-limit must be between 1 and 100")
 
     episode_dir = args.episode_dir.resolve()
     report_path = args.report or episode_dir / "qa" / "audio-quality.json"
@@ -60,6 +69,8 @@ def main() -> int:
                         ffmpeg_bin=args.ffmpeg,
                     )
                 )
+                if len(previews) >= args.preview_limit:
+                    break
 
     result = {
         "report": str(report_path.resolve()),

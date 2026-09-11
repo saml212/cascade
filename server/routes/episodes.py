@@ -17,12 +17,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from lib.atomic_write import atomic_write_json
-from lib.clips import normalize_clip as _normalize_clip
-from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
-from lib.ffprobe import get_dimensions
 from agents.pipeline import load_config
 from agents.qa import quality_snapshot
+from lib.atomic_write import atomic_write_json
+from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER, selected_audio_source
+from lib.clips import normalize_clip as _normalize_clip
+from lib.ffprobe import get_dimensions
 from server.routes.delivery import _source_fingerprint, _video_fingerprint
 
 
@@ -101,12 +101,22 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
             if stat != {"size": actual.st_size, "mtime_ns": actual.st_mtime_ns}:
                 snapshot["video_status"] = "not_prepared"
             else:
-                canonical_audio = ep_dir / "work" / "audio_mix.wav"
-                if not canonical_audio.exists() or raw.get(
+                try:
+                    canonical_audio = selected_audio_source(
+                        ep_dir, episode, processing_config
+                    ) or (ep_dir / "work" / "audio_mix.wav")
+                except ValueError:
+                    canonical_audio = None
+                expected_fingerprint = (
+                    _video_fingerprint(
+                        ep_dir, episode, processing_config, canonical_audio
+                    )
+                    if canonical_audio is not None and canonical_audio.exists()
+                    else None
+                )
+                if not expected_fingerprint or raw.get(
                     "video_source_fingerprint"
-                ) != _video_fingerprint(
-                    ep_dir, episode, processing_config, canonical_audio
-                ):
+                ) != expected_fingerprint:
                     snapshot["video_status"] = "not_prepared"
     return snapshot
 

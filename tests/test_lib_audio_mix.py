@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from lib.audio_mix import (
+    AUDIO_SELECTION_PATH,
+    AUDIO_SELECTION_SCHEMA,
+    SELECTED_REPAIR_AUDIO_PATH,
     _build_from_crop_config,
     _cache_matches,
     _generate_audio_mix_locked,
     _generate_camera_audio_mix,
     _mix_fingerprint,
+    audio_processing_settings,
+    audio_selection_settings,
+    generate_audio_mix,
     logical_track_groups,
 )
 
@@ -310,6 +317,29 @@ class TestMixCache:
 
         assert len({original, changed_setting, changed_source}) == 3
 
+    def test_fingerprint_ignores_picture_and_video_only_settings(self, tmp_path):
+        source = tmp_path / "Tr1.wav"
+        source.write_bytes(b"audio")
+        episode = {"crop_config": {"speakers": [{"track": 1, "volume": 1.0}]}}
+        original = _mix_fingerprint(
+            episode, {"processing": {"video_crf": 18}}, [source]
+        )
+        changed_picture = _mix_fingerprint(
+            {
+                "crop_config": {
+                    "speakers": [{"track": 1, "volume": 1.0, "center_x": 900}]
+                }
+            },
+            {"processing": {"video_crf": 30}},
+            [source],
+        )
+        changed_audio = _mix_fingerprint(
+            episode, {"processing": {"audio_target_lufs": -14}}, [source]
+        )
+
+        assert changed_picture == original
+        assert changed_audio != original
+
     def test_cache_requires_nonempty_output_and_matching_fingerprint(self, tmp_path):
         output = tmp_path / "audio_mix.wav"
         fingerprint_file = tmp_path / "audio_mix.fingerprint"
@@ -320,6 +350,64 @@ class TestMixCache:
         assert not _cache_matches(output, "stale")
         output.write_bytes(b"")
         assert not _cache_matches(output, "current")
+
+
+class TestRepairSelection:
+    @staticmethod
+    def _write_selection(episode_dir: Path, episode: dict, config: dict) -> Path:
+        work = episode_dir / "work"
+        work.mkdir()
+        source = episode_dir / "source_merged.mp4"
+        source.write_bytes(b"camera source")
+        selected = episode_dir / SELECTED_REPAIR_AUDIO_PATH
+        selected.write_bytes(b"reviewed repair")
+        source_stat, selected_stat = source.stat(), selected.stat()
+        record = {
+            "schema": AUDIO_SELECTION_SCHEMA,
+            "source": {
+                "path": str(source.resolve()),
+                "fingerprint": {
+                    "id": "sha256:source",
+                    "size_bytes": source_stat.st_size,
+                    "mtime_ns": source_stat.st_mtime_ns,
+                },
+            },
+            "audio_selection_settings": audio_selection_settings(episode),
+            "audio_processing_settings": audio_processing_settings(config),
+            "selected_output": {
+                "path": str(selected.resolve()),
+                "fingerprint": {
+                    "id": "sha256:selected",
+                    "size_bytes": selected_stat.st_size,
+                    "mtime_ns": selected_stat.st_mtime_ns,
+                },
+            },
+        }
+        (episode_dir / AUDIO_SELECTION_PATH).write_text(json.dumps(record))
+        return selected
+
+    def test_generate_returns_current_selection_without_regenerating(self, tmp_path):
+        episode, config = {"audio_sync": {}}, {"processing": {"audio_enhance": False}}
+        selected = self._write_selection(tmp_path, episode, config)
+
+        with patch("lib.audio_mix._generate_audio_mix_locked") as generate_base:
+            result = generate_audio_mix(tmp_path, episode, config)
+
+        assert result == selected
+        generate_base.assert_not_called()
+
+    def test_stale_selection_blocks_instead_of_falling_back(self, tmp_path):
+        episode, config = {"audio_sync": {}}, {"processing": {"audio_enhance": False}}
+        selected = self._write_selection(tmp_path, episode, config)
+        selected.write_bytes(b"changed reviewed repair")
+
+        with (
+            patch("lib.audio_mix._generate_audio_mix_locked") as generate_base,
+            pytest.raises(ValueError, match="changed since review"),
+        ):
+            generate_audio_mix(tmp_path, episode, config)
+
+        generate_base.assert_not_called()
 
 
 class TestMixGraph:

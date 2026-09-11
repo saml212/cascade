@@ -17,11 +17,18 @@ from typing import Any
 import numpy as np
 
 from lib.atomic_write import atomic_write_json
-from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
+from lib.audio_mix import (
+    CAMERA_AUDIO_TIMELINE_FILTER,
+    audio_selection_settings,
+    current_audio_selection,
+)
+from lib.ffprobe import file_fingerprint, get_audio_stream, media_fingerprint
 from lib.ffprobe import probe as ffprobe
 
 REPORT_SCHEMA = "cascade.audio-quality/v1"
-DETECTOR_VERSION = "1.0"
+DETECTOR_VERSION = "1.1"
+PREVIEW_ALGORITHM_VERSION = "4"
+TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD = "sha256-audio-word-timing-speaker/v1"
 
 
 @dataclass(frozen=True)
@@ -53,6 +60,7 @@ class WindowStats:
     rms_dbfs: np.ndarray
     peak: np.ndarray
     zero_fraction: np.ndarray
+    channel_delta_peak: np.ndarray | None = None
 
     @property
     def duration(self) -> float:
@@ -80,16 +88,10 @@ def analyze_episode_audio(
 
     settings = config or AudioQAConfig()
     media_probe = ffprobe(source)
-    audio_stream = next(
-        (
-            stream
-            for stream in media_probe.get("streams", [])
-            if stream.get("codec_type") == "audio"
-        ),
-        None,
-    )
-    if audio_stream is None:
-        raise ValueError(f"Source media has no audio stream: {source}")
+    try:
+        audio_stream = get_audio_stream(media_probe)
+    except ValueError as exc:
+        raise ValueError(f"Source media has no audio stream: {source}") from exc
 
     source_duration = float(
         audio_stream.get("duration")
@@ -104,7 +106,11 @@ def analyze_episode_audio(
         timeline = _episode_timeline(source_duration, episode)
     transcript_path, transcript = _load_episode_transcript(episode_dir)
     transcript_fingerprint = (
-        file_fingerprint(transcript_path) if transcript_path is not None else None
+        transcript_analysis_fingerprint(
+            transcript_path, transcript, settings.transcript_confidence
+        )
+        if transcript_path is not None and transcript is not None
+        else None
     )
     fingerprint = media_fingerprint(source, media_probe)
     decoder = resolve_ffmpeg(ffmpeg_bin)
@@ -113,6 +119,7 @@ def analyze_episode_audio(
         episode_dir=episode_dir,
         source_fingerprint=fingerprint,
     )
+    repair_selection = current_audio_selection(episode_dir, episode)
 
     channels = int(audio_stream.get("channels") or 0)
     if channels < 2:
@@ -135,6 +142,7 @@ def analyze_episode_audio(
             episode_id=episode_dir.name,
             config=settings,
         )
+    _apply_repair_resolutions(findings, repair_selection)
 
     report = {
         "schema": REPORT_SCHEMA,
@@ -169,6 +177,9 @@ def analyze_episode_audio(
                             "role": "transcript",
                             "path": str(transcript_path.resolve()),
                             "fingerprint": transcript_fingerprint["id"],
+                            "content_fingerprint": transcript_fingerprint[
+                                "content_fingerprint"
+                            ],
                         }
                     ]
                     if transcript_path and transcript_fingerprint
@@ -185,6 +196,18 @@ def analyze_episode_audio(
                 "This report classifies source-channel evidence; it does not prove mastered or rendered output continuity.",
                 "Diarized speaker labels are acoustic clusters, not persisted person identities.",
                 "Candidate findings require review or output-level repair evidence before resolution.",
+                *(
+                    [
+                        "Some active source ranges contain duplicated stereo samples and have no distinct alternate recovery channel."
+                    ]
+                    if any(
+                        item.get("status") == "duplicated_samples"
+                        for item in analysis.get("channel_relationship", {}).get(
+                            "ranges", []
+                        )
+                    )
+                    else []
+                ),
             ],
         },
         "detector": {
@@ -205,6 +228,10 @@ def analyze_episode_audio(
         settings,
         findings,
     )
+    if repair_selection is not None:
+        report["scope"]["outputs_checked"] = [
+            _selected_repair_output_proof(report, repair_selection)
+        ]
     report["release_gate"] = release_gate(report)
 
     if report_path is not None:
@@ -212,6 +239,73 @@ def analyze_episode_audio(
         destination.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(destination, report)
     return report
+
+
+def _apply_repair_resolutions(findings: list[dict], selection: dict | None) -> None:
+    """Bind repaired finding resolutions to the selected candidate revision."""
+    if selection is None:
+        return
+    selected = {
+        item.get("id"): item.get("fingerprint")
+        for item in selection.get("repaired_findings", [])
+        if isinstance(item, dict)
+    }
+    for finding in findings:
+        fingerprint = finding.get("fingerprint") or finding.get("id")
+        if selected.get(finding.get("id")) != fingerprint:
+            continue
+        finding["resolution"] = {
+            "status": "repaired",
+            "finding_fingerprint": fingerprint,
+            "evidence": {
+                "audio_selection_fingerprint": selection.get("fingerprint"),
+                "candidate_manifest_fingerprint": selection.get(
+                    "candidate_manifest_fingerprint"
+                ),
+                "synthetic_audio_used": False,
+            },
+        }
+
+
+def _selected_repair_output_proof(report: dict, selection: dict) -> dict:
+    """Project candidate verification onto the current report and selected bytes."""
+    current = {
+        (finding.get("id"), finding.get("fingerprint") or finding.get("id"))
+        for finding in report.get("findings", [])
+    }
+    selected = {
+        (item.get("id"), item.get("fingerprint"))
+        for item in selection.get("repaired_findings", [])
+        if isinstance(item, dict)
+    }
+    bindings_current = bool(selected) and selected.issubset(current)
+    verification = json.loads(json.dumps(selection.get("verification") or {}))
+    verification["status"] = (
+        "pass" if bindings_current and verification.get("status") == "pass" else "stale"
+    )
+    verification["repair_binding_status"] = "current" if bindings_current else "stale"
+    verification["repaired_findings"] = [
+        {"id": finding_id, "fingerprint": fingerprint}
+        for finding_id, fingerprint in sorted(selected)
+    ]
+    verification["repaired_finding_ids"] = sorted(
+        finding_id for finding_id, _ in selected
+    )
+    verification["excluded_finding_ids"] = []
+    return {
+        "role": "selected_audio_master",
+        "status": verification["status"],
+        "source_report_fingerprint": report.get("fingerprint"),
+        "selected_mix_fingerprint": report.get("scope", {})
+        .get("selected_mix_provenance", {})
+        .get("fingerprint"),
+        "fingerprint": selection.get("selected_output", {}).get("fingerprint"),
+        "audio_selection_fingerprint": selection.get("fingerprint"),
+        "candidate_manifest_fingerprint": selection.get(
+            "candidate_manifest_fingerprint"
+        ),
+        "verification": verification,
+    }
 
 
 def decode_audio_windows(
@@ -258,6 +352,7 @@ def decode_audio_windows(
     rms_blocks: list[np.ndarray] = []
     peak_blocks: list[np.ndarray] = []
     zero_blocks: list[np.ndarray] = []
+    delta_blocks: list[np.ndarray] = []
     frames_per_block = max(1, round(10 / settings.frame_seconds))
     block_bytes = frames_per_block * samples_per_frame * 2 * 4
 
@@ -283,6 +378,9 @@ def decode_audio_windows(
                     zero_blocks.append(
                         np.mean(np.abs(frames) <= settings.exact_zero_peak, axis=1)
                     )
+                    delta_blocks.append(
+                        np.max(np.abs(frames[:, :, 0] - frames[:, :, 1]), axis=1)
+                    )
                 pending.clear()
             if not chunk:
                 break
@@ -299,6 +397,9 @@ def decode_audio_windows(
         rms_dbfs=np.concatenate(rms_blocks) if rms_blocks else empty,
         peak=np.concatenate(peak_blocks) if peak_blocks else empty,
         zero_fraction=np.concatenate(zero_blocks) if zero_blocks else empty,
+        channel_delta_peak=(
+            np.concatenate(delta_blocks) if delta_blocks else np.empty(0)
+        ),
     )
 
 
@@ -428,8 +529,57 @@ def analyze_windows(
             "Suppressed candidates were consistent with turn-taking or lacked "
             "evidence that the quiet channel should contain speech."
         ),
+        "channel_relationship": _channel_relationship(stats, settings),
     }
     return findings, analysis, speaker_channels
+
+
+def _channel_relationship(stats: WindowStats, settings: AudioQAConfig) -> dict:
+    """Report where stereo samples offer a distinct alternate recovery channel."""
+    delta = stats.channel_delta_peak
+    if delta is None or len(delta) != len(stats.rms_dbfs):
+        return {"status": "unknown", "window_seconds": 5.0, "ranges": []}
+
+    frames_per_window = max(1, round(5 / stats.frame_seconds))
+    minimum_active_frames = max(1, round(0.2 / stats.frame_seconds))
+    windows = []
+    for start in range(0, len(delta), frames_per_window):
+        end = min(len(delta), start + frames_per_window)
+        active = (
+            np.max(stats.rms_dbfs[start:end], axis=1) >= settings.survivor_floor_dbfs
+        )
+        if np.count_nonzero(active) < minimum_active_frames:
+            state = "insufficient_active_audio"
+        elif np.mean(delta[start:end][active] <= settings.exact_zero_peak) >= 0.99:
+            state = "duplicated_samples"
+        else:
+            state = "distinct_samples"
+        left = round(start * stats.frame_seconds, 6)
+        right = round(end * stats.frame_seconds, 6)
+        if windows and windows[-1]["status"] == state:
+            windows[-1]["end_seconds"] = right
+            windows[-1]["duration_seconds"] = round(
+                right - windows[-1]["start_seconds"], 6
+            )
+        else:
+            windows.append(
+                {
+                    "status": state,
+                    "start_seconds": left,
+                    "end_seconds": right,
+                    "duration_seconds": round(right - left, 6),
+                }
+            )
+    active_states = {item["status"] for item in windows} - {"insufficient_active_audio"}
+    return {
+        "status": active_states.pop() if len(active_states) == 1 else "mixed",
+        "window_seconds": round(frames_per_window * stats.frame_seconds, 6),
+        "ranges": windows,
+        "limitations": (
+            "Duplicated-sample ranges have no distinct alternate source channel; "
+            "distinct samples do not prove microphone or speaker identity."
+        ),
+    }
 
 
 def release_gate(report: dict) -> dict:
@@ -572,7 +722,14 @@ def _finding_resolution_is_current(finding: dict, output_proof: dict | None) -> 
         return False
     verification = output_proof.get("verification") or {}
     if status == "repaired":
-        return finding.get("id") in verification.get("repaired_finding_ids", [])
+        return bool(
+            resolution.get("finding_fingerprint") == finding_fingerprint
+            and any(
+                item.get("id") == finding.get("id")
+                and item.get("fingerprint") == finding_fingerprint
+                for item in verification.get("repaired_findings", [])
+            )
+        )
     if status == "not_in_selected_mix":
         return finding.get("id") in verification.get("excluded_finding_ids", [])
     return False
@@ -604,13 +761,23 @@ def render_finding_preview(
         finding["preview"]["padding_seconds"]
     )
     duration = requested_end - requested_start
-    issue_start = float(source_time["start_seconds"]) - requested_start
-    issue_end = float(source_time["end_seconds"]) - requested_start
+    source_intervals = finding.get("repair_intervals") or [source_time]
+    intervals = [
+        (
+            float(item["start_seconds"]) - requested_start,
+            float(item["end_seconds"]) - requested_start,
+        )
+        for item in source_intervals
+    ]
     channel = int(finding["channel"])
     survivor = 1 - channel
+    gain_limit = min(
+        18.0,
+        max(0.0, float(finding.get("recovery", {}).get("maximum_gain_db", 12.0))),
+    )
     gain_db = min(
-        12.0,
-        max(0.0, float(finding["evidence"].get("estimated_recovery_gain_db", 0.0))),
+        gain_limit,
+        max(-12.0, float(finding["evidence"].get("estimated_recovery_gain_db", 0.0))),
     )
     stem = finding["id"].replace(":", "-")
     original = output_dir / f"{stem}-source.wav"
@@ -639,9 +806,17 @@ def render_finding_preview(
         [*common, "-af", original_filter, "-c:a", "pcm_s24le", str(original)]
     )
 
-    fade = min(0.08, max(0.01, (issue_end - issue_start) / 4))
-    normal_weight = _switch_weight(issue_start, issue_end, fade, inverted=False)
-    fallback_weight = _switch_weight(issue_start, issue_end, fade, inverted=True)
+    repair_weights = [
+        _switch_weight(
+            start,
+            end,
+            min(0.08, max(0.01, (end - start) / 4)),
+            inverted=True,
+        )
+        for start, end in intervals
+    ]
+    fallback_weight = f"min(1,{'+'.join(f'({item})' for item in repair_weights)})"
+    normal_weight = f"1-({fallback_weight})"
     filter_graph = (
         f"[0:a]{CAMERA_AUDIO_TIMELINE_FILTER},"
         "aformat=channel_layouts=stereo,asplit=2[m][s];"
@@ -673,72 +848,20 @@ def render_finding_preview(
     }
 
 
-def media_fingerprint(path: str | Path, probe_data: dict | None = None) -> dict:
-    """Fingerprint media with sparse content samples and stream metadata."""
-    path = Path(path)
-    stat = path.stat()
-    probe_data = probe_data or ffprobe(path)
-    audio_streams = [
-        {
-            key: stream.get(key)
-            for key in (
-                "index",
-                "codec_name",
-                "sample_rate",
-                "channels",
-                "channel_layout",
-                "start_time",
-                "duration",
-                "time_base",
-            )
-        }
-        for stream in probe_data.get("streams", [])
-        if stream.get("codec_type") == "audio"
+def transcript_analysis_fingerprint(
+    path: str | Path, transcript: dict, minimum_confidence: float
+) -> dict:
+    """Fingerprint only transcript fields used by continuity classification."""
+    words = [
+        {key: word[key] for key in ("start", "end", "speaker")}
+        for word in _transcript_words(transcript, minimum_confidence)
     ]
-    metadata = json.dumps(
-        {
-            "size_bytes": stat.st_size,
-            "format_duration": probe_data.get("format", {}).get("duration"),
-            "audio_streams": audio_streams,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    digest = hashlib.sha256(metadata)
-    sample_size = 256 * 1024
-    offsets = sorted(
-        {
-            0,
-            max(0, stat.st_size // 2 - sample_size // 2),
-            max(0, stat.st_size - sample_size),
-        }
-    )
-    with path.open("rb") as media:
-        for offset in offsets:
-            media.seek(offset)
-            digest.update(offset.to_bytes(8, "big"))
-            digest.update(media.read(sample_size))
+    encoded = json.dumps(words, sort_keys=True, separators=(",", ":"))
     return {
-        "id": f"sha256:{digest.hexdigest()}",
-        "method": "sha256-stream-metadata-plus-3x256KiB/v1",
-        "size_bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
-
-
-def file_fingerprint(path: str | Path) -> dict:
-    """Return a complete content fingerprint for a bounded metadata file."""
-    path = Path(path)
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    stat = path.stat()
-    return {
-        "id": f"sha256:{digest.hexdigest()}",
-        "method": "sha256-full/v1",
-        "size_bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
+        "id": "sha256:" + hashlib.sha256(encoded.encode()).hexdigest(),
+        "method": TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD,
+        "word_count": len(words),
+        "content_fingerprint": file_fingerprint(path),
     }
 
 
@@ -810,6 +933,11 @@ def _classify_candidate(
 
     expected_seconds = float(np.count_nonzero(expected_frames) * stats.frame_seconds)
     surviving_seconds = float(np.count_nonzero(surviving_frames) * stats.frame_seconds)
+    expected_ranges = _activity_ranges(expected_frames, start, stats.frame_seconds)
+    surviving_ranges = _activity_ranges(surviving_frames, start, stats.frame_seconds)
+    temporal_overlap_seconds = float(
+        np.count_nonzero(expected_frames & surviving_frames) * stats.frame_seconds
+    )
     expected_minimum = min(0.20, duration * 0.15)
     transcript_expected = expected_seconds >= expected_minimum
     transcript_contradicts = (
@@ -867,6 +995,9 @@ def _classify_candidate(
         "surviving_speakers": surviving_speakers,
         "expected_speech_seconds": expected_seconds,
         "surviving_speech_seconds": surviving_seconds,
+        "expected_speech_ranges": expected_ranges,
+        "surviving_speech_ranges": surviving_ranges,
+        "temporal_overlap_seconds": temporal_overlap_seconds,
         "transcript_excerpt": excerpt or None,
         "transcript_word_count": len(overlap),
         "estimated_recovery_gain_db": gain,
@@ -903,6 +1034,9 @@ def _build_finding(
         "surviving_transcript_speakers": decision["surviving_speakers"],
         "expected_speech_seconds": round(decision["expected_speech_seconds"], 3),
         "surviving_speech_seconds": round(decision["surviving_speech_seconds"], 3),
+        "expected_speech_ranges": decision["expected_speech_ranges"],
+        "surviving_speech_ranges": decision["surviving_speech_ranges"],
+        "temporal_overlap_seconds": round(decision["temporal_overlap_seconds"], 3),
         "transcript_word_count": decision["transcript_word_count"],
         "transcript_excerpt": decision["transcript_excerpt"],
         "zero_sample_fraction": round(
@@ -1103,6 +1237,21 @@ def _transcript_words(transcript: dict | None, minimum_confidence: float) -> lis
     return words
 
 
+def _activity_ranges(
+    mask: np.ndarray, source_start_frame: int, frame_seconds: float
+) -> list[dict]:
+    """Describe transcript activity without merging separate speaker turns."""
+    boundaries = np.flatnonzero(np.diff(np.pad(mask.astype(np.int8), (1, 1))))
+    return [
+        {
+            "start_seconds": round((source_start_frame + start) * frame_seconds, 6),
+            "end_seconds": round((source_start_frame + end) * frame_seconds, 6),
+            "duration_seconds": round((end - start) * frame_seconds, 6),
+        }
+        for start, end in boundaries.reshape(-1, 2)
+    ]
+
+
 def _speaker_masks(
     words: list[dict], frame_count: int, frame_seconds: float
 ) -> dict[str, np.ndarray]:
@@ -1254,20 +1403,7 @@ def _mix_provenance(
             "input_paths": ["source_merged.mp4"],
         }
 
-    audio_selection = {
-        "audio_sync": episode.get("audio_sync") or {},
-        "audio_mix": episode.get("audio_mix") or {},
-        "speaker_tracks": [
-            {
-                "track": speaker.get("track"),
-                "volume": speaker.get("volume", 1.0),
-            }
-            for speaker in (episode.get("crop_config") or {}).get("speakers", [])
-        ],
-        "ambient_tracks": (episode.get("crop_config") or {}).get(
-            "ambient_tracks", []
-        ),
-    }
+    audio_selection = audio_selection_settings(episode)
     input_fingerprints = []
     if episode_dir is not None:
         for value in result["input_paths"]:
@@ -1285,17 +1421,46 @@ def _mix_provenance(
             input_fingerprints.append(
                 {"path": str(path.resolve()), "fingerprint": fingerprint["id"]}
             )
+    repair_selection = (
+        current_audio_selection(episode_dir, episode)
+        if episode_dir is not None
+        else None
+    )
+    if repair_selection is not None:
+        result["kind"] = "selected_audio_repair"
+        result["basis"] = (
+            "A revision-bound grounded repair candidate is selected for rendering."
+        )
+        result["repair_selection"] = {
+            key: repair_selection.get(key)
+            for key in (
+                "fingerprint",
+                "status",
+                "release_safe",
+                "source_report_fingerprint",
+                "repair_plan_fingerprint",
+                "candidate_manifest_fingerprint",
+                "repaired_findings",
+                "unresolved_findings",
+            )
+        }
+        result["selected_output"] = repair_selection["selected_output"]
+
     binding = {
         "kind": result["kind"],
         "uses_checked_source_audio": result["uses_checked_source_audio"],
         "inputs": input_fingerprints or result["input_paths"],
         "selection": audio_selection,
+        "repair_selection": result.get("repair_selection"),
+        "selected_output": (
+            (result.get("selected_output") or {}).get("fingerprint", {}).get("id")
+        ),
     }
     encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"), default=str)
     result["fingerprint"] = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
     result["input_fingerprints"] = input_fingerprints
 
-    if episode_dir is not None:
+    if episode_dir is not None and repair_selection is None:
         selected_output = episode_dir / "work" / "audio_mix.wav"
         if selected_output.is_file():
             result["selected_output"] = {
@@ -1313,6 +1478,15 @@ def _report_fingerprint(
     settings: AudioQAConfig,
     findings: list[dict],
 ) -> str:
+    semantic_findings = []
+    for finding in findings:
+        semantic = dict(finding)
+        semantic["evidence"] = {
+            key: value
+            for key, value in (finding.get("evidence") or {}).items()
+            if key != "transcript_excerpt"
+        }
+        semantic_findings.append(semantic)
     payload = json.dumps(
         {
             "schema": REPORT_SCHEMA,
@@ -1326,7 +1500,7 @@ def _report_fingerprint(
                 if key != "selected_output"
             },
             "settings": asdict(settings),
-            "findings": findings,
+            "findings": semantic_findings,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1373,7 +1547,9 @@ def _switch_weight(start: float, end: float, fade: float, *, inverted: bool) -> 
     return f"1-({normal})" if inverted else normal
 
 
-def _checked_ffmpeg(command: list[str]) -> None:
+def _checked_ffmpeg(
+    command: list[str], error: str = "Audio preview render failed"
+) -> None:
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode:
-        raise RuntimeError(f"Audio preview render failed: {result.stderr[-1000:]}")
+        raise RuntimeError(f"{error}: {result.stderr[-1000:]}")
