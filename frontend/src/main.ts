@@ -46,6 +46,9 @@ route('/episodes/:id/audio', ({ id }) => Episode(main, id));
 route('/episodes/:id/metadata', ({ id }) => Episode(main, id));
 
 route('/episodes/:id/crop-setup', ({ id }) => CropSetup(main, id));
+route('/episodes/:id/clips/review/:clipId', ({ id, clipId }) =>
+  ClipReview(main, id, clipId)
+);
 route('/episodes/:id/clips/review', ({ id }) => ClipReview(main, id));
 route('/episodes/:id/longform/review', ({ id }) => LongformReview(main, id));
 route('/episodes/:id/publish', ({ id }) => Publish(main, id));

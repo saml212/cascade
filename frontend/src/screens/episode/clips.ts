@@ -193,7 +193,8 @@ function renderTile(
   return h(
     'button',
     {
-      onclick: () => navigate(`/episodes/${episodeId}/clips/review`),
+      onclick: () =>
+        navigate(`/episodes/${episodeId}/clips/review/${encodeURIComponent(id)}`),
       ...hoverHandlers,
       class:
         'group text-left flex flex-col gap-1.5 focus:outline-none',

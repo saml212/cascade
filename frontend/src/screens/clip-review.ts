@@ -98,10 +98,14 @@ interface ChatMessage {
   actions?: UnknownRecord[];
 }
 
-export function ClipReview(target: HTMLElement, episodeId: string): void {
+export function ClipReview(
+  target: HTMLElement,
+  episodeId: string,
+  initialClipId?: string
+): void {
   const clips = signal<UnknownRecord[] | null>(null);
   const episode = signal<UnknownRecord | null>(null);
-  const expandedId = signal<string | null>(null);
+  const expandedId = signal<string | null>(initialClipId ?? null);
   const loadError = signal<string | null>(null);
   const chatMessages = signal<ChatMessage[]>([]);
   const chatSending = signal<boolean>(false);
@@ -205,7 +209,16 @@ export function ClipReview(target: HTMLElement, episodeId: string): void {
             c,
             expandedId,
             renderedIds.has(String(c.id ?? c.clip_id)),
-            async () => load()
+            async () => load(),
+            (nextId) => {
+              expandedId.set(nextId);
+              const suffix = nextId ? `/${encodeURIComponent(nextId)}` : '';
+              window.history.replaceState(
+                null,
+                '',
+                `#/episodes/${episodeId}/clips/review${suffix}`
+              );
+            }
           )
         )
       )
@@ -221,7 +234,11 @@ export function ClipReview(target: HTMLElement, episodeId: string): void {
       h(
         'div',
         { class: 'flex-1 min-h-0 overflow-y-auto' },
-        h('div', { class: 'max-w-[1080px] mx-auto px-10 py-6 pb-32' }, body)
+        h(
+          'div',
+          { class: 'max-w-[1080px] mx-auto px-4 sm:px-10 py-6 pb-32' },
+          body
+        )
       ),
       renderChatDock(chatMessages, chatSending, sendChat)
     )
@@ -375,7 +392,8 @@ function clipCard(
   clip: UnknownRecord,
   expandedId: Signal<string | null>,
   rendered: boolean,
-  reload: () => Promise<void>
+  reload: () => Promise<void>,
+  setExpanded: (clipId: string | null) => void
 ): HTMLElement {
   const id = (clip.id as string) ?? (clip.clip_id as string);
   const title = (clip.title as string) || 'Untitled clip';
@@ -392,7 +410,9 @@ function clipCard(
   const metadata = (clip.metadata as Record<string, UnknownRecord>) ?? {};
 
   const card = h('article', {
-    class: 'panel overflow-hidden transition-colors duration-[120ms]',
+    id: `clip-${id}`,
+    class:
+      'panel scroll-mt-24 overflow-hidden transition-colors duration-[120ms]',
   });
 
   effect(() => {
@@ -414,7 +434,7 @@ function clipCard(
       status,
       expanded,
       rendered,
-      () => expandedId.set((prev) => (prev === id ? null : id))
+      () => setExpanded(expanded ? null : id)
     );
     const children: Node[] = [head];
     if (expanded) {
@@ -423,6 +443,11 @@ function clipCard(
       );
     }
     card.replaceChildren(...children);
+    if (expanded) {
+      requestAnimationFrame(() =>
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      );
+    }
   });
 
   return card;
@@ -446,10 +471,14 @@ function clipHead(
   toggle: () => void
 ): HTMLElement {
   return h(
-    'div',
+    'button',
     {
+      type: 'button',
+      'aria-expanded': expanded,
+      'aria-controls': `clip-review-${id}`,
+      'aria-label': `${expanded ? 'Collapse' : 'Review'} ${title}`,
       class:
-        'p-5 grid grid-cols-[140px_1fr_auto] gap-5 items-start cursor-pointer hover:bg-surface-2/40',
+        'w-full p-4 sm:p-5 grid grid-cols-[88px_1fr_auto] sm:grid-cols-[140px_1fr_auto] gap-3 sm:gap-5 items-start text-left hover:bg-surface-2/40',
       onclick: toggle,
     },
     clipThumb(episodeId, id, duration, rendered),
@@ -490,7 +519,7 @@ function clipHead(
               class:
                 'font-display text-body-lg text-ink-secondary mt-2 leading-relaxed',
             },
-            '“' + hook + '”'
+            hook
           )
         : null,
       reason
@@ -507,6 +536,7 @@ function clipHead(
         class: `text-ink-tertiary transition-transform duration-[200ms] mt-2 ${
           expanded ? 'rotate-180' : ''
         }`,
+          'aria-hidden': 'true',
       },
       Icon.chevronDown()
     )
@@ -531,7 +561,9 @@ function clipThumb(
       muted: true,
       playsinline: true,
       preload: 'metadata',
-      class: 'w-full h-full object-cover bg-surface-inset',
+      tabindex: '-1',
+      'aria-hidden': 'true',
+      class: 'w-full h-full object-cover bg-surface-inset pointer-events-none',
     }) as HTMLVideoElement;
     innerEl = video;
     hoverHandlers = {
@@ -557,9 +589,8 @@ function clipThumb(
     'div',
     {
       class:
-        'w-[140px] aspect-[9/16] rounded-md overflow-hidden bg-surface-inset relative',
+        'w-[88px] sm:w-[140px] aspect-[9/16] rounded-md overflow-hidden bg-surface-inset relative',
       ...hoverHandlers,
-      onclick: (e: MouseEvent) => e.stopPropagation(),
     },
     innerEl,
     h(
@@ -586,10 +617,76 @@ function clipExpanded(
 ): HTMLElement {
   return h(
     'div',
-    { class: 'border-t border-border-subtle' },
+    { id: `clip-review-${clipId}`, class: 'border-t border-border-subtle' },
+    renderReviewPlayer(episodeId, clipId, rendered),
     renderActions(episodeId, clipId, rendered, reload),
     renderTrim(episodeId, clipId, start, end, reload),
     renderMetadataAccordion(episodeId, clipId, metadata, reload)
+  );
+}
+
+function renderReviewPlayer(
+  episodeId: string,
+  clipId: string,
+  rendered: boolean
+): HTMLElement {
+  if (!rendered) {
+    return h(
+      'section',
+      {
+        class:
+          'px-5 py-8 bg-surface-inset/50 text-center border-b border-border-subtle',
+        'aria-label': 'Clip video review',
+      },
+      h('p', { class: 'text-body text-ink-secondary' }, 'No current video to review.'),
+      h(
+        'p',
+        { class: 'text-body-sm text-ink-tertiary mt-1' },
+        'Render this candidate to inspect framing, captions, audio, and timing.'
+      )
+    );
+  }
+
+  const url = `/media/episodes/${episodeId}/shorts/${clipId}.mp4`;
+  return h(
+    'section',
+    {
+      class:
+        'px-5 py-5 bg-surface-inset/50 border-b border-border-subtle',
+      'aria-label': 'Clip video review',
+    },
+    h(
+      'div',
+      { class: 'w-full max-w-[390px] mx-auto' },
+      h('video', {
+        src: url,
+        controls: true,
+        playsinline: true,
+        preload: 'metadata',
+        class:
+          'block w-full max-h-[68vh] aspect-[9/16] object-contain bg-black rounded-lg border border-border-strong shadow-lift-lg',
+        'aria-label': `Review video for ${clipId}`,
+      }),
+      h(
+        'div',
+        { class: 'flex items-center justify-between gap-3 mt-3' },
+        h(
+          'span',
+          { class: 'text-body-sm text-ink-tertiary' },
+          'Current rendered file'
+        ),
+        h(
+          'a',
+          {
+            href: url,
+            download: `${clipId}.mp4`,
+            class:
+              'text-body-sm text-ink-secondary hover:text-ink-primary underline underline-offset-4',
+          },
+          'Download video'
+        )
+      )
+    )
   );
 }
 
