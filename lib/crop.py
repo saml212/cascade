@@ -9,6 +9,86 @@ Formulas must match frontend/app.js redrawCropCanvas(). See comments there.
 import math
 
 
+def _fallback(value, fallback):
+    return fallback if value is None else value
+
+
+def visual_crop_state(crop_config: dict, aspect: str) -> dict:
+    """Return only crop values that can change pixels for one aspect ratio."""
+    if aspect not in {"longform", "short"}:
+        raise ValueError(f"Unknown crop aspect: {aspect!r}")
+    configured = crop_config.get("speakers", [])
+    if configured:
+        speakers = []
+        for speaker in configured:
+            if aspect == "short":
+                speakers.append(
+                    {
+                        "center_x": speaker.get("center_x"),
+                        "center_y": speaker.get("center_y"),
+                        "zoom": speaker.get("zoom", 1.0),
+                    }
+                )
+            else:
+                speakers.append(
+                    {
+                        "center_x": _fallback(
+                            speaker.get("longform_center_x"), speaker.get("center_x")
+                        ),
+                        "center_y": _fallback(
+                            speaker.get("longform_center_y"), speaker.get("center_y")
+                        ),
+                        "zoom": _fallback(
+                            speaker.get("longform_zoom"), speaker.get("zoom", 1.0)
+                        ),
+                    }
+                )
+    else:
+        speakers = [
+            {
+                "center_x": crop_config.get(f"speaker_{side}_center_x"),
+                "center_y": crop_config.get(f"speaker_{side}_center_y"),
+                "zoom": crop_config.get(
+                    f"speaker_{side}_zoom", crop_config.get("zoom", 1.0)
+                ),
+            }
+            for side in ("l", "r")
+        ]
+    state = {"speakers": speakers}
+    if aspect == "longform":
+        wide_zoom = _fallback(
+            crop_config.get("wide_zoom"), crop_config.get("zoom", 1.0)
+        )
+        state["wide"] = {"zoom": wide_zoom}
+        if isinstance(wide_zoom, (int, float)) and wide_zoom > 1.0:
+            state["wide"].update(
+                center_x=crop_config.get("wide_center_x"),
+                center_y=crop_config.get("wide_center_y"),
+            )
+    return state
+
+
+def speaker_crop_state(crop_config: dict) -> list[dict]:
+    """Return crop fields that affect speaker-to-source assignment."""
+    return [
+        {
+            key: value
+            for key, value in speaker.items()
+            if key
+            not in {
+                "center_x",
+                "center_y",
+                "longform_center_x",
+                "longform_center_y",
+                "longform_zoom",
+                "volume",
+                "zoom",
+            }
+        }
+        for speaker in crop_config.get("speakers", [])
+    ]
+
+
 def compute_crop(src_w, src_h, cx, cy, zoom, mode):
     """Return (x, y, crop_w, crop_h) clamped to frame bounds.
 

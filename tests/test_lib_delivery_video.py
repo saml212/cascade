@@ -14,12 +14,15 @@ import pytest
 from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.delivery_video import (
     _audio_filter_graph,
+    _short_render_fingerprint,
     build_keep_intervals,
     build_render_segments,
     concat_video_segments,
     current_longform_render,
+    current_short_render,
     ffmpeg_executable,
     longform_render_fingerprint,
+    migrate_unchanged_short_crop_fingerprints,
     mux_timeline_audio,
     record_longform_render,
     record_short_render,
@@ -211,6 +214,124 @@ def test_short_fingerprint_marks_only_sustained_two_person_overlap(tmp_path):
 
     assert "shorts_overlap_layout" not in brief
     assert sustained["shorts_overlap_layout"] == "two-person-stack/v1"
+
+
+def test_render_fingerprints_only_track_their_resolved_crop(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    episode = {
+        "crop_config": {
+            "speakers": [
+                {
+                    "center_x": 400,
+                    "center_y": 500,
+                    "zoom": 1.1,
+                    "longform_center_x": 450,
+                    "longform_center_y": 520,
+                    "longform_zoom": 0.8,
+                }
+            ]
+        }
+    }
+    clip = {"id": "clip_01", "start_seconds": 1, "end_seconds": 3}
+    config = {"processing": {}}
+    segments = [{"start": 0, "end": 4, "speaker": "speaker_0"}]
+    old_long = longform_render_fingerprint(tmp_path, episode, config, audio, segments)
+    old_short = short_render_fingerprint(
+        tmp_path, episode, config, audio, segments, clip
+    )
+
+    longform_edit = json.loads(json.dumps(episode))
+    longform_edit["crop_config"]["speakers"][0]["longform_center_y"] = 600
+    assert (
+        longform_render_fingerprint(tmp_path, longform_edit, config, audio, segments)
+        != old_long
+    )
+    assert (
+        short_render_fingerprint(tmp_path, longform_edit, config, audio, segments, clip)
+        == old_short
+    )
+
+    short_edit = json.loads(json.dumps(episode))
+    short_edit["crop_config"]["speakers"][0]["center_y"] = 650
+    assert (
+        longform_render_fingerprint(tmp_path, short_edit, config, audio, segments)
+        == old_long
+    )
+    assert (
+        short_render_fingerprint(tmp_path, short_edit, config, audio, segments, clip)
+        != old_short
+    )
+
+
+def test_verified_legacy_short_migrates_after_longform_only_crop_edit(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "shorts" / "clip_01.mp4"
+    output.parent.mkdir()
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"render")
+    old_episode = {
+        "crop_config": {
+            "speakers": [
+                {
+                    "center_x": 400,
+                    "center_y": 500,
+                    "zoom": 1.1,
+                    "longform_center_x": 450,
+                    "longform_center_y": 520,
+                    "longform_zoom": 0.8,
+                }
+            ]
+        }
+    }
+    new_episode = json.loads(json.dumps(old_episode))
+    new_episode["crop_config"]["speakers"][0]["longform_center_y"] = 600
+    clip = {
+        "id": "clip_01",
+        "start_seconds": 1,
+        "end_seconds": 3,
+        "status": "approved",
+        "approved_render_fingerprint": "reviewed-old-fingerprint",
+    }
+    config = {"processing": {}}
+    segments = [{"start": 0, "end": 4, "speaker": "speaker_0"}]
+    legacy = _short_render_fingerprint(
+        tmp_path,
+        old_episode,
+        config,
+        audio,
+        segments,
+        clip,
+        legacy_crop=True,
+    )
+    record_short_render(
+        tmp_path,
+        "clip_01",
+        fingerprint=legacy,
+        timeline=Timeline.from_edits(4).slice(1, 3),
+        media={"duration_seconds": 2},
+    )
+
+    migrated = migrate_unchanged_short_crop_fingerprints(
+        tmp_path,
+        old_episode,
+        new_episode,
+        config,
+        audio,
+        segments,
+        [clip],
+    )
+
+    assert migrated == ["clip_01"]
+    assert current_short_render(tmp_path, new_episode, config, audio, segments, clip)
+    manifest = json.loads((tmp_path / "render_manifest.json").read_text())
+    record = manifest["shorts"]["clip_01"]
+    assert record["fingerprint_migration"]["from"] == legacy
+    assert clip["approved_render_fingerprint"] == "reviewed-old-fingerprint"
 
 
 def test_fingerprint_marks_missing_inputs_without_raising(tmp_path):

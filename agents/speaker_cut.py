@@ -1,5 +1,6 @@
 """Build source-clock camera decisions from camera or logical recorder tracks."""
 
+import copy
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ from agents.audio_analysis import (
 from agents.base import BaseAgent
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import logical_track_groups
-from lib.crop import compute_crop, resolve_speaker
+from lib.crop import compute_crop, resolve_speaker, speaker_crop_state
 
 DOMINANCE_DB = 6.0
 SPEAKER_CUT_VERSION = "source-clock-v3"
@@ -337,6 +338,49 @@ def current_speaker_segments(
         ):
             return None
     return segments
+
+
+def rebind_visual_crop_segments(
+    episode_dir: Path, old_episode: dict, new_episode: dict, config: dict
+) -> dict | None:
+    """Preserve verified acoustic decisions across picture-only crop changes."""
+    if speaker_crop_state(old_episode.get("crop_config", {})) != speaker_crop_state(
+        new_episode.get("crop_config", {})
+    ):
+        return None
+    current = current_speaker_segments(episode_dir, old_episode, config)
+    if current is None:
+        return None
+    try:
+        audio_analysis = json.loads((episode_dir / "audio_analysis.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    updated = copy.deepcopy(current)
+    previous_fingerprint = updated["fingerprint"]
+    updated["fingerprint"] = speaker_cut_fingerprint(
+        episode_dir, new_episode, audio_analysis, config
+    )
+    updated["crop_validation"] = validate_speaker_crops(new_episode)
+    if isinstance(updated.get("transcript_alignment"), dict):
+        alignment_fingerprint = transcript_alignment_fingerprint(episode_dir, updated)
+        if alignment_fingerprint is None:
+            return None
+        updated["transcript_alignment"]["fingerprint"] = alignment_fingerprint
+
+    atomic_write_json(episode_dir / "segments.json", updated)
+    metadata_path = episode_dir / "work" / "rms_meta.json"
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        metadata = None
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("fingerprint") == previous_fingerprint
+    ):
+        metadata["fingerprint"] = updated["fingerprint"]
+        atomic_write_json(metadata_path, metadata)
+    return updated
 
 
 def validate_speaker_crops(episode: dict) -> dict:

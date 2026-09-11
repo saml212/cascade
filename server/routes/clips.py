@@ -251,6 +251,7 @@ def _metadata_entry(ep_dir: Path, clip_id: str) -> dict | None:
 def _current_render(ep_dir: Path, clip: dict) -> dict | None:
     """Return the current validated render record for one clip."""
     from agents.pipeline import load_config
+    from lib.audio_mix import selected_audio_source
     from lib.delivery_video import current_short_render
 
     try:
@@ -260,10 +261,16 @@ def _current_render(ep_dir: Path, clip: dict) -> dict | None:
         )
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
-    audio = ep_dir / "work" / "audio_mix.wav"
+    config = load_config()
+    try:
+        audio = selected_audio_source(ep_dir, episode, config) or (
+            ep_dir / "work" / "audio_mix.wav"
+        )
+    except ValueError:
+        return None
     if not audio.exists() or not segments:
         return None
-    return current_short_render(ep_dir, episode, load_config(), audio, segments, clip)
+    return current_short_render(ep_dir, episode, config, audio, segments, clip)
 
 
 def _approve_current_render(

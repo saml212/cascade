@@ -2,7 +2,12 @@
 
 import pytest
 
-from lib.crop import compute_crop, resolve_speaker
+from lib.crop import (
+    compute_crop,
+    resolve_speaker,
+    speaker_crop_state,
+    visual_crop_state,
+)
 
 # -- compute_crop ----------------------------------------------------------
 
@@ -128,13 +133,38 @@ def test_longform_zero_center_and_zoom_are_not_treated_as_missing():
         longform_center_y=0,
         longform_zoom=2,
     )
-
     assert resolve_speaker("speaker_0", 1920, 1080, cfg) == (
         0,
         0,
         2,
         "speaker",
     )
+
+
+def test_visual_crop_state_separates_longform_and_short_values():
+    crop = _n_speaker_config(1)
+    crop["speakers"][0].update(
+        longform_center_x=700,
+        longform_center_y=None,
+        longform_zoom=None,
+        track=2,
+        volume=0.7,
+    )
+
+    short = visual_crop_state(crop, "short")
+    longform = visual_crop_state(crop, "longform")
+
+    assert short == {"speakers": [{"center_x": 400, "center_y": 540, "zoom": 1.0}]}
+    assert longform["speakers"] == [{"center_x": 700, "center_y": 540, "zoom": 1.0}]
+    assert speaker_crop_state(crop) == [{"label": "Speaker 0", "track": 2}]
+
+
+def test_wide_crop_only_affects_longform_visual_state():
+    before = _n_speaker_config(2)
+    after = {**before, "wide_center_x": 1100, "wide_zoom": 1.4}
+
+    assert visual_crop_state(before, "short") == visual_crop_state(after, "short")
+    assert visual_crop_state(before, "longform") != visual_crop_state(after, "longform")
 
 
 def test_resolve_legacy_l_r():

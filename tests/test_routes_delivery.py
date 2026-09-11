@@ -54,6 +54,23 @@ def test_status_defaults_to_not_prepared(delivery):
     assert response.json()["status"] == "not_prepared"
 
 
+def test_audio_source_fingerprint_ignores_picture_crop(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["crop_config"] = {
+        "speakers": [{"track": 1, "volume": 0.8, "center_x": 400, "center_y": 500}]
+    }
+    config = {"processing": {}}
+    fingerprint = mod._source_fingerprint(episode_dir, episode, config)
+
+    episode["crop_config"]["speakers"][0]["longform_center_y"] = 650
+    assert mod._source_fingerprint(episode_dir, episode, config) == fingerprint
+
+    episode["crop_config"]["speakers"][0]["volume"] = 1.0
+    assert mod._source_fingerprint(episode_dir, episode, config) != fingerprint
+
+
 def test_prepare_rejects_missing_input(delivery):
     client, _, episodes_dir = delivery
     make_episode(episodes_dir, with_source=False)

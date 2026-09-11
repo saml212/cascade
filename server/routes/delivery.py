@@ -21,9 +21,10 @@ from agents.qa import quality_snapshot
 from agents.speaker_cut import current_speaker_segments
 from agents.transcribe import current_diarized_transcript
 from lib.atomic_write import atomic_write_json
-from lib.audio_mix import generate_audio_mix
+from lib.audio_mix import audio_selection_settings, generate_audio_mix
 from lib.delivery_video import (
     build_keep_intervals,
+    current_longform_render,
     longform_render_fingerprint,
     render_config_for_episode,
     render_space_budget,
@@ -118,16 +119,11 @@ def _source_fingerprint(
     ]
     payload = {
         "episode": {
-            key: episode.get(key)
-            for key in (
-                "audio_sync",
-                "audio_mix",
-                "audio_tracks",
-                "crop_config",
-                "duration_seconds",
-                "longform_edits",
-                "source_properties",
-            )
+            "audio_selection": audio_selection_settings(episode),
+            "audio_tracks": episode.get("audio_tracks"),
+            "duration_seconds": episode.get("duration_seconds"),
+            "longform_edits": episode.get("longform_edits"),
+            "source_properties": episode.get("source_properties"),
         },
         "inputs": inputs,
     }
@@ -140,18 +136,80 @@ def _source_fingerprint(
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _legacy_source_fingerprint(
+    episode_dir: Path, episode: dict, config: dict | None = None
+) -> str:
+    paths = [episode_dir / "source_merged.mp4"]
+    paths.extend(
+        Path(value)
+        for track in episode.get("audio_tracks", [])
+        if (value := track.get("dest_path") or track.get("path"))
+    )
+    payload = {
+        "episode": {
+            key: episode.get(key)
+            for key in (
+                "audio_sync",
+                "audio_mix",
+                "audio_tracks",
+                "crop_config",
+                "duration_seconds",
+                "longform_edits",
+                "source_properties",
+            )
+        },
+        "inputs": [
+            {"path": str(path.resolve()), **_file_stat(path)}
+            for path in sorted(set(paths))
+            if path.exists()
+        ],
+    }
+    if config is not None:
+        payload["processing"] = {
+            key: config.get("processing", {}).get(key)
+            for key in _DELIVERY_PROCESSING_KEYS
+        }
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def migrate_unchanged_delivery_audio_fingerprint(
+    episode_dir: Path, old_episode: dict, new_episode: dict, config: dict
+) -> bool:
+    """Preserve prepared audio identity across edits unrelated to its bytes."""
+    if audio_selection_settings(old_episode) != audio_selection_settings(new_episode):
+        return False
+    status = _read_status(episode_dir)
+    stored = status.get("source_fingerprint")
+    accepted = {
+        _source_fingerprint(episode_dir, old_episode, config),
+        _source_fingerprint(episode_dir, old_episode),
+        _legacy_source_fingerprint(episode_dir, old_episode, config),
+        _legacy_source_fingerprint(episode_dir, old_episode),
+    }
+    if status.get("status") != "ready" or stored not in accepted:
+        return False
+    status["source_fingerprint"] = _source_fingerprint(episode_dir, new_episode, config)
+    _write_status(episode_dir, status)
+    return True
+
+
 def _video_fingerprint(
     episode_dir: Path, episode: dict, config: dict, audio: Path
 ) -> str | None:
     segment_document = current_speaker_segments(episode_dir, episode, config)
     if not segment_document:
         return None
+    segments = segment_document.get("segments", [])
+    current = current_longform_render(episode_dir, episode, config, audio, segments)
+    if current:
+        return current["fingerprint"]
     return longform_render_fingerprint(
         episode_dir,
         episode,
         config,
         audio,
-        segment_document.get("segments", []),
+        segments,
     )
 
 
@@ -236,8 +294,12 @@ def _refresh_status(episode_dir: Path) -> dict:
         try:
             stored_fingerprint = status.get("source_fingerprint")
             current_fingerprint = _source_fingerprint(episode_dir, episode, config)
-            legacy_fingerprint = _source_fingerprint(episode_dir, episode)
-            if stored_fingerprint == legacy_fingerprint:
+            legacy_fingerprints = {
+                _source_fingerprint(episode_dir, episode),
+                _legacy_source_fingerprint(episode_dir, episode, config),
+                _legacy_source_fingerprint(episode_dir, episode),
+            }
+            if stored_fingerprint in legacy_fingerprints:
                 status["source_fingerprint"] = current_fingerprint
                 stored_fingerprint = current_fingerprint
                 _write_status(episode_dir, status)

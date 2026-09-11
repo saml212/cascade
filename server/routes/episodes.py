@@ -19,11 +19,22 @@ from pydantic import BaseModel
 
 from agents.pipeline import load_config
 from agents.qa import quality_snapshot
+from agents.speaker_cut import current_speaker_segments, rebind_visual_crop_segments
 from lib.atomic_write import atomic_write_json
-from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER, selected_audio_source
+from lib.audio_mix import (
+    CAMERA_AUDIO_TIMELINE_FILTER,
+    audio_selection_settings,
+    selected_audio_source,
+)
 from lib.clips import normalize_clip as _normalize_clip
+from lib.crop import speaker_crop_state, visual_crop_state
+from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
 from lib.ffprobe import get_dimensions
-from server.routes.delivery import _source_fingerprint, _video_fingerprint
+from server.routes.delivery import (
+    _source_fingerprint,
+    _video_fingerprint,
+    migrate_unchanged_delivery_audio_fingerprint,
+)
 
 
 async def _run_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -1006,6 +1017,8 @@ class CropConfigRequest(BaseModel):
 async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
     """Save crop settings without rendering or deleting finished deliverables."""
     ep = read_episode(episode_id)
+    old_episode = dict(ep)
+    old_episode["crop_config"] = ep.get("crop_config", {})
 
     ep_dir = EPISODES_DIR / episode_id
     source_width = 1920
@@ -1078,14 +1091,37 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
     if crop_config == ep.get("crop_config"):
         return {"status": "saved", "changed": False, "crop_config": crop_config}
 
+    config = load_config()
+    old_crop = old_episode["crop_config"]
+    longform_changed = visual_crop_state(old_crop, "longform") != visual_crop_state(
+        crop_config, "longform"
+    )
+    short_changed = visual_crop_state(old_crop, "short") != visual_crop_state(
+        crop_config, "short"
+    )
+    speaker_mapping_changed = speaker_crop_state(old_crop) != speaker_crop_state(
+        crop_config
+    )
+    new_episode = dict(ep)
+    new_episode["crop_config"] = crop_config
+    audio_changed = audio_selection_settings(old_episode) != audio_selection_settings(
+        new_episode
+    )
+
     ep["crop_config"] = crop_config
-    crop_dependent_agents = {
-        "speaker_cut",
-        "longform_render",
-        "shorts_render",
-        "qa",
-        "podcast_feed",
-    }
+    crop_dependent_agents = set()
+    if speaker_mapping_changed:
+        crop_dependent_agents.update(
+            {"speaker_cut", "longform_render", "shorts_render", "qa"}
+        )
+    if audio_changed:
+        crop_dependent_agents.update(
+            {"longform_render", "shorts_render", "qa", "podcast_feed"}
+        )
+    if longform_changed:
+        crop_dependent_agents.update({"longform_render", "qa"})
+    if short_changed:
+        crop_dependent_agents.update({"shorts_render", "qa"})
 
     pipeline_state = ep.setdefault("pipeline", {})
     completed = pipeline_state.get("agents_completed", [])
@@ -1099,22 +1135,70 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
         if name not in crop_dependent_agents
     }
 
-    # Final deliverables and publishing receipts remain available until a new
-    # render successfully replaces them. Only disposable computation caches go.
     work_dir = ep_dir / "work"
-    for pattern in [
-        "longform_seg_*.mp4",
-        "longform_raw.mp4",
-        "longform_concat.txt",
-        "short_temp_*.mp4",
-        "speaker_*_channel.npy",
-        "speaker_*_rms_db.npy",
-        "rms_meta.json",
-    ]:
+    disposable_patterns = []
+    if "longform_render" in crop_dependent_agents:
+        disposable_patterns.extend(
+            ["longform_seg_*.mp4", "longform_raw.mp4", "longform_concat.txt"]
+        )
+    if "shorts_render" in crop_dependent_agents:
+        disposable_patterns.append("short_temp_*.mp4")
+    if speaker_mapping_changed:
+        disposable_patterns.extend(
+            ["speaker_*_channel.npy", "speaker_*_rms_db.npy", "rms_meta.json"]
+        )
+    for pattern in disposable_patterns:
         for path in work_dir.glob(pattern):
             path.unlink(missing_ok=True)
 
-    ep["status"] = "ready_to_render"
+    if crop_dependent_agents:
+        ep["status"] = "ready_to_render"
 
     write_episode(episode_id, ep)
-    return {"status": "saved", "changed": True, "crop_config": crop_config}
+    delivery_audio_preserved = migrate_unchanged_delivery_audio_fingerprint(
+        ep_dir, old_episode, ep, config
+    )
+
+    rebound = None
+    if not speaker_mapping_changed:
+        rebound = rebind_visual_crop_segments(ep_dir, old_episode, ep, config)
+    segments_preserved = bool(
+        rebound and current_speaker_segments(ep_dir, ep, config) is not None
+    )
+    migrated_short_ids = []
+    if segments_preserved and not short_changed and not audio_changed:
+        try:
+            audio_path = selected_audio_source(ep_dir, ep, config) or (
+                ep_dir / "work" / "audio_mix.wav"
+            )
+        except ValueError:
+            audio_path = None
+        clips_path = ep_dir / "clips.json"
+        try:
+            stored_clips = json.loads(clips_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            stored_clips = {"clips": []}
+        clips = (
+            stored_clips.get("clips", [])
+            if isinstance(stored_clips, dict)
+            else stored_clips
+        )
+        if audio_path is not None and audio_path.is_file() and isinstance(clips, list):
+            migrated_short_ids = migrate_unchanged_short_crop_fingerprints(
+                ep_dir,
+                old_episode,
+                ep,
+                config,
+                audio_path,
+                rebound.get("segments", []),
+                clips,
+            )
+    return {
+        "status": "saved",
+        "changed": True,
+        "crop_config": crop_config,
+        "invalidated_agents": sorted(crop_dependent_agents),
+        "speaker_segments_preserved": segments_preserved,
+        "migrated_short_render_ids": migrated_short_ids,
+        "delivery_audio_preserved": delivery_audio_preserved,
+    }

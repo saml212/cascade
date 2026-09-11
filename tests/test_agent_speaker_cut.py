@@ -9,6 +9,7 @@ from agents.speaker_cut import (
     SpeakerCutAgent,
     align_speaker_segments_to_transcript,
     current_speaker_segments,
+    rebind_visual_crop_segments,
     strict_bool,
     transcript_alignment_fingerprint,
     validate_speaker_crops,
@@ -50,6 +51,65 @@ def _tracks(n_speakers, n_samples, active_ranges):
             data[s:e] = rng.normal(0, 5000, e - s).astype(np.float32)
         out.append(data)
     return out
+
+
+def test_visual_crop_rebind_preserves_verified_segments_and_rms(
+    tmp_episode_dir, sample_config
+):
+    old_episode = {
+        "source_properties": {"width": 1920, "height": 1080},
+        "crop_config": {
+            "speakers": [
+                {"label": "Host", "track": 1, "center_x": 400, "center_y": 500},
+                {"label": "Guest", "track": 2, "center_x": 1400, "center_y": 500},
+            ]
+        },
+    }
+    new_episode = json.loads(json.dumps(old_episode))
+    new_episode["crop_config"]["speakers"][0]["longform_center_y"] = 600
+    current = {
+        "clock": "source",
+        "algorithm_version": "source-clock-v3",
+        "fingerprint": "old-fingerprint",
+        "segments": [{"start": 0, "end": 2, "speaker": "speaker_0"}],
+        "crop_validation": {"distinct": True},
+    }
+    _write(tmp_episode_dir / "audio_analysis.json", {"fingerprint": "analysis"})
+    work = tmp_episode_dir / "work"
+    work.mkdir(exist_ok=True)
+    _write(work / "rms_meta.json", {"fingerprint": "old-fingerprint"})
+
+    with (
+        patch("agents.speaker_cut.current_speaker_segments", return_value=current),
+        patch(
+            "agents.speaker_cut.speaker_cut_fingerprint",
+            return_value="new-fingerprint",
+        ),
+    ):
+        rebound = rebind_visual_crop_segments(
+            tmp_episode_dir, old_episode, new_episode, sample_config
+        )
+
+    assert rebound["segments"] == current["segments"]
+    assert rebound["fingerprint"] == "new-fingerprint"
+    assert rebound["crop_validation"]["distinct"] is True
+    assert json.loads((work / "rms_meta.json").read_text())["fingerprint"] == (
+        "new-fingerprint"
+    )
+
+
+def test_visual_crop_rebind_rejects_speaker_assignment_change(
+    tmp_episode_dir, sample_config
+):
+    old_episode = {"crop_config": {"speakers": [{"label": "Host", "track": 1}]}}
+    new_episode = {"crop_config": {"speakers": [{"label": "Host", "track": 2}]}}
+
+    assert (
+        rebind_visual_crop_segments(
+            tmp_episode_dir, old_episode, new_episode, sample_config
+        )
+        is None
+    )
 
 
 class TestIdenticalChannels:

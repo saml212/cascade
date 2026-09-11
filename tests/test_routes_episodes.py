@@ -132,7 +132,7 @@ class TestListEpisodes:
         video.write_bytes(b"video")
         canonical.write_bytes(b"canonical")
         import server.routes.episodes as episodes_mod
-        from server.routes.delivery import _source_fingerprint, _video_fingerprint
+        from server.routes.delivery import _source_fingerprint
 
         episode = json.loads((ep_dir / "episode.json").read_text())
         config = episodes_mod.load_config()
@@ -153,22 +153,27 @@ class TestListEpisodes:
                         "size": video.stat().st_size,
                         "mtime_ns": video.stat().st_mtime_ns,
                     },
-                    "video_source_fingerprint": _video_fingerprint(
-                        ep_dir, episode, config, canonical
-                    ),
+                    "video_source_fingerprint": "video-current",
                     "video": {"duration_seconds": 120.0, "width": 1920, "height": 1080},
                 }
             )
         )
 
-        delivery = client.get("/api/episodes/").json()[0]["delivery"]
-        assert delivery["status"] == "ready"
-        assert delivery["video_status"] == "ready"
-        assert delivery["video"]["duration_seconds"] == 120.0
+        with patch.object(
+            episodes_mod,
+            "_video_fingerprint",
+            side_effect=lambda _dir, current, _config, _audio: (
+                "video-changed" if current.get("crop_config") else "video-current"
+            ),
+        ):
+            delivery = client.get("/api/episodes/").json()[0]["delivery"]
+            assert delivery["status"] == "ready"
+            assert delivery["video_status"] == "ready"
+            assert delivery["video"]["duration_seconds"] == 120.0
 
-        episode["crop_config"] = {"speakers": [{"track": 1, "volume": 1.5}]}
-        (ep_dir / "episode.json").write_text(json.dumps(episode))
-        stale = client.get("/api/episodes/").json()[0]["delivery"]
+            episode["crop_config"] = {"speakers": [{"track": 1, "volume": 1.5}]}
+            (ep_dir / "episode.json").write_text(json.dumps(episode))
+            stale = client.get("/api/episodes/").json()[0]["delivery"]
         assert stale["status"] == "not_prepared"
         assert stale["video_status"] == "not_prepared"
 
@@ -616,6 +621,96 @@ class TestCropConfig:
         assert unchanged["pipeline"]["agents_completed"] == [
             "longform_render",
             "publish",
+        ]
+
+    def test_longform_only_crop_keeps_short_renders_and_speaker_cache(
+        self, test_client
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        base_payload = {
+            "speakers": [
+                {
+                    "label": "Host",
+                    "center_x": 480,
+                    "center_y": 540,
+                    "longform_center_x": 500,
+                    "longform_center_y": 500,
+                    "track": 1,
+                },
+                {
+                    "label": "Guest",
+                    "center_x": 1440,
+                    "center_y": 540,
+                    "longform_center_x": 1420,
+                    "longform_center_y": 500,
+                    "track": 2,
+                },
+            ]
+        }
+        assert (
+            client.post(
+                "/api/episodes/ep_001/crop-config", json=base_payload
+            ).status_code
+            == 200
+        )
+        episode_path = ep_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode["pipeline"] = {
+            "agents_completed": [
+                "speaker_cut",
+                "longform_render",
+                "shorts_render",
+                "qa",
+                "podcast_feed",
+            ],
+            "errors": {},
+        }
+        episode_path.write_text(json.dumps(episode))
+        work = ep_dir / "work"
+        work.mkdir(exist_ok=True)
+        (work / "audio_mix.wav").write_bytes(b"audio")
+        rms = work / "speaker_0_rms_db.npy"
+        rms.write_bytes(b"rms")
+        (ep_dir / "clips.json").write_text(json.dumps({"clips": [{"id": "clip_01"}]}))
+        changed_payload = json.loads(json.dumps(base_payload))
+        changed_payload["speakers"][0]["longform_center_y"] = 620
+        rebound = {"segments": [{"start": 0, "end": 10, "speaker": "speaker_0"}]}
+
+        with (
+            patch(
+                "server.routes.episodes.rebind_visual_crop_segments",
+                return_value=rebound,
+            ),
+            patch(
+                "server.routes.episodes.current_speaker_segments",
+                return_value=rebound,
+            ),
+            patch(
+                "server.routes.episodes.migrate_unchanged_short_crop_fingerprints",
+                return_value=["clip_01"],
+            ),
+            patch(
+                "server.routes.episodes.migrate_unchanged_delivery_audio_fingerprint",
+                return_value=True,
+            ),
+        ):
+            response = client.post(
+                "/api/episodes/ep_001/crop-config", json=changed_payload
+            )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["invalidated_agents"] == ["longform_render", "qa"]
+        assert result["speaker_segments_preserved"] is True
+        assert result["migrated_short_render_ids"] == ["clip_01"]
+        assert result["delivery_audio_preserved"] is True
+        assert rms.read_bytes() == b"rms"
+        saved = json.loads(episode_path.read_text())
+        assert saved["pipeline"]["agents_completed"] == [
+            "speaker_cut",
+            "shorts_render",
+            "podcast_feed",
         ]
 
     def test_legacy_format_generates_speakers_array(self, test_client):

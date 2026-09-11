@@ -19,6 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from lib.atomic_write import atomic_write_json
+from lib.crop import visual_crop_state
 from lib.encoding import (
     get_color_metadata_args,
     get_video_encoding_policy,
@@ -34,6 +35,7 @@ from lib.timeline import (  # noqa: F401
 RENDER_MANIFEST_NAME = "render_manifest.json"
 RENDER_PIPELINE_VERSION = "source-clock/v3"
 SHORTS_TWO_PERSON_STACK_VERSION = "two-person-stack/v1"
+ASPECT_CROP_FINGERPRINT_VERSION = "aspect-crop/v1"
 OUTPUT_RESERVE_BYTES = 1_000_000_000
 SCRATCH_RESERVE_BYTES = 10_000_000_000
 _manifest_lock = threading.Lock()
@@ -524,6 +526,21 @@ def longform_render_fingerprint(
     render_mode: str = "speaker_cut",
 ) -> str:
     """Fingerprint every input that can change the canonical longform pixels."""
+    return _longform_render_fingerprint(
+        episode_dir, episode, config, audio_path, segments, render_mode=render_mode
+    )
+
+
+def _longform_render_fingerprint(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    *,
+    render_mode: str = "speaker_cut",
+    legacy_crop: bool = False,
+) -> str:
     config = render_config_for_episode(episode, config)
     paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
     processing = config.get("processing", {})
@@ -534,7 +551,11 @@ def longform_render_fingerprint(
         "color_grade": "lut" if episode.get("delivery_apply_lut", False) else "source",
         "lut_sha256": lut_digest,
         "edits": episode.get("longform_edits", []),
-        "crop_config": episode.get("crop_config", {}),
+        "crop_config": (
+            episode.get("crop_config", {})
+            if legacy_crop
+            else visual_crop_state(episode.get("crop_config", {}), "longform")
+        ),
         "source_properties": episode.get("source_properties", {}),
         "segments": segments,
         "processing": {
@@ -558,6 +579,21 @@ def short_render_fingerprint(
     clip: dict,
 ) -> str:
     """Fingerprint a source-clock clip and its shared render inputs."""
+    return _short_render_fingerprint(
+        episode_dir, episode, config, audio_path, segments, clip
+    )
+
+
+def _short_render_fingerprint(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    clip: dict,
+    *,
+    legacy_crop: bool = False,
+) -> str:
     config = render_config_for_episode(episode, config)
     processing = config.get("processing", {})
     state = {
@@ -566,7 +602,11 @@ def short_render_fingerprint(
         "render_mode": "speaker_cut_short",
         "color_grade": "lut" if episode.get("delivery_apply_lut", False) else "source",
         "edits": episode.get("longform_edits", []),
-        "crop_config": episode.get("crop_config", {}),
+        "crop_config": (
+            episode.get("crop_config", {})
+            if legacy_crop
+            else visual_crop_state(episode.get("crop_config", {}), "short")
+        ),
         "source_properties": episode.get("source_properties", {}),
         "segments": segments,
         "clip_bounds": {
@@ -815,17 +855,28 @@ def current_longform_render(
     """Return the speaker-cut manifest record only when inputs and output match."""
     output = episode_dir / "upload_video.mp4"
     record = read_render_manifest(episode_dir).get("longform", {})
-    expected = longform_render_fingerprint(
-        episode_dir, episode, config, audio_path, segments
-    )
-    state = render_artifact_state(
-        episode_dir,
-        output,
-        record,
-        expected_fingerprint=expected,
-        expected_mode="speaker_cut",
-    )
-    return record if state["current"] else None
+    expected = [
+        longform_render_fingerprint(episode_dir, episode, config, audio_path, segments),
+        _longform_render_fingerprint(
+            episode_dir,
+            episode,
+            config,
+            audio_path,
+            segments,
+            legacy_crop=True,
+        ),
+    ]
+    for fingerprint in expected:
+        state = render_artifact_state(
+            episode_dir,
+            output,
+            record,
+            expected_fingerprint=fingerprint,
+            expected_mode="speaker_cut",
+        )
+        if state["current"]:
+            return record
+    return None
 
 
 def current_episode_longform_render(
@@ -857,17 +908,90 @@ def current_short_render(
         return None
     output = episode_dir / "shorts" / f"{clip_id}.mp4"
     record = read_render_manifest(episode_dir).get("shorts", {}).get(clip_id, {})
-    expected = short_render_fingerprint(
-        episode_dir, episode, config, audio_path, segments, clip
-    )
-    state = render_artifact_state(
-        episode_dir,
-        output,
-        record,
-        expected_fingerprint=expected,
-        expected_mode="speaker_cut_short",
-    )
-    return record if state["current"] else None
+    expected = [
+        short_render_fingerprint(
+            episode_dir, episode, config, audio_path, segments, clip
+        ),
+        _short_render_fingerprint(
+            episode_dir,
+            episode,
+            config,
+            audio_path,
+            segments,
+            clip,
+            legacy_crop=True,
+        ),
+    ]
+    for fingerprint in expected:
+        state = render_artifact_state(
+            episode_dir,
+            output,
+            record,
+            expected_fingerprint=fingerprint,
+            expected_mode="speaker_cut_short",
+        )
+        if state["current"]:
+            return record
+    return None
+
+
+def migrate_unchanged_short_crop_fingerprints(
+    episode_dir: Path,
+    old_episode: dict,
+    new_episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    clips: list[dict],
+) -> list[str]:
+    """Rebind verified shorts when an edit cannot change their pixels."""
+    if visual_crop_state(old_episode.get("crop_config", {}), "short") != (
+        visual_crop_state(new_episode.get("crop_config", {}), "short")
+    ):
+        return []
+
+    migrated = []
+    with _file_lock(episode_dir / ".render_manifest.lock", _manifest_lock):
+        manifest = read_render_manifest(episode_dir)
+        records = manifest.get("shorts", {})
+        for clip in clips:
+            clip_id = str(clip.get("id") or "")
+            record = records.get(clip_id)
+            if not clip_id or not isinstance(record, dict):
+                continue
+            verified = current_short_render(
+                episode_dir,
+                old_episode,
+                config,
+                audio_path,
+                segments,
+                clip,
+            )
+            if verified is None or verified.get("fingerprint") != record.get(
+                "fingerprint"
+            ):
+                continue
+            fingerprint = short_render_fingerprint(
+                episode_dir,
+                new_episode,
+                config,
+                audio_path,
+                segments,
+                clip,
+            )
+            previous = record.get("fingerprint")
+            if previous == fingerprint:
+                continue
+            record["fingerprint"] = fingerprint
+            record["fingerprint_migration"] = {
+                "version": ASPECT_CROP_FINGERPRINT_VERSION,
+                "reason": "short_visual_inputs_unchanged",
+                "from": previous,
+            }
+            migrated.append(clip_id)
+        if migrated:
+            atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
+    return migrated
 
 
 @contextmanager

@@ -16,7 +16,10 @@ from agents.qa import (
     editorial_revision,
 )
 from agents.speaker_cut import current_speaker_segments
+from lib.audio_mix import selected_audio_source
 from lib.delivery_video import (
+    current_longform_render,
+    current_short_render,
     longform_render_fingerprint,
     read_render_manifest,
     render_artifact_state,
@@ -135,8 +138,10 @@ def _selection_status(clip: dict) -> str:
 def _expected_fingerprints(
     episode_dir: Path, episode: dict, clips: list[dict], config: dict
 ) -> tuple[str | None, dict[str, str | None]]:
-    audio = episode_dir / "work" / "audio_mix.wav"
     try:
+        audio = selected_audio_source(episode_dir, episode, config) or (
+            episode_dir / "work" / "audio_mix.wav"
+        )
         current_segments = current_speaker_segments(episode_dir, episode, config)
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         current_segments = None
@@ -148,16 +153,30 @@ def _expected_fingerprints(
     if not audio.is_file() or not segments:
         return None, {str(clip.get("id")): None for clip in clips}
     try:
-        longform = longform_render_fingerprint(
+        current_longform = current_longform_render(
             episode_dir, episode, config, audio, segments
         )
-        shorts = {
-            str(clip["id"]): short_render_fingerprint(
+        longform = (
+            current_longform["fingerprint"]
+            if current_longform
+            else longform_render_fingerprint(
+                episode_dir, episode, config, audio, segments
+            )
+        )
+        shorts = {}
+        for clip in clips:
+            if not clip.get("id"):
+                continue
+            current_short = current_short_render(
                 episode_dir, episode, config, audio, segments, clip
             )
-            for clip in clips
-            if clip.get("id")
-        }
+            shorts[str(clip["id"])] = (
+                current_short["fingerprint"]
+                if current_short
+                else short_render_fingerprint(
+                    episode_dir, episode, config, audio, segments, clip
+                )
+            )
     except (FileNotFoundError, OSError, TypeError, ValueError):
         return None, {str(clip.get("id")): None for clip in clips}
     return longform, shorts
