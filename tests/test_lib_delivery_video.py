@@ -8,12 +8,18 @@ import numpy as np
 import pytest
 
 from lib.delivery_video import (
+    _audio_filter_graph,
     _filter_graph,
     _video_filter,
     build_keep_intervals,
+    build_render_segments,
+    current_longform_render,
     estimate_output_bytes,
+    longform_render_fingerprint,
+    record_longform_render,
     render_delivery_video,
 )
+from lib.timeline import Timeline
 
 
 def test_keep_intervals_applies_trims_and_cuts():
@@ -37,6 +43,43 @@ def test_filter_graph_splits_inputs_for_multiple_ranges():
     assert "concat=n=2:v=1:a=1[v][a]" in graph
 
 
+def test_audio_filter_graph_applies_the_same_interior_cut_ranges():
+    graph = _audio_filter_graph([(1, 2), (3, 4)])
+
+    assert "[1:a]asplit=2[ain0][ain1]" in graph
+    assert "[ain0]atrim=start=1:end=2" in graph
+    assert "[ain1]atrim=start=3:end=4" in graph
+    assert "[a0][a1]concat=n=2:v=0:a=1[a]" in graph
+
+
+def test_render_segments_cover_edits_and_switch_speakers_without_overlap():
+    timeline = Timeline.from_edits(
+        10, [{"type": "cut", "start_seconds": 4, "end_seconds": 6}]
+    )
+    segments = [
+        {"start": 0, "end": 2, "speaker": "A"},
+        {"start": 2, "end": 8, "speaker": "B"},
+        {"start": 8, "end": 10, "speaker": "A"},
+    ]
+
+    rendered = build_render_segments(timeline, segments)
+
+    assert [segment["speaker"] for segment in rendered] == ["A", "B", "B", "A"]
+    assert [
+        (segment["source_start"], segment["source_end"]) for segment in rendered
+    ] == [(0, 2.0), (2.0, 4.0), (6.0, 8.0), (8.0, 10)]
+    assert sum(segment["duration"] for segment in rendered) == timeline.duration
+
+
+def test_render_segments_fill_detection_gaps_with_wide_crop():
+    timeline = Timeline.from_edits(5)
+
+    rendered = build_render_segments(timeline, [{"start": 1, "end": 4, "speaker": "A"}])
+
+    assert [segment["speaker"] for segment in rendered] == ["BOTH", "A", "BOTH"]
+    assert sum(segment["duration"] for segment in rendered) == 5
+
+
 def test_video_filter_caps_4k_at_1080p_even_without_crop():
     vf, width, height = _video_filter(3840, 2160, {}, {})
     assert (width, height) == (1920, 1080)
@@ -56,6 +99,34 @@ def test_video_filter_uses_wide_crop():
 
 def test_disk_estimate_includes_video_audio_and_margin():
     assert estimate_output_bytes(3600) > 3_600_000_000
+
+
+def test_longform_manifest_rejects_changed_segments(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio_mix.wav"
+    output = tmp_path / "upload_video.mp4"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"render")
+    episode = {"crop_config": {"wide_zoom": 1}, "longform_edits": []}
+    config = {"processing": {"video_crf": 22}}
+    segments = [{"start": 0, "end": 5, "speaker": "A"}]
+    fingerprint = longform_render_fingerprint(
+        tmp_path, episode, config, audio, segments
+    )
+    timeline = Timeline.from_edits(5)
+
+    record_longform_render(
+        tmp_path,
+        fingerprint=fingerprint,
+        render_mode="speaker_cut",
+        timeline=timeline,
+        media={"duration_seconds": 5},
+    )
+
+    assert current_longform_render(tmp_path, episode, config, audio, segments)
+    changed = [{"start": 0, "end": 5, "speaker": "B"}]
+    assert current_longform_render(tmp_path, episode, config, audio, changed) is None
 
 
 def test_export_rejects_canonical_audio_that_does_not_cover_selected_end(tmp_path):
