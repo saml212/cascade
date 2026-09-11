@@ -91,20 +91,16 @@ def test_two_person_both_span_stacks_close_crops(tmp_episode_dir, sample_config)
         ]
     }
 
-    video_filter = agent._get_short_crop_filter_no_subs(
-        "BOTH", 320, 180, crop_config
-    )
+    video_filter = agent._get_short_crop_filter_no_subs("BOTH", 320, 180, crop_config)
 
     assert video_filter.startswith("split=2[stack0][stack1]")
-    assert "[stack0]crop=100:88:30:46" in video_filter
-    assert "[stack1]crop=100:88:190:46" in video_filter
+    assert "[stack0]crop=100:88:30:22" in video_filter
+    assert "[stack1]crop=100:88:190:22" in video_filter
     assert video_filter.count("scale=1080:960") == 2
     assert "[top][bottom]vstack=inputs=2" in video_filter
 
 
-def test_overlap_without_exactly_two_speakers_fits_wide(
-    tmp_episode_dir, sample_config
-):
+def test_overlap_without_exactly_two_speakers_fits_wide(tmp_episode_dir, sample_config):
     agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
 
     video_filter = agent._get_short_crop_filter_no_subs(
@@ -114,10 +110,7 @@ def test_overlap_without_exactly_two_speakers_fits_wide(
         {"speakers": [{}, {}, {}], "wide_zoom": 1},
     )
 
-    assert (
-        "force_original_aspect_ratio=decrease"
-        in video_filter
-    )
+    assert "force_original_aspect_ratio=decrease" in video_filter
     assert "vstack" not in video_filter
 
 

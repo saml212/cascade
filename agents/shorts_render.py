@@ -431,11 +431,10 @@ class ShortsRenderAgent(BaseAgent):
         if speaker == "BOTH" and len(crop_config.get("speakers", [])) == 2:
             panels = []
             for index, output_label in enumerate(("top", "bottom")):
-                cx, cy, _zoom, _mode = resolve_speaker(
-                    f"speaker_{index}", src_w, src_h, crop_config, for_shorts=True
-                )
-                portrait_w, _portrait_h, _x, _y = self._get_short_crop_region(
-                    f"speaker_{index}", src_w, src_h, crop_config
+                portrait_w, portrait_h, portrait_x, portrait_y = (
+                    self._get_short_crop_region(
+                        f"speaker_{index}", src_w, src_h, crop_config
+                    )
                 )
                 panel_w = min(src_w, portrait_w)
                 panel_h = panel_w * 8 / 9
@@ -444,8 +443,10 @@ class ShortsRenderAgent(BaseAgent):
                     panel_w = panel_h * 9 / 8
                 panel_w = max(2, int(panel_w) // 2 * 2)
                 panel_h = max(2, int(panel_h) // 2 * 2)
+                cx = portrait_x + portrait_w / 2
                 x = max(0, min(round(cx - panel_w / 2), src_w - panel_w))
-                y = max(0, min(round(cy - panel_h / 2), src_h - panel_h))
+                upper_body_y = portrait_y + max(0, portrait_h - panel_h) / 4
+                y = max(0, min(round(upper_body_y), src_h - panel_h))
                 x = x // 2 * 2
                 y = y // 2 * 2
                 panels.append(
