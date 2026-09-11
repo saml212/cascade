@@ -1,8 +1,8 @@
 """Publish agent — distribute shorts and longform via Upload-Post to all platforms.
 
 Inputs:
-    - clips.json, metadata/metadata.json
-    - shorts/<clip_id>.mp4, longform.mp4
+    - episode.json, clips.json, optional legacy metadata/metadata.json
+    - shorts/<clip_id>.mp4, upload_video.mp4
 Outputs:
     - publish.json (submission results, request IDs)
 Dependencies:
@@ -20,6 +20,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from agents.base import BaseAgent
+from agents.qa import canonical_release_metadata, quality_snapshot
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 STATUS_URL = "https://api.upload-post.com/api/uploadposts/status"
@@ -48,6 +49,10 @@ class PublishAgent(BaseAgent):
         episode = self.load_json_safe("episode.json")
         if not episode.get("publish_approved"):
             raise RuntimeError("not publish_approved — refusing to run")
+        gate = quality_snapshot(self.episode_dir)["release_gate"]
+        if not gate["safe"]:
+            reasons = "; ".join(item["message"] for item in gate["blockers"])
+            raise RuntimeError(f"release gate blocked — {reasons}")
 
         api_key = os.getenv("UPLOAD_POST_API_KEY")
         if not api_key:
@@ -65,8 +70,8 @@ class PublishAgent(BaseAgent):
         clips_data = self.load_json("clips.json")
         clips = clips_data.get("clips", [])
 
-        # Load metadata for per-platform captions
-        metadata = self.load_json_safe("metadata/metadata.json")
+        # Resolve the same episode and clip copy used by the release gate.
+        metadata = canonical_release_metadata(self.episode_dir, episode, clips)
 
         # Load schedule from metadata
         schedule = metadata.get("schedule", [])
@@ -114,8 +119,8 @@ class PublishAgent(BaseAgent):
 
         for i, clip in enumerate(clips):
             clip_id = clip.get("id", "")
-            if clip.get("status") == "rejected":
-                self.logger.info("  Skipping rejected clip %s" % clip_id)
+            if clip.get("status") != "approved":
+                self.logger.info("  Skipping unapproved clip %s" % clip_id)
                 continue
 
             short_path = self.episode_dir / "shorts" / ("%s.mp4" % clip_id)
@@ -123,9 +128,7 @@ class PublishAgent(BaseAgent):
                 self.logger.warning("  Short not found: %s" % clip_id)
                 continue
 
-            # Get per-platform metadata — prefer inline clips.json metadata,
-            # fall back to metadata.json lookup
-            cmeta = clip.get("metadata", {}) or clip_metadata.get(clip_id, {})
+            cmeta = clip_metadata.get(clip_id, {})
             title = clip.get("title", "Clip %s" % clip_id)
 
             # Build curl command with repeated platform[] fields
@@ -306,7 +309,7 @@ class PublishAgent(BaseAgent):
                 self.logger.error("  %s failed: %s" % (clip_id, e))
 
         # === Publish longform to YouTube ===
-        longform_path = self.episode_dir / "longform.mp4"
+        longform_path = self.episode_dir / "upload_video.mp4"
         longform_result = None
         # Idempotency: if the longform URL is already recorded, it was published
         # in a prior run. Skip re-upload so the two-phase flow (longform first,

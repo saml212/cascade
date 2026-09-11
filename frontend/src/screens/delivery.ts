@@ -5,19 +5,25 @@ import { link } from '../lib/router';
 import { effect, onCleanup, signal } from '../lib/signals';
 import { showToast } from '../state/ui';
 import { stableControl, type StableControl } from '../lib/stable-control';
+import {
+  QualityReview,
+  type QualityReviewControls,
+} from '../components/QualityReview';
+import type { QualitySnapshot } from '../lib/api';
 
 interface DeliveryControls {
   audio?: StableControl<HTMLAudioElement>;
   video?: StableControl<HTMLVideoElement>;
   trimStart?: StableControl<HTMLInputElement>;
   trimEnd?: StableControl<HTMLInputElement>;
+  quality: QualityReviewControls;
 }
 
 export function Delivery(target: HTMLElement, episodeId: string): void {
   const episode = signal<UnknownRecord | null>(null);
   const status = signal<DeliveryStatus | null>(null);
   const page = h('div', { class: 'min-h-full' });
-  const controls: DeliveryControls = {};
+  const controls: DeliveryControls = { quality: { previews: new Map() } };
   let pollTimer: number | undefined;
   let disposed = false;
   onCleanup(() => {
@@ -73,7 +79,7 @@ export function Delivery(target: HTMLElement, episodeId: string): void {
       } catch (error) {
         showToast((error as Error).message, 'error');
       }
-    }));
+    }, load));
   });
 
   void load();
@@ -87,12 +93,14 @@ function renderPage(
   controls: DeliveryControls,
   prepare: () => Promise<void>,
   prepareVideo: () => Promise<void>,
-  saveTrim: (start: number, end: number) => Promise<void>
+  saveTrim: (start: number, end: number) => Promise<void>,
+  refresh: () => Promise<void>
 ): HTMLElement {
-  const title = String(
-    episode?.episode_name || episode?.title || episode?.guest_name || episodeId
-  );
-  const state = delivery?.status ?? 'not_prepared';
+  const title = episode
+    ? String(episode.episode_name || episode.title || episode.guest_name || episodeId)
+    : 'Loading episode…';
+  const state = delivery?.status;
+  const loading = !delivery;
   const audioBusy = state === 'preparing';
   const videoBusy = delivery?.video_status === 'preparing';
 
@@ -116,6 +124,16 @@ function renderPage(
         'Build a clean local podcast master, verify its loudness, and download the MP3 for scheduling. This does not upload or publish anything.'
       )
     ),
+    loading
+      ? h('div', { class: 'panel p-6 animate-pulse-breath text-ink-tertiary' }, 'Loading release state…')
+      : QualityReview({
+          episodeId,
+          quality:
+            delivery.quality ??
+            (episode?.quality as QualitySnapshot | null | undefined),
+          onUpdated: refresh,
+          controls: controls.quality,
+        }),
     delivery ? trimDetails(delivery, controls, saveTrim) : null,
     h(
       'div',
@@ -128,7 +146,9 @@ function renderPage(
         Button({
           variant: 'primary',
           size: 'lg',
-          label: audioBusy
+          label: loading
+            ? 'Loading…'
+            : audioBusy
             ? 'Preparing…'
             : videoBusy
               ? 'Video preparing…'
@@ -136,7 +156,7 @@ function renderPage(
                 ? 'Prepare again'
                 : 'Prepare episode',
           loading: audioBusy,
-          disabled: audioBusy || videoBusy,
+          disabled: loading || audioBusy || videoBusy,
           onClick: () => void prepare(),
         })
       ),
@@ -216,14 +236,16 @@ function videoDetails(
     h('div', { class: 'flex items-center justify-between gap-4' },
       h('div', null,
         h('div', { class: 'text-heading-sm text-ink-primary' },
-          videoState === 'ready' ? 'Upload video ready' : busy ? 'Preparing upload video' : videoState === 'failed' ? 'Video preparation failed' : 'Upload video'
+          videoState === 'ready' ? 'Rendered video available' : busy ? 'Preparing release video' : videoState === 'failed' ? 'Video preparation failed' : 'Release video'
         ),
         h('div', { class: 'text-body-sm text-ink-tertiary mt-1' },
           busy
             ? `${delivery.video_detail || 'Encoding'} · ${(delivery.video_progress ?? 0).toFixed(0)}%`
-            : delivery.delivery_apply_lut
-              ? 'Continuous 1080p wide shot with saved edits, camera LUT, and mastered audio.'
-              : 'Continuous 1080p wide shot with saved edits, source color, and mastered audio.'
+            : video?.render_mode === 'speaker_cut'
+              ? 'Speaker-cut 1080p render with saved edits and mastered audio.'
+              : delivery.delivery_apply_lut
+                ? 'Existing wide render with saved edits, camera LUT, and mastered audio.'
+                : 'Existing wide render with saved edits, source color, and mastered audio.'
         )
       ),
       Button({
@@ -260,7 +282,7 @@ function videoDetails(
             href: delivery.video_download_url,
             download: video.filename,
             class: 'inline-flex h-11 px-5 items-center justify-center self-start rounded-md bg-accent text-ink-on-accent font-medium hover:brightness-110',
-          }, 'Download upload video')
+          }, 'Download rendered video')
         )
       : null
   );
@@ -352,18 +374,22 @@ function videoPlayer(
   return controls.video.value;
 }
 
-function statusLabel(status: DeliveryStatus['status']): string {
+function statusLabel(status?: DeliveryStatus['status']): string {
+  if (!status) return 'Loading release state';
   if (status === 'preparing') return 'Preparing audio';
-  if (status === 'ready') return 'Audio ready';
+  if (status === 'ready') return 'Audio master rendered';
   if (status === 'failed') return 'Preparation failed';
   return 'Not prepared';
 }
 
 function statusDetail(status: DeliveryStatus | null): string {
-  if (!status || status.status === 'not_prepared') return 'No local podcast master has been prepared yet.';
+  if (!status) return 'Reading the current local artifacts and checks.';
+  if (status.status === 'not_prepared') return 'No local podcast master has been prepared yet.';
   if (status.status === 'preparing') return 'Mixing, mastering, encoding, and checking the finished MP3.';
   if (status.status === 'failed') return 'Fix the issue below, then prepare the episode again.';
-  return status.completed_at ? `Verified ${new Date(status.completed_at).toLocaleString()}` : 'Audio checks passed.';
+  return status.completed_at
+    ? `Duration and loudness measured ${new Date(status.completed_at).toLocaleString()}`
+    : 'Duration and loudness checks completed.';
 }
 
 function formatDuration(value?: number): string {

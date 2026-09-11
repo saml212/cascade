@@ -17,6 +17,8 @@ import { link, navigate } from '../lib/router';
 
 const PRIORITY: Record<string, number> = {
   delivery_ready: 95,
+  quality_blocked: 98,
+  quality_review_required: 96,
   delivery_audio_ready: 75,
   delivery_preparing_video: 65,
   delivery_preparing_audio: 65,
@@ -274,6 +276,9 @@ function ctaFor(ep: EpisodeSummary): { label: string } {
   switch (key) {
     case 'delivery_ready':
       return { label: 'Open upload files →' };
+    case 'quality_blocked':
+    case 'quality_review_required':
+      return { label: 'Review quality →' };
     case 'delivery_audio_ready':
       return { label: 'Prepare video →' };
     case 'delivery_preparing_audio':
@@ -304,6 +309,8 @@ function ctaTarget(ep: EpisodeSummary, key: string): string {
   const base = `/episodes/${ep.episode_id}`;
   switch (key) {
     case 'delivery_ready':
+    case 'quality_blocked':
+    case 'quality_review_required':
     case 'delivery_audio_ready':
     case 'delivery_preparing_audio':
     case 'delivery_preparing_video':

@@ -193,6 +193,13 @@ def run_pipeline(
             _save_episode(ef, episode)
 
         result = agent.run()
+        if agent_name == "qa" and result.get("overall") != "pass":
+            failed_checks = [
+                check.get("name", "unknown")
+                for check in result.get("checks", [])
+                if not check.get("pass")
+            ]
+            raise RuntimeError("QA release gate failed: " + ", ".join(failed_checks))
         return result
 
     def _on_agent_complete(agent_name, result):

@@ -7,6 +7,8 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 
+from agents.qa import canonical_release_metadata, quality_revision
+
 
 @pytest.fixture
 def test_client(tmp_path, monkeypatch):
@@ -301,6 +303,33 @@ class TestUpdateEpisode:
         assert data["guest_name"] == "Jane Doe"
         assert data["guest_title"] == "Engineer"
         assert data["episode_name"] == "The Interview"
+
+    def test_update_release_copy_changes_quality_revision(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"description": "Draft description", "tags": ["draft"]},
+        )
+        before = quality_revision(episode_dir)
+
+        response = client.patch(
+            "/api/episodes/ep_001",
+            json={
+                "title": "Final title",
+                "description": "Final description",
+                "tags": ["final"],
+            },
+        )
+
+        assert response.status_code == 200
+        assert quality_revision(episode_dir) != before
+        metadata = canonical_release_metadata(episode_dir)
+        assert metadata["longform"] == {
+            "title": "Final title",
+            "description": "Final description",
+            "tags": ["final"],
+        }
 
     def test_update_not_found(self, test_client):
         client, _ = test_client

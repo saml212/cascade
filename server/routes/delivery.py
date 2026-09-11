@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from agents.pipeline import load_config
 from agents.podcast_feed import PodcastFeedAgent
+from agents.qa import quality_snapshot
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import generate_audio_mix
 from lib.delivery_video import build_keep_intervals, render_delivery_video
@@ -414,7 +415,8 @@ def _prepare_video(episode_id: str) -> None:
 
 @router.get("/{episode_id}/delivery")
 async def delivery_status(episode_id: str) -> dict:
-    return _refresh_status(_episode_dir(episode_id))
+    episode_dir = _episode_dir(episode_id)
+    return {**_refresh_status(episode_dir), "quality": quality_snapshot(episode_dir)}
 
 
 class DeliveryTrimRequest(BaseModel):

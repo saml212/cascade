@@ -206,7 +206,7 @@ function renderHeader(
             )
           : null
       ),
-      primaryActionFor(rawStatus.key, episodeId, ep)
+      primaryActionFor(status.key, episodeId, ep)
     ),
     isProcessing && agents.length > 0
       ? h(
@@ -243,7 +243,11 @@ function primaryActionFor(
   ep: Record<string, unknown>
 ): HTMLElement | null {
   const delivery = ep.delivery as Record<string, unknown> | undefined;
-  if (delivery?.video_status === 'ready' && delivery.video_download_url) {
+  if (
+    key === 'delivery_ready' &&
+    delivery?.video_status === 'ready' &&
+    delivery.video_download_url
+  ) {
     return Button({
       variant: 'primary',
       label: 'Upload files ready',
@@ -258,6 +262,13 @@ function primaryActionFor(
     });
   }
   switch (key) {
+    case 'quality_blocked':
+    case 'quality_review_required':
+      return Button({
+        variant: 'primary',
+        label: 'Review quality',
+        onClick: () => navigate(`/episodes/${episodeId}/delivery`),
+      });
     case 'awaiting_crop':
       return Button({
         variant: 'primary',

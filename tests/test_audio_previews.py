@@ -156,3 +156,69 @@ def test_sync_preview_rejects_unbounded_duration(preview_client):
 
     assert response.status_code == 400
     assert "duration must be between" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_channel_preview_rejects_non_finite_windows(preview_client, value):
+    client, episode_dir = preview_client
+    _write_episode(episode_dir, [])
+    (episode_dir / "source_merged.mp4").write_bytes(b"video")
+
+    response = client.get(
+        f"/api/episodes/ep_test/channel-preview/right?start={value}&duration=1"
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_channel_preview_cache_keeps_fractional_windows_distinct(
+    preview_client, monkeypatch
+):
+    client, episode_dir = preview_client
+    _write_episode(episode_dir, [])
+    (episode_dir / "source_merged.mp4").write_bytes(b"video")
+
+    async def fake_ffmpeg(cmd):
+        Path(cmd[-1]).write_bytes(b"mp3")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    run = AsyncMock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    first = client.get(
+        "/api/episodes/ep_test/channel-preview/right?start=10.1&duration=1.1"
+    )
+    second = client.get(
+        "/api/episodes/ep_test/channel-preview/right?start=10.9&duration=1.9"
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert run.await_count == 2
+    for call in run.await_args_list:
+        command = call.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        assert "aresample=async=1000" in graph
+
+
+def test_track_preview_applies_reliable_tempo_drift(preview_client, monkeypatch):
+    client, episode_dir = preview_client
+    tracks = [_track(episode_dir, "session_Tr1.WAV", 1, 100)]
+    _write_episode(episode_dir, tracks, offset=2)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["audio_sync"].update({"tempo_factor": 1.01, "r_squared": 0.9})
+    (episode_dir / "episode.json").write_text(json.dumps(episode))
+
+    async def fake_ffmpeg(cmd):
+        Path(cmd[-1]).write_bytes(b"mp3")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    run = AsyncMock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    response = client.get(
+        "/api/episodes/ep_test/audio-preview/track/1?start=10&duration=5"
+    )
+
+    assert response.status_code == 200
+    command = run.await_args.args[0]
+    assert command[command.index("-ss") + 1] == "12.1"
+    assert "atempo=1.01000000" in command[command.index("-filter_complex") + 1]

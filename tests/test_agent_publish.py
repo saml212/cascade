@@ -25,6 +25,20 @@ from unittest.mock import patch
 import pytest
 
 from agents.publish import PublishAgent
+from agents.pipeline import load_config
+from agents.qa import (
+    clip_review_revision,
+    editorial_revision,
+    quality_revision,
+    release_revision,
+)
+from lib.delivery_video import (
+    longform_render_fingerprint,
+    record_longform_render,
+    record_short_render,
+    short_render_fingerprint,
+)
+from lib.timeline import Timeline
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -53,14 +67,14 @@ def _write_json(path, data):
 
 def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=True):
     """Write the minimum files publish agent needs to run successfully."""
-    _write_json(
-        episode_dir / "episode.json",
-        {
-            "episode_id": "ep_test",
-            "publish_approved": publish_approved,
-            "status": "ready_for_review",
-        },
-    )
+    episode = {
+        "episode_id": "ep_test",
+        "publish_approved": publish_approved,
+        "status": "ready_for_review",
+        "crop_config": {"speakers": [{"label": "Host"}]},
+        "longform_edits": [],
+    }
+    _write_json(episode_dir / "episode.json", episode)
     clips = clips or [
         {
             "id": "clip_0",
@@ -71,6 +85,7 @@ def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=Tr
             "metadata": {
                 "youtube": {"title": "yt title", "description": "yt desc"},
                 "tiktok": {"caption": "tt cap", "hashtags": ["#a", "#b"]},
+                "instagram": {"caption": "ig cap", "hashtags": ["#a"]},
                 "x": {"text": "x text"},
             },
         },
@@ -92,8 +107,77 @@ def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=Tr
     for c in clips:
         if c.get("status") != "rejected":
             (episode_dir / "shorts" / f"{c['id']}.mp4").write_bytes(b"fake mp4")
+    (episode_dir / "source_merged.mp4").write_bytes(b"source")
+    (episode_dir / "work").mkdir(exist_ok=True)
+    (episode_dir / "work" / "audio_mix.wav").write_bytes(b"master")
+    duration = max(
+        60.0,
+        *(float(clip.get("end_seconds", 0)) for clip in clips),
+    )
+    segments = [{"start": 0, "end": duration, "speaker": "BOTH"}]
+    _write_json(episode_dir / "segments.json", {"segments": segments})
+    config = load_config()
+    audio = episode_dir / "work" / "audio_mix.wav"
     if longform:
-        (episode_dir / "longform.mp4").write_bytes(b"fake mp4")
+        video = episode_dir / "upload_video.mp4"
+        video.write_bytes(b"fake mp4")
+        record_longform_render(
+            episode_dir,
+            fingerprint=longform_render_fingerprint(
+                episode_dir, episode, config, audio, segments
+            ),
+            render_mode="speaker_cut",
+            timeline=Timeline(duration, [(0, duration)]),
+            media={"duration_seconds": duration},
+        )
+    metadata_by_id = {
+        item["id"]: item
+        for item in json.loads(
+            (episode_dir / "metadata" / "metadata.json").read_text()
+        )["clips"]
+    }
+    for clip in clips:
+        if clip.get("status") != "approved":
+            continue
+        clip_id = clip["id"]
+        record = record_short_render(
+            episode_dir,
+            clip_id,
+            fingerprint=short_render_fingerprint(
+                episode_dir, episode, config, audio, segments, clip
+            ),
+            timeline=Timeline(
+                duration,
+                [(float(clip["start_seconds"]), float(clip["end_seconds"]))],
+            ),
+            media={
+                "duration_seconds": float(clip["end_seconds"])
+                - float(clip["start_seconds"])
+            },
+        )
+        clip["approved_render_fingerprint"] = record["fingerprint"]
+        clip["approved_revision"] = clip_review_revision(
+            clip, record, metadata_by_id.get(clip_id)
+        )
+    _write_json(episode_dir / "clips.json", {"clips": clips})
+    episode["editorial_approval"] = {
+        "revision": editorial_revision(episode_dir, episode),
+        "approved_at": "2026-01-01T00:00:00+00:00",
+    }
+    _write_json(episode_dir / "episode.json", episode)
+    episode["publish_approval"] = {
+        "revision": release_revision(episode_dir, episode),
+        "approved_at": "2026-01-01T00:01:00+00:00",
+    }
+    _write_json(episode_dir / "episode.json", episode)
+    _write_json(
+        episode_dir / "qa" / "qa.json",
+        {
+            "overall": "pass",
+            "quality_revision": quality_revision(episode_dir, episode),
+            "checks": [],
+        },
+    )
 
 
 def _make_agent(episode_dir, **platform_overrides):
@@ -149,6 +233,83 @@ class TestSafetyGate:
             result = agent.execute()
         assert result["shorts_submitted"] == 1
         assert result["shorts_failed"] == 0
+
+    @pytest.mark.parametrize("report_state", ["missing", "failed", "stale"])
+    def test_refuses_missing_failed_or_stale_qa(self, env, episode_dir, report_state):
+        _seed_episode(episode_dir)
+        qa_path = episode_dir / "qa" / "qa.json"
+        if report_state == "missing":
+            qa_path.unlink()
+        elif report_state == "failed":
+            report = json.loads(qa_path.read_text())
+            report["overall"] = "fail"
+            _write_json(qa_path, report)
+        else:
+            episode = json.loads((episode_dir / "episode.json").read_text())
+            episode["title"] = "Changed after QA"
+            _write_json(episode_dir / "episode.json", episode)
+
+        with patch("agents.publish.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="release gate blocked"):
+                _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_pending_clip_is_never_submitted(self, env, episode_dir):
+        clips = [
+            {
+                "id": "clip_0",
+                "title": "Pending",
+                "status": "pending",
+                "start_seconds": 0,
+                "end_seconds": 30,
+                "metadata": {
+                    "youtube": {"title": "Pending", "description": "Copy"},
+                    "tiktok": {"caption": "Copy"},
+                    "instagram": {"caption": "Copy"},
+                    "x": {"text": "Copy"},
+                },
+            }
+        ]
+        _seed_episode(episode_dir, clips=clips)
+
+        with patch("agents.publish.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="release gate blocked"):
+                _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_episode_editor_copy_is_the_publisher_payload(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode["title"] = "Title saved in the episode editor"
+        episode["description"] = "Description saved in the episode editor"
+        episode["tags"] = ["editor-copy"]
+        episode["publish_approval"] = {
+            "revision": release_revision(episode_dir, episode),
+            "approved_at": "2026-01-01T00:02:00+00:00",
+        }
+        _write_json(episode_path, episode)
+        qa_path = episode_dir / "qa" / "qa.json"
+        report = json.loads(qa_path.read_text())
+        report["quality_revision"] = quality_revision(episode_dir, episode)
+        _write_json(qa_path, report)
+
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda cmd, **_kwargs: (
+                captured.append(cmd)
+                or _mock_proc(stdout=json.dumps({"request_id": "request"}))
+            )
+            _make_agent(episode_dir).execute()
+
+        longform = next(cmd for cmd in captured if "upload_video.mp4" in " ".join(cmd))
+        fields = [
+            value
+            for index, value in enumerate(longform)
+            if index > 0 and longform[index - 1] == "-F"
+        ]
+        assert "youtube_title=Title saved in the episode editor" in fields
+        assert "youtube_description=Description saved in the episode editor" in fields
 
 
 class TestApiKeyGate:
@@ -266,7 +427,7 @@ class TestXLongTextFlag:
             "or X posts > 280 chars silently fail."
         )
 
-    def test_x_long_text_flag_not_sent_when_x_metadata_absent(self, env, episode_dir):
+    def test_missing_x_copy_is_blocked_before_submission(self, env, episode_dir):
         clips = [
             {
                 "id": "clip_0",
@@ -274,24 +435,19 @@ class TestXLongTextFlag:
                 "status": "approved",
                 "start_seconds": 0,
                 "end_seconds": 30,
-                "metadata": {"youtube": {"title": "yt", "description": ""}},
+                "metadata": {
+                    "youtube": {"title": "yt", "description": "description"},
+                    "tiktok": {"caption": "caption"},
+                    "instagram": {"caption": "caption"},
+                },
             }
         ]
         _seed_episode(episode_dir, clips=clips)
         agent = _make_agent(episode_dir)
-        captured = []
         with patch("agents.publish.subprocess.run") as run:
-
-            def _capture(cmd, **_kwargs):
-                captured.append(cmd)
-                return _mock_proc(stdout=json.dumps({"request_id": "r"}))
-
-            run.side_effect = _capture
-            agent.execute()
-        flags = [
-            a for i, a in enumerate(captured[0]) if i > 0 and captured[0][i - 1] == "-F"
-        ]
-        assert not any("x_long_text_as_post" in f for f in flags)
+            with pytest.raises(RuntimeError, match="x copy is missing: text"):
+                agent.execute()
+        run.assert_not_called()
 
 
 # ── YouTube longform link funnel ────────────────────────────────────────────
@@ -412,7 +568,7 @@ class TestYouTubeLongformFunnel:
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         # Only 1 call: short upload. Longform upload is skipped by idempotency.
         assert len(captured) == 1
-        assert "longform.mp4" not in " ".join(captured[0])
+        assert "upload_video.mp4" not in " ".join(captured[0])
 
 
 # ── rejected clips skipped ──────────────────────────────────────────────────
@@ -427,7 +583,12 @@ class TestRejectedClips:
                 "status": "approved",
                 "start_seconds": 0,
                 "end_seconds": 30,
-                "metadata": {"youtube": {"title": "yt", "description": ""}},
+                "metadata": {
+                    "youtube": {"title": "yt", "description": "description"},
+                    "tiktok": {"caption": "caption"},
+                    "instagram": {"caption": "caption"},
+                    "x": {"text": "post"},
+                },
             },
             {
                 "id": "clip_1",
@@ -435,7 +596,7 @@ class TestRejectedClips:
                 "status": "rejected",
                 "start_seconds": 30,
                 "end_seconds": 60,
-                "metadata": {"youtube": {"title": "yt", "description": ""}},
+                "metadata": {"youtube": {"title": "unused"}},
             },
         ]
         _seed_episode(episode_dir, clips=clips)

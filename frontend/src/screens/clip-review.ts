@@ -9,9 +9,10 @@
 
 import { h, mount } from '../lib/dom';
 import { signal, effect, type Signal } from '../lib/signals';
-import { api, type UnknownRecord } from '../lib/api';
+import { api, type QualitySnapshot, type UnknownRecord } from '../lib/api';
 import {
   describeStatus,
+  describeEpisodeStatus,
   episodeTitle,
   formatDuration,
   formatTimecode,
@@ -191,16 +192,21 @@ export function ClipReview(target: HTMLElement, episodeId: string): void {
     }
 
     const ep = episode();
-    const pipeline = (ep?.pipeline as Record<string, unknown>) ?? {};
-    const agentsCompleted = (pipeline.agents_completed as string[]) ?? [];
-    const shortsRendered = agentsCompleted.includes('shorts_render');
+    const quality = ep?.quality as QualitySnapshot | null | undefined;
+    const renderedIds = new Set(quality?.artifacts.rendered_short_ids ?? []);
 
     body.replaceChildren(
       h(
         'div',
         { class: 'flex flex-col gap-4 pb-4' },
         ...cs.map((c) =>
-          clipCard(episodeId, c, expandedId, shortsRendered, async () => load())
+          clipCard(
+            episodeId,
+            c,
+            expandedId,
+            renderedIds.has(String(c.id ?? c.clip_id)),
+            async () => load()
+          )
         )
       )
     );
@@ -247,7 +253,15 @@ function renderHeader(
           { class: 'text-heading-sm uppercase text-ink-tertiary' },
           'Clip review'
         ),
-        ep ? StatusPill({ raw: ep.status as string, size: 'sm' }) : null
+        ep
+          ? StatusPill({
+              descriptor: describeEpisodeStatus(ep, {
+                cropConfig: ep.crop_config,
+                clips: cs ?? undefined,
+              }),
+              size: 'sm',
+            })
+          : null
       ),
       h(
         'div',
@@ -296,12 +310,25 @@ function renderHeader(
     Button({
       variant: 'primary',
       size: 'md',
-      label: 'Approve all',
+      label: 'Final approve rendered clips',
       onClick: async () => {
         try {
-          await api.autoApprove(episodeId);
+          const ep = episode.peek();
+          const quality = ep?.quality as QualitySnapshot | null | undefined;
+          const currentClips = clipsSig.peek() ?? [];
+          const keptIds = currentClips
+            .filter((clip) => clip.status !== 'rejected')
+            .map((clip) => String(clip.id ?? clip.clip_id));
+          const renderedIds = new Set(
+            quality?.artifacts.rendered_short_ids ?? []
+          );
+          if (!keptIds.length || keptIds.some((id) => !renderedIds.has(id))) {
+            showToast('Render every kept candidate before final clip approval.', 'error');
+            return;
+          }
+          await api.approveClips(episodeId, keptIds);
           showToast(
-            'All clips approved — moving to publish.',
+            'Rendered clips approved for the current files.',
             'success'
           );
           navigate(`/episodes/${episodeId}`);
@@ -347,7 +374,7 @@ function clipCard(
   episodeId: string,
   clip: UnknownRecord,
   expandedId: Signal<string | null>,
-  shortsRendered: boolean,
+  rendered: boolean,
   reload: () => Promise<void>
 ): HTMLElement {
   const id = (clip.id as string) ?? (clip.clip_id as string);
@@ -386,13 +413,13 @@ function clipCard(
       speaker,
       status,
       expanded,
-      shortsRendered,
+      rendered,
       () => expandedId.set((prev) => (prev === id ? null : id))
     );
     const children: Node[] = [head];
     if (expanded) {
       children.push(
-        clipExpanded(episodeId, id, start, end, metadata, reload)
+        clipExpanded(episodeId, id, start, end, metadata, rendered, reload)
       );
     }
     card.replaceChildren(...children);
@@ -415,7 +442,7 @@ function clipHead(
   speaker: string,
   status: StatusDescriptor,
   expanded: boolean,
-  shortsRendered: boolean,
+  rendered: boolean,
   toggle: () => void
 ): HTMLElement {
   return h(
@@ -425,7 +452,7 @@ function clipHead(
         'p-5 grid grid-cols-[140px_1fr_auto] gap-5 items-start cursor-pointer hover:bg-surface-2/40',
       onclick: toggle,
     },
-    clipThumb(episodeId, id, duration, shortsRendered),
+    clipThumb(episodeId, id, duration, rendered),
     h(
       'div',
       { class: 'min-w-0' },
@@ -436,7 +463,7 @@ function clipHead(
           ? h('span', { class: 'chip font-mono tabular' }, `#${rank}`)
           : null,
         score != null
-          ? h('span', { class: 'chip font-mono tabular' }, `${score}/10`)
+          ? h('span', { class: 'chip font-mono tabular' }, `Candidate score ${score}/10`)
           : null,
         h(
           'span',
@@ -490,14 +517,14 @@ function clipThumb(
   episodeId: string,
   clipId: string,
   duration: number,
-  shortsRendered: boolean
+  rendered: boolean
 ): HTMLElement {
   // Only set a src when the shorts MP4 actually exists on disk.
   // Without this guard every card fires a 404 for the missing file.
   let innerEl: HTMLElement;
   let hoverHandlers: Record<string, unknown> = {};
 
-  if (shortsRendered) {
+  if (rendered) {
     const url = `/media/episodes/${episodeId}/shorts/${clipId}.mp4`;
     const video = h('video', {
       src: url,
@@ -516,9 +543,14 @@ function clipThumb(
     };
   } else {
     // Placeholder — no network request, no 404
-    innerEl = h('div', {
-      class: 'w-full h-full bg-surface-inset',
-    });
+    innerEl = h(
+      'div',
+      {
+        class:
+          'w-full h-full bg-surface-inset flex items-center justify-center text-body-sm text-ink-tertiary',
+      },
+      'Not rendered'
+    );
   }
 
   return h(
@@ -549,12 +581,13 @@ function clipExpanded(
   start: number,
   end: number,
   metadata: Record<string, UnknownRecord>,
+  rendered: boolean,
   reload: () => Promise<void>
 ): HTMLElement {
   return h(
     'div',
     { class: 'border-t border-border-subtle' },
-    renderActions(episodeId, clipId, reload),
+    renderActions(episodeId, clipId, rendered, reload),
     renderTrim(episodeId, clipId, start, end, reload),
     renderMetadataAccordion(episodeId, clipId, metadata, reload)
   );
@@ -563,6 +596,7 @@ function clipExpanded(
 function renderActions(
   episodeId: string,
   clipId: string,
+  rendered: boolean,
   reload: () => Promise<void>
 ): HTMLElement {
   return h(
@@ -571,11 +605,18 @@ function renderActions(
     Button({
       variant: 'primary',
       size: 'sm',
-      label: 'Keep',
+      label: rendered ? 'Final approve' : 'Render clip',
       onClick: async () => {
         try {
-          await api.approveClip(episodeId, clipId);
-          showToast('Kept.', 'success');
+          if (rendered) {
+            await api.approveClip(episodeId, clipId);
+            showToast('Current render approved.', 'success');
+          } else {
+            await api.selectClip(episodeId, clipId);
+            showToast('Rendering the selected clip locally…');
+            await api.renderClip(episodeId, clipId);
+            showToast('Clip rendered. Review it before final approval.', 'success');
+          }
           await reload();
         } catch (e) {
           showToast((e as Error).message, 'error');

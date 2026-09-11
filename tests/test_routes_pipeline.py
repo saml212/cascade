@@ -1,8 +1,11 @@
 """Tests for pipeline API routes."""
 
 import json
-import pytest
-from tests.test_routes_episodes import test_client, _create_episode
+from unittest.mock import patch
+
+from tests.test_routes_episodes import _create_episode
+
+pytest_plugins = ["tests.test_routes_episodes"]
 
 
 class TestPipelineStatus:
@@ -44,12 +47,14 @@ class TestRunPipeline:
 
         # Mock the pipeline run to avoid actual execution
         from unittest.mock import patch
+
         with patch("server.routes.pipeline.threading.Thread") as mock_thread:
             mock_instance = mock_thread.return_value
             mock_instance.is_alive.return_value = False
-            resp = client.post("/api/episodes/ep_001/run-pipeline", json={
-                "source_path": "/tmp/test_source"
-            })
+            resp = client.post(
+                "/api/episodes/ep_001/run-pipeline",
+                json={"source_path": "/tmp/test_source"},
+            )
         assert resp.status_code == 200
         assert resp.json()["status"] == "started"
 
@@ -64,7 +69,7 @@ class TestCancelPipeline:
 
 
 class TestAutoApprove:
-    def test_auto_approve(self, test_client):
+    def test_auto_approve_refuses_unrendered_clips(self, test_client):
         client, episodes_dir = test_client
         clips = [
             {"id": "clip_01", "status": "pending", "virality_score": 8},
@@ -75,21 +80,55 @@ class TestAutoApprove:
             json.dump({"clips": clips}, f)
 
         resp = client.post("/api/episodes/ep_001/auto-approve")
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "approved"
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["clip_ids"] == ["clip_01", "clip_02"]
+
+
+class TestEditorialApproval:
+    def test_approving_longform_does_not_publish(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "publish_approved": True,
+                "publish_approval": {"revision": "old"},
+            },
+        )
+
+        with (
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+            patch("agents.pipeline.run_pipeline") as run_pipeline,
+        ):
+            response = client.post("/api/episodes/ep_001/approve-longform")
+            thread_class.call_args.kwargs["target"]()
+
+        assert response.status_code == 200
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert episode["editorial_approval"]["revision"].startswith("sha256:")
+        assert "publish_approved" not in episode
+        assert "publish_approval" not in episode
+        requested = run_pipeline.call_args.kwargs["agents"]
+        assert "publish" not in requested
+        assert "podcast_feed" not in requested
 
 
 class TestResumeAfterComplete:
     def test_resume_already_complete(self, test_client):
         client, episodes_dir = test_client
         from agents import PIPELINE_ORDER
-        _create_episode(episodes_dir, "ep_001", {
-            "pipeline": {
-                "started_at": "2026-01-01T12:00:00+00:00",
-                "completed_at": "2026-01-01T13:00:00+00:00",
-                "agents_completed": list(PIPELINE_ORDER),
-            }
-        })
+
+        _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "pipeline": {
+                    "started_at": "2026-01-01T12:00:00+00:00",
+                    "completed_at": "2026-01-01T13:00:00+00:00",
+                    "agents_completed": list(PIPELINE_ORDER),
+                }
+            },
+        )
         resp = client.post("/api/episodes/ep_001/resume-pipeline")
         assert resp.status_code == 200
         assert resp.json()["status"] == "already_complete"

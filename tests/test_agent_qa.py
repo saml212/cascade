@@ -26,11 +26,13 @@ class TestQAAgent:
             (episode_dir / "shorts" / "{}.mp4".format(clip["id"])).write_bytes(b"\x00")
 
         # SRT
-        (episode_dir / "subtitles" / "transcript.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n")
+        (episode_dir / "subtitles" / "transcript.srt").write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nTest\n"
+        )
 
         # Metadata
         metadata = {
-            "longform": {"title": "Test"},
+            "longform": {"title": "Test", "description": "Test description"},
             "clips": [{"id": c["id"]} for c in sample_clips],
             "schedule": [{"clip_id": "clip_01", "platform": "youtube"}],
         }
@@ -43,13 +45,25 @@ class TestQAAgent:
         mock_probe = {
             "format": {"duration": "3600.0"},
             "streams": [
-                {"codec_type": "video", "width": 1920, "height": 1080, "duration": "3600.0"},
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "3600.0",
+                },
                 {"codec_type": "audio", "channels": 2, "duration": "3600.0"},
             ],
         }
 
         agent = QAAgent(tmp_episode_dir, sample_config)
-        with patch("agents.qa.ffprobe", return_value=mock_probe):
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
             result = agent.execute()
 
         assert result["overall"] == "pass"
@@ -62,20 +76,34 @@ class TestQAAgent:
         mock_probe = {
             "format": {"duration": "3600.0"},
             "streams": [
-                {"codec_type": "video", "width": 1920, "height": 1080, "duration": "3600.0"},
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "3600.0",
+                },
                 {"codec_type": "audio", "channels": 2, "duration": "3600.0"},
             ],
         }
 
         agent = QAAgent(tmp_episode_dir, sample_config)
-        with patch("agents.qa.ffprobe", return_value=mock_probe):
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
             result = agent.execute()
 
         assert result["overall"] == "fail"
         failed = [c for c in result["checks"] if not c["pass"]]
         assert any("source_merged" in c["name"] for c in failed)
 
-    def test_missing_shorts_detected(self, tmp_episode_dir, sample_config, sample_clips):
+    def test_missing_shorts_detected(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
         self._setup_full_episode(tmp_episode_dir, sample_clips)
         # Remove one short
         (tmp_episode_dir / "shorts" / "clip_02.mp4").unlink()
@@ -83,37 +111,69 @@ class TestQAAgent:
         mock_probe = {
             "format": {"duration": "3600.0"},
             "streams": [
-                {"codec_type": "video", "width": 1920, "height": 1080, "duration": "3600.0"},
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "3600.0",
+                },
                 {"codec_type": "audio", "channels": 2, "duration": "3600.0"},
             ],
         }
 
         agent = QAAgent(tmp_episode_dir, sample_config)
-        with patch("agents.qa.ffprobe", return_value=mock_probe):
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
             result = agent.execute()
 
         assert result["overall"] == "fail"
-        shorts_check = next(c for c in result["checks"] if c["name"] == "all_shorts_rendered")
+        shorts_check = next(
+            c for c in result["checks"] if c["name"] == "all_shorts_rendered"
+        )
         assert not shorts_check["pass"]
         assert "clip_02" in shorts_check["detail"]
 
     def test_duration_warnings(self, tmp_episode_dir, sample_config):
         """Clips outside configured duration range produce warnings."""
         clips = [
-            {"id": "clip_01", "start_seconds": 0, "end_seconds": 10, "duration": 10.0, "status": "pending"},
+            {
+                "id": "clip_01",
+                "start_seconds": 0,
+                "end_seconds": 10,
+                "duration": 10.0,
+                "status": "pending",
+            },
         ]
         self._setup_full_episode(tmp_episode_dir, clips)
 
         mock_probe = {
             "format": {"duration": "3600.0"},
             "streams": [
-                {"codec_type": "video", "width": 1920, "height": 1080, "duration": "3600.0"},
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "3600.0",
+                },
                 {"codec_type": "audio", "channels": 2, "duration": "3600.0"},
             ],
         }
 
         agent = QAAgent(tmp_episode_dir, sample_config)
-        with patch("agents.qa.ffprobe", return_value=mock_probe):
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
             result = agent.execute()
 
         assert result["warning_count"] > 0
@@ -124,13 +184,25 @@ class TestQAAgent:
         mock_probe = {
             "format": {"duration": "3600.0"},
             "streams": [
-                {"codec_type": "video", "width": 1920, "height": 1080, "duration": "3600.0"},
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "3600.0",
+                },
                 {"codec_type": "audio", "channels": 2, "duration": "3600.0"},
             ],
         }
 
         agent = QAAgent(tmp_episode_dir, sample_config)
-        with patch("agents.qa.ffprobe", return_value=mock_probe):
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
             agent.execute()
 
         assert (tmp_episode_dir / "qa" / "qa.json").exists()

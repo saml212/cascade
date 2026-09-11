@@ -366,3 +366,48 @@ class TestPipelineNonCriticalFailure:
         # Pipeline should complete (not error) because thumbnail_gen is non-critical
         assert result["status"] == "ready_for_review"
         assert "thumbnail_gen" in result["pipeline"].get("errors", {})
+
+
+class TestPipelineQualityFailure:
+    @patch("agents.pipeline._is_cancelled", return_value=False)
+    @patch("agents.pipeline.load_config")
+    def test_failed_qa_report_hard_fails_pipeline(
+        self, mock_config, _mock_cancel, tmp_path
+    ):
+        mock_config.return_value = {
+            "paths": {"output_dir": str(tmp_path)},
+            "processing": {},
+        }
+        episodes_dir = tmp_path / "episodes"
+        episode_dir = episodes_dir / "ep_test"
+        episode_dir.mkdir(parents=True)
+        (episode_dir / "episode.json").write_text(
+            json.dumps(
+                {
+                    "episode_id": "ep_test",
+                    "status": "processing",
+                    "source_path": "/source",
+                    "crop_config": {"speakers": []},
+                    "pipeline": {"agents_completed": []},
+                }
+            )
+        )
+        qa_class = MagicMock()
+        qa_class.return_value.run.return_value = {
+            "overall": "fail",
+            "checks": [{"name": "audio_continuity", "pass": False}],
+        }
+
+        from agents.pipeline import run_pipeline
+
+        with (
+            patch("agents.pipeline.resolve_path", return_value=episodes_dir),
+            patch.dict("agents.pipeline.AGENT_REGISTRY", {"qa": qa_class}),
+        ):
+            result = run_pipeline(
+                source_path="/source", episode_id="ep_test", agents=["qa"]
+            )
+
+        assert result["status"] == "error"
+        assert "audio_continuity" in result["pipeline"]["errors"]["qa"]
+        assert "qa" not in result["pipeline"]["agents_completed"]

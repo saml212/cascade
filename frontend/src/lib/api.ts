@@ -31,7 +31,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       : null;
     const message = typeof detail === 'string' ? detail
       : Array.isArray(detail) ? detail.map((item: { msg?: string }) => item.msg).filter(Boolean).join('; ')
-      : `${method} ${path} failed (${res.status})`;
+      : detail && typeof detail === 'object' && typeof (detail as Record<string, unknown>).message === 'string'
+        ? String((detail as Record<string, unknown>).message)
+        : `${method} ${path} failed (${res.status})`;
     const err = new Error(message) as ApiError;
     err.status = res.status;
     err.body = payload;
@@ -63,6 +65,81 @@ export interface EpisodeSummary {
    */
   has_crop_config?: boolean;
   delivery?: DeliveryStatus | null;
+  quality?: QualitySnapshot | null;
+}
+
+export interface QualityBlocker extends UnknownRecord {
+  code: string;
+  severity: string;
+  message: string;
+  clip_ids?: string[];
+}
+
+export interface QualityFinding extends UnknownRecord {
+  id: string;
+  kind: string;
+  classification?: string;
+  severity: string;
+  confidence?: number;
+  channel?: number;
+  source_time?: {
+    start_seconds: number;
+    end_seconds: number;
+    duration_seconds: number;
+  };
+  edited_time?: {
+    status: string;
+    ranges: Array<{
+      start_seconds: number;
+      end_seconds: number;
+      source_start_seconds: number;
+      source_end_seconds: number;
+    }>;
+  };
+  evidence?: UnknownRecord;
+  preview?: {
+    source?: string;
+    grounded_fallback?: string;
+  };
+}
+
+export interface QualitySnapshot extends UnknownRecord {
+  episode_id: string;
+  quality: {
+    status: 'missing' | 'stale' | 'blocked' | 'passed';
+    current_revision: string;
+    report_revision?: string;
+    generated_at?: string;
+    overall?: string;
+    checks: UnknownRecord[];
+  };
+  release_gate: {
+    status: 'blocked' | 'awaiting_publish_approval' | 'ready';
+    safe: boolean;
+    can_approve_publish: boolean;
+    revision: string;
+    blockers: QualityBlocker[];
+  };
+  artifacts: {
+    release_video: { ready: boolean; detail: string; download_url: string };
+    legacy_longform: {
+      available: boolean;
+      review_url: string;
+      release_candidate: false;
+    };
+    approved_short_count: number;
+    candidate_count: number;
+    rendered_short_count: number;
+    rendered_short_ids: string[];
+    pending_clip_count: number;
+    missing_short_ids: string[];
+  };
+  audio_quality: {
+    release_gate: UnknownRecord;
+    analysis: UnknownRecord;
+    finding_count: number;
+    findings: QualityFinding[];
+  };
 }
 
 export interface NewEpisodeRequest {
@@ -145,10 +222,12 @@ export interface DeliveryStatus extends UnknownRecord {
     audio_codec: string;
     encoder: string;
     edit_count: number;
+    render_mode?: string;
   };
   source_duration_seconds?: number;
   trim_start_seconds?: number;
   trim_end_seconds?: number;
+  quality?: QualitySnapshot;
 }
 
 export const api = {
@@ -185,14 +264,16 @@ export const api = {
       start_seconds,
       end_seconds,
     }),
+  quality: (id: string) =>
+    request<QualitySnapshot>('GET', `/api/episodes/${id}/quality`),
+  runQuality: (id: string) =>
+    request<UnknownRecord>('POST', `/api/episodes/${id}/run-agent/qa`, {}),
 
   /* Pipeline */
   pipelineStatus: (id: string) =>
     request<UnknownRecord>('GET', `/api/episodes/${id}/pipeline-status`),
   resumePipeline: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/resume-pipeline`),
-  autoApprove: (id: string) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/auto-approve`),
   approveLongform: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/approve-longform`),
   approvePublish: (id: string) =>
@@ -205,6 +286,18 @@ export const api = {
     request<UnknownRecord[]>('GET', `/api/episodes/${id}/clips/`),
   approveClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/approve`),
+  selectClip: (id: string, clipId: string) =>
+    request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/select`),
+  renderClip: (id: string, clipId: string) =>
+    request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/render`),
+  approveClips: (id: string, clipIds: string[]) =>
+    request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/approve`, {
+      clip_ids: clipIds,
+    }),
+  rejectClips: (id: string, clipIds: string[]) =>
+    request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/reject`, {
+      clip_ids: clipIds,
+    }),
   rejectClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/reject`),
   alternativeClip: (id: string, clipId: string) =>

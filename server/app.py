@@ -20,6 +20,7 @@ from server.routes import (
     edits,
     episodes,
     pipeline,
+    quality,
     schedule,
     trim,
 )
@@ -55,6 +56,7 @@ app.include_router(trim.router)
 app.include_router(schedule.router)
 app.include_router(edits.router)
 app.include_router(delivery.router)
+app.include_router(quality.router)
 
 # Mount output directory for video file serving
 if OUTPUT_DIR.exists():

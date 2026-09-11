@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from lib.paths import get_episodes_dir
+from agents.qa import editorial_revision, quality_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,21 @@ async def run_single_agent(
     if agent_name == "ingest" and req.source_path:
         agent.source_path = req.source_path
 
-    result = agent.run()
+    result = await asyncio.to_thread(agent.run)
+    if agent_name == "qa" and result.get("overall") != "pass":
+        failed_checks = [
+            check.get("name", "unknown")
+            for check in result.get("checks", [])
+            if not check.get("pass")
+        ]
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "QA release gate failed",
+                "failed_checks": failed_checks,
+                "quality_url": f"/api/episodes/{episode_id}/quality",
+            },
+        )
     return {"status": "completed", "agent": agent_name, "result": result}
 
 
@@ -305,35 +320,24 @@ async def resume_pipeline(
 
 @router.post("/{episode_id}/auto-approve")
 async def auto_approve(episode_id: str) -> PipelineActionResponse:
-    """Auto-approve all clips for an episode (skip manual review)."""
+    """Approve all exact current short renders as one atomic review decision."""
     logger.info("POST /api/episodes/%s/auto-approve", episode_id)
     episode_file = OUTPUT_DIR / episode_id / "episode.json"
     if not episode_file.exists():
         raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+    from server.routes.clips import BulkClipRequest, approve_clips, load_clips
 
-    with open(episode_file) as f:
-        episode = json.load(f)
-
-    # Approve all clips in episode.json
-    for clip in episode.get("clips", []):
-        if clip.get("status", "pending") == "pending":
-            clip["status"] = "approved"
-
-    episode["status"] = "approved"
-    episode["approved_at"] = datetime.now(timezone.utc).isoformat()
-
-    atomic_write_json(episode_file, episode)
-
-    # Also approve in clips.json
-    clips_file = OUTPUT_DIR / episode_id / "clips.json"
-    if clips_file.exists():
-        with open(clips_file) as f:
-            clips_data = json.load(f)
-        for clip in clips_data.get("clips", []):
-            if clip.get("status", "pending") == "pending":
-                clip["status"] = "approved"
-        atomic_write_json(clips_file, clips_data)
-
+    clips, _ = load_clips(episode_id)
+    await approve_clips(
+        episode_id,
+        BulkClipRequest(
+            clip_ids=[
+                str(clip["id"])
+                for clip in clips
+                if clip.get("id") and clip.get("status") != "rejected"
+            ]
+        ),
+    )
     return {"status": "approved", "episode_id": episode_id}
 
 
@@ -384,25 +388,7 @@ async def approve_backup(episode_id: str) -> PipelineActionResponse:
 
 @router.post("/{episode_id}/approve-longform")
 async def approve_longform(episode_id: str) -> PipelineActionResponse:
-    """Approve the longform render — publishes the longform FIRST.
-
-    Fires podcast_feed (triggers Spotify RSS ingest) + publish (uploads
-    longform to YouTube via Upload-Post). Shorts do NOT render here — the
-    shorts_render agent is hard-gated on episode.json.youtube_longform_url
-    being set, which only happens after YouTube returns the processed URL
-    (15 min to several hours after submit).
-
-    After this route:
-    1. Longform uploads to YouTube (publish.py loops over clips, skips them
-       because the shorts/ dir is empty; then uploads longform).
-    2. RSS updates, Spotify auto-ingests.
-    3. /produce polls for YouTube URL OR Sam pastes it in.
-    4. /produce fires resume-pipeline with ["shorts_render", "metadata_gen",
-       "thumbnail_gen", "qa"] to produce the shorts (URL now known).
-    5. Sam reviews clips + metadata.
-    6. /produce fires approve-publish → shorts upload (longform idempotently
-       skips because youtube_longform_url is set).
-    """
+    """Approve the current edit and continue local production only."""
     logger.info("POST /api/episodes/%s/approve-longform", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
@@ -417,14 +403,16 @@ async def approve_longform(episode_id: str) -> PipelineActionResponse:
         with open(episode_file) as f:
             episode = json.load(f)
 
-        # Both flags must be set: longform_approved unpauses the
-        # awaiting_longform_approval gate, publish_approved passes publish.py's
-        # safety gate so the longform upload can fire.
         now = datetime.now(timezone.utc).isoformat()
         episode["longform_approved"] = True
         episode["longform_approved_at"] = now
-        episode["publish_approved"] = True
-        episode["publish_approved_at"] = now
+        episode["editorial_approval"] = {
+            "revision": editorial_revision(episode_file.parent, episode),
+            "approved_at": now,
+        }
+        episode.pop("publish_approved", None)
+        episode.pop("publish_approved_at", None)
+        episode.pop("publish_approval", None)
         episode["status"] = "processing"
         atomic_write_json(episode_file, episode)
 
@@ -436,29 +424,26 @@ async def approve_longform(episode_id: str) -> PipelineActionResponse:
             run_pipeline(
                 source_path=source_path,
                 episode_id=episode_id,
-                agents=["podcast_feed", "publish"],
+                agents=[
+                    "clip_miner",
+                    "shorts_render",
+                    "metadata_gen",
+                    "thumbnail_gen",
+                    "qa",
+                ],
             )
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
         _running[episode_id] = thread
 
-    logger.info("Longform approved, publishing longform for %s", episode_id)
-    return {"status": "longform_publishing", "episode_id": episode_id}
+    logger.info("Longform approved; local clip production started for %s", episode_id)
+    return {"status": "approved", "episode_id": episode_id}
 
 
 @router.post("/{episode_id}/approve-publish")
 async def approve_publish(episode_id: str) -> PipelineActionResponse:
-    """Approve publishing the SHORTS (phase 4 of the flow).
-
-    Assumes longform is already live (approve-longform was fired earlier,
-    publish_approved is already True, youtube_longform_url is saved to
-    episode.json). Shorts are already rendered with metadata.
-
-    Fires publish only — the longform upload block in publish.py is
-    idempotent and will skip because youtube_longform_url is set. Shorts
-    upload with youtube_first_comment referencing the longform URL.
-    """
+    """Approve and publish one fully reviewed, current release revision."""
     logger.info("POST /api/episodes/%s/approve-publish", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
@@ -475,11 +460,24 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
         with open(episode_file) as f:
             episode = json.load(f)
 
-        # publish_approved should already be set by approve-longform; set
-        # defensively in case this route is called directly.
+        snapshot = quality_snapshot(episode_file.parent)
+        gate = snapshot["release_gate"]
+        if not gate["can_approve_publish"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Release prerequisites are not satisfied",
+                    "quality_url": f"/api/episodes/{episode_id}/quality",
+                    "blockers": gate["blockers"],
+                },
+            )
+        now = datetime.now(timezone.utc).isoformat()
         episode["publish_approved"] = True
-        if not episode.get("publish_approved_at"):
-            episode["publish_approved_at"] = datetime.now(timezone.utc).isoformat()
+        episode["publish_approved_at"] = now
+        episode["publish_approval"] = {
+            "revision": gate["revision"],
+            "approved_at": now,
+        }
         episode["status"] = "processing"
 
         atomic_write_json(episode_file, episode)

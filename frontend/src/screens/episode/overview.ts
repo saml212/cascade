@@ -13,6 +13,8 @@ import {
 } from '../../lib/format';
 import { navigate } from '../../lib/router';
 import { showToast } from '../../state/ui';
+import { QualityReview } from '../../components/QualityReview';
+import type { QualitySnapshot } from '../../lib/api';
 
 export function renderOverview(
   target: HTMLElement,
@@ -41,6 +43,8 @@ export function renderOverview(
   const delivery = ep.delivery as Record<string, unknown> | undefined;
   const deliveryVideoReady =
     delivery?.video_status === 'ready' && !!delivery.video_download_url;
+  const quality = ep.quality as QualitySnapshot | null | undefined;
+  const releaseReady = quality?.release_gate.status === 'ready';
   const deliveryPreparing =
     delivery?.status === 'preparing' || delivery?.video_status === 'preparing';
 
@@ -112,12 +116,22 @@ export function renderOverview(
                 { class: 'mt-5' },
                 Button({
                   variant: 'primary',
-                  label: deliveryVideoReady ? 'Open upload files' : 'View preparation',
+                  label: deliveryVideoReady
+                    ? releaseReady
+                      ? 'Open release files'
+                      : 'Review rendered files and quality'
+                    : 'View preparation',
                   onClick: () => navigate(`/episodes/${episodeId}/delivery`),
                 })
               )
             : null
         ),
+
+        QualityReview({
+          episodeId,
+          quality,
+          compact: true,
+        }),
 
         // Keep processing diagnostics available without making them the workflow.
         h(
@@ -188,7 +202,7 @@ export function renderOverview(
           navigationRow('2. Episode details', 'Set the title and description', () =>
             navigate(`/episodes/${episodeId}/metadata`)
           ),
-          navigationRow(deliveryVideoReady ? '3. Upload files ready' : deliveryPreparing ? '3. Preparing upload files' : '3. Prepare for upload', deliveryVideoReady ? 'Review and download the verified files' : deliveryPreparing ? 'See preparation progress' : 'Trim, master, and download finished files', () =>
+          navigationRow(deliveryVideoReady ? releaseReady ? '3. Release files ready' : '3. Rendered files need review' : deliveryPreparing ? '3. Preparing release files' : '3. Prepare release files', deliveryVideoReady ? releaseReady ? 'Review the cleared revision and download files' : 'Inspect QA findings, clips, and current renders' : deliveryPreparing ? 'See preparation progress' : 'Trim, master, and download finished files', () =>
             navigate(`/episodes/${episodeId}/delivery`)
           ),
           h('details', { class: 'panel px-5 py-4' },

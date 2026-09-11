@@ -76,6 +76,8 @@ export type StatusKey =
   | 'delivery_preparing_video'
   | 'delivery_audio_ready'
   | 'delivery_ready'
+  | 'quality_review_required'
+  | 'quality_blocked'
   | 'processing'
   | 'awaiting_crop'
   | 'awaiting_longform_review'
@@ -120,12 +122,22 @@ const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
   delivery_audio_ready: {
     tone: 'waiting',
     label: 'Audio ready',
-    hint: 'Podcast audio is verified. Prepare the upload video when ready.',
+    hint: 'Podcast audio is rendered and measured. Prepare the upload video when ready.',
   },
   delivery_ready: {
     tone: 'success',
     label: 'Ready for upload',
-    hint: 'Verified audio and video files are ready to download.',
+    hint: 'Current media, copy, quality checks, and approvals are ready.',
+  },
+  quality_review_required: {
+    tone: 'waiting',
+    label: 'Quality review needed',
+    hint: 'This release revision still needs current renders, review, or approval.',
+  },
+  quality_blocked: {
+    tone: 'danger',
+    label: 'Release blocked',
+    hint: 'Review the current QA findings before release.',
   },
   processing: {
     tone: 'working',
@@ -266,7 +278,22 @@ export function describeEpisodeStatus(
     return { key: 'delivery_preparing_audio', ...STATUS.delivery_preparing_audio };
   }
   if (delivery.status === 'ready' && delivery.video_status === 'ready') {
-    return { key: 'delivery_ready', ...STATUS.delivery_ready };
+    const quality = episode.quality as Record<string, unknown> | null | undefined;
+    const report = quality?.quality as Record<string, unknown> | undefined;
+    const gate = quality?.release_gate as Record<string, unknown> | undefined;
+    if (gate?.status === 'ready') {
+      return { key: 'delivery_ready', ...STATUS.delivery_ready };
+    }
+    if (gate?.status === 'awaiting_publish_approval') {
+      return { key: 'awaiting_publish', ...STATUS.awaiting_publish };
+    }
+    if (report?.status === 'blocked') {
+      return { key: 'quality_blocked', ...STATUS.quality_blocked };
+    }
+    return {
+      key: 'quality_review_required',
+      ...STATUS.quality_review_required,
+    };
   }
   if (delivery.status === 'ready') {
     return { key: 'delivery_audio_ready', ...STATUS.delivery_audio_ready };

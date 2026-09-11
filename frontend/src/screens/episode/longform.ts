@@ -5,6 +5,8 @@ import { Icon } from '../../components/icons';
 import { api, type DeliveryStatus } from '../../lib/api';
 import { navigate } from '../../lib/router';
 import { showToast } from '../../state/ui';
+import { QualityReview } from '../../components/QualityReview';
+import type { QualitySnapshot } from '../../lib/api';
 
 export function renderLongform(
   target: HTMLElement,
@@ -20,8 +22,10 @@ export function renderLongform(
     status.key === 'live';
 
   const delivery = ep.delivery as DeliveryStatus | undefined;
+  const quality = ep.quality as QualitySnapshot | null | undefined;
   const deliveryReady =
     delivery?.video_status === 'ready' && !!delivery.video_download_url;
+  const canonicalReady = quality?.artifacts.release_video.ready === true;
   const hasPlayableVideo = deliveryReady || longformReady;
   const videoUrl = deliveryReady
     ? delivery.video_download_url!
@@ -47,14 +51,14 @@ export function renderLongform(
         ? h(
             'div',
             { class: 'panel overflow-hidden' },
-            !deliveryReady
+            !canonicalReady
               ? h(
                   'div',
                   {
                     class:
                       'px-4 py-2 bg-status-warning/10 border-b border-status-warning/30 text-body-sm text-status-warning',
                   },
-                  'Earlier render — prepare the verified upload video before release.'
+                  'Existing render for review — the current speaker-cut release master is still required.'
                 )
               : null,
             h('video', {
@@ -89,6 +93,11 @@ export function renderLongform(
       h(
         'div',
         { class: 'flex flex-col gap-4' },
+        QualityReview({
+          episodeId,
+          quality,
+          compact: true,
+        }),
         hasPlayableVideo
           ? h(
               'div',
@@ -98,7 +107,7 @@ export function renderLongform(
                 {
                   class: 'text-heading-sm uppercase text-ink-tertiary',
                 },
-                deliveryReady ? 'Verified upload video' : 'Earlier render'
+                canonicalReady ? 'Current speaker-cut render' : 'Existing review render'
               ),
               detailRow('Duration', formatDuration(duration)),
               renderedAt

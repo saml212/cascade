@@ -2,15 +2,15 @@ import { h } from '../../lib/dom';
 import { Button } from '../../components/Button';
 import { navigate } from '../../lib/router';
 import { formatDuration, pluralize } from '../../lib/format';
+import type { QualitySnapshot } from '../../lib/api';
 
 export function renderClips(
   target: HTMLElement,
   ep: Record<string, unknown>,
   episodeId: string
 ): void {
-  const pipeline = (ep.pipeline as Record<string, unknown>) ?? {};
-  const agentsCompleted = (pipeline.agents_completed as string[]) ?? [];
-  const shortsRendered = agentsCompleted.includes('shorts_render');
+  const quality = ep.quality as QualitySnapshot | null | undefined;
+  const renderedIds = new Set(quality?.artifacts.rendered_short_ids ?? []);
 
   const clips = ((ep.clips as Array<Record<string, unknown>>) ?? []).slice();
   // Sort by rank if available, else by start time, to mirror the review surface
@@ -62,7 +62,8 @@ export function renderClips(
           'div',
           { class: 'flex items-center gap-8' },
           statBlock('Total', String(clips.length), 'ink-primary'),
-          statBlock('Kept', String(approved), 'status-success'),
+          statBlock('Rendered', String(renderedIds.size), 'ink-primary'),
+          statBlock('Final approved', String(approved), 'status-success'),
           statBlock('Pending', String(pending), pending > 0 ? 'status-warning' : 'ink-secondary'),
           statBlock('Rejected', String(rejected), 'ink-secondary')
         ),
@@ -85,7 +86,7 @@ export function renderClips(
             { class: 'text-heading-sm uppercase text-ink-tertiary' },
             `${pluralize(clips.length, 'clip')} in order`
           ),
-          shortsRendered
+          renderedIds.size > 0
             ? h(
                 'span',
                 { class: 'text-body-sm text-ink-tertiary' },
@@ -93,14 +94,14 @@ export function renderClips(
               )
             : null
         ),
-        !shortsRendered
+        renderedIds.size < clips.length
           ? h(
               'div',
               {
                 class:
                   'mb-4 px-4 py-3 rounded-md bg-status-warning/10 border border-status-warning/30 text-body-sm text-ink-secondary',
               },
-              'Clip data is ready, but the short videos haven’t been rendered yet. Approve the longform first — clip mining and short rendering happen after YouTube finishes processing the longform.'
+              `${clips.length - renderedIds.size} candidate video(s) still need local rendering. Publishing stays locked until every kept clip has been rendered and reviewed.`
             )
           : null,
         h(
@@ -113,7 +114,9 @@ export function renderClips(
                 'repeat(auto-fill, minmax(132px, 1fr))',
             },
           },
-          ...clips.map((c) => renderTile(c, episodeId, shortsRendered))
+          ...clips.map((c) =>
+            renderTile(c, episodeId, renderedIds.has(String(c.id ?? c.clip_id)))
+          )
         )
       )
     )
@@ -142,7 +145,7 @@ function statBlock(label: string, value: string, tone: string): HTMLElement {
 function renderTile(
   clip: Record<string, unknown>,
   episodeId: string,
-  shortsRendered: boolean
+  rendered: boolean
 ): HTMLElement {
   const id = (clip.id as string) ?? (clip.clip_id as string);
   const title = (clip.title as string) || 'Untitled';
@@ -162,7 +165,7 @@ function renderTile(
   // Without this guard every tile fires a 404 request for the missing file.
   let previewEl: HTMLElement;
   let hoverHandlers: Record<string, unknown> = {};
-  if (shortsRendered) {
+  if (rendered) {
     const url = `/media/episodes/${episodeId}/shorts/${id}.mp4`;
     const video = h('video', {
       src: url,
@@ -242,7 +245,7 @@ function renderTile(
         ? h(
             'div',
             { class: 'text-code-sm text-ink-tertiary font-mono tabular mt-0.5' },
-            `${score}/10`
+            `Candidate score ${score}/10`
           )
         : null
     )

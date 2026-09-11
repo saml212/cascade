@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -18,8 +19,10 @@ from pydantic import BaseModel
 
 from lib.atomic_write import atomic_write_json
 from lib.clips import normalize_clip as _normalize_clip
+from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
 from lib.ffprobe import get_dimensions
 from agents.pipeline import load_config
+from agents.qa import quality_snapshot
 from server.routes.delivery import _source_fingerprint, _video_fingerprint
 
 
@@ -167,6 +170,7 @@ async def list_episodes() -> list[dict]:
                     # pipeline done, awaiting clip review").
                     "has_crop_config": bool(ep.get("crop_config")),
                     "delivery": _delivery_snapshot(ep_dir, config),
+                    "quality": quality_snapshot(ep_dir, include_findings=False),
                 }
             )
         except (json.JSONDecodeError, OSError):
@@ -264,6 +268,7 @@ async def get_episode(episode_id: str) -> dict:
     ep = read_episode(episode_id)
     ep_dir = EPISODES_DIR / episode_id
     ep["delivery"] = _delivery_snapshot(ep_dir)
+    ep["quality"] = quality_snapshot(ep_dir, include_findings=False)
 
     # Stamp the actual longform.mp4 mtime so the UI shows when the file was
     # last written (after a re-mux the mtime is fresh even if pipeline
@@ -602,6 +607,10 @@ async def save_sync_offset(
 
 
 def _validate_preview_window(start: float, duration: float) -> tuple[float, float]:
+    if not math.isfinite(start) or not math.isfinite(duration):
+        raise HTTPException(
+            status_code=400, detail="start and duration must be finite numbers"
+        )
     if start < 0:
         raise HTTPException(status_code=400, detail="start must be non-negative")
     if duration <= 0 or duration > _MAX_AUDIO_PREVIEW_SECONDS:
@@ -619,6 +628,9 @@ def _preview_cache_path(
     start: float,
     duration: float,
     offset: float,
+    tempo: float = 1.0,
+    channel: str | None = None,
+    preserve_timestamps: bool = False,
 ) -> Path:
     """Key previews by exact sources and timeline parameters."""
     sources = []
@@ -634,7 +646,15 @@ def _preview_cache_path(
             }
         )
     payload = json.dumps(
-        {"sources": sources, "start": start, "duration": duration, "offset": offset},
+        {
+            "sources": sources,
+            "start": start,
+            "duration": duration,
+            "offset": offset,
+            "tempo": tempo,
+            "channel": channel,
+            "preserve_timestamps": preserve_timestamps,
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -680,45 +700,74 @@ async def _render_audio_preview(
     start: float,
     duration: float,
     offset: float,
+    *,
+    tempo: float = 1.0,
+    channel: str | None = None,
+    preserve_timestamps: bool = False,
 ) -> Path:
     start, duration = _validate_preview_window(start, duration)
+    if not math.isfinite(offset) or not math.isfinite(tempo) or tempo <= 0:
+        raise HTTPException(status_code=400, detail="Audio sync values are invalid")
     for track in tracks:
         if not Path(track["dest_path"]).exists():
             raise HTTPException(status_code=404, detail="Audio file not found on disk")
 
     cache_file = _preview_cache_path(
-        ep_dir, cache_name, tracks, start, duration, offset
+        ep_dir,
+        cache_name,
+        tracks,
+        start,
+        duration,
+        offset,
+        tempo,
+        channel,
+        preserve_timestamps,
     )
     if cache_file.exists() and cache_file.stat().st_size > 0:
         return cache_file
 
-    timeline_audio_start = start + offset
-    leading_silence = min(duration, max(0.0, -timeline_audio_start))
+    timeline_audio_start = start * tempo + offset
+    leading_silence = min(duration, max(0.0, -timeline_audio_start / tempo))
     slices = _preview_slices(
-        tracks, max(0.0, timeline_audio_start), duration - leading_silence
+        tracks,
+        max(0.0, timeline_audio_start),
+        (duration - leading_silence) * tempo,
     )
     if not slices and leading_silence <= 0:
         raise HTTPException(status_code=416, detail="Preview starts after audio ends")
 
-    inputs = []
-    labels = []
+    inputs: list[str] = []
+    filters: list[str] = []
+    labels: list[str] = []
     if leading_silence > 0:
         inputs.extend(
             [
                 "-f",
                 "lavfi",
                 "-t",
-                str(leading_silence),
+                str(leading_silence * tempo),
                 "-i",
                 "anullsrc=r=44100:cl=mono",
             ]
         )
-        labels.append("[0:a]")
+        labels.append("[p0]")
+        filters.append("[0:a]anull[p0]")
     for path, local_start, slice_duration in slices:
+        index = len(labels)
         inputs.extend(
             ["-ss", str(local_start), "-t", str(slice_duration), "-i", str(path)]
         )
-        labels.append(f"[{len(labels)}:a]")
+        input_filter = f"[{index}:a]"
+        if preserve_timestamps:
+            input_filter += CAMERA_AUDIO_TIMELINE_FILTER + ","
+        if channel:
+            channel_name = "FL" if channel == "left" else "FR"
+            input_filter += f"pan=mono|c0={channel_name}"
+        else:
+            input_filter += "aformat=channel_layouts=mono"
+        label = f"p{index}"
+        filters.append(f"{input_filter}[{label}]")
+        labels.append(f"[{label}]")
 
     with tempfile.NamedTemporaryFile(
         prefix=f".{cache_file.stem}.",
@@ -727,17 +776,29 @@ async def _render_audio_preview(
         delete=False,
     ) as temp_handle:
         temp_file = Path(temp_handle.name)
-    cmd = ["ffmpeg", "-y", *inputs]
+    output_label = labels[0]
     if len(labels) > 1:
-        cmd.extend(
-            [
-                "-filter_complex",
-                f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[out]",
-                "-map",
-                "[out]",
-            ]
-        )
-    cmd.extend(["-ac", "1", "-ar", "44100", "-b:a", "128k", str(temp_file)])
+        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[joined]")
+        output_label = "[joined]"
+    if abs(tempo - 1.0) > 1e-7:
+        filters.append(f"{output_label}atempo={tempo:.8f}[timed]")
+        output_label = "[timed]"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        *inputs,
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        output_label,
+        "-ac",
+        "1",
+        "-ar",
+        "44100",
+        "-b:a",
+        "128k",
+        str(temp_file),
+    ]
     result = await _run_ffmpeg(cmd)
     if result.returncode != 0:
         temp_file.unlink(missing_ok=True)
@@ -766,7 +827,11 @@ async def get_logical_track_preview(
         raise HTTPException(
             status_code=404, detail=f"Logical track {track_number} not found"
         )
-    offset = float((ep.get("audio_sync") or {}).get("offset_seconds", 0))
+    sync = ep.get("audio_sync") or {}
+    offset = float(sync.get("offset_seconds", 0))
+    tempo = (
+        float(sync.get("tempo_factor", 1)) if sync.get("r_squared", 0) > 0.5 else 1.0
+    )
     cache_file = await _render_audio_preview(
         EPISODES_DIR / episode_id,
         f"track_{track_number}",
@@ -774,6 +839,7 @@ async def get_logical_track_preview(
         start,
         duration,
         offset,
+        tempo=tempo,
     )
     return FileResponse(cache_file, media_type="audio/mpeg")
 
@@ -829,9 +895,13 @@ async def get_audio_preview(
         raise HTTPException(status_code=404, detail=f"Track '{track_name}' not found")
 
     # audio_time = video_time + offset_seconds
-    offset = float((ep.get("audio_sync") or {}).get("offset_seconds", 0))
+    sync = ep.get("audio_sync") or {}
+    offset = float(sync.get("offset_seconds", 0))
+    tempo = (
+        float(sync.get("tempo_factor", 1)) if sync.get("r_squared", 0) > 0.5 else 1.0
+    )
     cache_file = await _render_audio_preview(
-        ep_dir, track_name, [track], start, duration, offset
+        ep_dir, track_name, [track], start, duration, offset, tempo=tempo
     )
 
     return FileResponse(cache_file, media_type="audio/mpeg")
@@ -859,42 +929,23 @@ async def get_channel_preview(
     if channel not in ("left", "right"):
         raise HTTPException(status_code=400, detail="channel must be 'left' or 'right'")
 
+    start, duration = _validate_preview_window(start, duration)
+
     ep_dir = EPISODES_DIR / episode_id
     source = ep_dir / "source_merged.mp4"
     if not source.exists():
         raise HTTPException(status_code=404, detail="source_merged.mp4 not found")
 
-    cache_dir = ep_dir / "work" / "audio_preview"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"channel_{channel}_{int(start)}_{int(duration)}.mp3"
-
-    if not cache_file.exists():
-        # Use channelsplit to extract just the requested channel
-        ch_idx = "FL" if channel == "left" else "FR"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(start),
-            "-i",
-            str(source),
-            "-t",
-            str(duration),
-            "-vn",
-            "-af",
-            f"pan=mono|c0={ch_idx}",
-            "-ar",
-            "44100",
-            "-b:a",
-            "128k",
-            str(cache_file),
-        ]
-        result = await _run_ffmpeg(cmd)
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
-            )
-
+    cache_file = await _render_audio_preview(
+        ep_dir,
+        f"channel_{channel}",
+        [{"dest_path": str(source)}],
+        start,
+        duration,
+        0.0,
+        channel=channel,
+        preserve_timestamps=True,
+    )
     return FileResponse(cache_file, media_type="audio/mpeg")
 
 
