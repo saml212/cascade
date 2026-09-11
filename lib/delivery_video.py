@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -17,14 +19,22 @@ from functools import lru_cache
 from pathlib import Path
 
 from lib.atomic_write import atomic_write_json
-from lib.crop import compute_crop
-from lib.encoding import get_color_metadata_args, get_lut_filter, has_videotoolbox
+from lib.encoding import (
+    get_color_metadata_args,
+    resolve_lut_path,
+)
 from lib.ffprobe import probe
-from lib.timeline import Timeline, build_keep_intervals, quantize_timestamp
+from lib.timeline import (  # noqa: F401
+    Timeline,
+    build_keep_intervals,
+    quantize_timestamp,
+)
 
-ProgressCallback = Callable[[float, str], None]
 RENDER_MANIFEST_NAME = "render_manifest.json"
+RENDER_PIPELINE_VERSION = "source-clock/v2"
 _manifest_lock = threading.Lock()
+_render_locks_guard = threading.Lock()
+_render_locks: dict[str, threading.Lock] = {}
 
 
 @lru_cache(maxsize=1)
@@ -43,59 +53,40 @@ def ffmpeg_executable() -> str:
     raise FileNotFoundError("ffmpeg is required for video rendering")
 
 
-def _video_filter(
-    src_w: int, src_h: int, crop_config: dict, config: dict
-) -> tuple[str, int, int]:
-    zoom = float(crop_config.get("wide_zoom", crop_config.get("zoom", 1.0)))
-    cx = int(crop_config.get("wide_center_x", src_w // 2))
-    cy = int(crop_config.get("wide_center_y", src_h // 2))
-    if zoom > 1.0:
-        x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "wide")
+def render_config_for_episode(episode: dict, config: dict) -> dict:
+    """Apply episode-level choices to the shared render configuration."""
+    resolved = copy.deepcopy(config)
+    processing = resolved.setdefault("processing", {})
+    if episode.get("delivery_apply_lut", False):
+        if resolve_lut_path(resolved) is None:
+            raise ValueError("The selected episode LUT is unavailable")
     else:
-        crop_w = min(src_w, int(src_h * 16 / 9))
-        crop_h = min(src_h, int(src_w * 9 / 16))
-        x = max(0, (src_w - crop_w) // 2)
-        y = max(0, (src_h - crop_h) // 2)
-    crop_w -= crop_w % 2
-    crop_h -= crop_h % 2
-    out_w = min(1920, src_w)
-    out_h = min(1080, src_h)
-    out_w -= out_w % 2
-    out_h -= out_h % 2
-    filters = [
-        f"crop={crop_w}:{crop_h}:{x}:{y}",
-        f"scale={out_w}:{out_h}:flags=lanczos",
-    ]
-    lut = get_lut_filter(config)
-    if lut:
-        filters.append(lut)
-    filters.append("format=yuv420p")
-    return ",".join(filters), out_w, out_h
+        processing["lut_path"] = ""
+    if "delivery_burn_captions" in episode:
+        processing["longform_burn_captions"] = bool(episode["delivery_burn_captions"])
+    return resolved
 
 
-def _filter_graph(intervals: list[tuple[float, float]], video_filter: str) -> str:
-    chains = []
-    labels = []
-    if len(intervals) > 1:
-        video_inputs = [f"[vin{i}]" for i in range(len(intervals))]
-        audio_inputs = [f"[ain{i}]" for i in range(len(intervals))]
-        chains.append(f"[0:v]split={len(intervals)}{''.join(video_inputs)}")
-        chains.append(f"[1:a]asplit={len(intervals)}{''.join(audio_inputs)}")
-    else:
-        video_inputs = ["[0:v]"]
-        audio_inputs = ["[1:a]"]
-    for index, (start, end) in enumerate(intervals):
-        chains.append(
-            f"{video_inputs[index]}trim=start={start}:end={end},"
-            f"setpts=PTS-STARTPTS,{video_filter}[v{index}]"
-        )
-        chains.append(
-            f"{audio_inputs[index]}atrim=start={start}:end={end},"
-            f"asetpts=PTS-STARTPTS[a{index}]"
-        )
-        labels.append(f"[v{index}][a{index}]")
-    chains.append(f"{''.join(labels)}concat=n={len(intervals)}:v=1:a=1[v][a]")
-    return ";".join(chains)
+@contextmanager
+def _file_lock(path: Path, local_lock: threading.Lock):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with local_lock, path.open("a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextmanager
+def render_output_lock(output: Path):
+    """Serialize writers of one media artifact across threads and processes."""
+    key = str(output.resolve())
+    with _render_locks_guard:
+        local_lock = _render_locks.setdefault(key, threading.Lock())
+    lock_path = output.with_name(f".{output.name}.render.lock")
+    with _file_lock(lock_path, local_lock):
+        yield
 
 
 def build_render_segments(
@@ -358,8 +349,15 @@ def mux_timeline_audio(
             f"requires audio through {required_end:.3f}s"
         )
 
-    temp = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
-    temp.unlink(missing_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{output_path.stem}-",
+        suffix=output_path.suffix,
+        dir=output_path.parent,
+    )
+    os.close(descriptor)
+    temp = Path(temp_name)
+    temp.unlink()
     try:
         runner(
             [
@@ -466,18 +464,51 @@ def render_fingerprint(paths: list[Path], state: dict) -> str:
     """Fingerprint media identities and every source-clock render decision."""
     files = []
     for path in paths:
-        stat = path.stat()
-        files.append(
-            {
-                "path": str(path.resolve()),
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-            }
-        )
+        identity = {"path": str(path.resolve())}
+        try:
+            stat = path.stat()
+        except OSError:
+            identity["missing"] = True
+        else:
+            identity.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+        files.append(identity)
     payload = json.dumps(
         {"files": files, "state": state}, sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _render_inputs(
+    episode_dir: Path, audio_path: Path, config: dict
+) -> tuple[list[Path], str | None]:
+    paths = [episode_dir / "source_merged.mp4", audio_path]
+    transcript = episode_dir / "diarized_transcript.json"
+    if transcript.exists():
+        paths.append(transcript)
+    lut = resolve_lut_path(config)
+    if lut is not None:
+        paths.append(lut)
+        digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    else:
+        digest = None
+    return paths, digest
+
+
+_VIDEO_PROCESSING_KEYS = (
+    "encode_preset",
+    "lut_interpolation",
+    "lut_path",
+    "output_resolution",
+    "use_hardware_accel",
+    "video_contrast",
+    "video_denoise",
+    "video_gamma",
+    "video_polish",
+    "video_saturation",
+    "video_sharpen",
+    "video_sharpen_strength",
+    "videotoolbox_quality",
+)
 
 
 def longform_render_fingerprint(
@@ -490,14 +521,15 @@ def longform_render_fingerprint(
     render_mode: str = "speaker_cut",
 ) -> str:
     """Fingerprint every input that can change the canonical longform pixels."""
-    transcript_path = episode_dir / "diarized_transcript.json"
-    paths = [episode_dir / "source_merged.mp4", audio_path]
-    if transcript_path.exists():
-        paths.append(transcript_path)
+    config = render_config_for_episode(episode, config)
+    paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
     processing = config.get("processing", {})
     state = {
+        "pipeline_version": RENDER_PIPELINE_VERSION,
         "clock": "source",
         "render_mode": render_mode,
+        "color_grade": "lut" if episode.get("delivery_apply_lut", False) else "source",
+        "lut_sha256": lut_digest,
         "edits": episode.get("longform_edits", []),
         "crop_config": episode.get("crop_config", {}),
         "source_properties": episode.get("source_properties", {}),
@@ -506,18 +538,9 @@ def longform_render_fingerprint(
             key: processing.get(key)
             for key in (
                 "audio_bitrate",
-                "encode_preset",
-                "lut_interpolation",
-                "lut_path",
-                "video_contrast",
+                "longform_burn_captions",
                 "video_crf",
-                "video_denoise",
-                "video_gamma",
-                "video_polish",
-                "video_saturation",
-                "video_sharpen",
-                "video_sharpen_strength",
-                "videotoolbox_quality",
+                *_VIDEO_PROCESSING_KEYS,
             )
         },
     }
@@ -533,10 +556,13 @@ def short_render_fingerprint(
     clip: dict,
 ) -> str:
     """Fingerprint a source-clock clip and its shared render inputs."""
+    config = render_config_for_episode(episode, config)
     processing = config.get("processing", {})
     state = {
+        "pipeline_version": RENDER_PIPELINE_VERSION,
         "clock": "source",
         "render_mode": "speaker_cut_short",
+        "color_grade": "lut" if episode.get("delivery_apply_lut", False) else "source",
         "edits": episode.get("longform_edits", []),
         "crop_config": episode.get("crop_config", {}),
         "source_properties": episode.get("source_properties", {}),
@@ -548,26 +574,15 @@ def short_render_fingerprint(
         "processing": {
             key: processing.get(key)
             for key in (
-                "encode_preset",
-                "lut_interpolation",
-                "lut_path",
                 "shorts_audio_bitrate",
                 "shorts_crf",
-                "video_contrast",
-                "video_denoise",
-                "video_gamma",
-                "video_polish",
-                "video_saturation",
-                "video_sharpen",
-                "video_sharpen_strength",
-                "videotoolbox_quality",
+                "shorts_hold_wide_seconds",
+                *_VIDEO_PROCESSING_KEYS,
             )
         },
     }
-    transcript_path = episode_dir / "diarized_transcript.json"
-    paths = [episode_dir / "source_merged.mp4", audio_path]
-    if transcript_path.exists():
-        paths.append(transcript_path)
+    paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
+    state["lut_sha256"] = lut_digest
     return render_fingerprint(paths, state)
 
 
@@ -592,6 +607,8 @@ def record_longform_render(
     render_mode: str,
     timeline: Timeline,
     media: dict,
+    captions: dict | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Record a validated canonical longform render for API and release gates."""
     output = episode_dir / "upload_video.mp4"
@@ -599,6 +616,7 @@ def record_longform_render(
     record = {
         "path": output.name,
         "render_mode": render_mode,
+        "pipeline_version": RENDER_PIPELINE_VERSION,
         "fingerprint": fingerprint,
         "keep_intervals": [list(interval) for interval in timeline.keep_intervals],
         "output_duration_seconds": round(timeline.duration, 3),
@@ -609,7 +627,11 @@ def record_longform_render(
         },
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    with _manifest_lock:
+    if captions is not None:
+        record["captions"] = captions
+    if provenance is not None:
+        record["provenance"] = provenance
+    with _file_lock(episode_dir / ".render_manifest.lock", _manifest_lock):
         manifest = read_render_manifest(episode_dir)
         manifest["longform"] = record
         atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
@@ -623,6 +645,8 @@ def record_short_render(
     fingerprint: str,
     timeline: Timeline,
     media: dict,
+    captions: dict | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Record one validated short without changing other manifest entries."""
     output = episode_dir / "shorts" / f"{clip_id}.mp4"
@@ -630,6 +654,7 @@ def record_short_render(
     record = {
         "path": str(output.relative_to(episode_dir)),
         "render_mode": "speaker_cut_short",
+        "pipeline_version": RENDER_PIPELINE_VERSION,
         "fingerprint": fingerprint,
         "clip_source_intervals": [
             list(interval) for interval in timeline.keep_intervals
@@ -642,7 +667,11 @@ def record_short_render(
         },
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    with _manifest_lock:
+    if captions is not None:
+        record["captions"] = captions
+    if provenance is not None:
+        record["provenance"] = provenance
+    with _file_lock(episode_dir / ".render_manifest.lock", _manifest_lock):
         manifest = read_render_manifest(episode_dir)
         manifest["shorts"][clip_id] = record
         atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
@@ -662,6 +691,11 @@ def current_longform_render(
         return None
     record = read_render_manifest(episode_dir).get("longform", {})
     if record.get("render_mode") != "speaker_cut":
+        return None
+    captions = record.get("captions")
+    if captions is not None and not (
+        captions.get("path") and (episode_dir / captions["path"]).exists()
+    ):
         return None
     expected = longform_render_fingerprint(
         episode_dir, episode, config, audio_path, segments
@@ -708,6 +742,11 @@ def current_short_render(
     if not output.exists():
         return None
     record = read_render_manifest(episode_dir).get("shorts", {}).get(clip_id, {})
+    captions = record.get("captions")
+    if captions is not None and not (
+        captions.get("path") and (episode_dir / captions["path"]).exists()
+    ):
+        return None
     expected = short_render_fingerprint(
         episode_dir, episode, config, audio_path, segments, clip
     )
@@ -751,155 +790,3 @@ def require_output_space(path: Path, estimated_bytes: int) -> None:
 
 def estimate_output_bytes(duration: float, video_mbps: float = 8.0) -> int:
     return int(duration * ((video_mbps * 1_000_000) + 192_000) / 8 * 1.2)
-
-
-def render_delivery_video(
-    episode_dir: Path,
-    episode: dict,
-    config: dict,
-    audio_path: Path,
-    progress: ProgressCallback | None = None,
-) -> dict:
-    source = episode_dir / "source_merged.mp4"
-    if not source.exists():
-        raise FileNotFoundError("source_merged.mp4 is required for video delivery")
-    if not audio_path.exists():
-        raise FileNotFoundError(
-            "Prepared mastered audio is required for video delivery"
-        )
-
-    source_probe = probe(source)
-    video_stream = next(
-        s for s in source_probe["streams"] if s["codec_type"] == "video"
-    )
-    source_duration = float(source_probe["format"]["duration"])
-    intervals = build_keep_intervals(source_duration, episode.get("longform_edits", []))
-    output_duration = sum(end - start for start, end in intervals)
-    audio_duration = float(probe(audio_path)["format"]["duration"])
-    required_audio_end = max(end for _, end in intervals)
-    if audio_duration + 0.1 < required_audio_end:
-        raise RuntimeError(
-            f"Canonical audio ends at {audio_duration:.3f}s but the selected video "
-            f"requires audio through {required_audio_end:.3f}s"
-        )
-    required = estimate_output_bytes(output_duration)
-    free = shutil.disk_usage(episode_dir).free
-    if free < required + 1_000_000_000:
-        raise RuntimeError(
-            f"Not enough free space: need about {required / 1e9:.1f} GB plus 1 GB reserve; "
-            f"{free / 1e9:.1f} GB available"
-        )
-
-    vf, _, _ = _video_filter(
-        int(video_stream["width"]),
-        int(video_stream["height"]),
-        episode.get("crop_config", {}),
-        config,
-    )
-    output = episode_dir / "upload_video.mp4"
-    temp = episode_dir / "upload_video.tmp.mp4"
-    filter_graph = _filter_graph(intervals, vf)
-    encoder = "h264_videotoolbox" if has_videotoolbox() else "libx264"
-    decoder_args = (
-        ["-hwaccel", "videotoolbox"] if encoder == "h264_videotoolbox" else []
-    )
-    encoder_args = ["-c:v", encoder, "-b:v", "7M", "-maxrate", "8M", "-bufsize", "14M"]
-    if encoder == "libx264":
-        encoder_args += ["-preset", "medium"]
-    cmd = [
-        ffmpeg_executable(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        *decoder_args,
-        "-i",
-        str(source),
-        "-i",
-        str(audio_path),
-        "-filter_complex",
-        filter_graph,
-        "-map",
-        "[v]",
-        "-map",
-        "[a]",
-        *encoder_args,
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        "48000",
-        *get_color_metadata_args(),
-        "-movflags",
-        "+faststart",
-        "-use_editlist",
-        "0",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        str(temp),
-    ]
-    temp.unlink(missing_ok=True)
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    assert process.stdout is not None
-    for line in process.stdout:
-        key, _, value = line.strip().partition("=")
-        if key in {"out_time_us", "out_time_ms"}:
-            try:
-                seconds = float(value) / 1_000_000
-            except ValueError:
-                continue
-            if progress:
-                progress(min(99.0, seconds / output_duration * 100), "Encoding video")
-    _, stderr = process.communicate()
-    if process.returncode != 0:
-        temp.unlink(missing_ok=True)
-        raise RuntimeError(f"Video export failed: {stderr[-500:]}")
-    # Validate the temporary artifact before publishing it so a failed export
-    # cannot replace a previously verified delivery file.
-    result_probe = probe(temp)
-    streams = result_probe["streams"]
-    out_video = next(s for s in streams if s["codec_type"] == "video")
-    out_audio = next(s for s in streams if s["codec_type"] == "audio")
-    actual_duration = float(result_probe["format"]["duration"])
-    video_duration = float(out_video.get("duration", actual_duration))
-    audio_duration = float(out_audio.get("duration", 0))
-    if out_video.get("codec_name") != "h264" or out_audio.get("codec_name") != "aac":
-        raise RuntimeError("Video export codec validation failed")
-    if int(out_video["width"]) > 1920 or int(out_video["height"]) > 1080:
-        raise RuntimeError("Video export exceeds 1080p")
-    if abs(actual_duration - output_duration) > 1.0:
-        raise RuntimeError(
-            f"Video duration is {actual_duration:.3f}s; expected {output_duration:.3f}s"
-        )
-    if abs(video_duration - output_duration) > 1.0:
-        raise RuntimeError(
-            f"Video stream duration is {video_duration:.3f}s; expected {output_duration:.3f}s"
-        )
-    if audio_duration <= 0 or abs(audio_duration - output_duration) > 1.0:
-        raise RuntimeError(
-            f"Audio stream duration is {audio_duration:.3f}s; expected {output_duration:.3f}s"
-        )
-    if temp.stat().st_size <= 0:
-        raise RuntimeError("Video export is empty")
-    os.replace(temp, output)
-    if progress:
-        progress(100.0, "Video verified")
-    return {
-        "path": str(output),
-        "filename": output.name,
-        "size_bytes": output.stat().st_size,
-        "duration_seconds": round(actual_duration, 3),
-        "audio_duration_seconds": round(audio_duration, 3),
-        "video_duration_seconds": round(video_duration, 3),
-        "expected_duration_seconds": round(output_duration, 3),
-        "width": int(out_video["width"]),
-        "height": int(out_video["height"]),
-        "video_codec": "h264",
-        "audio_codec": "aac",
-        "encoder": encoder,
-        "edit_count": len(episode.get("longform_edits", [])),
-    }

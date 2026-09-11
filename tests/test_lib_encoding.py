@@ -1,18 +1,17 @@
 """Tests for lib.encoding — VideoToolbox detection, encoder args, color metadata, and LUT filter."""
 
 import subprocess
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lib.encoding import (
-    has_videotoolbox,
-    get_video_encoder_args,
     get_color_metadata_args,
     get_lut_filter,
     get_scale_filter,
+    get_video_encoder_args,
     get_video_polish_filters,
+    has_videotoolbox,
 )
 
 
@@ -31,22 +30,28 @@ class TestHasVideoToolbox:
             assert has_videotoolbox() is False
 
     def test_returns_true_when_available_on_macos(self):
-        with patch("lib.encoding.sys") as mock_sys, \
-             patch("lib.encoding.subprocess.run") as mock_run:
+        with (
+            patch("lib.encoding.sys") as mock_sys,
+            patch("lib.encoding.subprocess.run") as mock_run,
+        ):
             mock_sys.platform = "darwin"
             mock_run.return_value = MagicMock(stdout="... h264_videotoolbox ...")
             assert has_videotoolbox() is True
 
     def test_returns_false_when_not_available_on_macos(self):
-        with patch("lib.encoding.sys") as mock_sys, \
-             patch("lib.encoding.subprocess.run") as mock_run:
+        with (
+            patch("lib.encoding.sys") as mock_sys,
+            patch("lib.encoding.subprocess.run") as mock_run,
+        ):
             mock_sys.platform = "darwin"
             mock_run.return_value = MagicMock(stdout="libx264 libx265")
             assert has_videotoolbox() is False
 
     def test_result_is_cached(self):
-        with patch("lib.encoding.sys") as mock_sys, \
-             patch("lib.encoding.subprocess.run") as mock_run:
+        with (
+            patch("lib.encoding.sys") as mock_sys,
+            patch("lib.encoding.subprocess.run") as mock_run,
+        ):
             mock_sys.platform = "darwin"
             mock_run.return_value = MagicMock(stdout="h264_videotoolbox")
             has_videotoolbox()
@@ -54,14 +59,20 @@ class TestHasVideoToolbox:
             assert mock_run.call_count == 1
 
     def test_returns_false_on_subprocess_error(self):
-        with patch("lib.encoding.sys") as mock_sys, \
-             patch("lib.encoding.subprocess.run", side_effect=subprocess.SubprocessError):
+        with (
+            patch("lib.encoding.sys") as mock_sys,
+            patch(
+                "lib.encoding.subprocess.run", side_effect=subprocess.SubprocessError
+            ),
+        ):
             mock_sys.platform = "darwin"
             assert has_videotoolbox() is False
 
     def test_returns_false_on_file_not_found(self):
-        with patch("lib.encoding.sys") as mock_sys, \
-             patch("lib.encoding.subprocess.run", side_effect=FileNotFoundError):
+        with (
+            patch("lib.encoding.sys") as mock_sys,
+            patch("lib.encoding.subprocess.run", side_effect=FileNotFoundError),
+        ):
             mock_sys.platform = "darwin"
             assert has_videotoolbox() is False
 
@@ -98,7 +109,9 @@ class TestGetVideoEncoderArgs:
         assert "medium" in args
 
     def test_custom_preset(self):
-        config = {"processing": {"use_hardware_accel": False, "encode_preset": "ultrafast"}}
+        config = {
+            "processing": {"use_hardware_accel": False, "encode_preset": "ultrafast"}
+        }
         args = get_video_encoder_args(config)
         assert "ultrafast" in args
 
@@ -121,7 +134,9 @@ class TestGetVideoEncoderArgs:
 
     def test_videotoolbox_custom_quality(self):
         """VideoToolbox quality should be configurable."""
-        config = {"processing": {"use_hardware_accel": True, "videotoolbox_quality": 90}}
+        config = {
+            "processing": {"use_hardware_accel": True, "videotoolbox_quality": 90}
+        }
         with patch("lib.encoding.has_videotoolbox", return_value=True):
             args = get_video_encoder_args(config)
             assert args[0:2] == ["-c:v", "h264_videotoolbox"]
@@ -236,21 +251,29 @@ class TestGetVideoPolishFilters:
         assert "gamma=1.01" in f
 
     def test_custom_eq(self):
-        f = get_video_polish_filters({"processing": {
-            "video_contrast": 1.1,
-            "video_saturation": 1.15,
-            "video_gamma": 1.05,
-        }})
+        f = get_video_polish_filters(
+            {
+                "processing": {
+                    "video_contrast": 1.1,
+                    "video_saturation": 1.15,
+                    "video_gamma": 1.05,
+                }
+            }
+        )
         assert "contrast=1.1" in f
         assert "saturation=1.15" in f
         assert "gamma=1.05" in f
 
     def test_all_disabled_returns_empty(self):
-        f = get_video_polish_filters({"processing": {
-            "video_denoise": False,
-            "video_sharpen": False,
-            "video_polish": False,
-        }})
+        f = get_video_polish_filters(
+            {
+                "processing": {
+                    "video_denoise": False,
+                    "video_sharpen": False,
+                    "video_polish": False,
+                }
+            }
+        )
         assert f == ""
 
 
@@ -285,10 +308,12 @@ class TestGetLutFilter:
     def test_custom_interpolation(self, tmp_path):
         lut_file = tmp_path / "test.cube"
         lut_file.write_text("# Fake LUT\n")
-        config = {"processing": {
-            "lut_path": str(lut_file),
-            "lut_interpolation": "trilinear",
-        }}
+        config = {
+            "processing": {
+                "lut_path": str(lut_file),
+                "lut_interpolation": "trilinear",
+            }
+        }
         result = get_lut_filter(config)
         assert "interp=trilinear" in result
 

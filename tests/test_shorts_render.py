@@ -10,6 +10,22 @@ from agents.shorts_render import ShortsRenderAgent, render_single_clip
 from lib.timeline import Timeline
 
 
+def test_batch_render_skips_rejected_candidates(tmp_episode_dir, sample_config):
+    clips = [
+        {"id": "pending", "status": "pending"},
+        {"id": "selected", "selection_status": "selected"},
+        {"id": "rejected-selection", "selection_status": "rejected"},
+        {"id": "rejected-legacy", "status": "rejected"},
+    ]
+    (tmp_episode_dir / "clips.json").write_text(json.dumps({"clips": clips}))
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+
+    with patch.object(agent, "_render_clips", return_value={}) as render:
+        agent.execute()
+
+    assert render.call_args.args == ([clips[0], clips[1]],)
+
+
 def test_clip_segments_switch_crop_dynamically_and_fill_gaps(
     tmp_episode_dir, sample_config
 ):
@@ -18,12 +34,54 @@ def test_clip_segments_switch_crop_dynamically_and_fill_gaps(
         {"start": 10, "end": 13, "speaker": "A"},
         {"start": 15, "end": 20, "speaker": "B"},
     ]
-
     assert agent._get_clip_segments(segments, 10, 20) == [
         {"start": 10.0, "end": 13.0, "speaker": "A"},
         {"start": 13.0, "end": 15.0, "speaker": "BOTH"},
         {"start": 15.0, "end": 20.0, "speaker": "B"},
     ]
+
+
+def test_brief_both_span_holds_previous_crop_and_long_span_stays_wide(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    segments = [
+        {
+            "start": 0,
+            "end": 2,
+            "duration": 2,
+            "source_start": 0,
+            "source_end": 2,
+            "speaker": "speaker_0",
+        },
+        {
+            "start": 2,
+            "end": 4,
+            "duration": 2,
+            "source_start": 2,
+            "source_end": 4,
+            "speaker": "BOTH",
+        },
+        {
+            "start": 4,
+            "end": 8,
+            "duration": 4,
+            "source_start": 4,
+            "source_end": 8,
+            "speaker": "BOTH",
+        },
+    ]
+
+    resolved = agent._apply_overlap_policy(segments)
+
+    assert [(item["speaker"], item["duration"]) for item in resolved] == [
+        ("speaker_0", 4),
+        ("BOTH", 4),
+    ]
+    assert (
+        "force_original_aspect_ratio=decrease"
+        in agent._get_short_crop_filter_no_subs("BOTH", 3840, 2160, {"wide_zoom": 1})
+    )
 
 
 def test_render_short_uses_each_retained_source_range_and_rebases_ass(

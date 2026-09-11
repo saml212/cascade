@@ -1,7 +1,10 @@
-"""Tests for the compact delivery video renderer."""
+"""Tests for shared source-clock render infrastructure."""
 
+import json
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -10,8 +13,6 @@ import pytest
 from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.delivery_video import (
     _audio_filter_graph,
-    _filter_graph,
-    _video_filter,
     build_keep_intervals,
     build_render_segments,
     concat_video_segments,
@@ -21,12 +22,29 @@ from lib.delivery_video import (
     longform_render_fingerprint,
     mux_timeline_audio,
     record_longform_render,
-    render_delivery_video,
+    record_short_render,
+    render_config_for_episode,
+    render_fingerprint,
     render_video_segment,
     source_fps,
 )
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
+
+
+def _record_short_in_process(args):
+    episode_dir, clip_id = args
+    episode_dir = Path(episode_dir)
+    output = episode_dir / "shorts" / f"{clip_id}.mp4"
+    output.write_bytes(clip_id.encode())
+    record_short_render(
+        episode_dir,
+        clip_id,
+        fingerprint=f"fingerprint-{clip_id}",
+        timeline=Timeline.from_edits(1),
+        media={"duration_seconds": 1},
+    )
+    return clip_id
 
 
 def test_keep_intervals_applies_trims_and_cuts():
@@ -41,13 +59,6 @@ def test_keep_intervals_applies_trims_and_cuts():
 def test_keep_intervals_rejects_unknown_edit():
     with pytest.raises(ValueError, match="Unsupported"):
         build_keep_intervals(100, [{"type": "fade"}])
-
-
-def test_filter_graph_splits_inputs_for_multiple_ranges():
-    graph = _filter_graph([(0, 10), (20, 30)], "scale=1920:1080")
-    assert "[0:v]split=2[vin0][vin1]" in graph
-    assert "[1:a]asplit=2[ain0][ain1]" in graph
-    assert "concat=n=2:v=1:a=1[v][a]" in graph
 
 
 def test_audio_filter_graph_applies_the_same_interior_cut_ranges():
@@ -91,25 +102,96 @@ def test_render_segments_fill_detection_gaps_with_wide_crop():
     assert sum(segment["duration"] for segment in rendered) == 5
 
 
-def test_video_filter_caps_4k_at_1080p_even_without_crop():
-    vf, width, height = _video_filter(3840, 2160, {}, {})
-    assert (width, height) == (1920, 1080)
-    assert "scale=1920:1080" in vf
-
-
-def test_video_filter_uses_wide_crop():
-    vf, width, height = _video_filter(
-        3840,
-        2160,
-        {"wide_zoom": 1.5, "wide_center_x": 2000, "wide_center_y": 1080},
-        {},
-    )
-    assert "crop=2560:1440" in vf
-    assert (width, height) == (1920, 1080)
-
-
 def test_disk_estimate_includes_video_audio_and_margin():
     assert estimate_output_bytes(3600) > 3_600_000_000
+
+
+def test_episode_render_config_preserves_source_color_without_explicit_opt_in(
+    tmp_path,
+):
+    lut = tmp_path / "grade.cube"
+    lut.write_text("LUT_3D_SIZE 2\n")
+    config = {"processing": {"lut_path": str(lut)}}
+
+    assert render_config_for_episode({}, config)["processing"]["lut_path"] == ""
+    assert render_config_for_episode({"delivery_apply_lut": True}, config)[
+        "processing"
+    ]["lut_path"] == str(lut)
+    assert config["processing"]["lut_path"] == str(lut)
+
+
+def test_longform_fingerprint_tracks_caption_choice_and_lut_contents(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio.wav"
+    transcript = tmp_path / "diarized_transcript.json"
+    lut = tmp_path / "grade.cube"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    transcript.write_text('{"utterances": []}')
+    lut.write_text("first")
+    episode = {"delivery_apply_lut": True}
+    config = {"processing": {"lut_path": str(lut)}}
+
+    first = longform_render_fingerprint(tmp_path, episode, config, audio, [])
+    config["processing"]["longform_burn_captions"] = True
+    burned = longform_render_fingerprint(tmp_path, episode, config, audio, [])
+    lut.write_text("other")
+    changed_lut = longform_render_fingerprint(tmp_path, episode, config, audio, [])
+
+    assert len({first, burned, changed_lut}) == 3
+
+
+def test_fingerprint_marks_missing_inputs_without_raising(tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    available = render_fingerprint([source], {})
+
+    source.unlink()
+
+    assert render_fingerprint([source], {}) != available
+
+
+def test_mux_uses_a_unique_atomic_temp_for_each_attempt(tmp_path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "result.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    destinations = []
+
+    def runner(command, **_kwargs):
+        destination = Path(command[-1])
+        destinations.append(destination)
+        destination.write_bytes(b"render")
+
+    with (
+        patch("lib.delivery_video.probe", return_value={"format": {"duration": "1"}}),
+        patch(
+            "lib.delivery_video.validate_av_output",
+            return_value={"duration_seconds": 1},
+        ),
+    ):
+        mux_timeline_audio(video, audio, output, Timeline.from_edits(1), runner=runner)
+        mux_timeline_audio(video, audio, output, Timeline.from_edits(1), runner=runner)
+
+    assert destinations[0] != destinations[1]
+    assert all(destination.parent == tmp_path for destination in destinations)
+    assert not any(destination.exists() for destination in destinations)
+
+
+def test_manifest_updates_survive_multiple_writer_processes(tmp_path):
+    (tmp_path / "shorts").mkdir()
+    clip_ids = [f"clip_{index:02d}" for index in range(8)]
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        assert sorted(
+            executor.map(
+                _record_short_in_process,
+                [(str(tmp_path), clip_id) for clip_id in clip_ids],
+            )
+        ) == sorted(clip_ids)
+
+    manifest = json.loads((tmp_path / "render_manifest.json").read_text())
+    assert sorted(manifest["shorts"]) == clip_ids
 
 
 def test_longform_manifest_rejects_changed_segments(tmp_path):
@@ -138,117 +220,6 @@ def test_longform_manifest_rejects_changed_segments(tmp_path):
     assert current_longform_render(tmp_path, episode, config, audio, segments)
     changed = [{"start": 0, "end": 5, "speaker": "B"}]
     assert current_longform_render(tmp_path, episode, config, audio, changed) is None
-
-
-def test_export_rejects_canonical_audio_that_does_not_cover_selected_end(tmp_path):
-    source = tmp_path / "source_merged.mp4"
-    audio = tmp_path / "audio_mix.wav"
-    source.write_bytes(b"video")
-    audio.write_bytes(b"audio")
-    source_info = {
-        "format": {"duration": "100"},
-        "streams": [{"codec_type": "video", "width": 320, "height": 180}],
-    }
-    audio_info = {"format": {"duration": "94.5"}, "streams": []}
-    episode = {
-        "longform_edits": [
-            {"type": "trim_start", "seconds": 10},
-            {"type": "trim_end", "seconds": 95},
-        ]
-    }
-    with (
-        patch("lib.delivery_video.probe", side_effect=[source_info, audio_info]),
-        patch("lib.delivery_video.subprocess.Popen") as popen,
-        pytest.raises(RuntimeError, match="requires audio through 95.000s"),
-    ):
-        render_delivery_video(tmp_path, episode, {}, audio)
-    popen.assert_not_called()
-
-
-@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
-def test_real_export_applies_audio_trim_once_from_canonical_wav(tmp_path):
-    source = tmp_path / "source_merged.mp4"
-    audio = tmp_path / "audio_mix.wav"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x180:rate=30:duration=4",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(source),
-        ],
-        check=True,
-    )
-    inputs = []
-    for frequency in (440, 880, 1320, 1760):
-        inputs += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"sine={frequency}:sample_rate=48000:duration=1",
-        ]
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            *inputs,
-            "-filter_complex",
-            "[0:a][1:a][2:a][3:a]concat=n=4:v=0:a=1[a]",
-            "-map",
-            "[a]",
-            "-c:a",
-            "pcm_s24le",
-            str(audio),
-        ],
-        check=True,
-    )
-    episode = {
-        "longform_edits": [
-            {"type": "trim_start", "seconds": 1},
-            {"type": "trim_end", "seconds": 4},
-        ]
-    }
-    with patch("lib.delivery_video.has_videotoolbox", return_value=False):
-        result = render_delivery_video(
-            tmp_path, episode, {"processing": {"lut_path": ""}}, audio
-        )
-    decoded = subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-t",
-            "0.5",
-            "-i",
-            result["path"],
-            "-vn",
-            "-f",
-            "f32le",
-            "-ac",
-            "1",
-            "-ar",
-            "8000",
-            "-",
-        ],
-        capture_output=True,
-        check=True,
-    ).stdout
-    samples = np.frombuffer(decoded, dtype="<f4")
-    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
-    frequencies = np.fft.rfftfreq(len(samples), 1 / 8000)
-    dominant = frequencies[int(np.argmax(spectrum))]
-    assert dominant == pytest.approx(880, abs=10)
-    assert result["audio_duration_seconds"] == pytest.approx(3, abs=0.1)
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")

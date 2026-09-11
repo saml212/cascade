@@ -1,5 +1,6 @@
 """Tests for local delivery preparation routes."""
 
+import asyncio
 import importlib
 import json
 from unittest.mock import MagicMock, patch
@@ -73,6 +74,57 @@ def test_video_prepare_requires_ready_audio(delivery):
     make_episode(episodes_dir)
     response = client.post("/api/episodes/ep_test/delivery/video/prepare")
     assert response.status_code == 409
+
+
+def test_video_prepare_explains_missing_speaker_prerequisites(delivery):
+    client, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    audio = episode_dir / "work" / "audio_mix.wav"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    with patch.object(mod, "_refresh_status", return_value={"status": "ready"}):
+        response = client.post("/api/episodes/ep_test/delivery/video/prepare")
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Complete crop setup first"
+
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        episode["crop_config"] = {"speakers": [{"center_x": 10, "center_y": 10}]}
+        (episode_dir / "episode.json").write_text(json.dumps(episode))
+        response = client.post("/api/episodes/ep_test/delivery/video/prepare")
+        assert response.status_code == 422
+        assert "speaker analysis" in response.json()["detail"]
+
+
+def test_video_prepare_persists_explicit_caption_and_color_choices(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["crop_config"] = {"speakers": [{"center_x": 10, "center_y": 10}]}
+    (episode_dir / "episode.json").write_text(json.dumps(episode))
+    (episode_dir / "segments.json").write_text(
+        '{"segments": [{"start": 0, "end": 1, "speaker": "speaker_0"}]}'
+    )
+    (episode_dir / "diarized_transcript.json").write_text('{"utterances": []}')
+    audio = episode_dir / "work" / "audio_mix.wav"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod.threading.Thread, "start"),
+    ):
+        response = asyncio.run(
+            mod.prepare_delivery_video(
+                "ep_test",
+                mod.DeliveryVideoRequest(apply_lut=False, burn_captions=True),
+            )
+        )
+
+    assert response["video_status"] == "preparing"
+    stored = json.loads((episode_dir / "episode.json").read_text())
+    assert stored["delivery_apply_lut"] is False
+    assert stored["delivery_burn_captions"] is True
+    mod._video_running.clear()
 
 
 def test_trim_saves_absolute_range_and_preserves_cuts(delivery):
@@ -179,14 +231,12 @@ def test_worker_persists_failure(delivery):
     assert status["error"] == "bad mix"
 
 
-def test_video_worker_uses_untrimmed_canonical_wav(delivery):
+def test_video_worker_delegates_to_canonical_speaker_cut_renderer(delivery):
     _, mod, episodes_dir = delivery
     episode_dir = make_episode(episodes_dir)
     mix = episode_dir / "work" / "audio_mix.wav"
     mix.parent.mkdir()
     mix.write_bytes(b"wav data" * 10)
-    mp3 = episode_dir / "podcast_audio.mp3"
-    mp3.write_bytes(b"already trimmed mp3")
     mod._write_status(episode_dir, {"status": "ready", "episode_id": "ep_test"})
     video = episode_dir / "upload_video.mp4"
     video.write_bytes(b"video result")
@@ -194,6 +244,7 @@ def test_video_worker_uses_untrimmed_canonical_wav(delivery):
         "path": str(video),
         "filename": video.name,
         "size_bytes": video.stat().st_size,
+        "render_fingerprint": "canonical-fingerprint",
     }
     with (
         patch.object(
@@ -202,13 +253,15 @@ def test_video_worker_uses_untrimmed_canonical_wav(delivery):
             return_value={"processing": {"lut_path": "/global/dlog.cube"}},
         ),
         patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
-        patch.object(mod, "render_delivery_video", return_value=rendered) as render,
+        patch.object(mod, "render_longform", return_value=rendered) as render,
     ):
         mod._video_running.add("ep_test")
         mod._prepare_video("ep_test")
-    assert render.call_args.args[3] == mix
-    assert render.call_args.args[3] != mp3
-    assert render.call_args.args[2]["processing"]["lut_path"] == ""
+    assert render.call_args.args[0] == episode_dir
+    assert render.call_args.args[1]["processing"]["lut_path"] == ""
+    assert render.call_args.kwargs["progress"]
+    status = json.loads((episode_dir / "delivery.json").read_text())
+    assert status["video_source_fingerprint"] == "canonical-fingerprint"
 
 
 def test_worker_rejects_out_of_range_loudness(delivery):

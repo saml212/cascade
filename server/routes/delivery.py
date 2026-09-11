@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import logging
@@ -15,12 +14,17 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from agents.longform_render import render_longform
 from agents.pipeline import load_config
 from agents.podcast_feed import PodcastFeedAgent
 from agents.qa import quality_snapshot
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import generate_audio_mix
-from lib.delivery_video import build_keep_intervals, render_delivery_video
+from lib.delivery_video import (
+    build_keep_intervals,
+    longform_render_fingerprint,
+    render_config_for_episode,
+)
 from lib.ffprobe import get_duration
 from lib.loudness import measure_loudness
 from lib.paths import get_episodes_dir
@@ -133,21 +137,19 @@ def _source_fingerprint(
 def _video_fingerprint(
     episode_dir: Path, episode: dict, config: dict, audio: Path
 ) -> str:
-    apply_lut = bool(episode.get("delivery_apply_lut", False))
-    payload = {
-        "source": _source_fingerprint(episode_dir, episode, config),
-        "audio": _file_stat(audio),
-        "crop_config": episode.get("crop_config"),
-        "edits": episode.get("longform_edits"),
-        "apply_lut": apply_lut,
-        "lut_path": config.get("processing", {}).get("lut_path") if apply_lut else None,
-        "lut_interpolation": (
-            config.get("processing", {}).get("lut_interpolation") if apply_lut else None
-        ),
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode()
-    ).hexdigest()
+    try:
+        segments = json.loads((episode_dir / "segments.json").read_text()).get(
+            "segments", []
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        segments = []
+    return longform_render_fingerprint(
+        episode_dir,
+        episode,
+        config,
+        audio,
+        segments,
+    )
 
 
 def _refresh_status(episode_dir: Path) -> dict:
@@ -166,6 +168,7 @@ def _refresh_status(episode_dir: Path) -> dict:
                 trims.get("trim_end", {}).get("seconds", source_duration or 0)
             ),
             delivery_apply_lut=bool(episode.get("delivery_apply_lut", False)),
+            delivery_burn_captions=bool(episode.get("delivery_burn_captions", False)),
         )
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, config = {}, {}
@@ -211,8 +214,9 @@ def _refresh_status(episode_dir: Path) -> dict:
         with _running_lock:
             video_active = episode_id in _video_running
         if not video_active:
-            partial_video = episode_dir / "upload_video.tmp.mp4"
-            partial_video.unlink(missing_ok=True)
+            for partial_video in episode_dir.glob(".upload_video-*.mp4"):
+                partial_video.unlink(missing_ok=True)
+            (episode_dir / "upload_video.tmp.mp4").unlink(missing_ok=True)
             status.update(
                 video_status="failed",
                 video_error="Video preparation was interrupted; start it again.",
@@ -363,16 +367,7 @@ def _prepare_video(episode_id: str) -> None:
     try:
         status = _refresh_status(episode_dir)
         episode = json.loads((episode_dir / "episode.json").read_text())
-        config = load_config()
-        # Delivery defaults to source color. A LUT is destructive and is only
-        # enabled when an operator explicitly identifies the episode as log.
-        if not episode.get("delivery_apply_lut", False):
-            config = copy.deepcopy(config)
-            config.setdefault("processing", {})["lut_path"] = ""
-        audio_path = episode_dir / "work" / "audio_mix.wav"
-        source_fingerprint = _video_fingerprint(
-            episode_dir, episode, config, audio_path
-        )
+        config = render_config_for_episode(episode, load_config())
 
         def progress(percent: float, detail: str) -> None:
             current = _read_status(episode_dir)
@@ -384,16 +379,14 @@ def _prepare_video(episode_id: str) -> None:
             )
             _write_status(episode_dir, current)
 
-        video = render_delivery_video(
-            episode_dir, episode, config, audio_path, progress=progress
-        )
+        video = render_longform(episode_dir, config, progress=progress)
         status = _read_status(episode_dir)
         status.update(
             video_status="ready",
             video_progress=100.0,
             video_completed_at=_now(),
             video_download_url=f"/api/episodes/{episode_id}/delivery/video",
-            video_source_fingerprint=source_fingerprint,
+            video_source_fingerprint=video["render_fingerprint"],
             video_output_stat=_file_stat(episode_dir / "upload_video.mp4"),
             video=video,
             video_error=None,
@@ -426,6 +419,7 @@ class DeliveryTrimRequest(BaseModel):
 
 class DeliveryVideoRequest(BaseModel):
     apply_lut: bool = False
+    burn_captions: bool = False
 
 
 @router.put("/{episode_id}/delivery/trim")
@@ -573,6 +567,31 @@ async def prepare_delivery_video(
         raise HTTPException(
             status_code=422, detail="Canonical mastered WAV is required"
         )
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    if not episode.get("crop_config"):
+        raise HTTPException(status_code=422, detail="Complete crop setup first")
+    try:
+        segments = json.loads((episode_dir / "segments.json").read_text()).get(
+            "segments", []
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        segments = []
+    if not segments:
+        raise HTTPException(
+            status_code=422,
+            detail="Run speaker analysis before preparing speaker-cut video",
+        )
+    if not (episode_dir / "diarized_transcript.json").exists():
+        raise HTTPException(
+            status_code=422,
+            detail="Run transcription before preparing video subtitles",
+        )
+    episode["delivery_apply_lut"] = request.apply_lut
+    episode["delivery_burn_captions"] = request.burn_captions
+    try:
+        render_config_for_episode(episode, load_config())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     with _running_lock:
         if episode_id in _running:
             raise HTTPException(
@@ -584,8 +603,6 @@ async def prepare_delivery_video(
                 detail="Another video preparation is already running; wait for it to finish",
             )
         _video_running.add(episode_id)
-    episode = json.loads((episode_dir / "episode.json").read_text())
-    episode["delivery_apply_lut"] = request.apply_lut
     atomic_write_json(episode_dir / "episode.json", episode)
     status.update(
         video_status="preparing",
@@ -594,6 +611,7 @@ async def prepare_delivery_video(
         video_error=None,
         video_started_at=_now(),
         delivery_apply_lut=request.apply_lut,
+        delivery_burn_captions=request.burn_captions,
     )
     _write_status(episode_dir, status)
     threading.Thread(

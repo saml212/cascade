@@ -17,7 +17,10 @@ def has_videotoolbox() -> bool:
     try:
         result = subprocess.run(
             ["ffmpeg", "-encoders"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         return "h264_videotoolbox" in result.stdout
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -41,7 +44,14 @@ def get_video_encoder_args(config: dict, crf_key: str = "video_crf") -> list:
 
     if use_hw and has_videotoolbox():
         vt_quality = config.get("processing", {}).get("videotoolbox_quality", 45)
-        return ["-c:v", "h264_videotoolbox", "-q:v", str(vt_quality), "-profile:v", "high"]
+        return [
+            "-c:v",
+            "h264_videotoolbox",
+            "-q:v",
+            str(vt_quality),
+            "-profile:v",
+            "high",
+        ]
 
     crf = config.get("processing", {}).get(crf_key, 22)
     preset = config.get("processing", {}).get("encode_preset", "medium")
@@ -56,10 +66,14 @@ def get_color_metadata_args() -> list:
     washed-out or oversaturated playback on YouTube/Spotify/etc.
     """
     return [
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
-        "-colorspace", "bt709",
-        "-color_range", "tv",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-color_range",
+        "tv",
     ]
 
 
@@ -100,7 +114,9 @@ def get_video_polish_filters(config: dict) -> str:
     # without softening pore detail. Temporal=6 is safe for tripod-mounted
     # talking head where motion between frames is minimal.
     if processing.get("video_denoise", True):
-        parts.append("hqdn3d=luma_spatial=1.5:chroma_spatial=1.5:luma_tmp=6:chroma_tmp=6")
+        parts.append(
+            "hqdn3d=luma_spatial=1.5:chroma_spatial=1.5:luma_tmp=6:chroma_tmp=6"
+        )
 
     # cas — Contrast Adaptive Sharpening (AMD FidelityFX algorithm).
     # Better than unsharp: contrast-adaptive so flat skin areas are sharpened
@@ -122,27 +138,33 @@ def get_video_polish_filters(config: dict) -> str:
     return ",".join(parts)
 
 
-def get_lut_filter(config: dict) -> str:
-    """Return the ffmpeg lut3d filter string if a LUT is configured, else empty string.
-
-    Resolves relative paths against the project root (config/ directory's parent).
-    """
-    processing = config.get("processing", {})
-    lut_path = processing.get("lut_path", "")
+def resolve_lut_path(config: dict) -> Path | None:
+    """Resolve the configured LUT path, returning None when it is unavailable."""
+    lut_path = config.get("processing", {}).get("lut_path", "")
     if not lut_path:
-        return ""
+        return None
 
-    lut_file = Path(lut_path)
+    lut_file = Path(lut_path).expanduser()
     if not lut_file.is_absolute():
-        # Resolve relative to project root
         project_root = Path(__file__).resolve().parent.parent
         lut_file = project_root / lut_file
-
     if not lut_file.exists():
-        logger.warning("LUT file not found: %s — rendering without color grading", lut_file)
+        logger.warning(
+            "LUT file not found: %s — rendering without color grading", lut_file
+        )
+        return None
+    return lut_file.resolve()
+
+
+def get_lut_filter(config: dict) -> str:
+    """Return the ffmpeg lut3d filter string if a LUT is configured."""
+    lut_file = resolve_lut_path(config)
+    if lut_file is None:
         return ""
 
-    interp = processing.get("lut_interpolation", "tetrahedral")
+    interp = config.get("processing", {}).get("lut_interpolation", "tetrahedral")
     # Escape path for ffmpeg filter syntax (matches escape_srt_path in lib/srt.py)
-    escaped = str(lut_file).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    escaped = (
+        str(lut_file).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    )
     return f"lut3d={escaped}:interp={interp}"

@@ -6,13 +6,28 @@ Formulas must match frontend/app.js redrawCropCanvas(). See comments there.
   short:   crop_h = src_h / zoom   — 9:16 portrait
 """
 
+import math
+
 
 def compute_crop(src_w, src_h, cx, cy, zoom, mode):
     """Return (x, y, crop_w, crop_h) clamped to frame bounds.
 
-    For "speaker" mode: zoom=1.0 gives full frame, zoom=2.0 gives half-frame.
-    This avoids the crop-then-upscale quality loss at low zoom values.
+    In speaker mode, zoom=1.0 selects one 16:9 half of a two-person frame.
     """
+    if mode not in {"speaker", "wide", "short"}:
+        raise ValueError(f"Unknown crop mode: {mode!r}")
+    values = {"source width": src_w, "source height": src_h, "zoom": zoom}
+    for label, value in values.items():
+        if (
+            not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{label} must be a positive finite number")
+    for label, value in (("center x", cx), ("center y", cy)):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{label} must be a finite number")
+
     if mode == "speaker":
         crop_w = max(64, int(src_w / (2 * zoom)))
         crop_h = max(36, int(crop_w * 9 / 16))
@@ -22,9 +37,6 @@ def compute_crop(src_w, src_h, cx, cy, zoom, mode):
     elif mode == "short":
         crop_h = max(36, int(src_h / zoom))
         crop_w = max(64, int(crop_h * 9 / 16))
-    else:
-        raise ValueError(f"Unknown crop mode: {mode!r}")
-
     crop_w = min(crop_w, src_w)
     crop_h = min(crop_h, src_h)
     x = max(0, min(cx - crop_w // 2, src_w - crop_w))
@@ -51,7 +63,10 @@ def resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=False):
         if speaker in ("L", "R"):
             idx = 0 if speaker == "L" else 1
         else:
-            idx = int(speaker.split("_")[1])
+            suffix = speaker.removeprefix("speaker_")
+            if not suffix.isdigit():
+                raise ValueError(f"Invalid speaker label: {speaker!r}")
+            idx = int(suffix)
 
         # Use speakers[] array if available
         if speakers and idx < len(speakers):
@@ -61,10 +76,12 @@ def resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=False):
                 cx = spk["center_x"]
                 cy = spk.get("center_y", src_h // 2)
             else:
-                zoom = spk.get("longform_zoom", spk.get("zoom", 1.0))
-                # Longform center falls back to shorts center if not explicitly set.
-                cx = spk.get("longform_center_x") or spk["center_x"]
-                cy = spk.get("longform_center_y") or spk.get("center_y", src_h // 2)
+                zoom = spk.get("longform_zoom")
+                zoom = spk.get("zoom", 1.0) if zoom is None else zoom
+                cx = spk.get("longform_center_x")
+                cx = spk["center_x"] if cx is None else cx
+                cy = spk.get("longform_center_y")
+                cy = spk.get("center_y", src_h // 2) if cy is None else cy
             return cx, cy, zoom, "speaker"
 
         # Fallback: legacy speaker_l/speaker_r fields for 2-speaker setups
@@ -75,7 +92,10 @@ def resolve_speaker(speaker, src_w, src_h, crop_config, for_shorts=False):
             zoom = crop_config.get(f"{prefix}_zoom", crop_config.get("zoom", 1.0))
             return cx, cy, zoom, "speaker"
 
-        return src_w // 2, src_h // 2, 1.0, "speaker"
+        raise ValueError(
+            f"Speaker index {idx} has no crop configuration; "
+            f"configured speaker count is {len(speakers)}"
+        )
 
     # BOTH/NONE — wide shot
     zoom = crop_config.get("wide_zoom", crop_config.get("zoom", 1.0))

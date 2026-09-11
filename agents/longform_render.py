@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from lib.delivery_video import (
     longform_render_fingerprint,
     mux_timeline_audio,
     record_longform_render,
+    render_config_for_episode,
+    render_output_lock,
     render_scratch_dir,
     render_video_segment,
     require_output_space,
@@ -38,8 +41,22 @@ from lib.timeline import Timeline, rebase_diarized
 class LongformRenderAgent(BaseAgent):
     name = "longform_render"
 
+    def __init__(
+        self,
+        episode_dir: Path,
+        config: dict,
+        progress: Callable[[float, str], None] | None = None,
+    ):
+        super().__init__(episode_dir, config)
+        self._delivery_progress = progress
+
     def execute(self) -> dict:
+        with render_output_lock(self.episode_dir / "upload_video.mp4"):
+            return self._execute_locked()
+
+    def _execute_locked(self) -> dict:
         episode = self.load_json("episode.json")
+        self.config = render_config_for_episode(episode, self.config)
         crop_config = episode.get("crop_config")
         if not crop_config:
             raise ValueError("Complete crop setup before rendering")
@@ -70,34 +87,14 @@ class LongformRenderAgent(BaseAgent):
         fingerprint = longform_render_fingerprint(
             self.episode_dir, episode, self.config, audio, segments
         )
-        current = current_longform_render(
-            self.episode_dir, episode, self.config, audio, segments
-        )
-        if current:
-            self.logger.info("Canonical speaker-cut longform is already current")
-            return {
-                "output_path": str(self.episode_dir / "upload_video.mp4"),
-                "render_mode": "speaker_cut",
-                "render_fingerprint": fingerprint,
-                "reused": True,
-                **current["output"],
-            }
-
         render_segments = build_render_segments(timeline, segments, frame_rate=fps)
         if not render_segments:
             raise ValueError("No retained speaker segments remain after edits")
-        captions = rebase_diarized(diarized, timeline)
 
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
         out_w, out_h = self._output_dimensions(src_w, src_h)
-        encoder_args = get_video_encoder_args(self.config)
-        lut_filter = get_lut_filter(self.config)
-        audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
-        estimate = estimate_output_bytes(timeline.duration)
-        require_output_space(self.episode_dir, estimate)
-        output = self.episode_dir / "upload_video.mp4"
-
+        captions = rebase_diarized(diarized, timeline)
         style = CaptionStyle(
             font_size=max(36, round(out_h * 0.045)),
             margin_v=max(48, round(out_h * 0.07)),
@@ -105,6 +102,31 @@ class LongformRenderAgent(BaseAgent):
             play_res_x=out_w,
             play_res_y=out_h,
         )
+        caption_path = self.episode_dir / "subtitles" / "longform.ass"
+        caption_path.parent.mkdir(parents=True, exist_ok=True)
+        generate_ass_from_diarized(captions, 0, timeline.duration, caption_path, style)
+        burn_captions = bool(
+            self.config.get("processing", {}).get("longform_burn_captions", False)
+        )
+        caption_record = {
+            "path": str(caption_path.relative_to(self.episode_dir)),
+            "format": "ass",
+            "burned_in": burn_captions,
+        }
+        current = current_longform_render(
+            self.episode_dir, episode, self.config, audio, segments
+        )
+        if current:
+            self.logger.info("Canonical speaker-cut longform is already current")
+            return self._result(current, caption_path, reused=True)
+
+        encoder_args = get_video_encoder_args(self.config)
+        lut_filter = get_lut_filter(self.config)
+        audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
+        estimate = estimate_output_bytes(timeline.duration)
+        require_output_space(self.episode_dir, estimate)
+        output = self.episode_dir / "upload_video.mp4"
+
         with render_scratch_dir(
             f"longform-{self.episode_dir.name}", round(estimate * 2.2)
         ) as scratch:
@@ -112,8 +134,8 @@ class LongformRenderAgent(BaseAgent):
                 source,
                 scratch,
                 render_segments,
-                captions,
-                style,
+                captions if burn_captions else None,
+                style if burn_captions else None,
                 src_w,
                 src_h,
                 crop_config,
@@ -134,28 +156,46 @@ class LongformRenderAgent(BaseAgent):
                 runner=self._run_ffmpeg,
             )
 
+        media.update(
+            encoder=encoder_args[1],
+            edit_count=len(episode.get("longform_edits", [])),
+            segment_count=len(render_segments),
+            expected_duration_seconds=round(timeline.duration, 3),
+        )
+        loudness = measure_loudness(output)
+        if loudness:
+            media["audio_loudness"] = loudness
         record = record_longform_render(
             self.episode_dir,
             fingerprint=fingerprint,
             render_mode="speaker_cut",
             timeline=timeline,
             media=media,
+            captions=caption_record,
+            provenance={
+                "color_grade": (
+                    "lut" if episode.get("delivery_apply_lut", False) else "source"
+                )
+            },
         )
-        loudness = measure_loudness(output)
-        result = {
+        return self._result(record, caption_path, reused=False)
+
+    def _result(self, record: dict, caption_path: Path, *, reused: bool) -> dict:
+        output = self.episode_dir / "upload_video.mp4"
+        return {
+            "path": str(output),
             "output_path": str(output),
-            "render_mode": "speaker_cut",
-            "render_fingerprint": fingerprint,
-            "segment_count": len(render_segments),
+            "filename": output.name,
+            "render_mode": record["render_mode"],
+            "render_fingerprint": record["fingerprint"],
+            "reused": reused,
             "source_clock": True,
-            "keep_intervals": [list(value) for value in timeline.keep_intervals],
-            "file_size_mb": round(output.stat().st_size / 1e6, 1),
-            **media,
+            "keep_intervals": record["keep_intervals"],
+            "caption_path": str(caption_path),
+            "captions_burned_in": record["captions"]["burned_in"],
+            **record["output"],
+            "manifest": record,
         }
-        if loudness:
-            result["audio_loudness"] = loudness
-        result["manifest"] = record
-        return result
 
     def _render_segments(
         self,
@@ -178,17 +218,19 @@ class LongformRenderAgent(BaseAgent):
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
             for index, segment in enumerate(segments):
-                ass_path = scratch / f"segment_{index:04d}.ass"
-                segment_timeline = Timeline(
-                    segments[-1]["end"], [(segment["start"], segment["end"])]
-                )
-                generate_ass_from_diarized(
-                    rebase_diarized(captions, segment_timeline),
-                    0,
-                    segment["duration"],
-                    ass_path,
-                    style,
-                )
+                ass_path = None
+                if captions is not None and style is not None:
+                    ass_path = scratch / f"segment_{index:04d}.ass"
+                    segment_timeline = Timeline(
+                        segments[-1]["end"], [(segment["start"], segment["end"])]
+                    )
+                    generate_ass_from_diarized(
+                        rebase_diarized(captions, segment_timeline),
+                        0,
+                        segment["duration"],
+                        ass_path,
+                        style,
+                    )
                 output = scratch / f"segment_{index:04d}.mp4"
                 future = executor.submit(
                     self._render_segment,
@@ -290,9 +332,31 @@ class LongformRenderAgent(BaseAgent):
     def _run_ffmpeg(self, cmd, **kwargs):
         return timed_ffmpeg(cmd, agent_logger=self.logger, **kwargs)
 
-    @staticmethod
-    def _output_dimensions(src_w: int, src_h: int) -> tuple[int, int]:
-        scale = min(1.0, 1920 / src_w, 1080 / src_h)
-        width = int(src_w * scale) // 2 * 2
-        height = int(src_h * scale) // 2 * 2
+    def report_progress(self, current: int, total: int, detail: str = ""):
+        super().report_progress(current, total, detail)
+        if self._delivery_progress:
+            percent = current / total * 100 if total else 0.0
+            self._delivery_progress(percent, detail)
+
+    def _output_dimensions(self, src_w: int, src_h: int) -> tuple[int, int]:
+        value = self.config.get("processing", {}).get("output_resolution", "1920x1080")
+        try:
+            target_w, target_h = (int(part) for part in value.lower().split("x", 1))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid output_resolution: {value!r}") from exc
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError(f"Invalid output_resolution: {value!r}")
+        scale = min(1.0, src_w / target_w, src_h / target_h)
+        width = int(target_w * scale) // 2 * 2
+        height = int(target_h * scale) // 2 * 2
         return width, height
+
+
+def render_longform(
+    episode_dir: Path,
+    config: dict,
+    *,
+    progress: Callable[[float, str], None] | None = None,
+) -> dict:
+    """Render or reuse the canonical manifest-backed longform artifact."""
+    return LongformRenderAgent(episode_dir, config, progress=progress).execute()

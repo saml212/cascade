@@ -1,9 +1,10 @@
 """Tests for LongformRenderAgent — crop filters, edit operations, segment splitting."""
 
 import json
+from contextlib import nullcontext
+from unittest.mock import patch
+
 import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 from agents.longform_render import LongformRenderAgent
 
@@ -52,7 +53,7 @@ class TestGetCropFilter:
         crop_config["speakers"][1]["zoom"] = 1.5
         result_l = agent._get_crop_filter("speaker_0", 3840, 2160, crop_config)
         result_r = agent._get_crop_filter("speaker_1", 3840, 2160, crop_config)
-        assert "crop=960:" in result_l   # 3840 / (2*2.0)
+        assert "crop=960:" in result_l  # 3840 / (2*2.0)
         assert "crop=1280:" in result_r  # 3840 / (2*1.5)
 
     def test_both_no_zoom_passthrough(self, agent, crop_config):
@@ -75,11 +76,11 @@ class TestGetCropFilter:
         wide = agent._get_crop_filter("BOTH", 3840, 2160, crop_config)
         spk = agent._get_crop_filter("speaker_0", 3840, 2160, crop_config)
         assert "crop=2560:" in wide  # 3840 / 1.5
-        assert "crop=1280:" in spk   # 3840 / (2*1.5)
+        assert "crop=1280:" in spk  # 3840 / (2*1.5)
 
     def test_out_of_range_speaker_index(self, agent, crop_config):
-        result = agent._get_crop_filter("speaker_5", 3840, 2160, crop_config)
-        assert "crop=" in result  # still produces a crop (centered)
+        with pytest.raises(ValueError, match="Speaker index 5"):
+            agent._get_crop_filter("speaker_5", 3840, 2160, crop_config)
 
     def test_1080p_source(self, agent):
         config = {
@@ -252,3 +253,100 @@ class TestApplyEdits:
 
         # Original should be unchanged
         assert [s["start"] for s in segments] == original_starts
+
+
+def test_longform_uses_configured_1080p_ceiling(agent):
+    agent.config["processing"]["output_resolution"] = "1920x1080"
+
+    assert agent._output_dimensions(3840, 2160) == (1920, 1080)
+    assert agent._output_dimensions(1280, 720) == (1280, 720)
+
+
+@pytest.mark.parametrize("burn_captions", [False, True])
+def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
+    tmp_episode_dir, sample_config, burn_captions
+):
+    episode = {
+        "crop_config": {"speakers": [{"center_x": 80, "center_y": 45, "zoom": 1}]},
+        "longform_edits": [],
+        "delivery_apply_lut": False,
+    }
+    (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+    (tmp_episode_dir / "segments.json").write_text(
+        json.dumps({"segments": [{"start": 0, "end": 2, "speaker": "speaker_0"}]})
+    )
+    (tmp_episode_dir / "diarized_transcript.json").write_text(
+        json.dumps(
+            {
+                "utterances": [
+                    {
+                        "speaker": 0,
+                        "words": [{"word": "hello", "start": 0.2, "end": 0.6}],
+                    }
+                ]
+            }
+        )
+    )
+    source = tmp_episode_dir / "source_merged.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    scratch = tmp_episode_dir / "scratch"
+    scratch.mkdir()
+    config = json.loads(json.dumps(sample_config))
+    config["processing"]["longform_burn_captions"] = burn_captions
+    agent = LongformRenderAgent(tmp_episode_dir, config)
+    source_probe = {
+        "format": {"duration": "2"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 160,
+                "height": 90,
+                "r_frame_rate": "30/1",
+            }
+        ],
+    }
+
+    def fake_concat(_paths, destination, **_kwargs):
+        destination.write_bytes(b"video")
+
+    def fake_mux(_video, _audio, destination, _timeline, **_kwargs):
+        destination.write_bytes(b"muxed")
+        return {
+            "duration_seconds": 2,
+            "audio_duration_seconds": 2,
+            "video_duration_seconds": 2,
+            "width": 160,
+            "height": 90,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+        }
+
+    with (
+        patch("agents.longform_render.generate_audio_mix", return_value=audio),
+        patch("agents.longform_render.ffprobe", return_value=source_probe),
+        patch(
+            "agents.longform_render.get_video_encoder_args",
+            return_value=["-c:v", "libx264"],
+        ),
+        patch("agents.longform_render.require_output_space"),
+        patch(
+            "agents.longform_render.render_scratch_dir",
+            return_value=nullcontext(scratch),
+        ),
+        patch.object(
+            agent,
+            "_render_segments",
+            return_value=[scratch / "segment.mp4"],
+        ) as render_segments,
+        patch("agents.longform_render.concat_video_segments", side_effect=fake_concat),
+        patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
+        patch("agents.longform_render.measure_loudness", return_value=None),
+    ):
+        result = agent.execute()
+
+    assert "hello" in (tmp_episode_dir / "subtitles" / "longform.ass").read_text()
+    assert (render_segments.call_args.args[3] is not None) is burn_captions
+    assert result["captions_burned_in"] is burn_captions
+    assert result["filename"] == "upload_video.mp4"

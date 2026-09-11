@@ -17,6 +17,8 @@ from lib.delivery_video import (
     estimate_output_bytes,
     mux_timeline_audio,
     record_short_render,
+    render_config_for_episode,
+    render_output_lock,
     render_scratch_dir,
     render_video_segment,
     require_output_space,
@@ -39,7 +41,14 @@ class ShortsRenderAgent(BaseAgent):
 
     def execute(self) -> dict:
         clips = self.load_json("clips.json").get("clips", [])
-        return self._render_clips(clips)
+        return self._render_clips(
+            [
+                clip
+                for clip in clips
+                if clip.get("selection_status") != "rejected"
+                and clip.get("status") != "rejected"
+            ]
+        )
 
     def render_clip(self, clip_id: str) -> dict:
         """Render one stored candidate without mutating clip selection state."""
@@ -60,6 +69,7 @@ class ShortsRenderAgent(BaseAgent):
         segments = self.load_json("segments.json").get("segments", [])
         diarized = self.load_json("diarized_transcript.json")
         episode = self.load_json("episode.json")
+        self.config = render_config_for_episode(episode, self.config)
         crop_config = episode.get("crop_config")
         if not crop_config:
             raise ValueError("Complete crop setup before rendering")
@@ -171,7 +181,11 @@ class ShortsRenderAgent(BaseAgent):
             "renders": records,
         }
 
-    def _render_short(
+    def _render_short(self, source, output, *args, **kwargs) -> dict:
+        with render_output_lock(Path(output)):
+            return self._render_short_unlocked(source, output, *args, **kwargs)
+
+    def _render_short_unlocked(
         self,
         source,
         output,
@@ -217,6 +231,7 @@ class ShortsRenderAgent(BaseAgent):
             raise ValueError("Clip contains no retained source material")
 
         render_segments = build_render_segments(timeline, segments, frame_rate=fps)
+        render_segments = self._apply_overlap_policy(render_segments)
         captions = rebase_diarized(diarized, timeline)
         style = CaptionStyle()
         caption_path = Path(caption_path).with_suffix(".ass")
@@ -295,7 +310,60 @@ class ShortsRenderAgent(BaseAgent):
             fingerprint=fingerprint,
             timeline=timeline,
             media=media,
+            captions={
+                "path": str(caption_path.relative_to(self.episode_dir)),
+                "format": "ass",
+                "burned_in": True,
+            },
+            provenance={
+                "color_grade": (
+                    "lut" if episode.get("delivery_apply_lut", False) else "source"
+                ),
+                "overlap_policy": "hold_neighbor_up_to_threshold_else_fit_wide",
+                "overlap_hold_seconds": self.config.get("processing", {}).get(
+                    "shorts_hold_wide_seconds", 3.0
+                ),
+            },
         )
+
+    def _apply_overlap_policy(self, segments: list[dict]) -> list[dict]:
+        """Hold a nearby speaker through brief BOTH spans; keep long spans wide."""
+        threshold = float(
+            self.config.get("processing", {}).get("shorts_hold_wide_seconds", 3.0)
+        )
+        resolved = []
+        for index, segment in enumerate(segments):
+            updated = dict(segment)
+            if (
+                segment["speaker"] in {"BOTH", "NONE"}
+                and segment["duration"] <= threshold
+            ):
+                neighbors = [
+                    resolved[-1]["speaker"] if resolved else None,
+                    next(
+                        (
+                            item["speaker"]
+                            for item in segments[index + 1 :]
+                            if item["speaker"] not in {"BOTH", "NONE"}
+                        ),
+                        None,
+                    ),
+                ]
+                updated["speaker"] = next(
+                    (speaker for speaker in neighbors if speaker is not None),
+                    segment["speaker"],
+                )
+            if (
+                resolved
+                and resolved[-1]["speaker"] == updated["speaker"]
+                and abs(resolved[-1]["source_end"] - updated["source_start"]) < 1e-6
+            ):
+                resolved[-1]["end"] = updated["end"]
+                resolved[-1]["source_end"] = updated["source_end"]
+                resolved[-1]["duration"] = resolved[-1]["end"] - resolved[-1]["start"]
+            else:
+                resolved.append(updated)
+        return resolved
 
     def _get_clip_segments(self, segments, clip_start, clip_end):
         timeline = Timeline(float(clip_end), [(float(clip_start), float(clip_end))])
@@ -316,6 +384,15 @@ class ShortsRenderAgent(BaseAgent):
         return crop_w, crop_h, x, y
 
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
+        if speaker in {"BOTH", "NONE"}:
+            chain = (
+                "scale=1080:1920:force_original_aspect_ratio=decrease:"
+                "flags=lanczos+accurate_rnd+full_chroma_int:"
+                "sws_dither=ed:param0=5,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+            )
+            polish = get_video_polish_filters(self.config)
+            return f"{chain},{polish}" if polish else chain
         crop_w, crop_h, x, y = self._get_short_crop_region(
             speaker, src_w, src_h, crop_config
         )
