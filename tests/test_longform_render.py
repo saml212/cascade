@@ -264,6 +264,36 @@ def test_longform_uses_configured_1080p_ceiling(agent):
     assert agent._output_dimensions(1280, 720) == (1280, 720)
 
 
+def test_segment_progress_reserves_completion_for_post_render_phases(
+    agent, tmp_episode_dir, crop_config
+):
+    segments = [
+        {"speaker": "speaker_0", "start": 0.0, "end": 1.0, "duration": 1.0},
+        {"speaker": "speaker_1", "start": 1.0, "end": 2.0, "duration": 1.0},
+    ]
+    with (
+        patch.object(agent, "_render_segment"),
+        patch.object(agent, "report_progress") as report,
+    ):
+        agent._render_segments(
+            tmp_episode_dir / "source.mp4",
+            tmp_episode_dir,
+            segments,
+            None,
+            None,
+            3840,
+            2160,
+            crop_config,
+            ["-c:v", "libx264"],
+            "",
+            "30/1",
+            1920,
+            1080,
+        )
+
+    assert [call.args[:2] for call in report.call_args_list] == [(1, 5), (2, 5)]
+
+
 @pytest.mark.parametrize("burn_captions", [False, True])
 def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     tmp_episode_dir, sample_config, burn_captions
@@ -297,7 +327,12 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     scratch.mkdir()
     config = json.loads(json.dumps(sample_config))
     config["processing"]["longform_burn_captions"] = burn_captions
-    agent = LongformRenderAgent(tmp_episode_dir, config)
+    progress = []
+    agent = LongformRenderAgent(
+        tmp_episode_dir,
+        config,
+        progress=lambda percent, detail: progress.append((percent, detail)),
+    )
     source_probe = {
         "format": {"duration": "2"},
         "streams": [
@@ -367,6 +402,14 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     assert (render_segments.call_args.args[3] is not None) is burn_captions
     assert result["captions_burned_in"] is burn_captions
     assert result["filename"] == "upload_video.mp4"
+    assert [detail for _, detail in progress] == [
+        "Joining rendered segments",
+        "Muxing canonical audio",
+        "Measuring output loudness",
+        "Longform render complete",
+    ]
+    assert all(percent < 100 for percent, _ in progress[:-1])
+    assert progress[-1][0] == 100
     budget = render_space_budget(2, get_video_encoding_policy(config, "longform"))
     render_space.assert_called_once_with(tmp_episode_dir, budget)
     assert scratch_space.call_args.args[1] == budget["scratch_bytes"]

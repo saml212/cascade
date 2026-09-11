@@ -40,6 +40,8 @@ from lib.loudness import measure_loudness
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
+_POST_RENDER_PHASES = 3
+
 
 class LongformRenderAgent(BaseAgent):
     name = "longform_render"
@@ -158,7 +160,14 @@ class LongformRenderAgent(BaseAgent):
                 out_h,
             )
             video_only = scratch / "longform_video.mp4"
+            progress_total = len(render_segments) + _POST_RENDER_PHASES
+            self.report_progress(
+                len(render_segments), progress_total, "Joining rendered segments"
+            )
             concat_video_segments(segment_paths, video_only, runner=self._run_ffmpeg)
+            self.report_progress(
+                len(render_segments) + 1, progress_total, "Muxing canonical audio"
+            )
             media = mux_timeline_audio(
                 video_only,
                 audio,
@@ -173,6 +182,9 @@ class LongformRenderAgent(BaseAgent):
             edit_count=len(episode.get("longform_edits", [])),
             segment_count=len(render_segments),
             expected_duration_seconds=round(timeline.duration, 3),
+        )
+        self.report_progress(
+            len(render_segments) + 2, progress_total, "Measuring output loudness"
         )
         loudness = measure_loudness(output)
         if loudness:
@@ -191,6 +203,7 @@ class LongformRenderAgent(BaseAgent):
                 "encoding": {**encoding, "encoder": encoder_args[1]},
             },
         )
+        self.report_progress(progress_total, progress_total, "Longform render complete")
         return self._result(record, caption_path, reused=False)
 
     def _result(self, record: dict, caption_path: Path, *, reused: bool) -> dict:
@@ -267,7 +280,7 @@ class LongformRenderAgent(BaseAgent):
                 paths[index] = output
                 self.report_progress(
                     sum(path is not None for path in paths),
-                    len(paths),
+                    len(paths) + _POST_RENDER_PHASES,
                     f"Rendered speaker segment {index + 1}",
                 )
         return [path for path in paths if path is not None]

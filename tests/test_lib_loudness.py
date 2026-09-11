@@ -118,6 +118,15 @@ class TestMeasureLoudnessParsing:
             "measured_at",
         }
 
+    def test_decodes_only_the_first_audio_stream(self):
+        with patch("lib.loudness.subprocess.run") as mock_run:
+            mock_run.return_value = self._make_mock_result(_EBUR128_STDERR_WITH_SUMMARY)
+            measure_loudness(Path("/fake/longform.mp4"))
+
+        command = mock_run.call_args.args[0]
+        assert command[command.index("-map") + 1] == "0:a:0"
+        assert "-vn" in command
+
 
 class TestMeasureLoudnessFailure:
     """Returns None on ffmpeg failure."""
