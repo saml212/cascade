@@ -17,6 +17,7 @@ import logging
 import subprocess
 from pathlib import Path
 
+from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
 from lib.ffprobe import probe as ffprobe
 
 logger = logging.getLogger("cascade")
@@ -65,16 +66,19 @@ def extract_camera_channels(merged_path: Path, audio_dir: Path) -> list[dict]:
     out_l = audio_dir / "camera_Tr1.WAV"
     out_r = audio_dir / "camera_Tr2.WAV"
 
-    # channelsplit produces one mono output per input channel; map each to
-    # its own pcm_s16le file. 48 kHz / 16-bit matches the H6E tracks we use
-    # downstream so the mixer doesn't have to resample.
+    # Materialize source timestamp gaps before splitting. Without this step,
+    # decoding concatenated AAC packets can collapse missing spans and shift
+    # every later word several seconds earlier than the video clock.
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         str(merged_path),
         "-filter_complex",
-        "[0:a]channelsplit=channel_layout=stereo[L][R]",
+        (
+            f"[0:a]{CAMERA_AUDIO_TIMELINE_FILTER},"
+            "channelsplit=channel_layout=stereo[L][R]"
+        ),
         "-map",
         "[L]",
         "-c:a",
@@ -94,7 +98,7 @@ def extract_camera_channels(merged_path: Path, audio_dir: Path) -> list[dict]:
         "camera_audio: splitting %s stereo → camera_Tr1.WAV + camera_Tr2.WAV",
         merged_path.name,
     )
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         logger.error("camera_audio split failed: %s", result.stderr[-500:])
         return []
@@ -113,6 +117,8 @@ def extract_camera_channels(merged_path: Path, audio_dir: Path) -> list[dict]:
                 "duration_seconds": round(duration, 3),
                 "size_bytes": path.stat().st_size,
                 "track_number": idx,
+                "clock": "source",
+                "timeline_filter": CAMERA_AUDIO_TIMELINE_FILTER,
             }
         )
 
