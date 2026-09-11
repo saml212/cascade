@@ -43,7 +43,7 @@ def test_clip_segments_switch_crop_dynamically_and_fill_gaps(
     ]
 
 
-def test_brief_both_span_holds_previous_crop_and_long_span_stays_wide(
+def test_brief_both_span_holds_previous_crop_and_long_span_stays_both(
     tmp_episode_dir, sample_config
 ):
     agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
@@ -80,10 +80,45 @@ def test_brief_both_span_holds_previous_crop_and_long_span_stays_wide(
         ("speaker_0", 4),
         ("BOTH", 4),
     ]
+
+
+def test_two_person_both_span_stacks_close_crops(tmp_episode_dir, sample_config):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {"center_x": 80, "center_y": 90, "zoom": 1},
+            {"center_x": 240, "center_y": 90, "zoom": 1},
+        ]
+    }
+
+    video_filter = agent._get_short_crop_filter_no_subs(
+        "BOTH", 320, 180, crop_config
+    )
+
+    assert video_filter.startswith("split=2[stack0][stack1]")
+    assert "[stack0]crop=100:88:30:46" in video_filter
+    assert "[stack1]crop=100:88:190:46" in video_filter
+    assert video_filter.count("scale=1080:960") == 2
+    assert "[top][bottom]vstack=inputs=2" in video_filter
+
+
+def test_overlap_without_exactly_two_speakers_fits_wide(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+
+    video_filter = agent._get_short_crop_filter_no_subs(
+        "BOTH",
+        3840,
+        2160,
+        {"speakers": [{}, {}, {}], "wide_zoom": 1},
+    )
+
     assert (
         "force_original_aspect_ratio=decrease"
-        in agent._get_short_crop_filter_no_subs("BOTH", 3840, 2160, {"wide_zoom": 1})
+        in video_filter
     )
+    assert "vstack" not in video_filter
 
 
 def test_render_short_uses_each_retained_source_range_and_rebases_ass(

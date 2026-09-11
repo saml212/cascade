@@ -360,7 +360,9 @@ class ShortsRenderAgent(BaseAgent):
                 "color_grade": (
                     "lut" if episode.get("delivery_apply_lut", False) else "source"
                 ),
-                "overlap_policy": "hold_neighbor_up_to_threshold_else_fit_wide",
+                "overlap_policy": (
+                    "hold_neighbor_up_to_threshold_else_two_person_stack_or_fit_wide"
+                ),
                 "overlap_hold_seconds": self.config.get("processing", {}).get(
                     "shorts_hold_wide_seconds", 3.0
                 ),
@@ -426,6 +428,39 @@ class ShortsRenderAgent(BaseAgent):
         return crop_w, crop_h, x, y
 
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
+        if speaker == "BOTH" and len(crop_config.get("speakers", [])) == 2:
+            panels = []
+            for index, output_label in enumerate(("top", "bottom")):
+                cx, cy, _zoom, _mode = resolve_speaker(
+                    f"speaker_{index}", src_w, src_h, crop_config, for_shorts=True
+                )
+                portrait_w, _portrait_h, _x, _y = self._get_short_crop_region(
+                    f"speaker_{index}", src_w, src_h, crop_config
+                )
+                panel_w = min(src_w, portrait_w)
+                panel_h = panel_w * 8 / 9
+                if panel_h > src_h:
+                    panel_h = src_h
+                    panel_w = panel_h * 9 / 8
+                panel_w = max(2, int(panel_w) // 2 * 2)
+                panel_h = max(2, int(panel_h) // 2 * 2)
+                x = max(0, min(round(cx - panel_w / 2), src_w - panel_w))
+                y = max(0, min(round(cy - panel_h / 2), src_h - panel_h))
+                x = x // 2 * 2
+                y = y // 2 * 2
+                panels.append(
+                    f"[stack{index}]crop={panel_w}:{panel_h}:{x}:{y},"
+                    f"{get_scale_filter(1080, 960)},format=yuv420p[{output_label}]"
+                )
+            chain = (
+                "split=2[stack0][stack1];"
+                f"{panels[0]};{panels[1]};"
+                "[top][bottom]vstack=inputs=2,"
+                "drawbox=x=0:y=957:w=1080:h=6:color=black@0.8:t=fill,"
+                "format=yuv420p"
+            )
+            polish = get_video_polish_filters(self.config)
+            return f"{chain},{polish}" if polish else chain
         if speaker in {"BOTH", "NONE"}:
             chain = (
                 "scale=1080:1920:force_original_aspect_ratio=decrease:"
