@@ -8,19 +8,39 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 from lib.atomic_write import atomic_write_json
 from lib.crop import compute_crop
 from lib.encoding import get_color_metadata_args, get_lut_filter, has_videotoolbox
 from lib.ffprobe import probe
-from lib.timeline import Timeline, build_keep_intervals
+from lib.timeline import Timeline, build_keep_intervals, quantize_timestamp
 
 ProgressCallback = Callable[[float, str], None]
 RENDER_MANIFEST_NAME = "render_manifest.json"
+_manifest_lock = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def ffmpeg_executable() -> str:
+    """Prefer the libass-enabled ffmpeg build used by production renders."""
+    configured = os.getenv("CASCADE_FFMPEG")
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"),
+        Path(shutil.which("ffmpeg-full") or ""),
+        Path(shutil.which("ffmpeg") or ""),
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError("ffmpeg is required for video rendering")
 
 
 def _video_filter(
@@ -84,6 +104,7 @@ def build_render_segments(
     *,
     default_speaker: str = "BOTH",
     minimum_duration: float = 0.05,
+    frame_rate: str | float | Fraction | None = None,
 ) -> list[dict]:
     """Cover a timeline with source-aligned speaker crop decisions.
 
@@ -95,8 +116,16 @@ def build_render_segments(
     candidates = sorted(
         (
             {
-                "source_start": float(segment["start"]),
-                "source_end": float(segment["end"]),
+                "source_start": (
+                    quantize_timestamp(float(segment["start"]), frame_rate)
+                    if frame_rate is not None
+                    else float(segment["start"])
+                ),
+                "source_end": (
+                    quantize_timestamp(float(segment["end"]), frame_rate)
+                    if frame_rate is not None
+                    else float(segment["end"])
+                ),
                 "speaker": segment.get("speaker", default_speaker),
             }
             for segment in speaker_segments
@@ -205,6 +234,19 @@ def _audio_filter_graph(
     return ";".join(chains)
 
 
+def source_fps(video_stream: dict, episode: dict) -> str:
+    """Return the exact rational source rate reported by ffprobe."""
+    numerator, _, denominator = video_stream.get("r_frame_rate", "30/1").partition("/")
+    try:
+        rate = Fraction(int(numerator), int(denominator or 1))
+    except (ValueError, ZeroDivisionError):
+        configured = episode.get("source_properties", {}).get("fps", 30)
+        rate = Fraction(str(configured)).limit_denominator(1_000_000)
+    if rate <= 0:
+        raise ValueError("Source frame rate must be positive")
+    return f"{rate.numerator}/{rate.denominator}"
+
+
 def render_video_segment(
     source: Path,
     output: Path,
@@ -213,15 +255,17 @@ def render_video_segment(
     source_end: float,
     video_filter: str,
     encoder_args: list[str],
-    fps: int,
+    fps: int | str,
     runner: Callable = subprocess.run,
 ) -> None:
     """Encode one frame-accurate, video-only source interval."""
     coarse_seek = max(0.0, source_start - 5.0)
     trim_start = source_start - coarse_seek
     trim_end = source_end - coarse_seek
+    rate = Fraction(str(fps))
+    gop = max(1, round(float(rate)))
     cmd = [
-        "ffmpeg",
+        ffmpeg_executable(),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -238,13 +282,13 @@ def render_video_segment(
         "-r",
         str(fps),
         "-g",
-        str(fps),
+        str(gop),
         "-bf",
         "0",
         "-fps_mode",
         "cfr",
         "-video_track_timescale",
-        str(fps * 1000),
+        str(rate.numerator),
         "-use_editlist",
         "0",
         "-movflags",
@@ -271,7 +315,7 @@ def concat_video_segments(
     try:
         runner(
             [
-                "ffmpeg",
+                ffmpeg_executable(),
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -319,7 +363,7 @@ def mux_timeline_audio(
     try:
         runner(
             [
-                "ffmpeg",
+                ffmpeg_executable(),
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -354,6 +398,8 @@ def mux_timeline_audio(
             check=True,
         )
         media = validate_av_output(temp, timeline.duration)
+        if output_path.name == "upload_video.mp4":
+            _preserve_previous_wide_render(output_path)
         os.replace(temp, output_path)
         return media
     finally:
@@ -402,6 +448,20 @@ def validate_av_output(path: Path, expected_duration: float) -> dict:
     }
 
 
+def _preserve_previous_wide_render(output_path: Path) -> None:
+    """Keep the pre-speaker-cut delivery artifact through an atomic replacement."""
+    if not output_path.exists():
+        return
+    prior_mode = (
+        read_render_manifest(output_path.parent).get("longform", {}).get("render_mode")
+    )
+    if prior_mode == "speaker_cut":
+        return
+    backup = output_path.with_name("upload_video.wide.mp4")
+    if not backup.exists():
+        os.link(output_path, backup)
+
+
 def render_fingerprint(paths: list[Path], state: dict) -> str:
     """Fingerprint media identities and every source-clock render decision."""
     files = []
@@ -440,6 +500,7 @@ def longform_render_fingerprint(
         "render_mode": render_mode,
         "edits": episode.get("longform_edits", []),
         "crop_config": episode.get("crop_config", {}),
+        "source_properties": episode.get("source_properties", {}),
         "segments": segments,
         "processing": {
             key: processing.get(key)
@@ -478,6 +539,7 @@ def short_render_fingerprint(
         "render_mode": "speaker_cut_short",
         "edits": episode.get("longform_edits", []),
         "crop_config": episode.get("crop_config", {}),
+        "source_properties": episode.get("source_properties", {}),
         "segments": segments,
         "clip_bounds": {
             "start_seconds": clip.get("start_seconds"),
@@ -534,8 +596,7 @@ def record_longform_render(
     """Record a validated canonical longform render for API and release gates."""
     output = episode_dir / "upload_video.mp4"
     stat = output.stat()
-    manifest = read_render_manifest(episode_dir)
-    manifest["longform"] = {
+    record = {
         "path": output.name,
         "render_mode": render_mode,
         "fingerprint": fingerprint,
@@ -548,8 +609,11 @@ def record_longform_render(
         },
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
-    return manifest["longform"]
+    with _manifest_lock:
+        manifest = read_render_manifest(episode_dir)
+        manifest["longform"] = record
+        atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
+    return record
 
 
 def record_short_render(
@@ -563,7 +627,6 @@ def record_short_render(
     """Record one validated short without changing other manifest entries."""
     output = episode_dir / "shorts" / f"{clip_id}.mp4"
     stat = output.stat()
-    manifest = read_render_manifest(episode_dir)
     record = {
         "path": str(output.relative_to(episode_dir)),
         "render_mode": "speaker_cut_short",
@@ -579,8 +642,10 @@ def record_short_render(
         },
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    manifest["shorts"][clip_id] = record
-    atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
+    with _manifest_lock:
+        manifest = read_render_manifest(episode_dir)
+        manifest["shorts"][clip_id] = record
+        atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
     return record
 
 
@@ -605,6 +670,52 @@ def current_longform_render(
     recorded_output = record.get("output", {})
     if (
         record.get("fingerprint") != expected
+        or recorded_output.get("size_bytes") != stat.st_size
+        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
+    ):
+        return None
+    return record
+
+
+def current_episode_longform_render(
+    episode_dir: Path, episode: dict, config: dict, audio_path: Path
+) -> dict | None:
+    """Validate the canonical longform using the episode's source segments."""
+    try:
+        segments = json.loads((episode_dir / "segments.json").read_text()).get(
+            "segments", []
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not segments:
+        return None
+    return current_longform_render(episode_dir, episode, config, audio_path, segments)
+
+
+def current_short_render(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    clip: dict,
+) -> dict | None:
+    """Return a short manifest record only while all source inputs match."""
+    clip_id = clip.get("id")
+    if not clip_id:
+        return None
+    output = episode_dir / "shorts" / f"{clip_id}.mp4"
+    if not output.exists():
+        return None
+    record = read_render_manifest(episode_dir).get("shorts", {}).get(clip_id, {})
+    expected = short_render_fingerprint(
+        episode_dir, episode, config, audio_path, segments, clip
+    )
+    stat = output.stat()
+    recorded_output = record.get("output", {})
+    if (
+        record.get("render_mode") != "speaker_cut_short"
+        or record.get("fingerprint") != expected
         or recorded_output.get("size_bytes") != stat.st_size
         or recorded_output.get("mtime_ns") != stat.st_mtime_ns
     ):
@@ -696,7 +807,7 @@ def render_delivery_video(
     if encoder == "libx264":
         encoder_args += ["-preset", "medium"]
     cmd = [
-        "ffmpeg",
+        ffmpeg_executable(),
         "-hide_banner",
         "-loglevel",
         "error",

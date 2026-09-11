@@ -1,296 +1,221 @@
-"""Longform render agent — render full episode with speaker-appropriate crops.
+"""Render the canonical 16:9 episode from the shared source timeline."""
 
-Inputs:
-    - segments.json, diarized_transcript.json, episode.json (crop_config)
-    - source_merged.mp4
-Outputs:
-    - longform.mp4 (final 16:9 render with speaker crops + subtitles)
-Dependencies:
-    - ffmpeg (render + concat), ffprobe (dimensions + validation)
-Config:
-    - processing.video_crf, processing.audio_bitrate
-"""
+from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
+from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
-from lib.loudness import measure_loudness
+from lib.delivery_video import (
+    build_render_segments,
+    concat_video_segments,
+    current_longform_render,
+    estimate_output_bytes,
+    longform_render_fingerprint,
+    mux_timeline_audio,
+    record_longform_render,
+    render_scratch_dir,
+    render_video_segment,
+    require_output_space,
+    source_fps,
+)
 from lib.encoding import (
-    get_video_encoder_args,
-    get_color_metadata_args,
     get_lut_filter,
     get_scale_filter,
+    get_video_encoder_args,
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
-from lib.srt import fmt_timecode, escape_srt_path
+from lib.loudness import measure_loudness
+from lib.srt import escape_srt_path
+from lib.timeline import Timeline, rebase_diarized
 
 
 class LongformRenderAgent(BaseAgent):
     name = "longform_render"
 
     def execute(self) -> dict:
-        segments_data = self.load_json("segments.json")
-        diarized = self.load_json("diarized_transcript.json")
-        segments = segments_data["segments"]
-
-        # Apply longform edits (cuts/trims) if present
-        episode_data = self.load_json("episode.json")
-        edits = episode_data.get("longform_edits", [])
-        if edits:
-            segments = self._apply_edits(segments, edits)
-            self.logger.info(
-                f"Applied {len(edits)} edits, {len(segments)} segments remaining"
-            )
-
-        merged_path = self.episode_dir / "source_merged.mp4"
-        work_dir = self.episode_dir / "work"
-        work_dir.mkdir(exist_ok=True)
-        srt_dir = work_dir / "longform_srt"
-        srt_dir.mkdir(exist_ok=True)
-
-        crop_config = episode_data.get("crop_config")
+        episode = self.load_json("episode.json")
+        crop_config = episode.get("crop_config")
         if not crop_config:
-            raise ValueError(
-                "crop_config not found in episode.json. "
-                "Complete crop setup before rendering."
-            )
+            raise ValueError("Complete crop setup before rendering")
 
-        # Resolve audio source: always (re)generate audio_mix.wav. With H6E
-        # tracks, this mixes the multi-track recording. Without H6E, it
-        # extracts the camera's embedded audio. Either way, the same
-        # enhancement chain (DeepFilterNet + ffmpeg) is applied.
-        self.logger.info("Generating enhanced audio_mix.wav...")
-        mix_result = generate_audio_mix(self.episode_dir, episode_data, self.config)
-        if mix_result and mix_result.exists():
-            audio_mix_path = mix_result
-            self.logger.info("audio_mix.wav ready: %s", mix_result)
-        else:
-            self.logger.warning(
-                "audio_mix.wav generation failed — falling back to raw camera audio"
-            )
-            audio_mix_path = None
+        source = self.episode_dir / "source_merged.mp4"
+        if not source.exists():
+            raise FileNotFoundError("source_merged.mp4 is required for longform render")
+        segments = self.load_json("segments.json").get("segments", [])
+        if not segments:
+            raise ValueError("Speaker segments are required for speaker-cut longform")
+        diarized = self.load_json("diarized_transcript.json")
 
-        # Get source video dimensions
-        probe = ffprobe(merged_path)
-        video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+        audio = generate_audio_mix(self.episode_dir, episode, self.config)
+        if not audio or not audio.exists():
+            raise RuntimeError("Canonical work/audio_mix.wav is required")
+
+        source_probe = ffprobe(source)
+        video_stream = next(
+            stream
+            for stream in source_probe["streams"]
+            if stream["codec_type"] == "video"
+        )
+        source_duration = float(source_probe["format"]["duration"])
+        fps = source_fps(video_stream, episode)
+        timeline = Timeline.from_edits(
+            source_duration, episode.get("longform_edits", [])
+        ).quantize(fps)
+        fingerprint = longform_render_fingerprint(
+            self.episode_dir, episode, self.config, audio, segments
+        )
+        current = current_longform_render(
+            self.episode_dir, episode, self.config, audio, segments
+        )
+        if current:
+            self.logger.info("Canonical speaker-cut longform is already current")
+            return {
+                "output_path": str(self.episode_dir / "upload_video.mp4"),
+                "render_mode": "speaker_cut",
+                "render_fingerprint": fingerprint,
+                "reused": True,
+                **current["output"],
+            }
+
+        render_segments = build_render_segments(timeline, segments, frame_rate=fps)
+        if not render_segments:
+            raise ValueError("No retained speaker segments remain after edits")
+        captions = rebase_diarized(diarized, timeline)
+
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
-
-        # Source fps from ingest properties, or detect from video stream
-        source_props = episode_data.get("source_properties", {})
-        source_fps = source_props.get("fps")
-        if not source_fps:
-            r_rate = video_stream.get("r_frame_rate", "30/1")
-            try:
-                num, den = r_rate.split("/")
-                source_fps = round(int(num) / int(den), 3)
-            except (ValueError, ZeroDivisionError):
-                source_fps = 30.0
-        source_fps_int = int(round(source_fps))
-        self.logger.info(f"Source: {src_w}x{src_h} @ {source_fps} fps")
-
-        # Determine output resolution. Default: preserve source resolution
-        # (no quality loss). Can be overridden via config.processing.preserve_source_resolution=false
-        # in which case it falls back to processing.output_resolution.
-        proc = self.config.get("processing", {})
-        if proc.get("preserve_source_resolution", True):
-            out_w, out_h = src_w, src_h
-            self.logger.info(f"Output: {out_w}x{out_h} (preserving source resolution)")
-        else:
-            out_res = proc.get("output_resolution", "1920x1080")
-            out_w, out_h = (int(x) for x in out_res.split("x"))
-            self.logger.info(f"Output: {out_w}x{out_h} (from config)")
-
-        audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
+        out_w, out_h = self._output_dimensions(src_w, src_h)
         encoder_args = get_video_encoder_args(self.config)
         lut_filter = get_lut_filter(self.config)
-        if lut_filter:
-            self.logger.info(
-                f"LUT enabled: {self.config['processing'].get('lut_path')}"
+        audio_bitrate = self.config.get("processing", {}).get("audio_bitrate", "192k")
+        estimate = estimate_output_bytes(timeline.duration)
+        require_output_space(self.episode_dir, estimate)
+        output = self.episode_dir / "upload_video.mp4"
+
+        style = CaptionStyle(
+            font_size=max(36, round(out_h * 0.045)),
+            margin_v=max(48, round(out_h * 0.07)),
+            words_per_phrase=4,
+            play_res_x=out_w,
+            play_res_y=out_h,
+        )
+        with render_scratch_dir(
+            f"longform-{self.episode_dir.name}", round(estimate * 2.2)
+        ) as scratch:
+            segment_paths = self._render_segments(
+                source,
+                scratch,
+                render_segments,
+                captions,
+                style,
+                src_w,
+                src_h,
+                crop_config,
+                encoder_args,
+                lut_filter,
+                fps,
+                out_w,
+                out_h,
+            )
+            video_only = scratch / "longform_video.mp4"
+            concat_video_segments(segment_paths, video_only, runner=self._run_ffmpeg)
+            media = mux_timeline_audio(
+                video_only,
+                audio,
+                output,
+                timeline,
+                audio_bitrate=audio_bitrate,
+                runner=self._run_ffmpeg,
             )
 
-        # Pre-generate per-segment SRT files
-        self.logger.info("Generating per-segment subtitles...")
-        for i, seg in enumerate(segments):
-            srt_path = srt_dir / f"seg_{i:04d}.srt"
-            self._generate_segment_srt(diarized, seg["start"], seg["end"], srt_path)
+        record = record_longform_render(
+            self.episode_dir,
+            fingerprint=fingerprint,
+            render_mode="speaker_cut",
+            timeline=timeline,
+            media=media,
+        )
+        loudness = measure_loudness(output)
+        result = {
+            "output_path": str(output),
+            "render_mode": "speaker_cut",
+            "render_fingerprint": fingerprint,
+            "segment_count": len(render_segments),
+            "source_clock": True,
+            "keep_intervals": [list(value) for value in timeline.keep_intervals],
+            "file_size_mb": round(output.stat().st_size / 1e6, 1),
+            **media,
+        }
+        if loudness:
+            result["audio_loudness"] = loudness
+        result["manifest"] = record
+        return result
 
-        # Render each segment with appropriate crop + subtitles
-        segment_files = []
-        self.logger.info(f"Rendering {len(segments)} segments with speaker crops...")
-
-        # Resume support: skip segments that are already rendered (non-zero size)
-        skipped = 0
-        to_render = []
-        for i, seg in enumerate(segments):
-            seg_path = work_dir / f"longform_seg_{i:04d}.mp4"
-            if seg_path.exists() and seg_path.stat().st_size > 0:
-                segment_files.append((i, seg_path))
-                skipped += 1
-            else:
-                to_render.append((i, seg))
-        if skipped:
-            self.logger.info(
-                f"Resuming: {skipped} segments already rendered, {len(to_render)} remaining"
-            )
-
-        with ThreadPoolExecutor(max_workers=min(os.cpu_count() // 2, 6)) as executor:
+    def _render_segments(
+        self,
+        source,
+        scratch,
+        segments,
+        captions,
+        style,
+        src_w,
+        src_h,
+        crop_config,
+        encoder_args,
+        lut_filter,
+        fps,
+        out_w,
+        out_h,
+    ) -> list[Path]:
+        paths: list[Path | None] = [None] * len(segments)
+        workers = min(max((os.cpu_count() or 2) // 2, 1), 4, len(segments))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
-            for i, seg in to_render:
-                seg_path = work_dir / f"longform_seg_{i:04d}.mp4"
-                srt_path = srt_dir / f"seg_{i:04d}.srt"
+            for index, segment in enumerate(segments):
+                ass_path = scratch / f"segment_{index:04d}.ass"
+                segment_timeline = Timeline(
+                    segments[-1]["end"], [(segment["start"], segment["end"])]
+                )
+                generate_ass_from_diarized(
+                    rebase_diarized(captions, segment_timeline),
+                    0,
+                    segment["duration"],
+                    ass_path,
+                    style,
+                )
+                output = scratch / f"segment_{index:04d}.mp4"
                 future = executor.submit(
                     self._render_segment,
-                    merged_path,
-                    seg_path,
-                    seg,
+                    source,
+                    output,
+                    segment,
                     src_w,
                     src_h,
                     crop_config,
-                    srt_path,
+                    ass_path,
                     encoder_args,
                     lut_filter,
-                    source_fps_int,
+                    fps,
                     out_w,
                     out_h,
                 )
-                futures[future] = (i, seg_path)
-
+                futures[future] = (index, output)
             for future in as_completed(futures):
-                i, seg_path = futures[future]
-                future.result()  # Raise any exception
-                segment_files.append((i, seg_path))
+                index, output = futures[future]
+                future.result()
+                paths[index] = output
                 self.report_progress(
-                    len(segment_files), len(segments), f"Rendered segment {i}"
+                    sum(path is not None for path in paths),
+                    len(paths),
+                    f"Rendered speaker segment {index + 1}",
                 )
-                self.logger.info(f"  Segment {i} rendered")
-
-        # Sort by index
-        segment_files.sort(key=lambda x: x[0])
-
-        # Concat all segments
-        concat_list = work_dir / "longform_concat.txt"
-        with open(concat_list, "w") as f:
-            for _, seg_path in segment_files:
-                safe_path = str(seg_path).replace("'", "'\\''")
-                f.write(f"file '{safe_path}'\n")
-
-        output_path = self.episode_dir / "longform.mp4"
-        raw_concat = work_dir / "longform_raw.mp4"
-        self.logger.info("Concatenating segments into longform.mp4...")
-
-        # Step 1: Concat all segments (stream-copy, fast)
-        concat_cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_list),
-            "-c",
-            "copy",
-            str(raw_concat),
-        ]
-        timed_ffmpeg(
-            concat_cmd,
-            agent_logger=self.logger,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Step 2: Mux video with audio_mix.wav directly.
-        # Per-segment audio encoding is skipped entirely — each AAC segment
-        # adds ~21ms of padding (1024 samples at 48kHz) which accumulates
-        # to seconds of drift over hundreds of segments. Using audio_mix.wav
-        # as a single audio source eliminates this completely.
-        audio_source = (
-            audio_mix_path
-            if (audio_mix_path and audio_mix_path.exists())
-            else merged_path
-        )
-        mux_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(raw_concat),
-            "-i",
-            str(audio_source),
-            "-map",
-            "0:v",
-            "-map",
-            "1:a",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
-            "-shortest",
-            "-use_editlist",
-            "0",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        timed_ffmpeg(
-            mux_cmd,
-            agent_logger=self.logger,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        raw_concat.unlink(missing_ok=True)
-
-        # Clean up intermediate segment files (~400+ files, gigabytes)
-        for f in work_dir.glob("longform_seg_*.mp4"):
-            f.unlink(missing_ok=True)
-        for f in srt_dir.glob("seg_*.srt"):
-            f.unlink(missing_ok=True)
-        concat_list.unlink(missing_ok=True)
-        self.logger.info("Cleaned up intermediate segment files")
-
-        # Validate
-        probe = ffprobe(output_path)
-        output_duration = float(probe["format"]["duration"])
-
-        # Measure loudness of the final muxed file.
-        # ebur128 on a 90-min file takes 30-60 seconds — run it here so the
-        # result is immediately persisted into episode.json via the pipeline
-        # merge in _on_agent_complete.
-        audio_loudness = None
-        try:
-            audio_loudness = measure_loudness(output_path)
-            if audio_loudness:
-                self.logger.info(
-                    "Loudness: %.1f LUFS / %.1f dBFS peak / %.1f LU range",
-                    audio_loudness["integrated_lufs"],
-                    audio_loudness["true_peak_dbfs"],
-                    audio_loudness["loudness_range_lu"],
-                )
-            else:
-                self.logger.warning(
-                    "Loudness measurement returned None for %s", output_path
-                )
-        except Exception:
-            self.logger.exception("Loudness measurement failed — continuing without it")
-
-        result = {
-            "output_path": str(output_path),
-            "duration_seconds": round(output_duration, 3),
-            "segment_count": len(segments),
-            "file_size_mb": round(output_path.stat().st_size / 1e6, 1),
-        }
-        if audio_loudness:
-            result["audio_loudness"] = audio_loudness
-        return result
+        return [path for path in paths if path is not None]
 
     def _render_segment(
         self,
@@ -300,92 +225,43 @@ class LongformRenderAgent(BaseAgent):
         src_w: int,
         src_h: int,
         crop_config: dict,
-        srt_path: Path = None,
-        encoder_args: list = None,
+        ass_path: Path | None = None,
+        encoder_args: list | None = None,
         lut_filter: str = "",
-        fps: int = 30,
+        fps: int | str = 30,
         out_w: int = 1920,
         out_h: int = 1080,
-    ):
-        """Render a single video-only segment with speaker-appropriate crop and subtitles."""
-        start = segment["start"]
-        duration = segment["end"] - segment["start"]
-        speaker = segment["speaker"]
-
-        # Build video filter:
-        # LUT (10-bit) → crop → scale (lanczos+dither) → format=yuv420p →
-        # hqdn3d (denoise) → cas (sharpen) → eq (polish) → subtitles
-        #
-        # LUT runs at source bit depth for accurate color math, then dither to
-        # 8-bit during scale, then polish, then burn subtitles last so they
-        # aren't affected by sharpening/grading.
-        vf_parts = []
+    ) -> None:
+        filters = []
         if lut_filter:
-            vf_parts.append(lut_filter)
-        vf_parts.append(
-            self._get_crop_filter(speaker, src_w, src_h, crop_config, out_w, out_h)
+            filters.append(lut_filter)
+        filters.extend(
+            [
+                self._get_crop_filter(
+                    segment["speaker"], src_w, src_h, crop_config, out_w, out_h
+                ),
+                "format=yuv420p",
+            ]
         )
-        vf_parts.append("format=yuv420p")
         polish = get_video_polish_filters(self.config)
         if polish:
-            vf_parts.append(polish)
-        vf = ",".join(vf_parts)
-
-        # Append subtitle burn-in if SRT has content
-        if srt_path and srt_path.exists() and srt_path.stat().st_size > 0:
-            srt_escaped = escape_srt_path(srt_path)
-            vf += (
-                f",subtitles='{srt_escaped}':force_style="
-                f"'FontSize=14,FontName=Arial,Bold=1,"
-                f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                f"BackColour=&H80000000,BorderStyle=4,Outline=2,"
-                f"Shadow=1,ShadowColour=&HA0000000,MarginV=30,"
-                f"Alignment=2'"
-            )
-
-        # Render VIDEO ONLY — no per-segment audio encoding.
-        # Audio is muxed once at the end from audio_mix.wav to avoid
-        # AAC frame padding accumulation (21ms per segment = seconds of drift).
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(start),
-            "-i",
-            str(source),
-            "-t",
-            str(duration),
-            "-an",  # no audio
-            "-vf",
-            vf,
-            *encoder_args,
-            *get_color_metadata_args(),
-            "-r",
-            str(fps),
-            "-g",
-            str(fps),
-            "-bf",
-            "0",
-            "-vsync",
-            "cfr",
-            "-video_track_timescale",
-            str(fps * 1000),
-            "-use_editlist",
-            "0",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-        timed_ffmpeg(
-            cmd, agent_logger=self.logger, capture_output=True, text=True, check=True
+            filters.append(polish)
+        if ass_path and ass_path.exists() and "Dialogue:" in ass_path.read_text():
+            filters.append(f"subtitles='{escape_srt_path(ass_path)}'")
+        render_video_segment(
+            source,
+            output,
+            source_start=segment.get("source_start", segment["start"]),
+            source_end=segment.get("source_end", segment["end"]),
+            video_filter=",".join(filters),
+            encoder_args=encoder_args or get_video_encoder_args(self.config),
+            fps=fps,
+            runner=self._run_ffmpeg,
         )
 
     def _get_crop_filter(
         self, speaker, src_w, src_h, crop_config, out_w=1920, out_h=1080
     ):
-        """Get ffmpeg crop+scale filter with high-quality lanczos+dither.
-        Crop math in lib/crop.py. out_w/out_h is the target output resolution
-        (typically the source resolution for full-quality preservation)."""
         scale = get_scale_filter(out_w, out_h)
         cx, cy, zoom, mode = resolve_speaker(speaker, src_w, src_h, crop_config)
         if mode is None:
@@ -393,101 +269,30 @@ class LongformRenderAgent(BaseAgent):
         x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, mode)
         return f"crop={crop_w}:{crop_h}:{x}:{y},{scale}"
 
-    def _generate_segment_srt(self, diarized, start, end, srt_path):
-        """Generate an SRT file for a segment, with times offset to segment-relative."""
-        words = []
-        last_end = -1.0
-        for utt in diarized.get("utterances", []):
-            for w in utt.get("words", []):
-                w_start = w.get("start", 0)
-                w_end = w.get("end", 0)
-                if w_start >= start and w_end <= end:
-                    # Skip overlapping words from other channels (multichannel bleed)
-                    if w_start < last_end - 0.05:
-                        continue
-                    words.append(w)
-                    last_end = w_end
-
-        srt_lines = []
-        idx = 1
-        i = 0
-        while i < len(words):
-            chunk = words[i : i + 4]
-            t_start = chunk[0]["start"] - start
-            t_end = chunk[-1]["end"] - start
-            text = " ".join(w.get("word", "") for w in chunk)
-
-            srt_lines.append(
-                f"{idx}\n{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n{text}\n"
-            )
-            idx += 1
-            i += 4
-
-        with open(srt_path, "w") as f:
-            f.write("\n".join(srt_lines))
-
     def _apply_edits(self, segments: list, edits: list) -> list:
-        """Apply longform edits (cuts/trims) to the segment list.
-
-        Edit types:
-          - cut: Remove time range [start, end] from the video
-          - trim_start: Set global start time (remove everything before)
-          - trim_end: Set global end time (remove everything after)
-        """
-        result = [dict(s) for s in segments]  # deep copy
-
+        """Compatibility wrapper; production render uses the probed source duration."""
+        if not segments:
+            return []
+        duration = max(float(segment["end"]) for segment in segments)
         for edit in edits:
-            edit_type = edit.get("type")
-            if edit_type == "trim_start":
-                trim_at = edit["seconds"]
-                result = [s for s in result if s["end"] > trim_at]
-                if result and result[0]["start"] < trim_at:
-                    result[0] = dict(result[0])
-                    result[0]["start"] = trim_at
-                    result[0]["duration"] = result[0]["end"] - result[0]["start"]
+            if edit.get("type") == "cut":
+                duration = max(duration, float(edit["end_seconds"]))
+            elif edit.get("type") in {"trim_start", "trim_end"}:
+                duration = max(duration, float(edit["seconds"]))
+        try:
+            timeline = Timeline.from_edits(duration, edits)
+        except ValueError as exc:
+            if "remove the entire episode" in str(exc):
+                return []
+            raise
+        return timeline.project(segments, minimum_duration=0.1)
 
-            elif edit_type == "trim_end":
-                trim_at = edit["seconds"]
-                result = [s for s in result if s["start"] < trim_at]
-                if result and result[-1]["end"] > trim_at:
-                    result[-1] = dict(result[-1])
-                    result[-1]["end"] = trim_at
-                    result[-1]["duration"] = result[-1]["end"] - result[-1]["start"]
+    def _run_ffmpeg(self, cmd, **kwargs):
+        return timed_ffmpeg(cmd, agent_logger=self.logger, **kwargs)
 
-            elif edit_type == "cut":
-                cut_start = edit["start_seconds"]
-                cut_end = edit["end_seconds"]
-                new_result = []
-                for s in result:
-                    if s["end"] <= cut_start or s["start"] >= cut_end:
-                        # Segment is entirely outside the cut — keep
-                        new_result.append(s)
-                    elif s["start"] >= cut_start and s["end"] <= cut_end:
-                        # Segment is entirely within the cut — remove
-                        continue
-                    elif s["start"] < cut_start and s["end"] > cut_end:
-                        # Cut is in the middle of this segment — split into two
-                        left = dict(s)
-                        left["end"] = cut_start
-                        left["duration"] = left["end"] - left["start"]
-                        right = dict(s)
-                        right["start"] = cut_end
-                        right["duration"] = right["end"] - right["start"]
-                        new_result.extend([left, right])
-                    elif s["start"] < cut_start:
-                        # Segment starts before cut — trim end
-                        trimmed = dict(s)
-                        trimmed["end"] = cut_start
-                        trimmed["duration"] = trimmed["end"] - trimmed["start"]
-                        new_result.append(trimmed)
-                    else:
-                        # Segment ends after cut — trim start
-                        trimmed = dict(s)
-                        trimmed["start"] = cut_end
-                        trimmed["duration"] = trimmed["end"] - trimmed["start"]
-                        new_result.append(trimmed)
-                result = new_result
-
-        # Filter out tiny segments (< 0.1s)
-        result = [s for s in result if s.get("duration", s["end"] - s["start"]) >= 0.1]
-        return result
+    @staticmethod
+    def _output_dimensions(src_w: int, src_h: int) -> tuple[int, int]:
+        scale = min(1.0, 1920 / src_w, 1080 / src_h)
+        width = int(src_w * scale) // 2 * 2
+        height = int(src_h * scale) // 2 * 2
+        return width, height

@@ -1,138 +1,144 @@
-"""Shorts render agent — render 9:16 vertical clips with burned-in subtitles.
+"""Render source-clock 9:16 clips with dynamic speaker crops and ASS captions."""
 
-Inputs:
-    - clips.json, segments.json, diarized_transcript.json, episode.json (crop_config)
-    - source_merged.mp4
-Outputs:
-    - shorts/<clip_id>.mp4 (9:16 vertical clips)
-    - subtitles/<clip_id>.srt (per-clip SRT files)
-Dependencies:
-    - ffmpeg (render + concat), ffprobe (dimensions)
-Config:
-    - processing.shorts_crf, processing.shorts_audio_bitrate
-"""
+from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
+from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
+from lib.delivery_video import (
+    build_render_segments,
+    concat_video_segments,
+    current_short_render,
+    estimate_output_bytes,
+    mux_timeline_audio,
+    record_short_render,
+    render_scratch_dir,
+    render_video_segment,
+    require_output_space,
+    short_render_fingerprint,
+    source_fps,
+)
 from lib.encoding import (
-    get_video_encoder_args,
-    get_color_metadata_args,
     get_lut_filter,
     get_scale_filter,
+    get_video_encoder_args,
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
-from lib.srt import fmt_timecode, escape_srt_path
+from lib.srt import escape_srt_path, generate_srt_from_diarized
+from lib.timeline import Timeline, rebase_diarized
 
 
 class ShortsRenderAgent(BaseAgent):
     name = "shorts_render"
 
     def execute(self) -> dict:
-        clips_data = self.load_json("clips.json")
-        segments_data = self.load_json("segments.json")
+        clips = self.load_json("clips.json").get("clips", [])
+        return self._render_clips(clips)
+
+    def render_clip(self, clip_id: str) -> dict:
+        """Render one stored candidate without mutating clip selection state."""
+        clips = self.load_json("clips.json").get("clips", [])
+        clip = next((item for item in clips if item.get("id") == clip_id), None)
+        if clip is None:
+            raise KeyError(f"Unknown clip: {clip_id}")
+        result = self._render_clips([clip])
+        return {
+            "clip_id": clip_id,
+            "output_path": str(self.episode_dir / "shorts" / f"{clip_id}.mp4"),
+            "caption_path": str(self.episode_dir / "subtitles" / f"{clip_id}.ass"),
+            "reused": bool(result["renders"][clip_id].get("reused")),
+            "render": result["renders"][clip_id],
+        }
+
+    def _render_clips(self, clips: list[dict]) -> dict:
+        segments = self.load_json("segments.json").get("segments", [])
         diarized = self.load_json("diarized_transcript.json")
-        merged_path = self.episode_dir / "source_merged.mp4"
-
-        # Load crop config from episode.json
-        episode_data = self.load_json("episode.json")
-        crop_config = episode_data.get("crop_config")
+        episode = self.load_json("episode.json")
+        crop_config = episode.get("crop_config")
         if not crop_config:
-            raise ValueError(
-                "crop_config not found in episode.json. "
-                "Complete crop setup before rendering."
-            )
+            raise ValueError("Complete crop setup before rendering")
 
-        # Gate: shorts are the funnel, not the content. Without a live longform URL
-        # they have nowhere to point viewers — publishing them would waste the
-        # virality moment. Refuse to render until the longform has been published
-        # and its URL recorded.
-        youtube_longform_url = episode_data.get("youtube_longform_url", "")
-        if not youtube_longform_url and clips_data.get("clips"):
-            raise RuntimeError(
-                "Shorts cannot render until the longform is live on YouTube and "
-                "its URL is recorded on episode.json.youtube_longform_url. "
-                "Publish the longform first, then save the YouTube URL, then "
-                "re-run shorts_render. (This prevents shorts from shipping "
-                "without the link-in-bio / first-comment funnel.)"
-            )
+        source = self.episode_dir / "source_merged.mp4"
+        if not source.exists():
+            raise FileNotFoundError("source_merged.mp4 is required for shorts render")
+        if not segments:
+            raise ValueError("Speaker segments are required for speaker-cut shorts")
+        audio = generate_audio_mix(self.episode_dir, episode, self.config)
+        if not audio or not audio.exists():
+            raise RuntimeError("Canonical work/audio_mix.wav is required")
 
-        # Always (re)generate enhanced audio_mix.wav. Works for both H6E
-        # multi-track and camera-audio modes (see lib/audio_mix.py).
-        self.logger.info("Generating enhanced audio_mix.wav...")
-        mix_result = generate_audio_mix(self.episode_dir, episode_data, self.config)
-        if mix_result and mix_result.exists():
-            audio_mix_path = mix_result
-            self.logger.info("audio_mix.wav ready: %s", mix_result)
-        else:
-            self.logger.warning(
-                "audio_mix.wav generation failed — falling back to raw camera audio"
-            )
-            audio_mix_path = None
-
-        clips = clips_data.get("clips", [])
-        segments = segments_data.get("segments", [])
-
-        # Get source dimensions
-        probe = ffprobe(merged_path)
-        video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+        source_probe = ffprobe(source)
+        video_stream = next(
+            stream
+            for stream in source_probe["streams"]
+            if stream["codec_type"] == "video"
+        )
+        episode_timeline = Timeline.from_edits(
+            float(source_probe["format"]["duration"]),
+            episode.get("longform_edits", []),
+        )
         src_w = int(video_stream["width"])
         src_h = int(video_stream["height"])
-
-        # Source fps from ingest properties, or detect from video stream
-        source_props = episode_data.get("source_properties", {})
-        source_fps = source_props.get("fps")
-        if not source_fps:
-            r_rate = video_stream.get("r_frame_rate", "30/1")
-            try:
-                num, den = r_rate.split("/")
-                source_fps = round(int(num) / int(den), 3)
-            except (ValueError, ZeroDivisionError):
-                source_fps = 30.0
-        source_fps_int = int(round(source_fps))
-
-        shorts_dir = self.episode_dir / "shorts"
-        shorts_dir.mkdir(exist_ok=True)
-        subtitles_dir = self.episode_dir / "subtitles"
-        subtitles_dir.mkdir(exist_ok=True)
-
+        fps = source_fps(video_stream, episode)
+        episode_timeline = episode_timeline.quantize(fps)
         audio_bitrate = self.config.get("processing", {}).get(
             "shorts_audio_bitrate", "192k"
         )
         encoder_args = get_video_encoder_args(self.config, crf_key="shorts_crf")
         lut_filter = get_lut_filter(self.config)
-        if lut_filter:
-            self.logger.info(
-                f"LUT enabled: {self.config['processing'].get('lut_path')}"
-            )
 
-        # Generate per-clip SRT and render
+        shorts_dir = self.episode_dir / "shorts"
+        subtitles_dir = self.episode_dir / "subtitles"
+        shorts_dir.mkdir(exist_ok=True)
+        subtitles_dir.mkdir(exist_ok=True)
+
         rendered = []
-        self.logger.info(f"Rendering {len(clips)} shorts...")
-
-        with ThreadPoolExecutor(max_workers=min(os.cpu_count() // 2, 6)) as executor:
+        records = {}
+        workers = min(max((os.cpu_count() or 2) // 4, 1), 2, max(1, len(clips)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
             for clip in clips:
                 clip_id = clip["id"]
-                start = clip["start_seconds"]
-                end = clip["end_seconds"]
-
-                # Generate per-clip SRT
-                srt_path = subtitles_dir / f"{clip_id}.srt"
-                self._generate_clip_srt(diarized, start, end, srt_path)
-
-                output_path = shorts_dir / f"{clip_id}.mp4"
+                clip_timeline = episode_timeline.slice(
+                    float(clip["start_seconds"]), float(clip["end_seconds"])
+                ).quantize(fps)
+                if clip_timeline.duration < 0.1:
+                    raise ValueError(f"{clip_id} contains no retained source material")
+                fingerprint = short_render_fingerprint(
+                    self.episode_dir,
+                    episode,
+                    self.config,
+                    audio,
+                    segments,
+                    clip,
+                )
+                current = current_short_render(
+                    self.episode_dir,
+                    episode,
+                    self.config,
+                    audio,
+                    segments,
+                    clip,
+                )
+                if current:
+                    records[clip_id] = {**current, "reused": True}
+                    rendered.append(clip_id)
+                    continue
+                output = shorts_dir / f"{clip_id}.mp4"
+                caption_path = subtitles_dir / f"{clip_id}.ass"
                 future = executor.submit(
                     self._render_short,
-                    merged_path,
-                    output_path,
-                    srt_path,
-                    start,
-                    end,
+                    source,
+                    output,
+                    caption_path,
+                    float(clip["start_seconds"]),
+                    float(clip["end_seconds"]),
                     segments,
                     src_w,
                     src_h,
@@ -140,72 +146,36 @@ class ShortsRenderAgent(BaseAgent):
                     crop_config,
                     encoder_args,
                     lut_filter,
-                    audio_mix_path,
-                    source_fps_int,
+                    audio,
+                    fps,
+                    timeline=clip_timeline,
+                    diarized=diarized,
+                    fingerprint=fingerprint,
+                    episode=episode,
+                    clip=clip,
                 )
                 futures[future] = clip_id
 
             for future in as_completed(futures):
                 clip_id = futures[future]
-                future.result()
+                records[clip_id] = future.result()
                 rendered.append(clip_id)
                 self.report_progress(len(rendered), len(clips), f"Rendered {clip_id}")
-                self.logger.info(f"  {clip_id} rendered")
 
         return {
             "rendered_clips": sorted(rendered),
             "count": len(rendered),
             "shorts_dir": str(shorts_dir),
+            "render_mode": "speaker_cut_short",
+            "clock": "source",
+            "renders": records,
         }
-
-    def _get_clip_segments(self, segments, clip_start, clip_end):
-        """Get speaker segments overlapping the clip time range, clipped to bounds."""
-        clip_segs = []
-        for seg in segments:
-            seg_start = seg["start"]
-            seg_end = seg["end"]
-            # Skip non-overlapping
-            if seg_end <= clip_start or seg_start >= clip_end:
-                continue
-            # Clip to bounds
-            s = max(seg_start, clip_start)
-            e = min(seg_end, clip_end)
-            if e - s < 0.05:
-                continue
-            clip_segs.append(
-                {
-                    "start": s,
-                    "end": e,
-                    "speaker": seg["speaker"],
-                }
-            )
-        # Fallback: if no segments found, use BOTH for entire clip
-        if not clip_segs:
-            clip_segs = [{"start": clip_start, "end": clip_end, "speaker": "BOTH"}]
-            return clip_segs
-
-        # Merge very short segments (< 0.5s) into neighbors to avoid ffmpeg failures
-        merged = []
-        for i, seg in enumerate(clip_segs):
-            if (seg["end"] - seg["start"]) < 0.5:
-                if merged:
-                    # Absorb into previous segment
-                    merged[-1]["end"] = seg["end"]
-                elif i + 1 < len(clip_segs):
-                    # First segment is short — extend next segment's start to absorb it
-                    clip_segs[i + 1]["start"] = seg["start"]
-                else:
-                    # Only segment — keep it regardless of duration
-                    merged.append(seg)
-            else:
-                merged.append(seg)
-        return merged if merged else clip_segs
 
     def _render_short(
         self,
         source,
         output,
-        srt_path,
+        caption_path,
         start,
         end,
         segments,
@@ -217,196 +187,128 @@ class ShortsRenderAgent(BaseAgent):
         lut_filter="",
         audio_mix_path=None,
         fps=30,
-    ):
-        """Render a 9:16 short with per-segment dynamic speaker crops."""
-        clip_segs = self._get_clip_segments(segments, start, end)
-
-        def _audio_args(seek_time):
-            """Return (extra_inputs, map_args, af_args) for audio source.
-
-            When audio_mix_path exists, use pre-mixed H6E audio (offset already
-            baked in — only seek to segment time, no additional offset).
-            Otherwise fall back to camera audio with stereo-to-mono pan.
-            """
-            if audio_mix_path and audio_mix_path.exists():
-                return (
-                    ["-ss", str(seek_time), "-i", str(audio_mix_path)],
-                    ["-map", "0:v", "-map", "1:a"],
-                    [],
-                )
-            return ([], [], ["-af", "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"])
-
-        # Find the dominant speaker for this clip (most time in the clip)
-        speaker_time = {}
-        for seg in clip_segs:
-            spk = seg["speaker"]
-            speaker_time[spk] = speaker_time.get(spk, 0) + (seg["end"] - seg["start"])
-        speaker = max(speaker_time, key=speaker_time.get)
-
-        # Two-step render: video-only first, then mux audio separately.
-        # -ss before -i on HEVC seeks to nearest keyframe (imprecise).
-        # WAV seek is sample-accurate. Rendering them together creates
-        # a mismatch. Separating them and using trim/atrim filters for
-        # precise frame-accurate sync eliminates this.
-        duration = end - start
-        vf = self._get_short_crop_filter(speaker, src_w, src_h, srt_path, crop_config)
-        if lut_filter:
-            vf = lut_filter + "," + vf
-
-        # Coarse seek to 5s before target for speed, then precise trim
-        coarse_seek = max(0, start - 5)
-        trim_start = start - coarse_seek
-        trim_end = trim_start + duration
-
-        work_dir = output.parent.parent / "work"
-        temp_video = work_dir / f"short_temp_{output.stem}.mp4"
-
-        # Step 1: video-only with precise trim filter
-        cmd_video = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(coarse_seek),
-            "-i",
-            str(source),
-            "-an",
-            "-vf",
-            f"trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS," + vf,
-            *encoder_args,
-            *get_color_metadata_args(),
-            "-r",
-            str(fps),
-            "-g",
-            str(fps),
-            "-bf",
-            "0",
-            "-vsync",
-            "cfr",
-            "-video_track_timescale",
-            str(fps * 1000),
-            "-use_editlist",
-            "0",
-            "-movflags",
-            "+faststart",
-            str(temp_video),
-        ]
-        timed_ffmpeg(
-            cmd_video,
-            agent_logger=self.logger,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        if not temp_video.exists() or temp_video.stat().st_size == 0:
-            raise RuntimeError(f"Video render produced empty file: {temp_video}")
-
-        # Step 2: mux with audio from audio_mix.wav (precise WAV seek)
-        audio_source = (
-            audio_mix_path if (audio_mix_path and audio_mix_path.exists()) else source
-        )
-        cmd_mux = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(temp_video),
-            "-ss",
-            str(start),
-            "-i",
-            str(audio_source),
-            "-map",
-            "0:v",
-            "-map",
-            "1:a",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
-            "-shortest",
-            "-use_editlist",
-            "0",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-        timed_ffmpeg(
-            cmd_mux,
-            agent_logger=self.logger,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        temp_video.unlink(missing_ok=True)
-
-    def _generate_segment_srt(
-        self, clip_srt_path, seg_start_rel, seg_end_rel, out_path
-    ):
-        """Extract subtitle entries from the clip SRT that fall within segment bounds.
-
-        Times in clip SRT are clip-relative. We re-offset them to be segment-relative.
-        """
-        entries = self._parse_srt(clip_srt_path)
-        seg_entries = []
-        idx = 1
-        for entry in entries:
-            e_start = entry["start"]
-            e_end = entry["end"]
-            # Keep entries that overlap this segment
-            if e_end <= seg_start_rel or e_start >= seg_end_rel:
-                continue
-            # Clip to segment bounds and re-offset to segment-relative
-            new_start = max(0.0, e_start - seg_start_rel)
-            new_end = min(seg_end_rel - seg_start_rel, e_end - seg_start_rel)
-            if new_end - new_start < 0.01:
-                continue
-            seg_entries.append(
-                f"{idx}\n"
-                f"{fmt_timecode(new_start)} --> {fmt_timecode(new_end)}\n"
-                f"{entry['text']}\n"
+        *,
+        timeline=None,
+        diarized=None,
+        fingerprint=None,
+        episode=None,
+        clip=None,
+    ) -> dict:
+        """Render one clip; positional arguments remain compatible with chat actions."""
+        episode = episode or self.load_json("episode.json")
+        diarized = diarized or self.load_json("diarized_transcript.json")
+        if not audio_mix_path or not Path(audio_mix_path).exists():
+            raise RuntimeError("Canonical work/audio_mix.wav is required")
+        if timeline is None:
+            source_probe = ffprobe(source)
+            video_stream = next(
+                stream
+                for stream in source_probe["streams"]
+                if stream["codec_type"] == "video"
             )
-            idx += 1
+            fps = source_fps(video_stream, episode)
+            duration = float(source_probe["format"]["duration"])
+            timeline = (
+                Timeline.from_edits(duration, episode.get("longform_edits", []))
+                .slice(float(start), float(end))
+                .quantize(fps)
+            )
+        if timeline.duration < 0.1:
+            raise ValueError("Clip contains no retained source material")
 
-        with open(out_path, "w") as f:
-            f.write("\n".join(seg_entries))
+        render_segments = build_render_segments(timeline, segments, frame_rate=fps)
+        captions = rebase_diarized(diarized, timeline)
+        style = CaptionStyle()
+        caption_path = Path(caption_path).with_suffix(".ass")
+        caption_path.parent.mkdir(parents=True, exist_ok=True)
+        generate_ass_from_diarized(captions, 0, timeline.duration, caption_path, style)
 
-    def _parse_srt(self, srt_path):
-        """Parse an SRT file into a list of {start, end, text} dicts."""
-        entries = []
-        try:
-            with open(srt_path, "r") as f:
-                content = f.read()
-        except FileNotFoundError:
-            return entries
+        estimate = estimate_output_bytes(timeline.duration, video_mbps=10)
+        require_output_space(Path(output).parent, estimate)
+        with render_scratch_dir(
+            f"short-{Path(output).stem}", round(estimate * 2.2)
+        ) as scratch:
+            paths = []
+            for index, segment in enumerate(render_segments):
+                segment_ass = scratch / f"segment_{index:03d}.ass"
+                segment_timeline = Timeline(
+                    timeline.duration, [(segment["start"], segment["end"])]
+                )
+                generate_ass_from_diarized(
+                    rebase_diarized(captions, segment_timeline),
+                    0,
+                    segment["duration"],
+                    segment_ass,
+                    style,
+                )
+                filters = []
+                if lut_filter:
+                    filters.append(lut_filter)
+                filters.extend(
+                    [
+                        self._get_short_crop_filter_no_subs(
+                            segment["speaker"], src_w, src_h, crop_config
+                        ),
+                    ]
+                )
+                if "Dialogue:" in segment_ass.read_text():
+                    filters.append(f"subtitles='{escape_srt_path(segment_ass)}'")
+                segment_path = scratch / f"segment_{index:03d}.mp4"
+                render_video_segment(
+                    Path(source),
+                    segment_path,
+                    source_start=segment["source_start"],
+                    source_end=segment["source_end"],
+                    video_filter=",".join(filters),
+                    encoder_args=encoder_args,
+                    fps=fps,
+                    runner=self._run_ffmpeg,
+                )
+                paths.append(segment_path)
+            video_only = scratch / "short_video.mp4"
+            concat_video_segments(paths, video_only, runner=self._run_ffmpeg)
+            media = mux_timeline_audio(
+                video_only,
+                Path(audio_mix_path),
+                Path(output),
+                timeline,
+                audio_bitrate=audio_bitrate,
+                runner=self._run_ffmpeg,
+            )
 
-        blocks = content.strip().split("\n\n")
-        for block in blocks:
-            lines = block.strip().split("\n")
-            if len(lines) < 3:
-                continue
-            # lines[0] = index, lines[1] = timecodes, lines[2:] = text
-            timecode = lines[1]
-            parts = timecode.split(" --> ")
-            if len(parts) != 2:
-                continue
-            start = self._parse_srt_time(parts[0].strip())
-            end = self._parse_srt_time(parts[1].strip())
-            text = " ".join(lines[2:])
-            entries.append({"start": start, "end": end, "text": text})
-        return entries
+        clip = clip or {
+            "id": Path(output).stem,
+            "start_seconds": start,
+            "end_seconds": end,
+        }
+        fingerprint = fingerprint or short_render_fingerprint(
+            self.episode_dir,
+            episode,
+            self.config,
+            Path(audio_mix_path),
+            segments,
+            clip,
+        )
+        return record_short_render(
+            self.episode_dir,
+            clip["id"],
+            fingerprint=fingerprint,
+            timeline=timeline,
+            media=media,
+        )
 
-    @staticmethod
-    def _parse_srt_time(ts):
-        """Parse SRT timestamp (HH:MM:SS,mmm) to seconds."""
-        ts = ts.replace(",", ".")
-        parts = ts.split(":")
-        if len(parts) != 3:
-            return 0.0
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    def _get_clip_segments(self, segments, clip_start, clip_end):
+        timeline = Timeline(float(clip_end), [(float(clip_start), float(clip_end))])
+        return [
+            {
+                "start": segment["source_start"],
+                "end": segment["source_end"],
+                "speaker": segment["speaker"],
+            }
+            for segment in build_render_segments(timeline, segments)
+        ]
 
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
-        """Compute 9:16 crop region (w, h, x, y). Crop math in lib/crop.py."""
         cx, cy, zoom, _ = resolve_speaker(
             speaker, src_w, src_h, crop_config, for_shorts=True
         )
@@ -414,75 +316,30 @@ class ShortsRenderAgent(BaseAgent):
         return crop_w, crop_h, x, y
 
     def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
-        """Build 9:16 crop filter without subtitle burn-in."""
         crop_w, crop_h, x, y = self._get_short_crop_region(
             speaker, src_w, src_h, crop_config
         )
-        scale = get_scale_filter(1080, 1920)
-        polish = get_video_polish_filters(self.config)
-        chain = f"crop={crop_w}:{crop_h}:{x}:{y},{scale},format=yuv420p"
-        if polish:
-            chain += f",{polish}"
-        return chain
-
-    def _get_short_crop_filter(self, speaker, src_w, src_h, srt_path, crop_config):
-        """Build 9:16 crop filter chain with subtitle burn-in.
-
-        Filter order: crop → scale (lanczos+dither) → format=yuv420p →
-        hqdn3d → cas → eq → subtitles.
-
-        LUT runs at 10-bit (added by caller as separate prefix), then dither
-        during scale to 8-bit, then polish, then burn subtitles last.
-        """
-        crop_w, crop_h, x, y = self._get_short_crop_region(
-            speaker, src_w, src_h, crop_config
+        chain = (
+            f"crop={crop_w}:{crop_h}:{x}:{y},"
+            f"{get_scale_filter(1080, 1920)},format=yuv420p"
         )
-        scale = get_scale_filter(1080, 1920)
         polish = get_video_polish_filters(self.config)
+        return f"{chain},{polish}" if polish else chain
 
-        # Escape the SRT path for ffmpeg filter (colons and backslashes)
-        srt_escaped = escape_srt_path(srt_path)
-
-        chain = f"crop={crop_w}:{crop_h}:{x}:{y},{scale},format=yuv420p"
-        if polish:
-            chain += f",{polish}"
-        chain += (
-            f",subtitles='{srt_escaped}':force_style="
-            f"'FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            f"BorderStyle=3,Outline=1,Shadow=0,MarginV=80'"
-        )
+    def _get_short_crop_filter(self, speaker, src_w, src_h, caption_path, crop_config):
+        chain = self._get_short_crop_filter_no_subs(speaker, src_w, src_h, crop_config)
+        if caption_path and Path(caption_path).exists():
+            chain += f",subtitles='{escape_srt_path(Path(caption_path))}'"
         return chain
 
     def _generate_clip_srt(self, diarized, start, end, srt_path):
-        """Slice word-level transcript to clip range and write SRT."""
-        words = []
-        last_end = -1.0
-        for utt in diarized.get("utterances", []):
-            for w in utt.get("words", []):
-                w_start = w.get("start", 0)
-                w_end = w.get("end", 0)
-                if w_start >= start and w_end <= end:
-                    # Skip overlapping words from other channels (multichannel bleed)
-                    if w_start < last_end - 0.05:
-                        continue
-                    words.append(w)
-                    last_end = w_end
+        """Compatibility helper for chat clients that still request SRT."""
+        generate_srt_from_diarized(diarized, start, end, Path(srt_path))
 
-        # Group into ~4-word subtitle blocks, offset times to clip-relative
-        srt_lines = []
-        idx = 1
-        i = 0
-        while i < len(words):
-            chunk = words[i : i + 4]
-            t_start = chunk[0]["start"] - start
-            t_end = chunk[-1]["end"] - start
-            text = " ".join(w.get("word", "") for w in chunk)
+    def _run_ffmpeg(self, cmd, **kwargs):
+        return timed_ffmpeg(cmd, agent_logger=self.logger, **kwargs)
 
-            srt_lines.append(
-                f"{idx}\n{fmt_timecode(t_start)} --> {fmt_timecode(t_end)}\n{text}\n"
-            )
-            idx += 1
-            i += 4
 
-        with open(srt_path, "w") as f:
-            f.write("\n".join(srt_lines))
+def render_single_clip(episode_dir: Path, config: dict, clip_id: str) -> dict:
+    """Public API adapter for an atomic, manifest-backed single-clip render."""
+    return ShortsRenderAgent(episode_dir, config).render_clip(clip_id)

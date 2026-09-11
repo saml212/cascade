@@ -2,7 +2,12 @@
 
 import pytest
 
-from lib.timeline import Timeline, build_keep_intervals, rebase_diarized
+from lib.timeline import (
+    Timeline,
+    build_keep_intervals,
+    quantize_timestamp,
+    rebase_diarized,
+)
 
 
 def test_keep_intervals_are_order_independent_and_merge_overlapping_cuts():
@@ -38,6 +43,25 @@ def test_slice_intersects_clip_with_edits_and_rebases_to_zero():
     assert timeline.duration == 20
     assert timeline.source_to_output(10) == 0
     assert timeline.source_to_output(40) == 10
+
+
+def test_quantize_uses_exact_fractional_frame_grid_for_every_edit_boundary():
+    timeline = Timeline(10, [(0.017, 1.019), (2.021, 3.024), (4.026, 5.029)]).quantize(
+        "30000/1001"
+    )
+
+    rate = 30000 / 1001
+    frame_counts = [
+        round((end - start) * rate) for start, end in timeline.keep_intervals
+    ]
+    assert timeline.duration == pytest.approx(sum(frame_counts) / rate)
+    for start, end in timeline.keep_intervals:
+        assert start * rate == pytest.approx(round(start * rate))
+        assert end * rate == pytest.approx(round(end * rate))
+
+
+def test_quantize_timestamp_does_not_collapse_fractional_rate_to_30fps():
+    assert quantize_timestamp(1001 / 30000, "30000/1001") == pytest.approx(1001 / 30000)
 
 
 def test_project_splits_speaker_segment_and_preserves_source_bounds():
@@ -143,3 +167,14 @@ def test_project_does_not_emit_records_that_only_touch_a_boundary():
 
     assert timeline.project([{"start": 0, "end": 2}]) == []
     assert timeline.project([{"start": 4, "end": 6}]) == []
+
+
+def test_short_retained_interval_is_never_silently_removed():
+    timeline = Timeline.from_edits(
+        1,
+        [{"type": "cut", "start_seconds": 0.03, "end_seconds": 1}],
+    )
+
+    assert timeline.keep_intervals == ((0.0, 0.03),)
+    with pytest.raises(ValueError, match="complete source frame"):
+        timeline.quantize(30)

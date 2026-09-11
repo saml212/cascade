@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ class Timeline:
         duration: float,
         edits: Iterable[Mapping[str, object]] = (),
         *,
-        minimum_interval: float = 0.1,
+        minimum_interval: float = 0.0,
     ) -> Timeline:
         """Build a timeline after validating trims and interior cuts."""
         duration = _finite_number(duration, "source duration")
@@ -128,7 +129,9 @@ class Timeline:
             intervals = next_intervals
 
         intervals = [
-            (start, end) for start, end in intervals if end - start >= minimum_interval
+            (start, end)
+            for start, end in intervals
+            if end > start and end - start >= minimum_interval
         ]
         if not intervals:
             raise ValueError("Longform edits remove the entire episode")
@@ -184,6 +187,33 @@ class Timeline:
     def slice(self, start: float, end: float) -> Timeline:
         """Return a zero-based output mapping for retained material in a source range."""
         return Timeline(self.source_duration, self.source_ranges(start, end))
+
+    def quantize(self, frame_rate: str | float | Fraction) -> Timeline:
+        """Snap retained boundaries to a single global source-frame grid."""
+        rate = _frame_rate_fraction(frame_rate)
+        intervals = []
+        for span in self.spans:
+            first_boundary = math.ceil(span.source_start * float(rate) - 1e-7)
+            last_boundary = math.floor(span.source_end * float(rate) + 1e-7)
+            if last_boundary - first_boundary < 1:
+                raise ValueError(
+                    f"Retained interval {span.source_start:.6f}-{span.source_end:.6f}s "
+                    "does not contain a complete source frame"
+                )
+            start = quantize_timestamp(span.source_start, frame_rate)
+            end = min(
+                self.source_duration,
+                quantize_timestamp(span.source_end, frame_rate),
+            )
+            if end <= start:
+                raise ValueError(
+                    f"Retained interval {span.source_start:.6f}-{span.source_end:.6f}s "
+                    "does not contain a complete source frame"
+                )
+            intervals.append((start, end))
+        if not intervals:
+            raise ValueError("Timeline has no complete source frames")
+        return Timeline(self.source_duration, intervals)
 
     def project(
         self,
@@ -281,6 +311,31 @@ def rebase_diarized(diarized: Mapping[str, object], timeline: Timeline) -> dict:
         utterances.append(rebased_utterance)
     result["utterances"] = utterances
     return result
+
+
+def quantize_timestamp(timestamp: float, frame_rate: str | float | Fraction) -> float:
+    """Round a source timestamp to the nearest boundary on a rational frame grid."""
+    timestamp = _finite_number(timestamp, "timestamp")
+    if timestamp < 0:
+        raise ValueError("Timestamp cannot be negative")
+    rate = _frame_rate_fraction(frame_rate)
+    frame_position = Fraction(str(timestamp)) * rate
+    frame_number = int(frame_position + Fraction(1, 2))
+    return float(Fraction(frame_number, 1) / rate)
+
+
+def _frame_rate_fraction(frame_rate: str | float | Fraction) -> Fraction:
+    try:
+        rate = (
+            frame_rate
+            if isinstance(frame_rate, Fraction)
+            else Fraction(str(frame_rate)).limit_denominator(1_000_000)
+        )
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError("Frame rate must be positive") from exc
+    if rate <= 0:
+        raise ValueError("Frame rate must be positive")
+    return rate
 
 
 def _finite_number(value: object, label: str) -> float:
