@@ -132,7 +132,15 @@ def _generate_audio_mix_locked(
     mix_tracks = mix_cfg.get("tracks", [])
     master_vol = mix_cfg.get("master_volume", 1.0)
 
-    if not mix_tracks:
+    available_tracks = episode_audio_tracks(episode_dir, episode_data)
+    camera_channel_only = bool(available_tracks) and all(
+        track.get("track_type") == "camera_channel" for track in available_tracks
+    )
+    if camera_channel_only:
+        # The materialized camera_Tr WAVs from older runs may have collapsed
+        # AAC timestamp gaps. Decode the merged source with its PTS intact.
+        mix_tracks = []
+    elif not mix_tracks:
         mix_tracks = _build_from_crop_config(episode_dir, episode_data)
 
     # Camera-audio mode: no H6E tracks available, extract from source_merged.mp4
@@ -362,7 +370,7 @@ def _build_from_crop_config(episode_dir: Path, episode_data: dict) -> list[dict]
     fader level (room-mic / built-in ambient).
     """
     crop = episode_data.get("crop_config", {})
-    audio_tracks = _get_audio_tracks(episode_dir, episode_data)
+    audio_tracks = episode_audio_tracks(episode_dir, episode_data)
 
     num_to_stems = {}
     for t in audio_tracks:
@@ -427,7 +435,7 @@ def _build_from_crop_config(episode_dir: Path, episode_data: dict) -> list[dict]
 
 def _map_track_stems(episode_dir: Path, episode_data: dict) -> dict[str, Path]:
     """Map track filename stems to their disk paths."""
-    tracks = _get_audio_tracks(episode_dir, episode_data)
+    tracks = episode_audio_tracks(episode_dir, episode_data)
     result = {}
     for t in tracks:
         stem = Path(t["filename"]).stem
@@ -437,7 +445,7 @@ def _map_track_stems(episode_dir: Path, episode_data: dict) -> dict[str, Path]:
     return result
 
 
-def _get_audio_tracks(episode_dir: Path, episode_data: dict) -> list[dict]:
+def episode_audio_tracks(episode_dir: Path, episode_data: dict) -> list[dict]:
     """Get audio tracks, merging from ingest.json if needed."""
     tracks = episode_data.get("audio_tracks", [])
     if tracks:
@@ -451,3 +459,30 @@ def _get_audio_tracks(episode_dir: Path, episode_data: dict) -> list[dict]:
         except (json.JSONDecodeError, OSError):
             pass
     return []
+
+
+def logical_track_groups(
+    episode_dir: Path,
+    episode_data: dict,
+    *,
+    recorder_only: bool = False,
+    existing_only: bool = True,
+) -> dict[int, list[dict]]:
+    """Group consecutive recorder sessions by logical input number.
+
+    Zoom recorders restart names such as ``Tr1`` for each session. Manifest
+    order is the recording order, so callers concatenate each returned list
+    instead of letting a later session overwrite the earlier one.
+    """
+    groups: dict[int, list[dict]] = {}
+    for track in episode_audio_tracks(episode_dir, episode_data):
+        track_number = track.get("track_number")
+        if not isinstance(track_number, int) or isinstance(track_number, bool):
+            continue
+        if recorder_only and track.get("track_type") == "camera_channel":
+            continue
+        path = Path(track.get("dest_path", ""))
+        if existing_only and not path.is_file():
+            continue
+        groups.setdefault(track_number, []).append(track)
+    return groups

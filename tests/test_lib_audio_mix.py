@@ -13,6 +13,7 @@ from lib.audio_mix import (
     _generate_audio_mix_locked,
     _generate_camera_audio_mix,
     _mix_fingerprint,
+    logical_track_groups,
 )
 
 # ---------------------------------------------------------------------------
@@ -216,6 +217,39 @@ class TestNewSchemaSpeakersArray:
         assert result[0]["stem"] == "session_a_Tr1"
         assert result[0]["stems"] == ["session_a_Tr1", "session_b_Tr1"]
 
+    def test_logical_track_groups_preserve_session_order_and_exclude_camera(
+        self, tmp_path
+    ):
+        recorder_a = tmp_path / "session_a_Tr1.wav"
+        recorder_b = tmp_path / "session_b_Tr1.wav"
+        camera = tmp_path / "camera_Tr2.wav"
+        for path in (recorder_a, recorder_b, camera):
+            path.write_bytes(b"audio")
+        episode = {
+            "audio_tracks": [
+                {
+                    **_track(1, recorder_a.name, str(recorder_a)),
+                    "track_type": "input",
+                },
+                {
+                    **_track(1, recorder_b.name, str(recorder_b)),
+                    "track_type": "input",
+                },
+                {
+                    **_track(2, camera.name, str(camera)),
+                    "track_type": "camera_channel",
+                },
+            ]
+        }
+
+        groups = logical_track_groups(tmp_path, episode, recorder_only=True)
+
+        assert [track["filename"] for track in groups[1]] == [
+            recorder_a.name,
+            recorder_b.name,
+        ]
+        assert 2 not in groups
+
     def test_new_schema_does_not_trigger_legacy_fallback_even_with_l_fields(self):
         """If speakers array is present AND populated, legacy path must NOT activate
         even if speaker_l_center_x also happens to be in the dict (defensive)."""
@@ -317,6 +351,37 @@ class TestMixGraph:
 
         assert result == output
         camera_mix.assert_called_once()
+
+    def test_assigned_camera_channel_wavs_still_decode_source_timeline(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        merged = tmp_path / "source_merged.mp4"
+        merged.write_bytes(b"camera")
+        tracks = []
+        for number in (1, 2):
+            path = tmp_path / f"camera_Tr{number}.WAV"
+            path.write_bytes(b"legacy collapsed audio")
+            tracks.append(
+                {
+                    **_track(number, path.name, str(path)),
+                    "track_type": "camera_channel",
+                }
+            )
+        episode = {
+            "crop_config": {
+                "speakers": [{"track": 1}, {"track": 2}],
+            },
+            "audio_tracks": tracks,
+        }
+        output = work / "audio_mix.wav"
+
+        with patch(
+            "lib.audio_mix._generate_camera_audio_mix", return_value=output
+        ) as camera_mix:
+            result = _generate_audio_mix_locked(tmp_path, episode, {}, work, output)
+
+        assert result == output
+        assert camera_mix.call_args.args[:2] == (merged, output)
 
     def test_default_mix_avoids_independent_speaker_gain_riding(self, tmp_path):
         audio_dir = tmp_path / "audio"

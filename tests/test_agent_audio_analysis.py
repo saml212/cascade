@@ -1,12 +1,16 @@
-"""Tests for the audio analysis agent."""
+"""Tests for the source-clock audio analysis agent."""
 
-import json
-import pytest
+from unittest.mock import MagicMock, patch
+
 import numpy as np
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+import pytest
 
-from agents.audio_analysis import AudioAnalysisAgent
+from agents.audio_analysis import (
+    ANALYSIS_SAMPLE_RATE,
+    AudioAnalysisAgent,
+    audio_analysis_fingerprint,
+)
+from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
 
 
 class TestAudioAnalysisAgent:
@@ -44,13 +48,17 @@ class TestAudioAnalysisAgent:
             ],
         }
 
-        # Create identical WAV data
         samples = np.random.randint(-32768, 32767, 48000, dtype=np.int16)
 
         agent = AudioAnalysisAgent(tmp_episode_dir, sample_config)
-        with patch("agents.audio_analysis.ffprobe", return_value=mock_probe), \
-             patch.object(agent, "_extract_channels"), \
-             patch.object(agent, "_load_wav", return_value=samples.astype(np.float32)):
+        with (
+            patch("agents.audio_analysis.ffprobe", return_value=mock_probe),
+            patch.object(
+                agent,
+                "_extract_channels",
+                return_value=(samples.astype(np.float32), samples.astype(np.float32)),
+            ),
+        ):
             result = agent.execute()
 
         assert result["classification"] == "audio_channels_identical"
@@ -73,15 +81,11 @@ class TestAudioAnalysisAgent:
         left = rng.randint(-32768, 32767, 48000).astype(np.float32)
         right = rng.randint(-32768, 32767, 48000).astype(np.float32)
 
-        call_count = [0]
-        def mock_load_wav(path):
-            call_count[0] += 1
-            return left if call_count[0] == 1 else right
-
         agent = AudioAnalysisAgent(tmp_episode_dir, sample_config)
-        with patch("agents.audio_analysis.ffprobe", return_value=mock_probe), \
-             patch.object(agent, "_extract_channels"), \
-             patch.object(agent, "_load_wav", side_effect=mock_load_wav):
+        with (
+            patch("agents.audio_analysis.ffprobe", return_value=mock_probe),
+            patch.object(agent, "_extract_channels", return_value=(left, right)),
+        ):
             result = agent.execute()
 
         assert result["classification"] == "true_stereo"
@@ -96,9 +100,11 @@ class TestAudioAnalysisAgent:
         }
 
         agent = AudioAnalysisAgent(tmp_episode_dir, sample_config)
-        with patch("agents.audio_analysis.ffprobe", return_value=mock_probe):
-            with pytest.raises(RuntimeError, match="No audio stream"):
-                agent.execute()
+        with (
+            patch("agents.audio_analysis.ffprobe", return_value=mock_probe),
+            pytest.raises(RuntimeError, match="No audio stream"),
+        ):
+            agent.execute()
 
     def test_result_structure(self, tmp_episode_dir, sample_config):
         self._setup_merged(tmp_episode_dir)
@@ -144,16 +150,55 @@ class TestAudioAnalysisAgent:
         left = base
         right = base + noise  # Correlated but with significant noise
 
-        call_count = [0]
-        def mock_load_wav(path):
-            call_count[0] += 1
-            return left if call_count[0] == 1 else right
-
         agent = AudioAnalysisAgent(tmp_episode_dir, sample_config)
-        with patch("agents.audio_analysis.ffprobe", return_value=mock_probe), \
-             patch.object(agent, "_extract_channels"), \
-             patch.object(agent, "_load_wav", side_effect=mock_load_wav):
+        with (
+            patch("agents.audio_analysis.ffprobe", return_value=mock_probe),
+            patch.object(agent, "_extract_channels", return_value=(left, right)),
+        ):
             result = agent.execute()
 
         # With strict thresholds, this should be classified as true_stereo
         assert result["classification"] == "true_stereo"
+
+    def test_channel_decode_materializes_source_timeline_and_stays_compact(
+        self, tmp_episode_dir, sample_config
+    ):
+        source = tmp_episode_dir / "source_merged.mp4"
+        source.write_bytes(b"source")
+        stereo = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.int16)
+        completed = MagicMock(stdout=stereo.tobytes())
+        agent = AudioAnalysisAgent(tmp_episode_dir, sample_config)
+
+        with patch(
+            "agents.audio_analysis.subprocess.run", return_value=completed
+        ) as run:
+            left, right = agent._extract_channels(source)
+
+        cmd = run.call_args.args[0]
+        assert cmd[cmd.index("-af") + 1] == CAMERA_AUDIO_TIMELINE_FILTER
+        assert cmd[cmd.index("-ar") + 1] == str(ANALYSIS_SAMPLE_RATE)
+        assert left.tolist() == [1, 3, 5]
+        assert right.tolist() == [2, 4, 6]
+
+    def test_cache_requires_current_source_and_sync_fingerprint(
+        self, tmp_episode_dir, sample_config
+    ):
+        source = tmp_episode_dir / "source_merged.mp4"
+        source.write_bytes(b"source")
+        episode = {"audio_sync": {"offset_seconds": 1.0}}
+        current = audio_analysis_fingerprint(tmp_episode_dir, episode, sample_config)
+        work = tmp_episode_dir / "work"
+        AudioAnalysisAgent._publish_channel_cache(
+            work,
+            current,
+            np.ones(10, dtype=np.float32),
+            np.ones(10, dtype=np.float32),
+        )
+
+        assert AudioAnalysisAgent._load_cached_channels(work, current) is not None
+        changed = audio_analysis_fingerprint(
+            tmp_episode_dir,
+            {"audio_sync": {"offset_seconds": 2.0}},
+            sample_config,
+        )
+        assert AudioAnalysisAgent._load_cached_channels(work, changed) is None
