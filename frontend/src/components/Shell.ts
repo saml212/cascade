@@ -38,7 +38,7 @@ export function Shell(): { root: HTMLElement; main: HTMLElement } {
 
   const root = h(
     'div',
-    { class: 'h-screen w-screen flex bg-canvas text-ink-primary' },
+    { class: 'h-screen w-screen flex bg-canvas text-ink-primary relative' },
     NavRail(),
     main,
     AgentPanel(),

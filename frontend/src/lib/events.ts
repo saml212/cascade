@@ -30,6 +30,8 @@ interface Subscription {
   lastAgent: string | null;
   lastStatus: string | null;
   lastCompletedCount: number;
+  lastRunning: boolean | null;
+  emittedErrors: Map<string, string>;
 }
 
 const subs = new Map<string, Subscription>();
@@ -47,6 +49,8 @@ export function subscribe(
       lastAgent: null,
       lastStatus: null,
       lastCompletedCount: -1,
+      lastRunning: null,
+      emittedErrors: new Map(),
     };
     subs.set(episodeId, sub);
     startPolling(sub);
@@ -77,6 +81,7 @@ async function tick(sub: Subscription): Promise<void> {
   const currentAgent = (s.current_agent as string | null) ?? null;
   const completed = (s.agents_completed as string[]) ?? [];
   const errors = (s.errors as Record<string, string>) ?? {};
+  const isRunning = !!s.is_running;
 
   if (status && status !== sub.lastStatus) {
     emit(sub, {
@@ -89,7 +94,7 @@ async function tick(sub: Subscription): Promise<void> {
   }
 
   if (currentAgent !== sub.lastAgent) {
-    if (sub.lastAgent) {
+    if (sub.lastAgent && completed.includes(sub.lastAgent)) {
       emit(sub, {
         at: Date.now(),
         kind: 'agent_done',
@@ -113,6 +118,7 @@ async function tick(sub: Subscription): Promise<void> {
   }
 
   for (const [agent, msg] of Object.entries(errors)) {
+    if (sub.emittedErrors.get(agent) === msg) continue;
     emit(sub, {
       at: Date.now(),
       kind: 'agent_error',
@@ -120,7 +126,24 @@ async function tick(sub: Subscription): Promise<void> {
       detail: msg,
       agent,
     });
+    sub.emittedErrors.set(agent, msg);
   }
+
+  if (
+    sub.lastRunning === true &&
+    !isRunning &&
+    status === 'processing' &&
+    Object.keys(errors).length === 0
+  ) {
+    emit(sub, {
+      at: Date.now(),
+      kind: 'idle',
+      label: 'Pipeline stopped before completing',
+      detail: 'Resume the pipeline from the episode page.',
+      status,
+    });
+  }
+  sub.lastRunning = isRunning;
 }
 
 function startPolling(sub: Subscription): void {

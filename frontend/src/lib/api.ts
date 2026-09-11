@@ -26,9 +26,13 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     } catch {
       /* ignore */
     }
-    const err = new Error(
-      `${method} ${path} failed (${res.status})`
-    ) as ApiError;
+    const detail = payload && typeof payload === 'object'
+      ? (payload as Record<string, unknown>).detail
+      : null;
+    const message = typeof detail === 'string' ? detail
+      : Array.isArray(detail) ? detail.map((item: { msg?: string }) => item.msg).filter(Boolean).join('; ')
+      : `${method} ${path} failed (${res.status})`;
+    const err = new Error(message) as ApiError;
     err.status = res.status;
     err.body = payload;
     throw err;
@@ -58,12 +62,14 @@ export interface EpisodeSummary {
    * clip review"). Fall back to `false` if backend hasn't surfaced it.
    */
   has_crop_config?: boolean;
+  delivery?: DeliveryStatus | null;
 }
 
 export interface NewEpisodeRequest {
   source_path?: string;
   audio_path?: string;
   speaker_count?: number;
+  agents?: string[];
 }
 
 export interface EpisodeUpdateRequest {
@@ -107,12 +113,52 @@ export interface CropConfigRequest {
   source_height?: number;
 }
 
+export interface DeliveryStatus extends UnknownRecord {
+  status: 'not_prepared' | 'preparing' | 'ready' | 'failed';
+  episode_id: string;
+  error?: string;
+  filename?: string;
+  download_url?: string;
+  size_bytes?: number;
+  duration_seconds?: number;
+  expected_duration_seconds?: number;
+  duration_difference_seconds?: number;
+  integrated_lufs?: number;
+  true_peak_dbfs?: number;
+  loudness_range_lu?: number;
+  completed_at?: string;
+  notes?: string[];
+  stale?: boolean;
+  video_status?: 'not_prepared' | 'preparing' | 'ready' | 'failed';
+  video_progress?: number;
+  video_detail?: string;
+  video_error?: string;
+  video_completed_at?: string;
+  video_download_url?: string;
+  video?: {
+    filename: string;
+    size_bytes: number;
+    duration_seconds: number;
+    width: number;
+    height: number;
+    video_codec: string;
+    audio_codec: string;
+    encoder: string;
+    edit_count: number;
+  };
+  source_duration_seconds?: number;
+  trim_start_seconds?: number;
+  trim_end_seconds?: number;
+}
+
 export const api = {
   /* Episodes */
   listEpisodes: () => request<EpisodeSummary[]>('GET', '/api/episodes/'),
   getEpisode: (id: string) => request<UnknownRecord>('GET', `/api/episodes/${id}`),
   createEpisode: (req: NewEpisodeRequest) =>
     request<UnknownRecord>('POST', '/api/episodes/', req),
+  runPipeline: (id: string, req: NewEpisodeRequest) =>
+    request<UnknownRecord>('POST', `/api/episodes/${id}/run-pipeline`, req),
   updateEpisode: (id: string, req: EpisodeUpdateRequest) =>
     request<UnknownRecord>('PATCH', `/api/episodes/${id}`, req),
 
@@ -127,6 +173,18 @@ export const api = {
 
   saveCropConfig: (id: string, cfg: CropConfigRequest) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/crop-config`, cfg),
+
+  deliveryStatus: (id: string) =>
+    request<DeliveryStatus>('GET', `/api/episodes/${id}/delivery`),
+  prepareDelivery: (id: string) =>
+    request<DeliveryStatus>('POST', `/api/episodes/${id}/delivery/prepare`),
+  prepareDeliveryVideo: (id: string) =>
+    request<DeliveryStatus>('POST', `/api/episodes/${id}/delivery/video/prepare`),
+  saveDeliveryTrim: (id: string, start_seconds: number, end_seconds: number) =>
+    request<DeliveryStatus>('PUT', `/api/episodes/${id}/delivery/trim`, {
+      start_seconds,
+      end_seconds,
+    }),
 
   /* Pipeline */
   pipelineStatus: (id: string) =>

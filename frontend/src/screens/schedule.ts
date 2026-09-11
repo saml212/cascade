@@ -7,6 +7,7 @@ import { h, mount } from '../lib/dom';
 import { signal, effect } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
 import { pluralize } from '../lib/format';
+import { link } from '../lib/router';
 
 interface ScheduleItem {
   type: 'longform' | 'clip' | string;
@@ -102,8 +103,8 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           'p',
           { class: 'text-body text-ink-secondary mt-2' },
           total > 0
-            ? `${pluralize(total, 'post')} queued across the next seven days.`
-            : 'Nothing queued for the next seven days.'
+            ? `Suggested slots for ${pluralize(total, 'post')}. Confirm release dates in your publishing service.`
+            : 'No release suggestions for the next seven days.'
         )
       ),
       unscheduled > 0
@@ -131,7 +132,7 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           h(
             'p',
             { class: 'text-body text-ink-tertiary max-w-md mx-auto' },
-            'Once you approve clips they land on this calendar. The cascade scheduler spaces them per config/config.toml.'
+            'Approved episodes and clips appear here as a draft release plan.'
           )
         )
       : h(
@@ -139,7 +140,7 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           {
             class: 'grid gap-3',
             style: {
-              gridTemplateColumns: `repeat(${days.length}, minmax(0, 1fr))`,
+              gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
             },
           },
           ...days.map(renderDayColumn)
@@ -153,7 +154,7 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
     day: 'numeric',
   });
   const weekday = day.day_name?.slice(0, 3) || '';
-  const isToday = day.date === new Date().toISOString().slice(0, 10);
+  const isToday = day.date === new Date().toLocaleDateString('en-CA');
 
   return h(
     'div',
@@ -197,7 +198,7 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
             class:
               'flex-1 flex items-center justify-center text-body-sm text-ink-tertiary/70 italic',
           },
-          isToday ? 'Open day — nothing queued.' : 'No posts'
+            isToday ? 'Open day' : 'No suggested posts'
         )
       : h(
           'div',
@@ -216,8 +217,9 @@ function renderItem(item: ScheduleItem): HTMLElement {
       ? 'Short'
       : item.type;
   return h(
-    'div',
+    'a',
     {
+      ...link(`/episodes/${item.episode_id}`),
       class:
         'px-2.5 py-2 rounded bg-surface-2 border border-border-subtle flex flex-col gap-1',
     },

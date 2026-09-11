@@ -12,6 +12,7 @@ import { Publish } from './screens/publish';
 import { Backup } from './screens/backup';
 import { Schedule } from './screens/schedule';
 import { Analytics } from './screens/analytics';
+import { Delivery } from './screens/delivery';
 import { NotFound } from './screens/not-found';
 import { watchEpisode } from './state/episodes';
 
@@ -49,6 +50,7 @@ route('/episodes/:id/clips/review', ({ id }) => ClipReview(main, id));
 route('/episodes/:id/longform/review', ({ id }) => LongformReview(main, id));
 route('/episodes/:id/publish', ({ id }) => Publish(main, id));
 route('/episodes/:id/backup', ({ id }) => Backup(main, id));
+route('/episodes/:id/delivery', ({ id }) => Delivery(main, id));
 
 setFallback(() => NotFound(main));
 

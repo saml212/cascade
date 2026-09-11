@@ -14,18 +14,29 @@ export function NewEpisode(target: HTMLElement): void {
 
   async function submit(): Promise<void> {
     if (!sourcePath().trim()) {
-      error.set('Give cascade a source path (DJI SD card or archive folder).');
+      error.set('Enter the folder containing the camera recordings.');
       return;
     }
     submitting.set(true);
     error.set(null);
     try {
-      const ep = (await api.createEpisode({
+      const request = {
         source_path: sourcePath().trim(),
         audio_path: audioPath().trim() || undefined,
         speaker_count: speakerCount(),
-      })) as Record<string, unknown>;
+        // Stop at the crop gate. Transcription and rendering should only begin
+        // after the user has reviewed the framing, tracks, and sync.
+        agents: ['ingest', 'stitch', 'audio_analysis'],
+      };
+      const ep = (await api.createEpisode(request)) as Record<string, unknown>;
       const id = ep.episode_id as string;
+      try {
+        await api.runPipeline(id, request);
+      } catch {
+        showToast('Episode created, but the pipeline did not start. Open the episode to retry.', 'error');
+        navigate(`/episodes/${id}`);
+        return;
+      }
       showToast('Episode created — pipeline starting.', 'success');
       navigate(`/episodes/${id}`);
     } catch (e) {
@@ -36,6 +47,7 @@ export function NewEpisode(target: HTMLElement): void {
   }
 
   const sourceInput = h('input', {
+    id: 'episode-source-path',
     type: 'text',
     placeholder: '/Volumes/CAMERA/DCIM/DJI_001',
     class: inputClass,
@@ -44,6 +56,7 @@ export function NewEpisode(target: HTMLElement): void {
   }) as HTMLInputElement;
 
   const audioInput = h('input', {
+    id: 'episode-audio-path',
     type: 'text',
     placeholder: '/Volumes/ZOOM_H6E/…',
     class: inputClass,
@@ -96,7 +109,7 @@ export function NewEpisode(target: HTMLElement): void {
       Button({
         variant: 'primary',
         size: 'lg',
-        label: submitting() ? 'Starting pipeline…' : 'Start pipeline',
+        label: submitting() ? 'Importing…' : 'Import episode',
         loading: submitting(),
         onClick: submit,
       }),
@@ -122,7 +135,7 @@ export function NewEpisode(target: HTMLElement): void {
       h(
         'p',
         { class: 'text-body-lg text-ink-secondary mb-10' },
-        'Point cascade at a source folder. Add H6E audio separately if you recorded 3+ speakers. Pipeline runs until it reaches crop setup.'
+        'Choose your camera recordings and any separate microphone recordings. Import finishes at picture and sound setup.'
       ),
       formRow(
         'Source path',
@@ -131,7 +144,7 @@ export function NewEpisode(target: HTMLElement): void {
       ),
       formRow(
         'Audio path (optional)',
-        'Zoom H6E folder. Leave blank for 2-speaker DJI-mic-direct episodes — cascade will split the camera stereo into per-mic tracks automatically.',
+        'Choose the Zoom H6E folder, or leave blank to use the camera audio.',
         audioInput
       ),
       formRow('Speaker count', 'Includes the host.', speakerControls),
@@ -150,7 +163,7 @@ function formRow(label: string, hint: string, control: HTMLElement): HTMLElement
     { class: 'mb-8' },
     h(
       'label',
-      { class: 'block text-heading-sm uppercase text-ink-tertiary mb-2' },
+      { class: 'block text-heading-sm uppercase text-ink-tertiary mb-2', ...(control.id ? { for: control.id } : {}) },
       label
     ),
     control,

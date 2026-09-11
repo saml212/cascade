@@ -16,9 +16,14 @@
 
 import { h, mount } from '../lib/dom';
 import { effect, signal, type Signal } from '../lib/signals';
-import { api, type SpeakerCropConfig, type CropConfigRequest } from '../lib/api';
 import {
-  describeStatus,
+  api,
+  type AmbientTrackConfig,
+  type SpeakerCropConfig,
+  type CropConfigRequest,
+} from '../lib/api';
+import {
+  describeEpisodeStatus,
   episodeTitle,
   formatDuration,
   formatTimecode,
@@ -50,6 +55,7 @@ interface CropState {
   sourceHeight: number;
   scaleFactor: number;
   speakers: SpeakerState[];
+  ambientTracks: AmbientTrackConfig[];
   wide: { x: number; y: number; zoom: number };
   activeIdx: number; // -1 = wide, 0..n = speaker
   placeMode: 'shorts' | 'longform';
@@ -112,6 +118,7 @@ export function CropSetup(target: HTMLElement, episodeId: string): void {
     sourceHeight: 0,
     scaleFactor: 1,
     speakers: [],
+    ambientTracks: [],
     wide: { x: 0, y: 0, zoom: 1.0 },
     activeIdx: 0,
     placeMode: 'shorts',
@@ -146,6 +153,10 @@ function seedFromEpisode(
   const cfg = (ep.crop_config as Record<string, unknown> | undefined) ?? {};
   const speakersRaw = cfg.speakers as SpeakerCropConfig[] | undefined;
   const speakerCountHint = (ep.speaker_count as number | undefined) ?? 2;
+  const ambientTracks =
+    (cfg.ambient_tracks as AmbientTrackConfig[] | undefined)?.map((track) => ({
+      ...track,
+    })) ?? [];
 
   let speakers: SpeakerState[];
   if (speakersRaw && speakersRaw.length > 0) {
@@ -205,7 +216,7 @@ function seedFromEpisode(
     zoom: (cfg.wide_zoom as number) ?? 1.0,
   };
 
-  state.set((prev) => ({ ...prev, speakers, wide }));
+  state.set((prev) => ({ ...prev, speakers, ambientTracks, wide }));
 }
 
 function loadCropFrame(episodeId: string, state: Signal<CropState>): void {
@@ -302,53 +313,58 @@ function renderHeader(
   const audioTracks = (ep?.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
   const hasCameraChannels = audioTracks.some((t) => t.track_type === 'camera_channel');
   const mixSource = isH6E ? 'H6E multi-track' : hasCameraChannels ? 'Camera stereo' : 'Camera stereo';
-  const status = ep ? describeStatus(ep.status as string) : null;
+  const status = ep ? describeEpisodeStatus(ep) : null;
 
   return h(
     'header',
     {
       class:
-        'flex items-center gap-5 px-8 py-4 border-b border-border-subtle bg-surface-canvas',
+        'flex flex-col xl:flex-row xl:items-center gap-3 xl:gap-6 px-4 sm:px-8 py-4 border-b border-border-subtle bg-surface-canvas',
     },
     h(
-      'a',
-      {
-        ...link(`/episodes/${episodeId}`),
-        class:
-          'w-8 h-8 flex items-center justify-center text-ink-tertiary hover:text-ink-primary rounded-md hover:bg-surface-2',
-        title: 'Back to episode',
-      },
-      Icon.chevronLeft()
-    ),
-    h(
       'div',
-      { class: 'flex-1 min-w-0' },
+      { class: 'flex items-center gap-4 w-full min-w-0' },
       h(
-        'div',
-        { class: 'flex items-center gap-3 mb-0.5' },
-        h(
-          'span',
-          { class: 'text-heading-sm uppercase text-ink-tertiary' },
-          'Crop setup'
-        ),
-        status ? StatusPill({ descriptor: status, size: 'sm' }) : null
+        'a',
+        {
+          ...link(`/episodes/${episodeId}`),
+          class:
+            'shrink-0 w-8 h-8 flex items-center justify-center text-ink-tertiary hover:text-ink-primary rounded-md hover:bg-surface-2',
+          title: 'Back to episode',
+        },
+        Icon.chevronLeft()
       ),
-      h(
-        'div',
-        { class: 'text-body-lg text-ink-primary font-medium truncate' },
-        title
+      h('div', { class: 'flex-1 min-w-0' },
+        h(
+          'div',
+          { class: 'flex items-center gap-3 mb-0.5 flex-wrap' },
+          h(
+            'span',
+            { class: 'text-heading-sm uppercase text-ink-tertiary' },
+            'Crop setup'
+          ),
+          status ? StatusPill({ descriptor: status, size: 'sm' }) : null
+        ),
+        h(
+          'div',
+          { class: 'text-body-lg text-ink-primary font-medium truncate' },
+          title
+        )
       )
     ),
     h(
       'div',
-      { class: 'flex items-center gap-6 text-body-sm text-ink-secondary' },
+      {
+        class:
+          'flex flex-wrap items-center gap-x-6 gap-y-1 pl-12 xl:pl-0 xl:shrink-0 text-body-sm text-ink-secondary',
+      },
       metaTag('Duration', formatDuration(duration)),
       metaTag('Speakers', String(speakerCount)),
       // NOT "what you're hearing right now" — that's camera audio during
       // scrub and H6E tracks in the mixer below. This tag describes what
       // the FINAL longform mix will use as its source.
       metaTag('Final mix source', mixSource),
-      metaTag('ID', episodeId)
+      h('div', { class: 'hidden 2xl:block' }, metaTag('ID', episodeId))
     )
   );
 }
@@ -427,7 +443,7 @@ function renderBody(
     { class: 'flex-1 flex flex-col gap-6 px-8 py-6 min-h-0' },
     h(
       'div',
-      { class: 'grid grid-cols-[minmax(0,1fr)_380px] gap-6' },
+      { class: 'grid grid-cols-1 min-[1200px]:grid-cols-[minmax(0,1fr)_380px] gap-6' },
       renderEditor(state, episodeId),
       renderSidebar(episodeId, state)
     ),
@@ -447,7 +463,7 @@ function renderMixer(state: Signal<CropState>, episodeId: string): HTMLElement {
         track: spk.track,
         volume: spk.volume ?? 1.0,
       })),
-    getAmbient: () => [],
+    getAmbient: () => state().ambientTracks,
     onSpeakerVolume: (idx, volume) =>
       state.set((prev) => ({
         ...prev,
@@ -1359,6 +1375,14 @@ function renderSaveCard(
           'Place every speaker on the canvas before saving.'
         ),
     Button({
+      variant: 'secondary',
+      size: 'lg',
+      label: 'Save settings',
+      disabled: !valid || s.saving,
+      onClick: () => doSave(episodeId, state, false),
+      class: 'w-full',
+    }),
+    Button({
       variant: 'primary',
       size: 'lg',
       label: s.saving ? 'Saving…' : 'Save & continue',
@@ -1379,7 +1403,8 @@ function renderSaveCard(
 
 async function doSave(
   episodeId: string,
-  state: Signal<CropState>
+  state: Signal<CropState>,
+  resume = true
 ): Promise<void> {
   const s = state.peek();
   state.set({ ...s, saving: true });
@@ -1401,6 +1426,7 @@ async function doSave(
       if (spk.track != null) entry.track = spk.track;
       return entry;
     }),
+    ambient_tracks: s.ambientTracks,
   };
   if (s.wide.zoom > 1.0) {
     payload.wide_center_x = s.wide.x;
@@ -1411,11 +1437,21 @@ async function doSave(
   try {
     await api.saveCropConfig(episodeId, payload);
     try {
-      await api.resumePipeline(episodeId);
-    } catch {
-      /* resume is best-effort; the saved crop is the real success */
+      if (resume) {
+        await api.resumePipeline(episodeId);
+        showToast('Crops saved — pipeline resuming.', 'success');
+      } else {
+        showToast('Crop and audio settings saved.', 'success');
+      }
+    } catch (resumeError) {
+      const status = (resumeError as { status?: number }).status;
+      showToast(
+        status === 409
+          ? 'Crops saved — pipeline is already running.'
+          : 'Crops saved, but the pipeline did not resume. Retry from the episode page.',
+        status === 409 ? 'success' : 'error'
+      );
     }
-    showToast('Crops saved — pipeline resuming.', 'success');
     navigate(`/episodes/${episodeId}`);
   } catch (e) {
     state.set({ ...state.peek(), saving: false });

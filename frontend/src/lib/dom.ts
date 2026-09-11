@@ -4,11 +4,18 @@
  * signals primitive, this gives us a reactive UI in <200 lines total.
  */
 
+import { onCleanup } from './signals';
+
 type Child = Node | string | number | null | undefined | false | Child[];
 type Props = Record<string, unknown>;
 
 function applyProp(el: Element, key: string, value: unknown): void {
   if (value == null || value === false) return;
+
+  if (key === 'value' && 'value' in el) {
+    (el as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).value = String(value);
+    return;
+  }
 
   if (key === 'class' || key === 'className') {
     el.setAttribute('class', String(value));
@@ -68,6 +75,7 @@ export function h<K extends keyof HTMLElementTagNameMap>(
 export function h(tag: string, props?: Props | null, ...children: Child[]): HTMLElement;
 export function h(tag: string, props?: Props | null, ...children: Child[]): HTMLElement {
   const el = document.createElement(tag);
+  if (el instanceof HTMLMediaElement) onCleanup(() => el.pause());
   if (props) {
     for (const [key, val] of Object.entries(props)) applyProp(el, key, val);
   }
@@ -93,4 +101,5 @@ export function svg(tag: string, props?: Props | null, ...children: Child[]): SV
 
 export function mount(target: Element, node: Node): void {
   target.replaceChildren(node);
+  target.scrollTop = 0;
 }

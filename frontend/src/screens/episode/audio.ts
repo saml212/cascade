@@ -139,13 +139,15 @@ function loudnessPanel(loudness: Record<string, unknown> | undefined): HTMLEleme
     );
   }
 
-  const integrated = loudness.integrated_lufs as number;
-  const truePeak = loudness.true_peak_dbfs as number;
-  const lra = loudness.loudness_range_lu as number;
-  const target = loudness.target_lufs as number;
+  const integrated = finiteNumber(loudness.integrated_lufs);
+  const truePeak = finiteNumber(loudness.true_peak_dbfs);
+  const lra = finiteNumber(loudness.loudness_range_lu);
+  const target = finiteNumber(loudness.target_lufs);
   const measuredAt = loudness.measured_at as string | undefined;
 
-  const delta = Math.abs(integrated - target);
+  const delta = integrated != null && target != null
+    ? Math.abs(integrated - target)
+    : Number.POSITIVE_INFINITY;
   const lufsColorClass =
     delta <= 1
       ? 'text-status-success'
@@ -153,11 +155,13 @@ function loudnessPanel(loudness: Record<string, unknown> | undefined): HTMLEleme
       ? 'text-status-warning'
       : 'text-status-danger';
 
-  const integratedStr = integrated.toFixed(1);
-  const truePeakStr = (truePeak >= 0 ? '+' : '') + truePeak.toFixed(1);
-  const lraStr = lra.toFixed(1);
+  const integratedStr = integrated?.toFixed(1) ?? '—';
+  const truePeakStr = truePeak == null
+    ? '—'
+    : (truePeak >= 0 ? '+' : '') + truePeak.toFixed(1);
+  const lraStr = lra?.toFixed(1) ?? '—';
   // target.toFixed already carries the sign — don't double-prefix below.
-  const targetStr = target.toFixed(0);
+  const targetStr = target?.toFixed(0) ?? '—';
 
   return h(
     'div',
@@ -204,4 +208,8 @@ function miniStat(label: string, value: string): HTMLElement {
     h('div', { class: 'text-heading-sm uppercase text-ink-tertiary mb-0.5' }, label),
     h('div', { class: 'text-body text-ink-secondary font-mono tabular' }, value)
   );
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }

@@ -1,7 +1,12 @@
 import { h, mount } from '../../lib/dom';
-import { effect } from '../../lib/signals';
+import { effect, effectScope, onCleanup } from '../../lib/signals';
 import { link, navigate, currentPath } from '../../lib/router';
-import { describeAgent, describeStatus, episodeTitle } from '../../lib/format';
+import {
+  describeAgent,
+  describeEpisodeStatus,
+  describeStatus,
+  episodeTitle,
+} from '../../lib/format';
 import { StatusPill } from '../../components/StatusPill';
 import { Button } from '../../components/Button';
 import { StepProgress } from '../../components/StepProgress';
@@ -40,6 +45,9 @@ export function Episode(target: HTMLElement, episodeId: string): void {
   watchEpisode(episodeId);
 
   const content = h('div');
+  let mountedSection: SectionKey | null = null;
+  let disposeContent: (() => void) | null = null;
+  onCleanup(() => disposeContent?.());
 
   const header = h('header', {
     class: 'px-10 pt-8 pb-6 border-b border-border-subtle sticky top-0 bg-canvas/90 backdrop-blur-sm z-10',
@@ -70,7 +78,11 @@ export function Episode(target: HTMLElement, episodeId: string): void {
 
     header.replaceChildren(renderHeader(ep, episodeId));
     const section = sectionFromPath(currentPath(), episodeId);
-    renderSection(content, ep, episodeId, section);
+    // Live status updates must not discard draft fields or restart playback.
+    if (mountedSection === section && (section === 'metadata' || section === 'audio')) return;
+    mountedSection = section;
+    disposeContent?.();
+    disposeContent = effectScope(() => renderSection(content, ep, episodeId, section));
   });
 
   mount(target, page);
@@ -104,10 +116,12 @@ function renderHeader(
   ep: Record<string, unknown>,
   episodeId: string
 ): HTMLElement {
-  const status = describeStatus(ep.status as string, {
+  const statusContext = {
     cropConfig: ep.crop_config,
     clips: ep.clips as unknown[] | undefined,
-  });
+  };
+  const rawStatus = describeStatus(ep.status as string, statusContext);
+  const status = describeEpisodeStatus(ep, statusContext);
   const title = episodeTitle(ep, episodeId);
   const subtitle = (ep.guest_title as string) || (ep.episode_name as string) || '';
   const pipeline = ep.pipeline as Record<string, unknown> | undefined;
@@ -146,7 +160,7 @@ function renderHeader(
     })
   );
 
-  const isProcessing = status.key === 'processing';
+  const isProcessing = rawStatus.key === 'processing';
 
   return h(
     'div',
@@ -192,7 +206,7 @@ function renderHeader(
             )
           : null
       ),
-      primaryActionFor(status.key, episodeId)
+      primaryActionFor(rawStatus.key, episodeId, ep)
     ),
     isProcessing && agents.length > 0
       ? h(
@@ -223,7 +237,26 @@ function renderHeader(
   );
 }
 
-function primaryActionFor(key: string, episodeId: string): HTMLElement | null {
+function primaryActionFor(
+  key: string,
+  episodeId: string,
+  ep: Record<string, unknown>
+): HTMLElement | null {
+  const delivery = ep.delivery as Record<string, unknown> | undefined;
+  if (delivery?.video_status === 'ready' && delivery.video_download_url) {
+    return Button({
+      variant: 'primary',
+      label: 'Upload files ready',
+      onClick: () => navigate(`/episodes/${episodeId}/delivery`),
+    });
+  }
+  if (delivery?.video_status === 'preparing' || delivery?.status === 'preparing') {
+    return Button({
+      variant: 'primary',
+      label: 'View preparation',
+      onClick: () => navigate(`/episodes/${episodeId}/delivery`),
+    });
+  }
   switch (key) {
     case 'awaiting_crop':
       return Button({
@@ -236,6 +269,12 @@ function primaryActionFor(key: string, episodeId: string): HTMLElement | null {
         variant: 'primary',
         label: 'Review longform',
         onClick: () => navigate(`/episodes/${episodeId}/longform/review`),
+      });
+    case 'ready_to_render':
+      return Button({
+        variant: 'primary',
+        label: 'Prepare for upload',
+        onClick: () => navigate(`/episodes/${episodeId}/delivery`),
       });
     case 'awaiting_clip_review':
       return Button({
@@ -299,4 +338,3 @@ function errorHeader(err: string): HTMLElement {
     )
   );
 }
-

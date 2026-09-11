@@ -212,15 +212,25 @@ function renderControls(
   state: Signal<SyncState>,
   s: SyncState
 ): Node[] {
+  const setOffset = (value: number): void => {
+    const current = state.peek();
+    if (current.graph) current.graph.dispose();
+    state.set({
+      ...current,
+      currentOffset: value,
+      graph: null,
+      audioPlaying: false,
+      audioLoading: false,
+      audioError: null,
+    });
+  };
   const nudge = (delta: number): HTMLElement =>
     h(
       'button',
       {
         onclick: () => {
           const next = roundOffset(state.peek().currentOffset + delta);
-          state.set({ ...state.peek(), currentOffset: next });
-          const g = state.peek().graph;
-          if (g) g.updateDelay('h6e', next > 0 ? next : 0);
+          setOffset(next);
         },
         class:
           'h-8 px-2.5 rounded-md border border-border bg-surface-2 text-body-sm font-mono tabular text-ink-primary hover:bg-surface-3',
@@ -237,9 +247,7 @@ function renderControls(
     oninput: (e: Event) => {
       const v = Number((e.target as HTMLInputElement).value);
       if (!isNaN(v)) {
-        state.set({ ...state.peek(), currentOffset: v });
-        const g = state.peek().graph;
-        if (g) g.updateDelay('h6e', v > 0 ? v : 0);
+        setOffset(v);
       }
     },
   });
@@ -248,8 +256,7 @@ function renderControls(
     variant: 'ghost',
     size: 'sm',
     label: 'Reset to auto',
-    onClick: () =>
-      state.set({ ...state.peek(), currentOffset: state.peek().originalOffset }),
+    onClick: () => setOffset(state.peek().originalOffset),
     disabled: s.currentOffset === s.originalOffset,
   });
 
@@ -263,10 +270,15 @@ function renderControls(
       state.set({ ...state.peek(), saving: true });
       try {
         await api.saveSyncOffset(episodeId, state.peek().currentOffset);
+        const graph = state.peek().graph;
+        if (graph) graph.dispose();
         state.set({
           ...state.peek(),
           saving: false,
           originalOffset: state.peek().currentOffset,
+          graph: null,
+          audioPlaying: false,
+          audioError: null,
         });
         showToast('Sync offset saved.', 'success');
       } catch (e) {
@@ -286,9 +298,11 @@ function renderControls(
           ? 'bg-accent text-ink-on-accent border-transparent'
           : 'bg-surface-2 text-ink-primary border-border hover:bg-surface-3',
       ].join(' '),
-      disabled: s.audioLoading,
+      disabled: s.audioLoading || s.currentOffset !== s.originalOffset,
       title: s.audioError
         ? s.audioError
+        : s.currentOffset !== s.originalOffset
+        ? 'Save the offset before previewing it'
         : 'Play camera + H6E together with the current offset',
     },
     s.audioLoading
@@ -304,6 +318,8 @@ function renderControls(
       null,
       s.audioLoading
         ? 'Loading audio…'
+        : s.currentOffset !== s.originalOffset
+        ? 'Save to preview'
         : s.audioPlaying
         ? 'Stop'
         : 'Play preview'
@@ -372,10 +388,9 @@ function togglePlayback(
     state.set({ ...state.peek(), audioPlaying: true });
     return;
   }
-  // First play — lazy-build the graph. Camera L channel plus the H6E sync
-  // track (TrLR by convention, but the stem name has the recorder's
-  // timestamp prefix so we look it up from audio_sync.sync_track).
-  const offset = state.peek().currentOffset;
+  // The audio-preview route already applies the saved sync offset. Requiring
+  // save before playback keeps this preview identical to the render path and
+  // avoids applying the offset a second time in Web Audio.
   const h6eStem = findSyncStem();
   if (!h6eStem) {
     state.set({
@@ -395,11 +410,11 @@ function togglePlayback(
     {
       key: 'h6e',
       url: `/api/episodes/${episodeId}/audio-preview/${encodeURIComponent(h6eStem)}`,
-      delaySeconds: offset > 0 ? offset : 0,
     },
   ]);
   state.set({ ...state.peek(), graph, audioLoading: true });
   graph.ready.then(() => {
+    if (state.peek().graph !== graph) return;
     // If any stem failed, surface it and abort
     const errors: string[] = [];
     for (const [key, node] of graph.tracks.entries()) {
@@ -483,8 +498,9 @@ function drawWaveform(canvas: HTMLCanvasElement, s: SyncState): void {
 
   // Draw camera peaks (top half, accent-amber)
   drawHalf(ctx, s.cameraPeaks, s.peaksPerSecond, s.viewStart, s.viewEnd, w, midY, halfH, '#f5a524', 0);
-  // Draw h6e peaks (bottom half, teal, shifted by offset)
-  drawHalf(ctx, s.h6ePeaks, s.peaksPerSecond, s.viewStart, s.viewEnd, w, midY, halfH, '#6bb7b7', -s.currentOffset);
+  // The server returns waveforms aligned using the saved offset. Only draw
+  // the unsaved adjustment here; shifting by the full offset applies it twice.
+  drawHalf(ctx, s.h6ePeaks, s.peaksPerSecond, s.viewStart, s.viewEnd, w, midY, halfH, '#6bb7b7', s.currentOffset - s.originalOffset);
 
   // Track labels
   ctx.textAlign = 'right';

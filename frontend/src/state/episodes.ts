@@ -1,4 +1,4 @@
-import { signal } from '../lib/signals';
+import { signal, onCleanup } from '../lib/signals';
 import { api, type EpisodeSummary, type UnknownRecord } from '../lib/api';
 
 export const episodes = signal<EpisodeSummary[] | null>(null);
@@ -8,7 +8,8 @@ const EPISODES_POLL_MS = 8000;
 
 async function refreshEpisodes(): Promise<void> {
   try {
-    episodes.set(await api.listEpisodes());
+    const next = await api.listEpisodes();
+    if (JSON.stringify(next) !== JSON.stringify(episodes.peek())) episodes.set(next);
   } catch {
     // Poll will retry.
   }
@@ -33,7 +34,7 @@ async function loadDetail(id: string): Promise<void> {
   try {
     const d = await api.getEpisode(id);
     if (episodeDetailId.peek() === id) {
-      episodeDetail.set(d);
+      if (JSON.stringify(d) !== JSON.stringify(episodeDetail.peek())) episodeDetail.set(d);
       episodeDetailError.set(null);
     }
   } catch (e) {
@@ -44,7 +45,12 @@ async function loadDetail(id: string): Promise<void> {
 }
 
 export function watchEpisode(id: string | null): void {
+  if (id) onCleanup(() => {
+    if (episodeDetailId.peek() === id) watchEpisode(null);
+  });
+  if (episodeDetailId.peek() === id) return;
   episodeDetailId.set(id);
+  episodeDetailError.set(null);
   if (detailTimer != null) {
     clearInterval(detailTimer);
     detailTimer = null;

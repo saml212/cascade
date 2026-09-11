@@ -1,6 +1,6 @@
 import { h } from '../lib/dom';
 import { effect } from '../lib/signals';
-import { agentPanelCollapsed, toggleAgentPanel } from '../state/ui';
+import { agentPanelCollapsed, compactShell, toggleAgentPanel } from '../state/ui';
 import { episodeDetailId } from '../state/episodes';
 import { Icon } from './icons';
 import { EventFeed } from './EventFeed';
@@ -13,7 +13,13 @@ export function AgentPanel(): HTMLElement {
 
   effect(() => {
     const collapsed = agentPanelCollapsed();
-    host.style.width = collapsed ? '48px' : '380px';
+    const compact = compactShell();
+    host.classList.toggle('absolute', compact);
+    host.classList.toggle('right-0', compact);
+    host.classList.toggle('top-0', compact);
+    host.classList.toggle('h-full', compact);
+    host.classList.toggle('shadow-2xl', compact && !collapsed);
+    host.style.width = collapsed ? '48px' : compact ? 'min(380px, calc(100vw - 64px))' : '380px';
     host.replaceChildren(collapsed ? collapsedView() : expandedView());
   });
 
@@ -41,7 +47,7 @@ export function AgentPanel(): HTMLElement {
   function expandedView(): HTMLElement {
     return h(
       'div',
-      { class: 'h-full w-[380px] flex flex-col' },
+      { class: 'h-full w-full flex flex-col' },
       h(
         'div',
         {

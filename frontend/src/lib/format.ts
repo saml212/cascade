@@ -14,6 +14,17 @@ export function formatDuration(seconds: number | null | undefined): string {
   return `${sec}s`;
 }
 
+/** Prefer the verified edited delivery duration; otherwise show source duration. */
+export function episodeDisplayDuration(
+  episode: Record<string, unknown>
+): number | null | undefined {
+  const delivery = episode.delivery as Record<string, unknown> | null | undefined;
+  if (delivery?.status === 'ready' && typeof delivery.duration_seconds === 'number') {
+    return delivery.duration_seconds;
+  }
+  return episode.duration_seconds as number | null | undefined;
+}
+
 export function formatTimecode(seconds: number | null | undefined): string {
   if (seconds == null || !isFinite(seconds)) return '--:--';
   const s = Math.max(0, Math.round(seconds));
@@ -58,8 +69,13 @@ export function formatRelative(iso: string | null | undefined): string {
 
 /* ---------------------- Status → plain-English mapping --------------------- */
 
-type StatusKey =
+export type StatusKey =
   | 'queued'
+  | 'ready_to_render'
+  | 'delivery_preparing_audio'
+  | 'delivery_preparing_video'
+  | 'delivery_audio_ready'
+  | 'delivery_ready'
   | 'processing'
   | 'awaiting_crop'
   | 'awaiting_longform_review'
@@ -86,6 +102,31 @@ export interface StatusDescriptor {
 
 /** Descriptor shape keyed by StatusKey. */
 const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
+  ready_to_render: {
+    tone: 'waiting',
+    label: 'Ready to prepare',
+    hint: 'Settings saved. Prepare files for upload.',
+  },
+  delivery_preparing_audio: {
+    tone: 'working',
+    label: 'Preparing audio',
+    hint: 'Building and checking the podcast master.',
+  },
+  delivery_preparing_video: {
+    tone: 'working',
+    label: 'Preparing video',
+    hint: 'Building and checking the upload video.',
+  },
+  delivery_audio_ready: {
+    tone: 'waiting',
+    label: 'Audio ready',
+    hint: 'Podcast audio is verified. Prepare the upload video when ready.',
+  },
+  delivery_ready: {
+    tone: 'success',
+    label: 'Ready for upload',
+    hint: 'Verified audio and video files are ready to download.',
+  },
   processing: {
     tone: 'working',
     label: 'Processing',
@@ -136,6 +177,7 @@ const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
 
 /** Raw backend strings that map onto each canonical StatusKey. */
 const STATUS_ALIASES: Record<string, StatusKey> = {
+  ready_to_render: 'ready_to_render',
   processing: 'processing',
   running: 'processing',
   awaiting_crop_setup: 'awaiting_crop',
@@ -206,6 +248,30 @@ export function describeStatus(
     ? raw.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
     : 'Unknown';
   return { key: 'queued', tone: 'neutral', label, hint: '' };
+}
+
+/** Resolve user-facing status from raw pipeline state plus verified delivery state. */
+export function describeEpisodeStatus(
+  episode: Record<string, unknown>,
+  context?: { cropConfig?: unknown; clips?: unknown[] }
+): StatusDescriptor {
+  const base = describeStatus(episode.status as string | undefined, context);
+  if (base.key === 'live') return base;
+  const delivery = episode.delivery as Record<string, unknown> | null | undefined;
+  if (!delivery) return base;
+  if (delivery.video_status === 'preparing') {
+    return { key: 'delivery_preparing_video', ...STATUS.delivery_preparing_video };
+  }
+  if (delivery.status === 'preparing') {
+    return { key: 'delivery_preparing_audio', ...STATUS.delivery_preparing_audio };
+  }
+  if (delivery.status === 'ready' && delivery.video_status === 'ready') {
+    return { key: 'delivery_ready', ...STATUS.delivery_ready };
+  }
+  if (delivery.status === 'ready') {
+    return { key: 'delivery_audio_ready', ...STATUS.delivery_audio_ready };
+  }
+  return base;
 }
 
 /* ---------------------- Agent → plain-English mapping --------------------- */

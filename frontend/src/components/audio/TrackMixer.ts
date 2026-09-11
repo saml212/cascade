@@ -34,6 +34,8 @@ interface TrackRow {
   trackNumber: number | null;
   /** Session prefix when multiple H6E sessions exist, e.g. "260429_105232". Empty string = no disambig needed. */
   sessionLabel: string;
+  /** Logical numbered input tracks may span consecutive recorder files. */
+  logicalTrack: boolean;
 }
 
 const SPEAKER_VARS = [
@@ -106,6 +108,7 @@ function buildRows(): TrackRow[] {
   const multiSession = sessionPrefixes.size > 1;
 
   const rows: TrackRow[] = [];
+  const addedLogicalTracks = new Set<number>();
 
   for (const t of tracks) {
     const fn = (t.filename as string) ?? '';
@@ -113,10 +116,24 @@ function buildRows(): TrackRow[] {
     const stem = fn.replace(/\.[^./]+$/, ''); // strip extension
     const trackType = (t.track_type as string) ?? '';
     const trackNumber = (t.track_number as number | null | undefined) ?? null;
+    const logicalTrack = trackType === 'input' && trackNumber != null;
+    if (logicalTrack && addedLogicalTracks.has(trackNumber)) continue;
+    if (logicalTrack) addedLogicalTracks.add(trackNumber);
 
     // Session prefix, e.g. "260429_105232" — present only for H6E-style names.
     const sessionMatch = fn.match(/^(\d{6}_\d{6})_/);
-    const sessionLabel = multiSession && sessionMatch ? sessionMatch[1] : '';
+    const segmentCount = logicalTrack
+      ? tracks.filter(
+          (candidate) =>
+            candidate.track_type === 'input' &&
+            candidate.track_number === trackNumber
+        ).length
+      : 1;
+    const sessionLabel = segmentCount > 1
+      ? `${segmentCount} consecutive segments`
+      : multiSession && sessionMatch
+      ? sessionMatch[1]
+      : '';
 
     // Human-readable label for the stem part (after the session prefix).
     let stemLabel: string;
@@ -137,11 +154,12 @@ function buildRows(): TrackRow[] {
     }
 
     rows.push({
-      key: stem,
+      key: logicalTrack ? `track-${trackNumber}` : stem,
       label: stemLabel,
       stem,
       trackNumber,
       sessionLabel,
+      logicalTrack,
     });
   }
 
@@ -171,7 +189,20 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
     const ep = episodeDetail();
     if (ep) {
       const built = buildRows();
-      if (built.length !== rows.peek().length) {
+      const previousKeys = rows.peek().map((row) => row.key).join('\n');
+      const nextKeys = built.map((row) => row.key).join('\n');
+      if (nextKeys !== previousKeys) {
+        const graph = state.peek().graph;
+        if (graph) graph.dispose();
+        state.set({
+          ...state.peek(),
+          graph: null,
+          playing: false,
+          loading: false,
+          error: null,
+          solo: null,
+          muted: {},
+        });
         rows.set(built);
       }
     }
@@ -189,7 +220,7 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
           { class: 'text-heading-sm uppercase text-ink-tertiary' },
           'Track mixer'
         ),
-        playButton(props.episodeId, state, s, currentRows)
+        playButton(props, state, s, currentRows)
       ),
       h(
         'p',
@@ -240,7 +271,7 @@ export function TrackMixer(props: TrackMixerProps): HTMLElement {
 }
 
 function playButton(
-  episodeId: string,
+  props: TrackMixerProps,
   state: Signal<MixerState>,
   s: MixerState,
   currentRows: TrackRow[]
@@ -272,11 +303,15 @@ function playButton(
     const graph = createAudioGraph(
       currentRows.map((r) => ({
         key: r.key,
-        url: `/api/episodes/${episodeId}/audio-preview/${encodeURIComponent(r.stem)}`,
+        url: r.logicalTrack
+          ? `/api/episodes/${props.episodeId}/audio-preview/track/${r.trackNumber}`
+          : `/api/episodes/${props.episodeId}/audio-preview/${encodeURIComponent(r.stem)}`,
       }))
     );
+    state.set({ ...state.peek(), graph });
     try {
       await graph.ready;
+      if (state.peek().graph !== graph) return;
       const errors: string[] = [];
       for (const [k, n] of graph.tracks.entries()) {
         if (n.error) errors.push(`${k}: ${n.error}`);
@@ -284,6 +319,7 @@ function playButton(
       if (errors.length === currentRows.length) {
         state.set({
           ...state.peek(),
+          graph: null,
           loading: false,
           error: 'No stems loaded. Rendered audio may not exist yet.',
         });
@@ -291,11 +327,28 @@ function playButton(
         graph.dispose();
         return;
       }
+      // Match the persisted crop configuration from the first sample. Before
+      // this, previews always started at 100% until each slider was touched.
+      const speakers = props.getSpeakers();
+      const ambient = props.getAmbient();
+      for (const row of currentRows) {
+        const speaker = row.trackNumber == null
+          ? undefined
+          : speakers.find((item) => item.track === row.trackNumber);
+        const ambientTrack = ambient.find(
+          (item) =>
+            (item.track_number != null && item.track_number === row.trackNumber) ||
+            item.stem === row.stem
+        );
+        graph.setTrackGain(row.key, speaker?.volume ?? ambientTrack?.volume ?? 1);
+      }
       graph.play();
       state.set({ ...state.peek(), graph, loading: false, playing: true });
     } catch (e) {
+      if (state.peek().graph !== graph) return;
       state.set({
         ...state.peek(),
+        graph: null,
         loading: false,
         error: (e as Error).message,
       });

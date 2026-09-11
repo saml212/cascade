@@ -1,4 +1,4 @@
-import { signal } from './signals';
+import { signal, effectScope } from './signals';
 
 type Params = Record<string, string>;
 type Handler = (params: Params) => void;
@@ -6,6 +6,7 @@ type Route = { keys: string[]; pattern: RegExp; handler: Handler };
 
 const routes: Route[] = [];
 let fallback: Handler | null = null;
+let disposeScreen: (() => void) | null = null;
 
 export const currentPath = signal<string>(readPath());
 
@@ -47,6 +48,8 @@ export function link(path: string): { href: string; onclick: (e: Event) => void 
 
 function dispatch(): void {
   const path = readPath();
+  disposeScreen?.();
+  disposeScreen = null;
   currentPath.set(path);
   for (const r of routes) {
     const m = path.match(r.pattern);
@@ -55,11 +58,11 @@ function dispatch(): void {
       r.keys.forEach((k, i) => {
         params[k] = decodeURIComponent(m[i + 1]);
       });
-      r.handler(params);
+      disposeScreen = effectScope(() => r.handler(params));
       return;
     }
   }
-  fallback?.({});
+  disposeScreen = effectScope(() => fallback?.({}));
 }
 
 export function startRouter(): void {

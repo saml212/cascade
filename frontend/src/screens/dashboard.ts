@@ -3,7 +3,8 @@ import { effect } from '../lib/signals';
 import { episodes, startEpisodesPoll } from '../state/episodes';
 import { type EpisodeSummary } from '../lib/api';
 import {
-  describeStatus,
+  describeEpisodeStatus,
+  episodeDisplayDuration,
   episodeTitle,
   formatDuration,
   formatRelative,
@@ -15,6 +16,10 @@ import { Icon } from '../components/icons';
 import { link, navigate } from '../lib/router';
 
 const PRIORITY: Record<string, number> = {
+  delivery_ready: 95,
+  delivery_audio_ready: 75,
+  delivery_preparing_video: 65,
+  delivery_preparing_audio: 65,
   awaiting_crop: 100,
   awaiting_longform_review: 90,
   awaiting_clip_review: 85,
@@ -30,7 +35,7 @@ const PRIORITY: Record<string, number> = {
 function pickSpotlight(list: EpisodeSummary[]): EpisodeSummary | null {
   if (list.length === 0) return null;
   const scored = list.map((ep) => {
-    const key = describeStatus(ep.status, { cropConfig: ep.has_crop_config, clips: ep.clips }).key;
+    const key = statusOf(ep).key;
     return { ep, score: PRIORITY[key] ?? 0 };
   });
   // Highest priority first; within the same priority, newest created_at wins.
@@ -172,10 +177,7 @@ function emptyHero(): HTMLElement {
 }
 
 function heroSpotlight(ep: EpisodeSummary): HTMLElement {
-  const status = describeStatus(ep.status, {
-    cropConfig: ep.has_crop_config,
-    clips: ep.clips,
-  });
+  const status = statusOf(ep);
   const cta = ctaFor(ep);
   const target = ctaTarget(ep, status.key);
 
@@ -220,7 +222,12 @@ function heroSpotlight(ep: EpisodeSummary): HTMLElement {
         h(
           'div',
           { class: 'flex flex-wrap items-center gap-x-6 gap-y-1 mt-6 text-body-sm text-ink-secondary' },
-          meta('Duration', formatDuration(ep.duration_seconds)),
+          meta(
+            'Duration',
+            formatDuration(
+              episodeDisplayDuration(ep as unknown as Record<string, unknown>)
+            )
+          ),
           meta('Created', formatRelative(ep.created_at)),
           meta('Clips', clipCountOf(ep) > 0 ? String(clipCountOf(ep)) : '—')
         ),
@@ -263,8 +270,15 @@ function meta(label: string, value: string): HTMLElement {
 }
 
 function ctaFor(ep: EpisodeSummary): { label: string } {
-  const key = describeStatus(ep.status, { cropConfig: ep.has_crop_config, clips: ep.clips }).key;
+  const key = statusOf(ep).key;
   switch (key) {
+    case 'delivery_ready':
+      return { label: 'Open upload files →' };
+    case 'delivery_audio_ready':
+      return { label: 'Prepare video →' };
+    case 'delivery_preparing_audio':
+    case 'delivery_preparing_video':
+      return { label: 'View preparation →' };
     case 'awaiting_crop':
       return { label: 'Set up crops →' };
     case 'awaiting_longform_review':
@@ -289,6 +303,11 @@ function ctaFor(ep: EpisodeSummary): { label: string } {
 function ctaTarget(ep: EpisodeSummary, key: string): string {
   const base = `/episodes/${ep.episode_id}`;
   switch (key) {
+    case 'delivery_ready':
+    case 'delivery_audio_ready':
+    case 'delivery_preparing_audio':
+    case 'delivery_preparing_video':
+      return `${base}/delivery`;
     case 'awaiting_crop':
       return `${base}/crop-setup`;
     case 'awaiting_longform_review':
@@ -326,10 +345,7 @@ function episodesTable(list: EpisodeSummary[]): HTMLElement {
       h('div', { class: 'text-right' }, 'Created')
     ),
     ...rows.map((ep) => {
-      const status = describeStatus(ep.status, {
-    cropConfig: ep.has_crop_config,
-    clips: ep.clips,
-  });
+      const status = statusOf(ep);
       return h(
         'a',
         {
@@ -363,7 +379,9 @@ function episodesTable(list: EpisodeSummary[]): HTMLElement {
           {
             class: 'text-body text-ink-primary font-mono tabular text-right',
           },
-          formatDuration(ep.duration_seconds)
+          formatDuration(
+            episodeDisplayDuration(ep as unknown as Record<string, unknown>)
+          )
         ),
         h(
           'div',
@@ -382,4 +400,11 @@ function episodesTable(list: EpisodeSummary[]): HTMLElement {
       );
     })
   );
+}
+
+function statusOf(ep: EpisodeSummary) {
+  return describeEpisodeStatus(ep as unknown as Record<string, unknown>, {
+    cropConfig: ep.has_crop_config,
+    clips: ep.clips,
+  });
 }

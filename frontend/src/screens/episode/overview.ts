@@ -1,21 +1,25 @@
+import { Button } from '../../components/Button';
+import { api } from '../../lib/api';
 import { h } from '../../lib/dom';
 import {
   CANONICAL_AGENTS,
   describeAgent,
-  describeStatus,
+  describeEpisodeStatus,
+  episodeDisplayDuration,
   formatDuration,
   formatRelative,
   pluralize,
   summarizeErrorText,
 } from '../../lib/format';
 import { navigate } from '../../lib/router';
+import { showToast } from '../../state/ui';
 
 export function renderOverview(
   target: HTMLElement,
   ep: Record<string, unknown>,
   episodeId: string
 ): void {
-  const status = describeStatus(ep.status as string, {
+  const status = describeEpisodeStatus(ep, {
     cropConfig: ep.crop_config,
     clips: ep.clips as unknown[] | undefined,
   });
@@ -33,11 +37,17 @@ export function renderOverview(
 
   const cropConfigured = !!(ep.crop_config as unknown);
   const hasSync = !!(ep.audio_sync as unknown);
+  const retryPreparation = shouldOfferPreparationRetry(ep, pipeline, completed, errors);
+  const delivery = ep.delivery as Record<string, unknown> | undefined;
+  const deliveryVideoReady =
+    delivery?.video_status === 'ready' && !!delivery.video_download_url;
+  const deliveryPreparing =
+    delivery?.status === 'preparing' || delivery?.video_status === 'preparing';
 
   target.replaceChildren(
     h(
       'div',
-      { class: 'grid grid-cols-[2fr_1fr] gap-6' },
+      { class: 'grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-6' },
       // Main column
       h(
         'div',
@@ -67,17 +77,56 @@ export function renderOverview(
                   describeAgent(pipeline.current_agent as string)
                 )
               )
+            : null,
+          retryPreparation
+            ? h(
+                'div',
+                { class: 'mt-5 flex flex-col items-start gap-2' },
+                Button({
+                  variant: 'secondary',
+                  label: 'Retry preparation',
+                  onClick: async () => {
+                    try {
+                      await api.runPipeline(episodeId, {
+                        agents: ['ingest', 'stitch', 'audio_analysis'],
+                      });
+                      showToast('Preparation restarted safely.', 'success');
+                    } catch (error) {
+                      showToast(
+                        `Could not restart preparation: ${(error as Error).message}`,
+                        'error'
+                      );
+                    }
+                  },
+                }),
+                h(
+                  'p',
+                  { class: 'text-body-sm text-ink-tertiary' },
+                  'Retries source import and analysis only. It will not render or publish.'
+                )
+              )
+            : null,
+          deliveryVideoReady || deliveryPreparing
+            ? h(
+                'div',
+                { class: 'mt-5' },
+                Button({
+                  variant: 'primary',
+                  label: deliveryVideoReady ? 'Open upload files' : 'View preparation',
+                  onClick: () => navigate(`/episodes/${episodeId}/delivery`),
+                })
+              )
             : null
         ),
 
-        // Full canonical 14-stage pipeline timeline
+        // Keep processing diagnostics available without making them the workflow.
         h(
-          'div',
+          'details',
           { class: 'panel p-6' },
           h(
-            'h3',
-            { class: 'text-heading-md text-ink-primary mb-4' },
-            'Pipeline'
+            'summary',
+            { class: 'text-heading-md text-ink-secondary cursor-pointer' },
+            'Processing details'
           ),
           agentTimeline(
             canonicalSequence(completed, requested),
@@ -118,13 +167,13 @@ export function renderOverview(
             { class: 'text-heading-sm uppercase text-ink-tertiary mb-3' },
             'Details'
           ),
-          detailRow('Duration', formatDuration(ep.duration_seconds as number)),
+          detailRow('Duration', formatDuration(episodeDisplayDuration(ep))),
           detailRow('Created', formatRelative(ep.created_at as string)),
           detailRow(
             'Speakers',
             cropConfigured ? speakerCountOf(ep) : 'not set'
           ),
-          detailRow('Audio sync', hasSync ? 'Verified' : 'n/a'),
+          detailRow('Audio sync', hasSync ? 'Configured' : 'Camera audio'),
           detailRow('Clips', pluralize(clips.length, 'clip')),
           tags.length > 0 ? detailRow('Tags', `${tags.length}`) : null
         ),
@@ -132,24 +181,54 @@ export function renderOverview(
           'div',
           { class: 'flex flex-col gap-2' },
           navigationRow(
-            'Crop setup',
-            'Adjust speaker crops + audio sync',
+            '1. Picture and sound',
+            'Frame speakers and check microphone tracks',
             () => navigate(`/episodes/${episodeId}/crop-setup`)
           ),
-          navigationRow('Longform review', 'Watch the cut, request edits', () =>
+          navigationRow('2. Episode details', 'Set the title and description', () =>
+            navigate(`/episodes/${episodeId}/metadata`)
+          ),
+          navigationRow(deliveryVideoReady ? '3. Upload files ready' : deliveryPreparing ? '3. Preparing upload files' : '3. Prepare for upload', deliveryVideoReady ? 'Review and download the verified files' : deliveryPreparing ? 'See preparation progress' : 'Trim, master, and download finished files', () =>
+            navigate(`/episodes/${episodeId}/delivery`)
+          ),
+          h('details', { class: 'panel px-5 py-4' },
+            h('summary', { class: 'text-body text-ink-secondary cursor-pointer' }, 'Additional tools'),
+            h('div', { class: 'flex flex-col gap-2 mt-3' },
+          navigationRow('Longform review', 'Review an edited video', () =>
             navigate(`/episodes/${episodeId}/longform/review`)
           ),
-          navigationRow('Clip review', 'Keep/reject the 10 shorts, sign off per-platform', () =>
+          navigationRow('Clip review', 'Review generated short clips', () =>
             navigate(`/episodes/${episodeId}/clips/review`)
           ),
           navigationRow('Publish', 'Schedule across platforms', () =>
             navigate(`/episodes/${episodeId}/publish`)
+          )
+            )
           )
         )
       )
     )
   );
 
+}
+
+function shouldOfferPreparationRetry(
+  ep: Record<string, unknown>,
+  pipeline: Record<string, unknown> | undefined,
+  completed: string[],
+  errors: Record<string, string>
+): boolean {
+  const status = String(ep.status ?? '');
+  if (status === 'error' || status === 'cancelled') return true;
+  if (['ingest', 'stitch', 'audio_analysis'].some((name) => errors[name])) return true;
+  if (status !== 'processing' || pipeline?.current_agent) return false;
+  if (!pipeline?.agents_requested) return true;
+  const started = Date.parse(String(pipeline.started_at ?? ep.created_at ?? ''));
+  const stalled = Number.isFinite(started) && Date.now() - started > 120_000;
+  return (
+    stalled &&
+    !['ingest', 'stitch', 'audio_analysis'].every((name) => completed.includes(name))
+  );
 }
 
 function detailRow(label: string, value: string): HTMLElement {

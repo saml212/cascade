@@ -6,23 +6,21 @@
 
 import { h } from '../../lib/dom';
 import { signal, effect, type Signal } from '../../lib/signals';
-import { api, type EpisodeUpdateRequest } from '../../lib/api';
+import { api } from '../../lib/api';
 import { Button } from '../../components/Button';
 import { showToast } from '../../state/ui';
+import {
+  acceptSavedPatch,
+  buildMetadataPatch,
+  metadataValues,
+  type MetadataField,
+  type MetadataValues,
+} from '../../lib/metadata-draft';
 
-interface DraftState {
-  guest_name: string;
-  guest_title: string;
-  episode_name: string;
-  episode_description: string;
-  title: string;
-  description: string;
-  tags: string;
-  youtube_longform_url: string;
-  spotify_longform_url: string;
-  link_tree_url: string;
+interface DraftState extends MetadataValues {
   saving: boolean;
   dirty: boolean;
+  revision: number;
 }
 
 export function renderMetadata(
@@ -30,42 +28,36 @@ export function renderMetadata(
   ep: Record<string, unknown>,
   episodeId: string
 ): void {
+  let saved = metadataValues(ep);
   const draft = signal<DraftState>({
-    guest_name: (ep.guest_name as string) ?? '',
-    guest_title: (ep.guest_title as string) ?? '',
-    episode_name: (ep.episode_name as string) ?? '',
-    episode_description: (ep.episode_description as string) ?? '',
-    title: (ep.title as string) ?? '',
-    description: (ep.description as string) ?? '',
-    tags: ((ep.tags as string[]) ?? []).join(', '),
-    youtube_longform_url: (ep.youtube_longform_url as string) ?? '',
-    spotify_longform_url: (ep.spotify_longform_url as string) ?? '',
-    link_tree_url: (ep.link_tree_url as string) ?? '',
+    ...saved,
     saving: false,
     dirty: false,
+    revision: 0,
   });
 
   async function save(): Promise<void> {
     const d = draft.peek();
+    const submitted = valuesOf(d);
+    const payload = buildMetadataPatch(saved, submitted);
+    const fields = Object.keys(payload) as MetadataField[];
+    if (fields.length === 0) {
+      draft.set({ ...d, dirty: false });
+      return;
+    }
+    const submittedVersion = d.revision;
     draft.set({ ...d, saving: true });
-    const payload: EpisodeUpdateRequest = {
-      guest_name: d.guest_name.trim(),
-      guest_title: d.guest_title.trim(),
-      episode_name: d.episode_name.trim(),
-      episode_description: d.episode_description.trim(),
-      title: d.title.trim(),
-      description: d.description.trim(),
-      tags: d.tags
-        .split(',')
-        .map((t) => t.trim())
-        .filter(Boolean),
-      youtube_longform_url: d.youtube_longform_url.trim(),
-      spotify_longform_url: d.spotify_longform_url.trim(),
-      link_tree_url: d.link_tree_url.trim(),
-    };
     try {
       await api.updateEpisode(episodeId, payload);
-      draft.set({ ...draft.peek(), saving: false, dirty: false });
+      saved = acceptSavedPatch(saved, submitted, fields);
+      const current = draft.peek();
+      const changedDuringSave = current.revision !== submittedVersion;
+      const stillChanged = Object.keys(buildMetadataPatch(saved, valuesOf(current))).length > 0;
+      draft.set({
+        ...current,
+        saving: false,
+        dirty: changedDuringSave || stillChanged,
+      });
       showToast('Metadata saved.', 'success');
     } catch (e) {
       draft.set({ ...draft.peek(), saving: false });
@@ -167,12 +159,13 @@ function sectionHeader(label: string): HTMLElement {
 
 function fieldText(
   draft: Signal<DraftState>,
-  name: keyof DraftState,
+  name: MetadataField,
   label: string,
   hint?: string
 ): HTMLElement {
   const initial = (draft.peek() as unknown as Record<string, unknown>)[name] as string;
   const input = h('input', {
+    id: `metadata-${name}`,
     type: 'text',
     value: initial,
     class:
@@ -183,6 +176,7 @@ function fieldText(
         ...draft.peek(),
         [name]: v,
         dirty: true,
+        revision: draft.peek().revision + 1,
       } as DraftState);
     },
   }) as HTMLInputElement;
@@ -191,7 +185,7 @@ function fieldText(
     { class: 'flex flex-col gap-1.5 min-w-0' },
     h(
       'label',
-      { class: 'text-body-sm text-ink-secondary font-medium' },
+      { for: `metadata-${name}`, class: 'text-body-sm text-ink-secondary font-medium' },
       label
     ),
     input,
@@ -201,12 +195,13 @@ function fieldText(
 
 function fieldTextarea(
   draft: Signal<DraftState>,
-  name: keyof DraftState,
+  name: MetadataField,
   label: string,
   rows = 3
 ): HTMLElement {
   const initial = (draft.peek() as unknown as Record<string, unknown>)[name] as string;
   const input = h('textarea', {
+    id: `metadata-${name}`,
     class:
       'w-full bg-surface-2 border border-border rounded-md px-3 py-2 text-body text-ink-primary leading-relaxed focus:border-accent focus:outline-none resize-vertical',
     rows: String(rows),
@@ -217,6 +212,7 @@ function fieldTextarea(
         ...draft.peek(),
         [name]: v,
         dirty: true,
+        revision: draft.peek().revision + 1,
       } as DraftState);
     },
   }) as HTMLTextAreaElement;
@@ -225,9 +221,14 @@ function fieldTextarea(
     { class: 'flex flex-col gap-1.5' },
     h(
       'label',
-      { class: 'text-body-sm text-ink-secondary font-medium' },
+      { for: `metadata-${name}`, class: 'text-body-sm text-ink-secondary font-medium' },
       label
     ),
     input
   );
+}
+
+function valuesOf(draft: DraftState): MetadataValues {
+  const { saving: _saving, dirty: _dirty, revision: _revision, ...values } = draft;
+  return values;
 }
