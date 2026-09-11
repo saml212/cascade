@@ -1,11 +1,13 @@
 """Episode endpoints."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -16,6 +18,9 @@ from pydantic import BaseModel
 
 from lib.atomic_write import atomic_write_json
 from lib.clips import normalize_clip as _normalize_clip
+from lib.ffprobe import get_dimensions
+from agents.pipeline import load_config
+from server.routes.delivery import _source_fingerprint, _video_fingerprint
 
 
 async def _run_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -39,6 +44,68 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/episodes", tags=["episodes"])
 
 EPISODES_DIR = get_episodes_dir()
+
+_MAX_AUDIO_PREVIEW_SECONDS = 120.0
+
+
+def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
+    """Read cached delivery state without probing media or changing job state."""
+    path = ep_dir / "delivery.json"
+    try:
+        raw = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+    keys = (
+        "status",
+        "completed_at",
+        "download_url",
+        "duration_seconds",
+        "video_status",
+        "video_completed_at",
+        "video_download_url",
+        "video",
+    )
+    snapshot = {key: raw[key] for key in keys if key in raw}
+    try:
+        episode = json.loads((ep_dir / "episode.json").read_text())
+        processing_config = config if config is not None else load_config()
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        episode, processing_config = {}, {}
+
+    # File existence and stat comparisons are cheap and prevent other screens
+    # from presenting a deleted or replaced artifact as verified and ready.
+    if snapshot.get("status") == "ready":
+        audio = ep_dir / "podcast_audio.mp3"
+        stat = raw.get("output_stat")
+        if not audio.exists() or not isinstance(stat, dict):
+            snapshot["status"] = "not_prepared"
+        else:
+            actual = audio.stat()
+            if stat != {"size": actual.st_size, "mtime_ns": actual.st_mtime_ns}:
+                snapshot["status"] = "not_prepared"
+            elif raw.get("source_fingerprint") != _source_fingerprint(
+                ep_dir, episode, processing_config
+            ):
+                snapshot["status"] = "not_prepared"
+    if snapshot.get("video_status") == "ready":
+        video = ep_dir / "upload_video.mp4"
+        stat = raw.get("video_output_stat")
+        if not video.exists() or not isinstance(stat, dict):
+            snapshot["video_status"] = "not_prepared"
+        else:
+            actual = video.stat()
+            if stat != {"size": actual.st_size, "mtime_ns": actual.st_mtime_ns}:
+                snapshot["video_status"] = "not_prepared"
+            else:
+                canonical_audio = ep_dir / "work" / "audio_mix.wav"
+                if not canonical_audio.exists() or raw.get(
+                    "video_source_fingerprint"
+                ) != _video_fingerprint(
+                    ep_dir, episode, processing_config, canonical_audio
+                ):
+                    snapshot["video_status"] = "not_prepared"
+    return snapshot
 
 
 class NewEpisodeRequest(BaseModel):
@@ -72,6 +139,7 @@ async def list_episodes() -> list[dict]:
         return []
 
     episodes = []
+    config = load_config()
     for ep_dir in sorted(EPISODES_DIR.iterdir()):
         if not ep_dir.is_dir():
             continue
@@ -98,6 +166,7 @@ async def list_episodes() -> list[dict]:
                     # "truncated pipeline done, awaiting crop" and "full
                     # pipeline done, awaiting clip review").
                     "has_crop_config": bool(ep.get("crop_config")),
+                    "delivery": _delivery_snapshot(ep_dir, config),
                 }
             )
         except (json.JSONDecodeError, OSError):
@@ -137,10 +206,29 @@ def _derive_filming_timestamp(source_path: Optional[str]) -> Optional[datetime]:
 @router.post("/")
 async def create_episode(req: NewEpisodeRequest) -> dict:
     """Trigger a new episode ingest."""
+    for label, value in (
+        ("Camera source", req.source_path),
+        ("Audio source", req.audio_path),
+    ):
+        if value and not Path(value).expanduser().exists():
+            raise HTTPException(
+                status_code=422, detail=f"{label} does not exist: {value}"
+            )
+    if req.source_path:
+        req.source_path = str(Path(req.source_path).expanduser().absolute())
+    if req.audio_path:
+        req.audio_path = str(Path(req.audio_path).expanduser().absolute())
     logger.info("POST /api/episodes/ source_path=%s", req.source_path)
     filming = _derive_filming_timestamp(req.source_path)
     now = filming or datetime.now(timezone.utc)
     episode_id = f"ep_{now.strftime('%Y-%m-%d')}_{now.strftime('%H%M%S')}"
+
+    # Camera timestamps are stable, so importing the same recording twice
+    # resolves to the same ID. Never overwrite the existing episode metadata.
+    if (EPISODES_DIR / episode_id / "episode.json").exists():
+        raise HTTPException(
+            status_code=409, detail=f"Episode {episode_id} already exists"
+        )
 
     episode = {
         "episode_id": episode_id,
@@ -174,11 +262,13 @@ async def get_episode(episode_id: str) -> dict:
     """Get full episode detail."""
     logger.info("GET /api/episodes/%s", episode_id)
     ep = read_episode(episode_id)
+    ep_dir = EPISODES_DIR / episode_id
+    ep["delivery"] = _delivery_snapshot(ep_dir)
 
     # Stamp the actual longform.mp4 mtime so the UI shows when the file was
     # last written (after a re-mux the mtime is fresh even if pipeline
     # completed_at is weeks old).
-    longform_path = EPISODES_DIR / episode_id / "longform.mp4"
+    longform_path = ep_dir / "longform.mp4"
     if longform_path.exists():
         ep["longform_rendered_at"] = datetime.fromtimestamp(
             longform_path.stat().st_mtime, tz=timezone.utc
@@ -188,7 +278,7 @@ async def get_episode(episode_id: str) -> dict:
     # (approve, reject, update_metadata) write to. episode.json often carries
     # a stale snapshot from initial clip-mining. Always prefer clips.json if
     # it exists.
-    clips_file = EPISODES_DIR / episode_id / "clips.json"
+    clips_file = ep_dir / "clips.json"
     if clips_file.exists():
         try:
             with open(clips_file) as f:
@@ -388,11 +478,13 @@ async def get_video_preview(episode_id: str):
 async def get_sync_preview(episode_id: str, duration: float = 120.0):
     """Return waveform data for camera and H6E audio for visual sync verification."""
     import subprocess
+
     import numpy as np
 
+    _, duration = _validate_preview_window(0, duration)
     ep = read_episode(episode_id)
     ep_dir = EPISODES_DIR / episode_id
-    sync = ep.get("audio_sync", {})
+    sync = ep.get("audio_sync") or {}
     offset = sync.get("offset_seconds", 0)
 
     merged = ep_dir / "source_merged.mp4"
@@ -434,7 +526,7 @@ async def get_sync_preview(episode_id: str, duration: float = 120.0):
             "pcm_s16le",
             "-",
         ]
-        r = subprocess.run(cmd, capture_output=True)
+        r = subprocess.run(cmd, capture_output=True, check=False)
         if r.returncode != 0:
             return []
         data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)
@@ -509,6 +601,183 @@ async def save_sync_offset(
     return {"status": "saved", "offset_seconds": req.offset_seconds}
 
 
+def _validate_preview_window(start: float, duration: float) -> tuple[float, float]:
+    if start < 0:
+        raise HTTPException(status_code=400, detail="start must be non-negative")
+    if duration <= 0 or duration > _MAX_AUDIO_PREVIEW_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"duration must be between 0 and {_MAX_AUDIO_PREVIEW_SECONDS:g} seconds",
+        )
+    return start, duration
+
+
+def _preview_cache_path(
+    ep_dir: Path,
+    cache_name: str,
+    tracks: list[dict],
+    start: float,
+    duration: float,
+    offset: float,
+) -> Path:
+    """Key previews by exact sources and timeline parameters."""
+    sources = []
+    for track in tracks:
+        path = Path(track["dest_path"])
+        stat = path.stat()
+        sources.append(
+            {
+                "path": str(path.resolve()),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "duration": track.get("duration_seconds"),
+            }
+        )
+    payload = json.dumps(
+        {"sources": sources, "start": start, "duration": duration, "offset": offset},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    cache_dir = ep_dir / "work" / "audio_preview"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", cache_name)
+    return cache_dir / f"{safe_name}_{digest}.mp3"
+
+
+def _preview_slices(
+    tracks: list[dict], audio_start: float, duration: float
+) -> list[tuple[Path, float, float]]:
+    """Resolve a logical time window into local slices of consecutive files."""
+    if duration <= 0:
+        return []
+    remaining = duration
+    cursor = audio_start
+    result = []
+    for track in tracks:
+        track_duration = float(track.get("duration_seconds") or 0)
+        if track_duration <= 0:
+            # Unknown duration is safe for a single legacy file.
+            if len(tracks) == 1:
+                return [(Path(track["dest_path"]), cursor, remaining)]
+            continue
+        if cursor >= track_duration:
+            cursor -= track_duration
+            continue
+        slice_duration = min(remaining, track_duration - cursor)
+        result.append((Path(track["dest_path"]), cursor, slice_duration))
+        remaining -= slice_duration
+        cursor = 0
+        if remaining <= 1e-6:
+            break
+    return result
+
+
+async def _render_audio_preview(
+    ep_dir: Path,
+    cache_name: str,
+    tracks: list[dict],
+    start: float,
+    duration: float,
+    offset: float,
+) -> Path:
+    start, duration = _validate_preview_window(start, duration)
+    for track in tracks:
+        if not Path(track["dest_path"]).exists():
+            raise HTTPException(status_code=404, detail="Audio file not found on disk")
+
+    cache_file = _preview_cache_path(
+        ep_dir, cache_name, tracks, start, duration, offset
+    )
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        return cache_file
+
+    timeline_audio_start = start + offset
+    leading_silence = min(duration, max(0.0, -timeline_audio_start))
+    slices = _preview_slices(
+        tracks, max(0.0, timeline_audio_start), duration - leading_silence
+    )
+    if not slices and leading_silence <= 0:
+        raise HTTPException(status_code=416, detail="Preview starts after audio ends")
+
+    inputs = []
+    labels = []
+    if leading_silence > 0:
+        inputs.extend(
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                str(leading_silence),
+                "-i",
+                "anullsrc=r=44100:cl=mono",
+            ]
+        )
+        labels.append("[0:a]")
+    for path, local_start, slice_duration in slices:
+        inputs.extend(
+            ["-ss", str(local_start), "-t", str(slice_duration), "-i", str(path)]
+        )
+        labels.append(f"[{len(labels)}:a]")
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{cache_file.stem}.",
+        suffix=".mp3",
+        dir=cache_file.parent,
+        delete=False,
+    ) as temp_handle:
+        temp_file = Path(temp_handle.name)
+    cmd = ["ffmpeg", "-y", *inputs]
+    if len(labels) > 1:
+        cmd.extend(
+            [
+                "-filter_complex",
+                f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[out]",
+                "-map",
+                "[out]",
+            ]
+        )
+    cmd.extend(["-ac", "1", "-ar", "44100", "-b:a", "128k", str(temp_file)])
+    result = await _run_ffmpeg(cmd)
+    if result.returncode != 0:
+        temp_file.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
+        )
+    temp_file.replace(cache_file)
+    return cache_file
+
+
+@router.get("/{episode_id}/audio-preview/track/{track_number}")
+async def get_logical_track_preview(
+    episode_id: str,
+    track_number: int,
+    start: float = 30.0,
+    duration: float = 60.0,
+):
+    """Preview every consecutive recorder segment for one logical mic track."""
+    ep = read_episode(episode_id)
+    tracks = [
+        track
+        for track in ep.get("audio_tracks", [])
+        if track.get("track_number") == track_number
+    ]
+    if not tracks:
+        raise HTTPException(
+            status_code=404, detail=f"Logical track {track_number} not found"
+        )
+    offset = float((ep.get("audio_sync") or {}).get("offset_seconds", 0))
+    cache_file = await _render_audio_preview(
+        EPISODES_DIR / episode_id,
+        f"track_{track_number}",
+        tracks,
+        start,
+        duration,
+        offset,
+    )
+    return FileResponse(cache_file, media_type="audio/mpeg")
+
+
 @router.get("/{episode_id}/audio-preview/{track_name}")
 async def get_audio_preview(
     episode_id: str,
@@ -559,41 +828,11 @@ async def get_audio_preview(
     if not track:
         raise HTTPException(status_code=404, detail=f"Track '{track_name}' not found")
 
-    wav_path = Path(track["dest_path"])
-    if not wav_path.exists():
-        raise HTTPException(status_code=404, detail="Audio file not found on disk")
-
     # audio_time = video_time + offset_seconds
-    offset = ep.get("audio_sync", {}).get("offset_seconds", 0)
-    audio_start = max(0, start + offset)
-
-    cache_dir = ep_dir / "work" / "audio_preview"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{track_name}_{int(start)}_{int(duration)}.mp3"
-
-    if not cache_file.exists():
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(audio_start),
-            "-i",
-            str(wav_path),
-            "-t",
-            str(duration),
-            "-ac",
-            "1",
-            "-ar",
-            "44100",
-            "-b:a",
-            "128k",
-            str(cache_file),
-        ]
-        result = await _run_ffmpeg(cmd)
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
-            )
+    offset = float((ep.get("audio_sync") or {}).get("offset_seconds", 0))
+    cache_file = await _render_audio_preview(
+        ep_dir, track_name, [track], start, duration, offset
+    )
 
     return FileResponse(cache_file, media_type="audio/mpeg")
 
@@ -704,75 +943,52 @@ class CropConfigRequest(BaseModel):
 
 @router.post("/{episode_id}/crop-config")
 async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
-    """Save crop config to episode.json and update status."""
+    """Save crop settings without rendering or deleting finished deliverables."""
     ep = read_episode(episode_id)
 
-    # Get source dimensions from stitch.json
-    stitch_file = EPISODES_DIR / episode_id / "stitch.json"
+    ep_dir = EPISODES_DIR / episode_id
     source_width = 1920
     source_height = 1080
-    if stitch_file.exists():
-        with open(stitch_file) as f:
-            stitch_data = json.load(f)
-        output_path = stitch_data.get("output_path", "")
-        if output_path:
-            import subprocess
-
-            try:
-                probe_cmd = [
-                    "ffprobe",
-                    "-v",
-                    "quiet",
-                    "-print_format",
-                    "json",
-                    "-show_streams",
-                    output_path,
-                ]
-                result = subprocess.run(
-                    probe_cmd, capture_output=True, text=True, check=True
-                )
-                probe = json.loads(result.stdout)
-                for s in probe.get("streams", []):
-                    if s.get("codec_type") == "video":
-                        source_width = int(s["width"])
-                        source_height = int(s["height"])
-                        break
-            except (subprocess.CalledProcessError, KeyError, ValueError):
-                pass
+    merged = ep_dir / "source_merged.mp4"
+    if merged.exists():
+        try:
+            source_width, source_height = await asyncio.to_thread(
+                get_dimensions, merged
+            )
+        except (OSError, StopIteration, subprocess.SubprocessError, ValueError):
+            logger.warning("Could not probe source dimensions for %s", episode_id)
 
     if req.speakers:
         # New N-speaker format
-        ep["crop_config"] = {
+        crop_config = {
             "source_width": source_width,
             "source_height": source_height,
             "speakers": [s.model_dump() for s in req.speakers],
         }
         if req.ambient_tracks:
-            ep["crop_config"]["ambient_tracks"] = [
-                t.model_dump() for t in req.ambient_tracks
-            ]
+            crop_config["ambient_tracks"] = [t.model_dump() for t in req.ambient_tracks]
         if req.wide_center_x is not None:
-            ep["crop_config"]["wide_center_x"] = req.wide_center_x
-            ep["crop_config"]["wide_center_y"] = req.wide_center_y
-            ep["crop_config"]["wide_zoom"] = req.wide_zoom or 1.0
+            crop_config["wide_center_x"] = req.wide_center_x
+            crop_config["wide_center_y"] = req.wide_center_y
+            crop_config["wide_zoom"] = req.wide_zoom or 1.0
         # Also store legacy fields for backward compat with existing render agents
         if len(req.speakers) >= 2:
-            ep["crop_config"]["speaker_l_center_x"] = req.speakers[0].center_x
-            ep["crop_config"]["speaker_l_center_y"] = req.speakers[0].center_y
-            ep["crop_config"]["speaker_r_center_x"] = req.speakers[1].center_x
-            ep["crop_config"]["speaker_r_center_y"] = req.speakers[1].center_y
-            ep["crop_config"]["speaker_l_zoom"] = req.speakers[0].zoom
-            ep["crop_config"]["speaker_r_zoom"] = req.speakers[1].zoom
+            crop_config["speaker_l_center_x"] = req.speakers[0].center_x
+            crop_config["speaker_l_center_y"] = req.speakers[0].center_y
+            crop_config["speaker_r_center_x"] = req.speakers[1].center_x
+            crop_config["speaker_r_center_y"] = req.speakers[1].center_y
+            crop_config["speaker_l_zoom"] = req.speakers[0].zoom
+            crop_config["speaker_r_zoom"] = req.speakers[1].zoom
         elif len(req.speakers) == 1:
-            ep["crop_config"]["speaker_l_center_x"] = req.speakers[0].center_x
-            ep["crop_config"]["speaker_l_center_y"] = req.speakers[0].center_y
-            ep["crop_config"]["speaker_r_center_x"] = req.speakers[0].center_x
-            ep["crop_config"]["speaker_r_center_y"] = req.speakers[0].center_y
-            ep["crop_config"]["speaker_l_zoom"] = req.speakers[0].zoom
-            ep["crop_config"]["speaker_r_zoom"] = req.speakers[0].zoom
+            crop_config["speaker_l_center_x"] = req.speakers[0].center_x
+            crop_config["speaker_l_center_y"] = req.speakers[0].center_y
+            crop_config["speaker_r_center_x"] = req.speakers[0].center_x
+            crop_config["speaker_r_center_y"] = req.speakers[0].center_y
+            crop_config["speaker_l_zoom"] = req.speakers[0].zoom
+            crop_config["speaker_r_zoom"] = req.speakers[0].zoom
     else:
         # Legacy 2-speaker format
-        ep["crop_config"] = {
+        crop_config = {
             "source_width": source_width,
             "source_height": source_height,
             "speaker_l_center_x": req.speaker_l_center_x,
@@ -798,139 +1014,46 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
             ],
         }
 
-    # When crop_config changes on an already-processed episode, we need to
-    # invalidate the downstream agents that depend on crop but PRESERVE the
-    # expensive work (transcription, clip mining, metadata) which only
-    # depends on the audio/transcript, not the crop.
-    #
-    # Crop-dependent agents that must re-run:
-    #   speaker_cut      (speaker labels come from crop)
-    #   longform_render  (uses crop rectangle for video)
-    #   shorts_render    (uses crop rectangle for video)
-    #   qa               (validates renders)
-    #   podcast_feed     (depends on final artifacts)
-    #   publish          (depends on final artifacts)
-    #   backup           (depends on final artifacts)
-    #
-    # Crop-INDEPENDENT agents we keep (save money + time):
-    #   ingest, stitch, audio_analysis  (always kept)
-    #   transcribe                       (Deepgram, ~$0.50 — big savings)
-    #   clip_miner                       (Claude LLM, ~$0.20)
-    #   metadata_gen                     (Claude LLM, ~$0.10-0.20)
-    #   thumbnail_gen                    (OpenAI caricature, ~$0.10)
-    CROP_DEPENDENT_AGENTS = {
+    if crop_config == ep.get("crop_config"):
+        return {"status": "saved", "changed": False, "crop_config": crop_config}
+
+    ep["crop_config"] = crop_config
+    crop_dependent_agents = {
         "speaker_cut",
         "longform_render",
         "shorts_render",
         "qa",
         "podcast_feed",
-        "publish",
-        "backup",
     }
 
     pipeline_state = ep.setdefault("pipeline", {})
     completed = pipeline_state.get("agents_completed", [])
-    had_crop_dependent_work = any(a in completed for a in CROP_DEPENDENT_AGENTS)
-
-    # Remove crop-dependent agents from completed list so resume_pipeline will re-run them
     pipeline_state["agents_completed"] = [
-        a for a in completed if a not in CROP_DEPENDENT_AGENTS
+        agent for agent in completed if agent not in crop_dependent_agents
     ]
-
-    # Clear any errors from those agents so the pipeline doesn't refuse to continue
     errors = pipeline_state.get("errors", {})
     pipeline_state["errors"] = {
-        name: msg for name, msg in errors.items() if name not in CROP_DEPENDENT_AGENTS
+        name: message
+        for name, message in errors.items()
+        if name not in crop_dependent_agents
     }
 
-    # If we actually invalidated downstream work, nuke the artifacts so they
-    # get regenerated. Only do this when there was prior work — initial crop
-    # setup shouldn't delete anything (nothing exists yet).
-    if had_crop_dependent_work:
-        ep_dir = EPISODES_DIR / episode_id
-        work_dir = ep_dir / "work"
-        # Files that must be regenerated because crop changed
-        artifacts_to_remove = [
-            ep_dir / "longform.mp4",
-            ep_dir / "segments.json",
-            ep_dir / "speaker_cut.json",
-            ep_dir / "longform_render.json",
-            ep_dir / "shorts_render.json",
-            ep_dir / "qa.json",
-            ep_dir / "publish.json",
-        ]
-        for f in artifacts_to_remove:
-            if f.exists():
-                f.unlink()
-        # Shorts: delete all rendered clips
-        shorts_dir = ep_dir / "shorts"
-        if shorts_dir.exists():
-            for f in shorts_dir.glob("*.mp4"):
-                f.unlink(missing_ok=True)
-        # Work dir: segment caches, speaker channel caches, concat lists
-        if work_dir.exists():
-            for pattern in [
-                "longform_seg_*.mp4",
-                "longform_raw.mp4",
-                "longform_concat.txt",
-                "short_temp_*.mp4",
-                "speaker_*_channel.npy",
-                "speaker_*_rms_db.npy",
-                "rms_meta.json",
-                "audio_mix.wav",  # forces re-mix with new audio chain too
-                "audio_mix_enhanced.wav",
-                "audio_mix_denoised.wav",
-            ]:
-                for f in work_dir.glob(pattern):
-                    f.unlink(missing_ok=True)
+    # Final deliverables and publishing receipts remain available until a new
+    # render successfully replaces them. Only disposable computation caches go.
+    work_dir = ep_dir / "work"
+    for pattern in [
+        "longform_seg_*.mp4",
+        "longform_raw.mp4",
+        "longform_concat.txt",
+        "short_temp_*.mp4",
+        "speaker_*_channel.npy",
+        "speaker_*_rms_db.npy",
+        "rms_meta.json",
+    ]:
+        for path in work_dir.glob(pattern):
+            path.unlink(missing_ok=True)
 
-    # Transition from awaiting_crop_setup or error back to processing so the
-    # pipeline can run again.
-    if ep.get("status") in (
-        "awaiting_crop_setup",
-        "error",
-        "ready_for_review",
-        "awaiting_backup_approval",
-        "awaiting_longform_approval",
-    ):
-        ep["status"] = "processing"
+    ep["status"] = "ready_to_render"
 
     write_episode(episode_id, ep)
-
-    # Auto-generate audio_mix.wav if H6E audio tracks exist
-    # This uses speaker-to-track assignments and volumes from crop_config
-    audio_tracks = ep.get("audio_tracks", [])
-    if audio_tracks:
-        from lib.audio_mix import generate_audio_mix
-
-        ep_dir = EPISODES_DIR / episode_id
-        # Re-read to get full data with audio_tracks merged
-        ep_fresh = read_episode(episode_id)
-        try:
-            mix_path = generate_audio_mix(ep_dir, ep_fresh)
-            if mix_path:
-                logger.info(
-                    "Generated audio_mix.wav for %s (%.1f MB)",
-                    episode_id,
-                    mix_path.stat().st_size / 1e6,
-                )
-                # Invalidate ALL cached files that depend on crop/audio config
-                work_dir = ep_dir / "work"
-                for pattern in [
-                    "longform_seg_*.mp4",  # rendered video segments
-                    "speaker_*_channel.npy",  # cached speaker audio extractions
-                    "speaker_*_rms_db.npy",  # cached RMS data
-                    "transcript_audio.*",  # multichannel transcript audio
-                    "audio_preview/*.mp3",  # cached audio previews
-                ]:
-                    for f in work_dir.glob(pattern):
-                        f.unlink(missing_ok=True)
-                # Also invalidate rendered shorts
-                shorts_dir = ep_dir / "shorts"
-                if shorts_dir.exists():
-                    for f in shorts_dir.glob("*.mp4"):
-                        f.unlink(missing_ok=True)
-        except Exception:
-            logger.exception("Failed to generate audio_mix.wav for %s", episode_id)
-
-    return {"status": "saved", "crop_config": ep["crop_config"]}
+    return {"status": "saved", "changed": True, "crop_config": crop_config}

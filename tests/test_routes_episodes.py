@@ -1,8 +1,8 @@
 """Tests for episode API routes."""
 
 import json
-import os
 import importlib
+import subprocess
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,24 +17,31 @@ def test_client(tmp_path, monkeypatch):
 
     # Force reimport of modules that read env at import time
     import lib.paths
+
     importlib.reload(lib.paths)
 
     import server.routes.episodes as ep_mod
+
     importlib.reload(ep_mod)
 
     import server.routes.clips as clips_mod
+
     importlib.reload(clips_mod)
 
     import server.routes.pipeline as pipe_mod
+
     importlib.reload(pipe_mod)
 
     import server.routes.chat as chat_mod
+
     importlib.reload(chat_mod)
 
     import server.app as app_mod
+
     importlib.reload(app_mod)
 
     from fastapi.testclient import TestClient
+
     client = TestClient(app_mod.app)
 
     yield client, episodes_dir
@@ -58,7 +65,11 @@ def _create_episode(episodes_dir, episode_id, extra_data=None):
         "duration_seconds": 3600.0,
         "created_at": "2026-01-01T12:00:00+00:00",
         "clips": [],
-        "pipeline": {"started_at": "2026-01-01T12:00:00+00:00", "completed_at": None, "agents_completed": []},
+        "pipeline": {
+            "started_at": "2026-01-01T12:00:00+00:00",
+            "completed_at": None,
+            "agents_completed": [],
+        },
     }
     if extra_data:
         data.update(extra_data)
@@ -84,10 +95,14 @@ class TestListEpisodes:
 
     def test_list_returns_summary_fields(self, test_client):
         client, episodes_dir = test_client
-        _create_episode(episodes_dir, "ep_001", {
-            "guest_name": "John Doe",
-            "episode_name": "Test Episode",
-        })
+        _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "guest_name": "John Doe",
+                "episode_name": "Test Episode",
+            },
+        )
         resp = client.get("/api/episodes/")
         data = resp.json()
         assert data[0]["guest_name"] == "John Doe"
@@ -104,6 +119,57 @@ class TestListEpisodes:
         assert resp.status_code == 200
         assert len(resp.json()) == 1
 
+    def test_list_includes_lightweight_verified_delivery_snapshot(self, test_client):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        audio = ep_dir / "podcast_audio.mp3"
+        video = ep_dir / "upload_video.mp4"
+        canonical = ep_dir / "work" / "audio_mix.wav"
+        canonical.parent.mkdir()
+        audio.write_bytes(b"audio")
+        video.write_bytes(b"video")
+        canonical.write_bytes(b"canonical")
+        import server.routes.episodes as episodes_mod
+        from server.routes.delivery import _source_fingerprint, _video_fingerprint
+
+        episode = json.loads((ep_dir / "episode.json").read_text())
+        config = episodes_mod.load_config()
+        (ep_dir / "delivery.json").write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "duration_seconds": 120.0,
+                    "download_url": "/api/episodes/ep_001/delivery/audio",
+                    "output_stat": {
+                        "size": audio.stat().st_size,
+                        "mtime_ns": audio.stat().st_mtime_ns,
+                    },
+                    "source_fingerprint": _source_fingerprint(ep_dir, episode, config),
+                    "video_status": "ready",
+                    "video_download_url": "/api/episodes/ep_001/delivery/video",
+                    "video_output_stat": {
+                        "size": video.stat().st_size,
+                        "mtime_ns": video.stat().st_mtime_ns,
+                    },
+                    "video_source_fingerprint": _video_fingerprint(
+                        ep_dir, episode, config, canonical
+                    ),
+                    "video": {"duration_seconds": 120.0, "width": 1920, "height": 1080},
+                }
+            )
+        )
+
+        delivery = client.get("/api/episodes/").json()[0]["delivery"]
+        assert delivery["status"] == "ready"
+        assert delivery["video_status"] == "ready"
+        assert delivery["video"]["duration_seconds"] == 120.0
+
+        episode["crop_config"] = {"speakers": [{"track": 1, "volume": 1.5}]}
+        (ep_dir / "episode.json").write_text(json.dumps(episode))
+        stale = client.get("/api/episodes/").json()[0]["delivery"]
+        assert stale["status"] == "not_prepared"
+        assert stale["video_status"] == "not_prepared"
+
 
 class TestGetEpisode:
     def test_get_existing(self, test_client):
@@ -117,6 +183,24 @@ class TestGetEpisode:
         client, _ = test_client
         resp = client.get("/api/episodes/nonexistent")
         assert resp.status_code == 404
+
+    def test_get_downgrades_missing_delivery_artifact_without_mutating_status(
+        self, test_client
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        status = {
+            "status": "preparing",
+            "video_status": "ready",
+            "video_download_url": "/api/episodes/ep_001/delivery/video",
+            "video_output_stat": {"size": 10, "mtime_ns": 20},
+        }
+        (ep_dir / "delivery.json").write_text(json.dumps(status))
+
+        delivery = client.get("/api/episodes/ep_001").json()["delivery"]
+        assert delivery["status"] == "preparing"
+        assert delivery["video_status"] == "not_prepared"
+        assert json.loads((ep_dir / "delivery.json").read_text()) == status
 
     def test_get_loads_clips_from_clips_json(self, test_client):
         """If episode.json has no clips but clips.json exists, load from it."""
@@ -134,36 +218,59 @@ class TestGetEpisode:
     def test_get_normalizes_inline_clips(self, test_client):
         """Clips stored in episode.json should be normalized."""
         client, episodes_dir = test_client
-        _create_episode(episodes_dir, "ep_001", {
-            "clips": [{"id": "clip_01", "start": 5.0, "end": 15.0}]
-        })
+        _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"clips": [{"id": "clip_01", "start": 5.0, "end": 15.0}]},
+        )
         resp = client.get("/api/episodes/ep_001")
         data = resp.json()
         assert data["clips"][0]["start_seconds"] == 5.0
 
 
 class TestCreateEpisode:
-    def test_create(self, test_client):
+    def test_create(self, test_client, tmp_path):
         client, _ = test_client
-        resp = client.post("/api/episodes/", json={"source_path": "/tmp/source"})
+        resp = client.post("/api/episodes/", json={"source_path": str(tmp_path)})
         assert resp.status_code == 200
         data = resp.json()
         assert "episode_id" in data
         assert data["status"] == "processing"
 
-    def test_create_with_audio_path(self, test_client):
+    def test_create_with_audio_path(self, test_client, tmp_path):
         client, _ = test_client
-        resp = client.post("/api/episodes/", json={
-            "source_path": "/tmp/source",
-            "audio_path": "/tmp/audio",
-            "speaker_count": 2,
-        })
+        resp = client.post(
+            "/api/episodes/",
+            json={
+                "source_path": str(tmp_path),
+                "audio_path": str(tmp_path),
+                "speaker_count": 2,
+            },
+        )
         assert resp.status_code == 200
+
+    def test_missing_source_does_not_create_broken_episode(self, test_client, tmp_path):
+        client, episodes_dir = test_client
+        response = client.post(
+            "/api/episodes/", json={"source_path": str(tmp_path / "missing")}
+        )
+        assert response.status_code == 422
+        assert "does not exist" in response.json()["detail"]
+        assert not list(episodes_dir.iterdir())
 
     def test_create_without_source_path(self, test_client):
         client, _ = test_client
         resp = client.post("/api/episodes/", json={})
         assert resp.status_code == 200
+
+    def test_create_rejects_episode_id_collision(self, test_client):
+        client, _ = test_client
+        first = client.post("/api/episodes/", json={})
+        second = client.post("/api/episodes/", json={})
+
+        assert first.status_code == 200
+        assert second.status_code == 409
+        assert second.json()["detail"].endswith("already exists")
 
 
 class TestUpdateEpisode:
@@ -180,11 +287,14 @@ class TestUpdateEpisode:
     def test_update_multiple_fields(self, test_client):
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")
-        resp = client.patch("/api/episodes/ep_001", json={
-            "guest_name": "Jane Doe",
-            "guest_title": "Engineer",
-            "episode_name": "The Interview",
-        })
+        resp = client.patch(
+            "/api/episodes/ep_001",
+            json={
+                "guest_name": "Jane Doe",
+                "guest_title": "Engineer",
+                "episode_name": "The Interview",
+            },
+        )
         assert resp.status_code == 200
         resp2 = client.get("/api/episodes/ep_001")
         data = resp2.json()
@@ -213,16 +323,44 @@ class TestDeleteEpisode:
 
 
 class TestCropConfig:
+    @patch("server.routes.episodes.get_dimensions", return_value=(3840, 2160))
+    def test_crop_dimensions_use_source_merged(self, get_dimensions_mock, test_client):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        merged = ep_dir / "source_merged.mp4"
+        merged.write_bytes(b"video")
+        (ep_dir / "stitch.json").write_text(
+            json.dumps({"output_path": "/stale/moved/output.mp4"})
+        )
+
+        response = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speaker_l_center_x": 480,
+                "speaker_l_center_y": 540,
+                "speaker_r_center_x": 1440,
+                "speaker_r_center_y": 540,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["crop_config"]["source_width"] == 3840
+        assert response.json()["crop_config"]["source_height"] == 2160
+        get_dimensions_mock.assert_called_once_with(merged)
+
     def test_save_legacy_lr_format(self, test_client):
         """Test saving crop config with legacy L/R format."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speaker_l_center_x": 480,
-            "speaker_l_center_y": 540,
-            "speaker_r_center_x": 1440,
-            "speaker_r_center_y": 540,
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speaker_l_center_x": 480,
+                "speaker_l_center_y": 540,
+                "speaker_r_center_x": 1440,
+                "speaker_r_center_y": 540,
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "saved"
 
@@ -235,12 +373,15 @@ class TestCropConfig:
         """Test saving crop config with N-speaker format."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speakers": [
-                {"label": "Host", "center_x": 480, "center_y": 540, "zoom": 1.2},
-                {"label": "Guest", "center_x": 1440, "center_y": 540, "zoom": 1.0},
-            ],
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {"label": "Host", "center_x": 480, "center_y": 540, "zoom": 1.2},
+                    {"label": "Guest", "center_x": 1440, "center_y": 540, "zoom": 1.0},
+                ],
+            },
+        )
         assert resp.status_code == 200
         config = resp.json()["crop_config"]
         assert len(config["speakers"]) == 2
@@ -251,12 +392,15 @@ class TestCropConfig:
         """N-speaker format should generate backward-compatible L/R fields."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speakers": [
-                {"label": "Host", "center_x": 480, "center_y": 540, "zoom": 1.2},
-                {"label": "Guest", "center_x": 1440, "center_y": 540, "zoom": 1.5},
-            ],
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {"label": "Host", "center_x": 480, "center_y": 540, "zoom": 1.2},
+                    {"label": "Guest", "center_x": 1440, "center_y": 540, "zoom": 1.5},
+                ],
+            },
+        )
         config = resp.json()["crop_config"]
         # Legacy fields should be populated from first two speakers
         assert config["speaker_l_center_x"] == 480
@@ -270,11 +414,14 @@ class TestCropConfig:
         """Single speaker should set both L and R to the same values."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speakers": [
-                {"label": "Solo", "center_x": 960, "center_y": 540, "zoom": 1.0},
-            ],
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {"label": "Solo", "center_x": 960, "center_y": 540, "zoom": 1.0},
+                ],
+            },
+        )
         config = resp.json()["crop_config"]
         assert config["speaker_l_center_x"] == 960
         assert config["speaker_r_center_x"] == 960
@@ -285,16 +432,19 @@ class TestCropConfig:
         """Ambient track config should be stored in crop_config."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speakers": [
-                {"label": "Host", "center_x": 480, "center_y": 540},
-                {"label": "Guest", "center_x": 1440, "center_y": 540},
-            ],
-            "ambient_tracks": [
-                {"track_number": 3, "volume": 0.15},
-                {"track_number": 4, "volume": 0.2},
-            ],
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {"label": "Host", "center_x": 480, "center_y": 540},
+                    {"label": "Guest", "center_x": 1440, "center_y": 540},
+                ],
+                "ambient_tracks": [
+                    {"track_number": 3, "volume": 0.15},
+                    {"track_number": 4, "volume": 0.2},
+                ],
+            },
+        )
         config = resp.json()["crop_config"]
         assert len(config["ambient_tracks"]) == 2
         assert config["ambient_tracks"][0]["track_number"] == 3
@@ -304,59 +454,156 @@ class TestCropConfig:
         """Wide shot center and zoom should be stored."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speakers": [
-                {"label": "Host", "center_x": 480, "center_y": 540},
-                {"label": "Guest", "center_x": 1440, "center_y": 540},
-            ],
-            "wide_center_x": 960,
-            "wide_center_y": 540,
-            "wide_zoom": 1.3,
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {"label": "Host", "center_x": 480, "center_y": 540},
+                    {"label": "Guest", "center_x": 1440, "center_y": 540},
+                ],
+                "wide_center_x": 960,
+                "wide_center_y": 540,
+                "wide_zoom": 1.3,
+            },
+        )
         config = resp.json()["crop_config"]
         assert config["wide_center_x"] == 960
         assert config["wide_center_y"] == 540
         assert config["wide_zoom"] == 1.3
 
     def test_crop_config_transitions_status(self, test_client):
-        """Saving crop config should transition from awaiting_crop_setup to processing."""
+        """Saving crop config marks the episode ready for an explicit render."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "awaiting_crop_setup"})
-        client.post("/api/episodes/ep_001/crop-config", json={
-            "speaker_l_center_x": 480,
-            "speaker_l_center_y": 540,
-            "speaker_r_center_x": 1440,
-            "speaker_r_center_y": 540,
-        })
+        client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speaker_l_center_x": 480,
+                "speaker_l_center_y": 540,
+                "speaker_r_center_x": 1440,
+                "speaker_r_center_y": 540,
+            },
+        )
         resp = client.get("/api/episodes/ep_001")
-        assert resp.json()["status"] == "processing"
+        assert resp.json()["status"] == "ready_to_render"
 
     def test_crop_config_reopens_completed_episode(self, test_client):
-        """Editing crop on a completed episode should transition back to processing
-        so the downstream agents (speaker_cut, renders) can re-run."""
+        """Editing crop on a completed episode marks its renders stale."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001", {"status": "ready_for_review"})
-        client.post("/api/episodes/ep_001/crop-config", json={
-            "speaker_l_center_x": 480,
-            "speaker_l_center_y": 540,
-            "speaker_r_center_x": 1440,
-            "speaker_r_center_y": 540,
-        })
+        client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speaker_l_center_x": 480,
+                "speaker_l_center_y": 540,
+                "speaker_r_center_x": 1440,
+                "speaker_r_center_y": 540,
+            },
+        )
         resp = client.get("/api/episodes/ep_001")
-        assert resp.json()["status"] == "processing"
+        assert resp.json()["status"] == "ready_to_render"
+
+    @patch("lib.audio_mix.generate_audio_mix")
+    def test_crop_change_preserves_deliverables_and_does_not_render(
+        self, generate_mix, test_client
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "status": "awaiting_longform_approval",
+                "audio_tracks": [{"filename": "Tr1.wav", "track_number": 1}],
+                "pipeline": {
+                    "agents_completed": [
+                        "ingest",
+                        "speaker_cut",
+                        "longform_render",
+                        "publish",
+                        "backup",
+                    ],
+                    "errors": {"qa": "old error"},
+                },
+            },
+        )
+        preserved = [
+            ep_dir / "longform.mp4",
+            ep_dir / "publish.json",
+            ep_dir / "shorts" / "clip_01.mp4",
+        ]
+        for path in preserved:
+            path.write_bytes(b"finished")
+        work = ep_dir / "work"
+        work.mkdir()
+        disposable = work / "speaker_0_rms_db.npy"
+        disposable.write_bytes(b"cache")
+
+        response = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {"label": "Host", "center_x": 480, "center_y": 540, "track": 1}
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["changed"] is True
+        assert all(path.read_bytes() == b"finished" for path in preserved)
+        assert not disposable.exists()
+        generate_mix.assert_not_called()
+        saved = client.get("/api/episodes/ep_001").json()
+        assert saved["status"] == "ready_to_render"
+        assert saved["pipeline"]["agents_completed"] == [
+            "ingest",
+            "publish",
+            "backup",
+        ]
+
+    def test_noop_crop_save_preserves_status_and_completed_agents(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        payload = {
+            "speakers": [
+                {"label": "Host", "center_x": 480, "center_y": 540, "track": 1}
+            ]
+        }
+        assert (
+            client.post("/api/episodes/ep_001/crop-config", json=payload).status_code
+            == 200
+        )
+        episode_file = episodes_dir / "ep_001" / "episode.json"
+        saved = json.loads(episode_file.read_text())
+        saved["status"] = "awaiting_longform_approval"
+        saved["pipeline"]["agents_completed"] = ["longform_render", "publish"]
+        episode_file.write_text(json.dumps(saved))
+
+        response = client.post("/api/episodes/ep_001/crop-config", json=payload)
+
+        assert response.status_code == 200
+        assert response.json()["changed"] is False
+        unchanged = json.loads(episode_file.read_text())
+        assert unchanged["status"] == "awaiting_longform_approval"
+        assert unchanged["pipeline"]["agents_completed"] == [
+            "longform_render",
+            "publish",
+        ]
 
     def test_legacy_format_generates_speakers_array(self, test_client):
         """Legacy format should also store a speakers array."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speaker_l_center_x": 480,
-            "speaker_l_center_y": 540,
-            "speaker_r_center_x": 1440,
-            "speaker_r_center_y": 540,
-            "speaker_l_zoom": 1.2,
-            "speaker_r_zoom": 1.5,
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speaker_l_center_x": 480,
+                "speaker_l_center_y": 540,
+                "speaker_r_center_x": 1440,
+                "speaker_r_center_y": 540,
+                "speaker_l_zoom": 1.2,
+                "speaker_r_zoom": 1.5,
+            },
+        )
         config = resp.json()["crop_config"]
         assert len(config["speakers"]) == 2
         assert config["speakers"][0]["center_x"] == 480
@@ -381,12 +628,27 @@ class TestCropConfig:
         """Speakers with audio track assignments should be stored."""
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")
-        resp = client.post("/api/episodes/ep_001/crop-config", json={
-            "speakers": [
-                {"label": "Host", "center_x": 480, "center_y": 540, "track": 1, "volume": 1.0},
-                {"label": "Guest", "center_x": 1440, "center_y": 540, "track": 2, "volume": 0.8},
-            ],
-        })
+        resp = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    {
+                        "label": "Host",
+                        "center_x": 480,
+                        "center_y": 540,
+                        "track": 1,
+                        "volume": 1.0,
+                    },
+                    {
+                        "label": "Guest",
+                        "center_x": 1440,
+                        "center_y": 540,
+                        "track": 2,
+                        "volume": 0.8,
+                    },
+                ],
+            },
+        )
         config = resp.json()["crop_config"]
         assert config["speakers"][0]["track"] == 1
         assert config["speakers"][1]["volume"] == 0.8
@@ -395,9 +657,15 @@ class TestCropConfig:
 class TestAudioPreview:
     def test_audio_preview_track_not_found(self, test_client):
         client, episodes_dir = test_client
-        _create_episode(episodes_dir, "ep_001", {
-            "audio_tracks": [{"filename": "track_Tr1.WAV", "dest_path": "/tmp/audio/track.WAV"}],
-        })
+        _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "audio_tracks": [
+                    {"filename": "track_Tr1.WAV", "dest_path": "/tmp/audio/track.WAV"}
+                ],
+            },
+        )
         resp = client.get("/api/episodes/ep_001/audio-preview/nonexistent")
         assert resp.status_code == 404
 
@@ -406,29 +674,42 @@ class TestAudioPreview:
         resp = client.get("/api/episodes/nonexistent/audio-preview/track")
         assert resp.status_code == 404
 
-    @patch("subprocess.run")
+    @patch("server.routes.episodes._run_ffmpeg")
     def test_audio_preview_applies_sync_offset(self, mock_run, test_client):
         """Audio preview should add sync offset to the start time."""
         client, episodes_dir = test_client
-        ep_dir = _create_episode(episodes_dir, "ep_001", {
-            "audio_tracks": [
-                {"filename": "260311_TrLR.WAV", "dest_path": str(episodes_dir / "ep_001" / "audio" / "260311_TrLR.WAV")},
-            ],
-            "audio_sync": {"offset_seconds": 2.5},
-        })
+        ep_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "audio_tracks": [
+                    {
+                        "filename": "260311_TrLR.WAV",
+                        "dest_path": str(
+                            episodes_dir / "ep_001" / "audio" / "260311_TrLR.WAV"
+                        ),
+                    },
+                ],
+                "audio_sync": {"offset_seconds": 2.5},
+            },
+        )
         # Create the audio file
         audio_dir = ep_dir / "audio"
         audio_dir.mkdir(exist_ok=True)
         (audio_dir / "260311_TrLR.WAV").write_bytes(b"\x00" * 1000)
 
-        # Create work directory and cache file to avoid actual ffmpeg call
-        cache_dir = ep_dir / "work" / "audio_preview"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file = cache_dir / "260311_TrLR_30_60.mp3"
-        cache_file.write_bytes(b"\xff\xfb\x90")  # MP3 header bytes
+        async def fake_ffmpeg(cmd):
+            Path(cmd[-1]).write_bytes(b"\xff\xfb\x90")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        resp = client.get("/api/episodes/ep_001/audio-preview/260311_TrLR?start=30&duration=60")
+        mock_run.side_effect = fake_ffmpeg
+
+        resp = client.get(
+            "/api/episodes/ep_001/audio-preview/260311_TrLR?start=30&duration=60"
+        )
         assert resp.status_code == 200
+        cmd = mock_run.await_args.args[0]
+        assert cmd[cmd.index("-ss") + 1] == "32.5"
 
 
 class TestApproveEpisode:

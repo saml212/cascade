@@ -4,6 +4,7 @@ import json
 import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter
 
@@ -46,12 +47,16 @@ def _get_approved_items(episodes_dir: Path) -> list[dict]:
         if ep.get("status") in ("approved", "ready_for_review"):
             longform_path = ep_dir / "longform.mp4"
             if longform_path.exists() and not published.get("longform"):
-                items.append({
-                    "type": "longform",
-                    "episode_id": ep_id,
-                    "name": ep_name,
-                    "title": ep.get("metadata", {}).get("longform", {}).get("title", ep_name),
-                })
+                items.append(
+                    {
+                        "type": "longform",
+                        "episode_id": ep_id,
+                        "name": ep_name,
+                        "title": ep.get("metadata", {})
+                        .get("longform", {})
+                        .get("title", ep_name),
+                    }
+                )
 
         # Check shorts
         clips_file = ep_dir / "clips.json"
@@ -59,20 +64,26 @@ def _get_approved_items(episodes_dir: Path) -> list[dict]:
             try:
                 with open(clips_file) as f:
                     clips_data = json.load(f)
-                clips = clips_data.get("clips", clips_data if isinstance(clips_data, list) else [])
+                clips = (
+                    clips_data
+                    if isinstance(clips_data, list)
+                    else clips_data.get("clips", [])
+                )
             except (json.JSONDecodeError, OSError):
                 clips = []
 
             for clip in clips:
                 clip_id = clip.get("clip_id", clip.get("id", ""))
                 if clip.get("approved") and not published.get(f"short_{clip_id}"):
-                    items.append({
-                        "type": "short",
-                        "episode_id": ep_id,
-                        "clip_id": clip_id,
-                        "name": ep_name,
-                        "title": clip.get("title", f"Clip {clip_id}"),
-                    })
+                    items.append(
+                        {
+                            "type": "short",
+                            "episode_id": ep_id,
+                            "clip_id": clip_id,
+                            "name": ep_name,
+                            "title": clip.get("title", f"Clip {clip_id}"),
+                        }
+                    )
 
     return items
 
@@ -95,7 +106,7 @@ async def get_schedule():
     shorts = [i for i in items if i["type"] == "short"]
 
     # Build 7-day calendar starting today
-    today = datetime.now().date()
+    today = datetime.now(ZoneInfo(tz_name)).date()
     days = []
     short_idx = 0
 
@@ -117,7 +128,10 @@ async def get_schedule():
             day["items"].append({**lf, "scheduled_date": date.isoformat()})
 
         # Fill shorts up to daily limit
-        while short_idx < len(shorts) and len([i for i in day["items"] if i["type"] == "short"]) < limit:
+        while (
+            short_idx < len(shorts)
+            and len([i for i in day["items"] if i["type"] == "short"]) < limit
+        ):
             short = shorts[short_idx]
             day["items"].append({**short, "scheduled_date": date.isoformat()})
             short_idx += 1
@@ -133,4 +147,6 @@ async def get_schedule():
         "total_items": len(items),
         "unscheduled_shorts": unscheduled_shorts,
         "unscheduled_longforms": unscheduled_longforms,
+        "mode": "proposal",
+        "timezone": tz_name,
     }
