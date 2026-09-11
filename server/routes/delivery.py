@@ -21,7 +21,11 @@ from agents.qa import quality_snapshot
 from agents.speaker_cut import current_speaker_segments
 from agents.transcribe import current_diarized_transcript
 from lib.atomic_write import atomic_write_json
-from lib.audio_mix import audio_selection_settings, generate_audio_mix
+from lib.audio_mix import (
+    audio_selection_settings,
+    generate_audio_mix,
+    selected_audio_source,
+)
 from lib.delivery_video import (
     build_keep_intervals,
     current_longform_render,
@@ -127,6 +131,12 @@ def _source_fingerprint(
         },
         "inputs": inputs,
     }
+    selected_audio = selected_audio_source(episode_dir, episode, config)
+    if selected_audio is not None:
+        payload["selected_audio"] = {
+            "path": str(selected_audio.resolve()),
+            **_file_stat(selected_audio),
+        }
     if config is not None:
         payload["processing"] = {
             key: config.get("processing", {}).get(key)
@@ -179,14 +189,23 @@ def migrate_unchanged_delivery_audio_fingerprint(
     """Preserve prepared audio identity across edits unrelated to its bytes."""
     if audio_selection_settings(old_episode) != audio_selection_settings(new_episode):
         return False
+    try:
+        selected_audio = selected_audio_source(episode_dir, new_episode, config)
+    except ValueError:
+        return False
     status = _read_status(episode_dir)
     stored = status.get("source_fingerprint")
     accepted = {
         _source_fingerprint(episode_dir, old_episode, config),
         _source_fingerprint(episode_dir, old_episode),
-        _legacy_source_fingerprint(episode_dir, old_episode, config),
-        _legacy_source_fingerprint(episode_dir, old_episode),
     }
+    if selected_audio is None:
+        accepted.update(
+            {
+                _legacy_source_fingerprint(episode_dir, old_episode, config),
+                _legacy_source_fingerprint(episode_dir, old_episode),
+            }
+        )
     if status.get("status") != "ready" or stored not in accepted:
         return False
     status["source_fingerprint"] = _source_fingerprint(episode_dir, new_episode, config)
@@ -291,14 +310,18 @@ def _refresh_status(episode_dir: Path) -> dict:
             _write_status(episode_dir, status)
     elif status.get("status") == "ready":
         audio_path = episode_dir / "podcast_audio.mp3"
+        audio_input_error = None
         try:
+            selected_audio = selected_audio_source(episode_dir, episode, config)
             stored_fingerprint = status.get("source_fingerprint")
             current_fingerprint = _source_fingerprint(episode_dir, episode, config)
-            legacy_fingerprints = {
-                _source_fingerprint(episode_dir, episode),
-                _legacy_source_fingerprint(episode_dir, episode, config),
-                _legacy_source_fingerprint(episode_dir, episode),
-            }
+            legacy_fingerprints = set()
+            if selected_audio is None:
+                legacy_fingerprints = {
+                    _source_fingerprint(episode_dir, episode),
+                    _legacy_source_fingerprint(episode_dir, episode, config),
+                    _legacy_source_fingerprint(episode_dir, episode),
+                }
             if stored_fingerprint in legacy_fingerprints:
                 status["source_fingerprint"] = current_fingerprint
                 stored_fingerprint = current_fingerprint
@@ -308,14 +331,16 @@ def _refresh_status(episode_dir: Path) -> dict:
                 or status.get("output_stat") != _file_stat(audio_path)
                 or stored_fingerprint != current_fingerprint
             )
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             stale = True
+            audio_input_error = str(exc)
         if stale:
             status = {
                 **status,
                 "status": "not_prepared",
                 "stale": True,
-                "error": "Inputs or prepared audio changed; prepare the episode again.",
+                "error": audio_input_error
+                or "Inputs or prepared audio changed; prepare the episode again.",
             }
             _write_status(episode_dir, status)
     if status.get("video_status") == "preparing":
@@ -332,8 +357,11 @@ def _refresh_status(episode_dir: Path) -> dict:
             _write_status(episode_dir, status)
     elif status.get("video_status") == "ready":
         video_path = episode_dir / "upload_video.mp4"
+        video_input_error = None
         try:
-            audio_path = episode_dir / "work" / "audio_mix.wav"
+            audio_path = selected_audio_source(episode_dir, episode, config) or (
+                episode_dir / "work" / "audio_mix.wav"
+            )
             expected_fingerprint = _video_fingerprint(
                 episode_dir, episode, config, audio_path
             )
@@ -343,13 +371,15 @@ def _refresh_status(episode_dir: Path) -> dict:
                 or status.get("video_output_stat") != _file_stat(video_path)
                 or status.get("video_source_fingerprint") != expected_fingerprint
             )
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             video_stale = True
+            video_input_error = str(exc)
         if video_stale:
             status.update(
                 video_status="not_prepared",
                 video_stale=True,
-                video_error="Video inputs or output changed; prepare the video again.",
+                video_error=video_input_error
+                or "Video inputs or output changed; prepare the video again.",
             )
             _write_status(episode_dir, status)
     return status
@@ -669,13 +699,12 @@ async def prepare_delivery_video(
     episode_dir = _episode_dir(episode_id)
     status = _refresh_status(episode_dir)
     if status.get("status") != "ready":
-        raise HTTPException(status_code=409, detail="Prepare and verify audio first")
+        raise HTTPException(
+            status_code=409,
+            detail=status.get("error") or "Prepare and verify audio first",
+        )
     if not (episode_dir / "source_merged.mp4").exists():
         raise HTTPException(status_code=422, detail="source_merged.mp4 is required")
-    if not (episode_dir / "work" / "audio_mix.wav").exists():
-        raise HTTPException(
-            status_code=422, detail="Canonical mastered WAV is required"
-        )
     episode = json.loads((episode_dir / "episode.json").read_text())
     if not episode.get("crop_config"):
         raise HTTPException(status_code=422, detail="Complete crop setup first")
@@ -685,6 +714,16 @@ async def prepare_delivery_video(
         config = render_config_for_episode(episode, load_config())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        audio_path = selected_audio_source(episode_dir, episode, config) or (
+            episode_dir / "work" / "audio_mix.wav"
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not audio_path.is_file():
+        raise HTTPException(
+            status_code=422, detail="Canonical audio source is required"
+        )
     if not current_speaker_segments(episode_dir, episode, config):
         raise HTTPException(
             status_code=422,

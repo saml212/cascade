@@ -71,6 +71,44 @@ def test_audio_source_fingerprint_ignores_picture_crop(delivery):
     assert mod._source_fingerprint(episode_dir, episode, config) != fingerprint
 
 
+def test_audio_source_fingerprint_tracks_selected_repair(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    selected = episode_dir / "work" / "audio_repair_selected.wav"
+    selected.parent.mkdir()
+    selected.write_bytes(b"reviewed repair")
+
+    with patch.object(mod, "selected_audio_source", return_value=None):
+        base_fingerprint = mod._source_fingerprint(episode_dir, episode, {})
+    with patch.object(mod, "selected_audio_source", return_value=selected):
+        selected_fingerprint = mod._source_fingerprint(episode_dir, episode, {})
+
+    assert selected_fingerprint != base_fingerprint
+
+
+def test_audio_fingerprint_migration_does_not_bless_unrendered_selection(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    selected = episode_dir / "work" / "audio_repair_selected.wav"
+    selected.parent.mkdir()
+    selected.write_bytes(b"selected audio")
+    legacy = mod._legacy_source_fingerprint(episode_dir, episode, {})
+    mod._write_status(
+        episode_dir,
+        {"status": "ready", "source_fingerprint": legacy},
+    )
+
+    with patch.object(mod, "selected_audio_source", return_value=selected):
+        migrated = mod.migrate_unchanged_delivery_audio_fingerprint(
+            episode_dir, episode, episode, {}
+        )
+
+    assert migrated is False
+    assert mod._read_status(episode_dir)["source_fingerprint"] == legacy
+
+
 def test_prepare_rejects_missing_input(delivery):
     client, _, episodes_dir = delivery
     make_episode(episodes_dir, with_source=False)
@@ -137,6 +175,7 @@ def test_video_prepare_persists_explicit_caption_and_color_choices(delivery):
         patch.object(
             mod, "current_diarized_transcript", return_value={"utterances": []}
         ),
+        patch.object(mod, "require_render_space"),
         patch.object(mod.threading.Thread, "start"),
     ):
         response = asyncio.run(
@@ -152,6 +191,62 @@ def test_video_prepare_persists_explicit_caption_and_color_choices(delivery):
     assert stored["delivery_burn_captions"] is True
     assert response["video_preflight"]["encoding"]["video_max_bitrate"] == "16M"
     mod._video_running.clear()
+
+
+def test_video_prepare_accepts_selected_repair_without_base_mix(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["crop_config"] = {"speakers": [{"center_x": 10, "center_y": 10}]}
+    (episode_dir / "episode.json").write_text(json.dumps(episode))
+    selected = episode_dir / "work" / "audio_repair_selected.wav"
+    selected.parent.mkdir()
+    selected.write_bytes(b"selected audio")
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod, "selected_audio_source", return_value=selected),
+        patch.object(mod, "current_speaker_segments", return_value={"segments": [{}]}),
+        patch.object(
+            mod, "current_diarized_transcript", return_value={"utterances": []}
+        ),
+        patch.object(
+            mod,
+            "_video_preflight",
+            return_value={"safe": True, "budget": {"output_bytes": 1}},
+        ),
+        patch.object(mod, "require_render_space"),
+        patch.object(mod.threading.Thread, "start"),
+    ):
+        response = asyncio.run(mod.prepare_delivery_video("ep_test"))
+
+    assert response["video_status"] == "preparing"
+    mod._video_running.clear()
+
+
+def test_video_prepare_rejects_stale_selected_repair(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["crop_config"] = {"speakers": [{"center_x": 10, "center_y": 10}]}
+    (episode_dir / "episode.json").write_text(json.dumps(episode))
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(
+            mod,
+            "selected_audio_source",
+            side_effect=ValueError(
+                "Selected repair audio is stale for the source media"
+            ),
+        ),
+        pytest.raises(HTTPException) as raised,
+    ):
+        asyncio.run(mod.prepare_delivery_video("ep_test"))
+
+    assert raised.value.status_code == 409
+    assert "stale for the source media" in raised.value.detail
+    assert "ep_test" not in mod._video_running
 
 
 def test_video_prepare_rejects_unsafe_storage_before_starting_job(delivery):
@@ -437,6 +532,72 @@ def test_status_marks_changed_output_stale(delivery):
     response = client.get("/api/episodes/ep_test/delivery")
     assert response.json()["status"] == "not_prepared"
     assert response.json()["stale"] is True
+
+
+def test_status_surfaces_stale_selected_repair(delivery):
+    client, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    podcast = episode_dir / "podcast_audio.mp3"
+    podcast.write_bytes(b"podcast")
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    with patch.object(mod, "selected_audio_source", return_value=None):
+        source_fingerprint = mod._source_fingerprint(episode_dir, episode, {})
+    mod._write_status(
+        episode_dir,
+        {
+            "status": "ready",
+            "source_fingerprint": source_fingerprint,
+            "output_stat": mod._file_stat(podcast),
+        },
+    )
+
+    with patch.object(
+        mod,
+        "selected_audio_source",
+        side_effect=ValueError("Selected repair audio has changed since review"),
+    ):
+        response = client.get("/api/episodes/ep_test/delivery")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "not_prepared"
+    assert response.json()["error"] == "Selected repair audio has changed since review"
+
+
+def test_status_validates_ready_video_against_selected_repair(delivery):
+    client, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    selected = episode_dir / "work" / "audio_repair_selected.wav"
+    selected.parent.mkdir()
+    selected.write_bytes(b"selected audio")
+    podcast = episode_dir / "podcast_audio.mp3"
+    podcast.write_bytes(b"podcast")
+    video = episode_dir / "upload_video.mp4"
+    video.write_bytes(b"video")
+    episode = json.loads((episode_dir / "episode.json").read_text())
+
+    with patch.object(mod, "selected_audio_source", return_value=selected):
+        source_fingerprint = mod._source_fingerprint(episode_dir, episode, {})
+    mod._write_status(
+        episode_dir,
+        {
+            "status": "ready",
+            "source_fingerprint": source_fingerprint,
+            "output_stat": mod._file_stat(podcast),
+            "video_status": "ready",
+            "video_source_fingerprint": "current-video",
+            "video_output_stat": mod._file_stat(video),
+        },
+    )
+
+    with (
+        patch.object(mod, "selected_audio_source", return_value=selected),
+        patch.object(mod, "_video_fingerprint", return_value="current-video") as check,
+    ):
+        response = client.get("/api/episodes/ep_test/delivery")
+
+    assert response.status_code == 200
+    assert response.json()["video_status"] == "ready"
+    assert check.call_args.args[3] == selected
 
 
 def test_download_requires_ready_file(delivery):
