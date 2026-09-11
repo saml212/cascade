@@ -1,5 +1,6 @@
 """Tests for the transcribe agent — multichannel and mono fallback modes."""
 
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -509,6 +510,66 @@ class TestCanonicalRepair:
         assert (
             current_diarized_transcript(tmp_episode_dir, episode, sample_config)
             == repaired
+        )
+
+        (tmp_episode_dir / "transcript_corrections.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "clock": "source",
+                    "raw_transcript_sha256": hashlib.sha256(
+                        raw_text.encode()
+                    ).hexdigest(),
+                    "operations": [
+                        {
+                            "id": "verified_overlap",
+                            "op": "replace_range",
+                            "start": 0.25,
+                            "end": 0.58,
+                            "reason": "independent close-mic ASR",
+                            "words": [
+                                {
+                                    "word": "rowed",
+                                    "start": 0.31,
+                                    "end": 0.51,
+                                    "speaker": 1,
+                                    "confidence": 0.99,
+                                },
+                                {
+                                    "word": "yes",
+                                    "punctuated_word": "Yes.",
+                                    "start": 0.35,
+                                    "end": 0.55,
+                                    "speaker": 2,
+                                    "confidence": 0.98,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
+        )
+        repair_existing_transcript(tmp_episode_dir, sample_config)
+        corrected = json.loads(
+            (tmp_episode_dir / "diarized_transcript.json").read_text()
+        )
+        corrected_words = [
+            word for utterance in corrected["utterances"] for word in utterance["words"]
+        ]
+        assert [word["word"] for word in corrected_words] == [
+            "we",
+            "rowed",
+            "yes",
+            "crew",
+        ]
+        assert corrected_words[1]["id"] == "verified_overlap_000"
+        assert corrected_words[2]["speaker"] == 2
+        assert corrected["canonicalization"]["corrections_applied"] == [
+            "verified_overlap"
+        ]
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == corrected
         )
 
         episode["audio_sync"]["offset_seconds"] = 0.5

@@ -267,6 +267,22 @@ def _raw_is_multichannel(raw: dict) -> bool:
     )
 
 
+def _load_corrections(episode_dir: Path) -> dict | None:
+    try:
+        corrections = json.loads(
+            (episode_dir / "transcript_corrections.json").read_text()
+        )
+    except FileNotFoundError:
+        return None
+    if corrections.get("version") != 1 or corrections.get("clock") != "source":
+        raise ValueError(
+            "transcript_corrections.json must use version 1 and source clock"
+        )
+    if not isinstance(corrections.get("operations", []), list):
+        raise TypeError("transcript correction operations must be a list")
+    return corrections
+
+
 def repair_existing_transcript(episode_dir: Path, config: dict) -> dict:
     """Canonicalize a stored ASR response without uploading audio again.
 
@@ -316,6 +332,8 @@ def current_diarized_transcript(
         raw_hash = _file_sha256(agent.episode_dir / "transcript.json")
     except OSError:
         return None
+    corrections = _load_corrections(agent.episode_dir)
+    corrections_fingerprint = _stable_hash(corrections) if corrections else None
     if (
         diarized.get("clock") != "source"
         or diarized.get("algorithm_version") != TRANSCRIPT_CANONICAL_VERSION
@@ -327,6 +345,7 @@ def current_diarized_transcript(
         or provenance.get("channel_map") != (channel_map or [])
         or provenance.get("canonical_activity_fingerprint")
         != (activity.fingerprint if activity else None)
+        or provenance.get("corrections_fingerprint") != corrections_fingerprint
     ):
         return None
     return diarized
@@ -397,6 +416,159 @@ class TranscribeAgent(BaseAgent):
         result["mode"] = "multichannel" if multichannel else "diarized"
         result["reused_raw"] = reuse_raw
         return result
+
+    @staticmethod
+    def _apply_transcript_corrections(
+        diarized: dict, corrections: dict
+    ) -> tuple[dict, dict]:
+        words = []
+        for utterance_index, utterance in enumerate(diarized.get("utterances", [])):
+            source = utterance.get("source_utterance", utterance_index)
+            for word in utterance.get("words", []):
+                copied = dict(word)
+                copied["_group"] = f"source_{source}"
+                words.append(copied)
+
+        applied = []
+        for operation_index, operation in enumerate(corrections.get("operations", [])):
+            correction_id = str(
+                operation.get("id") or f"correction_{operation_index:03d}"
+            )
+            kind = operation.get("op")
+            if kind == "replace_word":
+                word_id = operation.get("word_id")
+                matching = [word for word in words if word.get("id") == word_id]
+                if len(matching) != 1:
+                    raise ValueError(
+                        f"Correction {correction_id} expected one word {word_id}, "
+                        f"found {len(matching)}"
+                    )
+                word = matching[0]
+                original = {
+                    key: word.get(key)
+                    for key in (
+                        "word",
+                        "punctuated_word",
+                        "speaker",
+                        "confidence",
+                    )
+                }
+                for key in ("word", "punctuated_word", "speaker", "confidence"):
+                    if key in operation:
+                        word[key] = operation[key]
+                word.setdefault("alternatives", []).append(
+                    {**original, "reason": "pre_correction"}
+                )
+                word["corrected"] = True
+                word["correction_id"] = correction_id
+                word["correction_reason"] = operation.get("reason")
+                word["suspect"] = bool(operation.get("suspect", False))
+                word["suspect_reasons"] = operation.get("suspect_reasons", [])
+                applied.append(correction_id)
+                continue
+            if kind != "replace_range":
+                raise ValueError(f"Unsupported transcript correction op: {kind}")
+            start = float(operation.get("start", -1))
+            end = float(operation.get("end", -1))
+            replacement = operation.get("words")
+            if start < 0 or end <= start or not isinstance(replacement, list):
+                raise ValueError(f"Invalid range correction {correction_id}")
+            words = [
+                word
+                for word in words
+                if not (start <= (word["start"] + word["end"]) / 2 < end)
+            ]
+            for replacement_index, item in enumerate(replacement):
+                word_start = float(item.get("start", -1))
+                word_end = float(item.get("end", -1))
+                speaker = item.get("speaker")
+                if (
+                    word_start < start
+                    or word_end > end
+                    or word_end < word_start
+                    or not isinstance(speaker, int)
+                ):
+                    raise ValueError(
+                        f"Correction {correction_id} has an invalid replacement word"
+                    )
+                value = str(item.get("word", "")).strip()
+                if not value:
+                    raise ValueError(
+                        f"Correction {correction_id} has an empty replacement word"
+                    )
+                words.append(
+                    {
+                        "id": f"{correction_id}_{replacement_index:03d}",
+                        "word": value,
+                        "punctuated_word": item.get("punctuated_word", value),
+                        "start": word_start,
+                        "end": word_end,
+                        "confidence": float(item.get("confidence", 0)),
+                        "speaker": speaker,
+                        "asr_channel": item.get("asr_channel"),
+                        "alternatives": item.get("alternatives", []),
+                        "suspect": bool(item.get("suspect", False)),
+                        "suspect_reasons": item.get("suspect_reasons", []),
+                        "corrected": True,
+                        "correction_id": correction_id,
+                        "correction_reason": operation.get("reason"),
+                        "_group": correction_id,
+                    }
+                )
+            applied.append(correction_id)
+
+        words.sort(
+            key=lambda word: (
+                float(word.get("start", 0)),
+                float(word.get("end", 0)),
+                int(word.get("speaker", 0)),
+            )
+        )
+        groups: list[list[dict]] = []
+        for word in words:
+            if (
+                groups
+                and groups[-1][-1]["_group"] == word["_group"]
+                and groups[-1][-1]["speaker"] == word["speaker"]
+            ):
+                groups[-1].append(word)
+            else:
+                groups.append([word])
+        utterances = []
+        for group in groups:
+            public_words = []
+            for word in group:
+                public_word = dict(word)
+                public_word.pop("_group", None)
+                public_words.append(public_word)
+            utterances.append(
+                {
+                    "speaker": public_words[0]["speaker"],
+                    "start": public_words[0]["start"],
+                    "end": public_words[-1]["end"],
+                    "text": " ".join(word["punctuated_word"] for word in public_words),
+                    "confidence": sum(
+                        word.get("confidence", 0) for word in public_words
+                    )
+                    / len(public_words),
+                    "words": public_words,
+                    "source_utterance": group[0]["_group"],
+                }
+            )
+        diarized = dict(diarized)
+        diarized["utterances"] = utterances
+        canonicalization = dict(diarized.get("canonicalization", {}))
+        canonicalization.update(
+            {
+                "output_words": len(words),
+                "output_utterances": len(utterances),
+                "suspect_words": sum(word.get("suspect", False) for word in words),
+                "corrections_applied": applied,
+                "corrected_words": sum(word.get("corrected", False) for word in words),
+            }
+        )
+        diarized["canonicalization"] = canonicalization
+        return diarized, {"applied": applied, "word_count": len(words)}
 
     def _resolve_channel_map(self, episode: dict) -> list[dict]:
         historic = self.load_json_safe("diarized_transcript.json").get("speaker_map")
@@ -1135,6 +1307,16 @@ class TranscribeAgent(BaseAgent):
         )
         raw_path = self.episode_dir / "transcript.json"
         raw_hash = _file_sha256(raw_path) if raw_path.is_file() else _stable_hash(raw)
+        corrections = _load_corrections(self.episode_dir)
+        corrections_fingerprint = None
+        if corrections:
+            expected_raw = corrections.get("raw_transcript_sha256")
+            if expected_raw and expected_raw != raw_hash:
+                raise RuntimeError(
+                    "Transcript corrections target a different raw transcript"
+                )
+            diarized, _ = self._apply_transcript_corrections(diarized, corrections)
+            corrections_fingerprint = _stable_hash(corrections)
         provenance = {
             "version": TRANSCRIPT_CANONICAL_VERSION,
             "clock": "source",
@@ -1145,6 +1327,7 @@ class TranscribeAgent(BaseAgent):
             "canonical_activity_fingerprint": (
                 activity.fingerprint if activity else None
             ),
+            "corrections_fingerprint": corrections_fingerprint,
             "channel_map": channel_map or [],
             "raw_reused_without_api": reused_raw,
         }
