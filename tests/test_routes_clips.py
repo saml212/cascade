@@ -206,6 +206,50 @@ class TestManualClip:
         )
         assert resp.status_code == 400
 
+    def test_rejects_negative_start_without_creating_clip(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+
+        resp = client.post(
+            "/api/episodes/ep_001/clips/manual",
+            json={"start_seconds": -1, "end_seconds": 30},
+        )
+
+        assert resp.status_code == 422
+        assert not (episode_dir / "clips.json").exists()
+
+    def test_rejects_end_beyond_probed_source_duration(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "source_merged.mp4").write_bytes(b"probe fixture")
+
+        import server.routes.clips as clips_mod
+
+        monkeypatch.setattr(clips_mod, "get_duration", lambda _path: 100.0)
+        resp = client.post(
+            "/api/episodes/ep_001/clips/manual",
+            json={"start_seconds": 50, "end_seconds": 101},
+        )
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["source_duration_seconds"] == 100.0
+        assert not (episode_dir / "clips.json").exists()
+
+    def test_rejects_nonfinite_json_without_server_error(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+
+        for literal in ("NaN", "1e999", "-1e999"):
+            resp = client.post(
+                "/api/episodes/ep_001/clips/manual",
+                content=f'{{"start_seconds":{literal},"end_seconds":30}}',
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 422
+        assert not (episode_dir / "clips.json").exists()
+
 
 class TestClipMutation:
     def test_typed_patch_keeps_clocks_in_sync_and_invalidates_approval(
@@ -250,6 +294,71 @@ class TestClipMutation:
         assert updated["selection_status"] == "selected"
         assert "approved_revision" not in updated
         assert "approved_render_fingerprint" not in updated
+
+    def test_time_patch_rejects_nonfinite_and_out_of_source_bounds(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        clip = dict(
+            SAMPLE_CLIPS[0],
+            start=10,
+            start_seconds=10,
+            end=50,
+            end_seconds=50,
+            duration=40,
+        )
+        _add_clips(episodes_dir, "ep_001", [clip])
+        (episode_dir / "source_merged.mp4").write_bytes(b"probe fixture")
+
+        import server.routes.clips as clips_mod
+
+        monkeypatch.setattr(clips_mod, "get_duration", lambda _path: 100.0)
+        nonfinite = client.patch(
+            "/api/episodes/ep_001/clips/clip_01/metadata",
+            content='{"start_seconds":NaN}',
+            headers={"content-type": "application/json"},
+        )
+        past_end = client.patch(
+            "/api/episodes/ep_001/clips/clip_01/metadata",
+            json={"end_seconds": 101},
+        )
+
+        assert nonfinite.status_code == 422
+        assert past_end.status_code == 422
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert stored["start_seconds"] == 10
+        assert stored["end_seconds"] == 50
+
+    def test_patch_rejects_nonfinite_score_without_persisting(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        resp = client.patch(
+            "/api/episodes/ep_001/clips/clip_01/metadata",
+            content='{"virality_score":1e999}',
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 422
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert stored["virality_score"] == 8
+
+    def test_patch_rejects_nested_nonfinite_metadata(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        resp = client.patch(
+            "/api/episodes/ep_001/clips/clip_01/metadata",
+            content='{"metadata":{"tiktok":{"score":NaN}}}',
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 422
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert "metadata" not in stored
 
     def test_delete_removes_only_requested_clip(self, test_client):
         client, episodes_dir = test_client

@@ -4,8 +4,132 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 from tests.test_routes_episodes import _create_episode, test_client  # noqa: F401
+
+
+class TestChatTransport:
+    def test_claude_cli_is_text_only_and_ignores_workspace_customizations(
+        self, monkeypatch
+    ):
+        import server.routes.chat as chat_mod
+
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return SimpleNamespace(
+                returncode=0, stdout='{"result":"Read-only answer"}', stderr=""
+            )
+
+        monkeypatch.setattr(chat_mod.subprocess, "run", run)
+
+        assert chat_mod._call_claude("Canonical context", [{"content": "Status?"}]) == (
+            "Read-only answer"
+        )
+        command, kwargs = calls[0]
+        assert "--system-prompt" in command
+        assert "--append-system-prompt" not in command
+        assert {
+            "--safe-mode",
+            "--no-session-persistence",
+            "--no-chrome",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+        }.issubset(command)
+        assert command[-2:] == ["--tools", ""]
+        assert kwargs["input"] == "<user>\nStatus?\n</user>"
+
+        calls.clear()
+        chat_mod._call_claude("", [{"content": "Find trim bounds"}])
+        fallback_command = calls[0][0]
+        assert fallback_command[fallback_command.index("--system-prompt") + 1] == (
+            chat_mod._TEXT_ONLY_PROMPT
+        )
+
+
+class TestChatContext:
+    def test_context_separates_current_release_state_from_legacy_evidence(
+        self, test_client, monkeypatch
+    ):
+        _, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"title": "Current title", "description": "Current description"},
+        )
+        (episode_dir / "metadata" / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "longform": {"title": "Legacy title"},
+                    "integrated_lufs": -14.0,
+                }
+            )
+        )
+        (episode_dir / "delivery.json").write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "integrated_lufs": -16.1,
+                    "true_peak_dbfs": -1.2,
+                }
+            )
+        )
+
+        import server.routes.chat as chat_mod
+
+        monkeypatch.setattr(
+            chat_mod,
+            "quality_snapshot",
+            lambda *_args, **_kwargs: {
+                "quality": {"status": "passed"},
+                "release_gate": {"status": "awaiting_publish_approval"},
+            },
+        )
+        monkeypatch.setattr(
+            chat_mod.episodes_api,
+            "_delivery_snapshot",
+            lambda _episode_dir: {"status": "ready"},
+        )
+
+        context = chat_mod._load_episode_context(episode_dir)
+
+        assert context["release_metadata"]["longform"]["title"] == "Current title"
+        assert context["verified_delivery"]["audio_measurements_current"] is True
+        assert context["verified_delivery"]["audio_measurements"] == {
+            "integrated_lufs": -16.1,
+            "true_peak_dbfs": -1.2,
+        }
+        assert context["legacy_metadata_evidence"]["status"] == (
+            "historical_unverified"
+        )
+        prompt = chat_mod._build_system_prompt(context)
+        assert "never describe a legacy value as a current measurement" in prompt
+        assert "<quality_snapshot>" in prompt
+        assert "<verified_delivery>" in prompt
+
+    def test_unverified_delivery_hides_cached_audio_measurements(
+        self, test_client, monkeypatch
+    ):
+        _, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "delivery.json").write_text(
+            json.dumps({"status": "ready", "integrated_lufs": -14.0})
+        )
+
+        import server.routes.chat as chat_mod
+
+        monkeypatch.setattr(
+            chat_mod.episodes_api,
+            "_delivery_snapshot",
+            lambda _episode_dir: {"status": "not_prepared"},
+        )
+
+        delivery = chat_mod._verified_delivery_context(episode_dir)
+
+        assert delivery["audio_measurements_current"] is False
+        assert delivery["audio_measurements"] == {}
 
 
 class TestChatEndpoint:

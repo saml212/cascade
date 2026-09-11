@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import math
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from lib.clips import (
 from lib.clips import (
     save_clips as _save_clips_to_dir,
 )
+from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
@@ -49,6 +52,72 @@ class BulkClipRequest(BaseModel):
     clip_ids: list[str] | None = None
     min_score: float | None = None
     max_score: float | None = None
+
+
+def _finite_number(name: str, value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        raise HTTPException(status_code=422, detail=f"{name} must be finite")
+    return value
+
+
+def _source_duration_seconds(ep_dir: Path) -> float | None:
+    """Return probed source duration, falling back to the recorded ingest value."""
+    source = ep_dir / "source_merged.mp4"
+    if source.is_file():
+        try:
+            duration = float(get_duration(source))
+            if math.isfinite(duration) and duration > 0:
+                return duration
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    try:
+        episode = json.loads((ep_dir / "episode.json").read_text())
+        duration = float(
+            episode.get("audio_sync", {}).get("video_duration")
+            or episode.get("duration_seconds", 0)
+            or 0
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _validate_clip_bounds(ep_dir: Path, start: float, end: float) -> float:
+    start = _finite_number("start_seconds", start)
+    end = _finite_number("end_seconds", end)
+    if start < 0:
+        raise HTTPException(status_code=422, detail="start_seconds must be non-negative")
+    if end <= start:
+        raise HTTPException(
+            status_code=400, detail="end_seconds must be greater than start_seconds"
+        )
+    source_duration = _source_duration_seconds(ep_dir)
+    if source_duration is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Source duration is unavailable; clip bounds cannot be validated",
+        )
+    if end > source_duration + 0.001:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "end_seconds exceeds the source duration",
+                "source_duration_seconds": round(source_duration, 6),
+            },
+        )
+    return end - start
+
+
+def _validate_finite_json(value, path: str = "metadata") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise HTTPException(status_code=422, detail=f"{path} must be finite")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _validate_finite_json(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_finite_json(child, f"{path}[{index}]")
 
 
 def load_clips(episode_id: str) -> tuple:
@@ -179,6 +248,8 @@ async def get_clip(episode_id: str, clip_id: str) -> dict:
 @router.post("/bulk/approve")
 async def approve_clips(episode_id: str, req: BulkClipRequest) -> dict:
     """Approve selected current renders as one all-or-nothing decision."""
+    if req.min_score is not None:
+        _finite_number("min_score", req.min_score)
     clips, clips_file = load_clips(episode_id)
     targets = [
         clip
@@ -211,6 +282,8 @@ async def approve_clips(episode_id: str, req: BulkClipRequest) -> dict:
 @router.post("/bulk/reject")
 async def reject_clips(episode_id: str, req: BulkClipRequest) -> dict:
     """Reject matching candidates while preserving prior final approvals."""
+    if req.max_score is not None:
+        _finite_number("max_score", req.max_score)
     clips, clips_file = load_clips(episode_id)
     targets = [
         clip
@@ -311,12 +384,10 @@ async def request_alternative(episode_id: str, clip_id: str) -> dict:
 @router.post("/manual")
 async def add_manual_clip(episode_id: str, req: ManualClipRequest) -> dict:
     """Add a custom clip by specifying start and end timestamps."""
-    if req.end_seconds <= req.start_seconds:
-        raise HTTPException(
-            status_code=400, detail="end_seconds must be greater than start_seconds"
-        )
-
-    duration = req.end_seconds - req.start_seconds
+    ep_dir = EPISODES_DIR / episode_id
+    if not (ep_dir / "episode.json").is_file():
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
+    duration = _validate_clip_bounds(ep_dir, req.start_seconds, req.end_seconds)
     if duration < 5 or duration > 300:
         raise HTTPException(
             status_code=400, detail="Clip duration must be between 5 and 300 seconds"
@@ -362,6 +433,26 @@ async def update_clip_metadata(
     clips, clips_file = load_clips(episode_id)
     clip, idx = find_clip(clips, clip_id)
 
+    if update.virality_score is not None:
+        _finite_number("virality_score", update.virality_score)
+    if update.metadata is not None:
+        _validate_finite_json(update.metadata)
+    start = update.start_seconds
+    end = update.end_seconds
+    next_start = (
+        start if start is not None else clip.get("start_seconds", clip.get("start"))
+    )
+    next_end = end if end is not None else clip.get("end_seconds", clip.get("end"))
+    bounds_changed = start is not None or end is not None
+    duration = None
+    if bounds_changed:
+        if next_start is None or next_end is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Both existing or updated clip bounds are required",
+            )
+        duration = _validate_clip_bounds(clips_file.parent, next_start, next_end)
+
     changed = False
     for field in (
         "title",
@@ -377,18 +468,6 @@ async def update_clip_metadata(
             clip[field] = value
             changed = True
 
-    start = update.start_seconds
-    end = update.end_seconds
-    next_start = (
-        start if start is not None else clip.get("start_seconds", clip.get("start"))
-    )
-    next_end = end if end is not None else clip.get("end_seconds", clip.get("end"))
-    if (start is not None or end is not None) and (
-        next_start is None or next_end is None or next_end <= next_start
-    ):
-        raise HTTPException(
-            status_code=400, detail="end_seconds must be greater than start_seconds"
-        )
     if start is not None:
         changed = (
             changed or clip.get("start") != start or clip.get("start_seconds") != start
@@ -397,8 +476,8 @@ async def update_clip_metadata(
     if end is not None:
         changed = changed or clip.get("end") != end or clip.get("end_seconds") != end
         clip["end"] = clip["end_seconds"] = end
-    if start is not None or end is not None:
-        clip["duration"] = next_end - next_start
+    if bounds_changed:
+        clip["duration"] = duration
 
     if update.metadata is not None:
         merged = dict(clip.get("metadata", {}))
