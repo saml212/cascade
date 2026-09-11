@@ -44,6 +44,7 @@ TRANSCRIPT_CANONICAL_VERSION = "source-clock-v3"
 _TRANSCRIPT_AUDIO_VERSION = "logical-tracks-v3"
 _TRACK_WINDOW_VERSION = "logical-track-window-v1"
 _TRANSCRIPT_COVERAGE_VERSION = "source-clock-v1"
+_SOURCE_ACTIVITY_FINGERPRINT_VERSION = "source-activity-v2"
 _WORD_TIME_TOLERANCE = 0.12
 MAX_TRANSCRIPT_REVIEW_SECONDS = 120.0
 
@@ -851,12 +852,61 @@ def current_diarized_transcript(
         or provenance.get("channel_map") != (channel_map or [])
         or _speaker_map_identity(provenance.get("speaker_map"))
         != _speaker_map_identity(speaker_map)
-        or provenance.get("canonical_activity_fingerprint")
-        != (activity.fingerprint if activity else None)
         or provenance.get("corrections_fingerprint") != corrections_fingerprint
     ):
         return None
+    expected_activity = activity.fingerprint if activity else None
+    if provenance.get(
+        "canonical_activity_fingerprint"
+    ) != expected_activity and not _canonical_content_matches_activity(
+        agent,
+        raw,
+        diarized,
+        multichannel=multichannel,
+        speaker_map=speaker_map,
+        activity=activity,
+        corrections=corrections,
+    ):
+        return None
     return diarized
+
+
+def _canonical_content_matches_activity(
+    agent: TranscribeAgent,
+    raw: dict,
+    stored: dict,
+    *,
+    multichannel: bool,
+    speaker_map: list[dict] | None,
+    activity: _SourceActivity | None,
+    corrections: dict | None,
+) -> bool:
+    """Verify a legacy activity fingerprint by rebuilding canonical content.
+
+    Older provenance included speaker-cut wrapper fingerprints. A picture-only
+    crop edit could therefore make a byte-identical activity cache look stale.
+    Rebuilding is a bounded local compatibility check: every public word,
+    speaker decision, and correction must still match before the stored
+    transcript is accepted.
+    """
+    try:
+        rebuilt = agent._build_diarized_transcript(
+            raw,
+            multichannel=multichannel,
+            channel_map=speaker_map,
+            activity=activity,
+        )
+        if corrections:
+            rebuilt, _ = agent._apply_transcript_corrections(rebuilt, corrections)
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+    existing = deepcopy(stored)
+    existing.pop("provenance", None)
+    for transcript in (rebuilt, existing):
+        canonicalization = transcript.get("canonicalization")
+        if isinstance(canonicalization, dict):
+            canonicalization["activity_fingerprint"] = None
+    return rebuilt == existing
 
 
 class TranscribeAgent(BaseAgent):
@@ -1435,7 +1485,8 @@ class TranscribeAgent(BaseAgent):
                 continue
             identities.append(
                 {
-                    "path": str(path.resolve()),
+                    "channel": channel,
+                    "logical_track": entry["logical_track"],
                     "size": path.stat().st_size,
                     "sha256": _file_sha256(path),
                 }
@@ -1447,7 +1498,18 @@ class TranscribeAgent(BaseAgent):
         preferred_channels = np.full(
             max(len(array) for array in arrays.values()), -1, dtype=np.int16
         )
-        for segment in segments.get("segments", []):
+        alignment = segments.get("transcript_alignment")
+        base_segments = (
+            alignment.get("base_segments") if isinstance(alignment, dict) else None
+        )
+        activity_segments = (
+            base_segments
+            if isinstance(base_segments, list)
+            else segments.get("segments", [])
+        )
+        for segment in activity_segments:
+            if not isinstance(segment, dict):
+                continue
             speaker = str(segment.get("speaker", ""))
             if not speaker.startswith("speaker_"):
                 continue
@@ -1466,8 +1528,9 @@ class TranscribeAgent(BaseAgent):
             preferred_channels[first:last] = channel
         fingerprint = _stable_hash(
             {
-                "rms": metadata,
-                "segments": segments.get("fingerprint"),
+                "version": _SOURCE_ACTIVITY_FINGERPRINT_VERSION,
+                "clock": "source",
+                "frame_seconds": frame_seconds,
                 "channel_tracks": [
                     {
                         "index": entry["index"],
@@ -1475,7 +1538,14 @@ class TranscribeAgent(BaseAgent):
                     }
                     for entry in channel_map
                 ],
-                "arrays": identities,
+                "arrays": sorted(identities, key=lambda item: item["channel"]),
+                "preferred_channels": {
+                    "count": len(preferred_channels),
+                    "dtype": preferred_channels.dtype.str,
+                    "sha256": hashlib.sha256(
+                        np.ascontiguousarray(preferred_channels).tobytes()
+                    ).hexdigest(),
+                },
             }
         )
         return _SourceActivity(

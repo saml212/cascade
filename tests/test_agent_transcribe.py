@@ -573,6 +573,55 @@ class TestCanonicalRepair:
             == repaired
         )
 
+        agent = TranscribeAgent(tmp_episode_dir, sample_config)
+        channel_map = agent._resolve_channel_map(episode)
+        activity_fingerprint = agent._load_source_activity(channel_map).fingerprint
+        segments_path = tmp_episode_dir / "segments.json"
+        rms_metadata_path = tmp_episode_dir / "work/rms_meta.json"
+        segments = json.loads(segments_path.read_text())
+        rms_metadata = json.loads(rms_metadata_path.read_text())
+        segments["fingerprint"] = "picture-only-rebind"
+        rms_metadata["fingerprint"] = "picture-only-rebind"
+        segments_path.write_text(json.dumps(segments))
+        rms_metadata_path.write_text(json.dumps(rms_metadata))
+        assert (
+            agent._load_source_activity(channel_map).fingerprint == activity_fingerprint
+        )
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == repaired
+        )
+
+        # Pre-v2 transcript provenance used the mutable wrapper fingerprint.
+        # Verify its exact canonical content locally instead of rewriting it or
+        # treating a picture-only change as missing transcript evidence.
+        diarized_path = tmp_episode_dir / "diarized_transcript.json"
+        provenance_path = tmp_episode_dir / "transcript_provenance.json"
+        original_diarized = diarized_path.read_text()
+        original_provenance = provenance_path.read_text()
+        legacy_diarized = json.loads(original_diarized)
+        legacy_provenance = json.loads(original_provenance)
+        legacy_diarized["canonicalization"]["activity_fingerprint"] = "legacy"
+        legacy_diarized["provenance"]["canonical_activity_fingerprint"] = "legacy"
+        legacy_provenance["canonical_activity_fingerprint"] = "legacy"
+        diarized_path.write_text(json.dumps(legacy_diarized))
+        provenance_path.write_text(json.dumps(legacy_provenance))
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == legacy_diarized
+        )
+        assert json.loads(diarized_path.read_text()) == legacy_diarized
+        assert json.loads(provenance_path.read_text()) == legacy_provenance
+        speaker_one = tmp_episode_dir / "work/speaker_1_rms_db.npy"
+        speaker_one_levels = np.load(speaker_one).copy()
+        np.save(speaker_one, np.full_like(speaker_one_levels, -100))
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config) is None
+        )
+        np.save(speaker_one, speaker_one_levels)
+        diarized_path.write_text(original_diarized)
+        provenance_path.write_text(original_provenance)
+
         for rms_path in (tmp_episode_dir / "work").glob("speaker_*_rms_db.npy"):
             values = np.load(rms_path)
             np.save(rms_path, values)
@@ -581,7 +630,6 @@ class TestCanonicalRepair:
             == repaired
         )
 
-        provenance_path = tmp_episode_dir / "transcript_provenance.json"
         provenance = json.loads(provenance_path.read_text())
         original_provenance = json.dumps(provenance)
         provenance["speaker_map"][1]["mapping_confidence"] = 0.01
