@@ -15,14 +15,15 @@ Environment:
     - CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN
 """
 
+import hashlib
 import json
 import os
 import subprocess
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
-from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 from agents.base import BaseAgent
 
@@ -38,7 +39,7 @@ class PodcastFeedAgent(BaseAgent):
         episode = self.load_json("episode.json")
         episode_id = episode.get("episode_id", self.episode_dir.name)
 
-        # --- Step 1: Extract audio from longform video ---
+        # --- Step 1: Prepare upload-ready audio locally ---
         longform_path = self.episode_dir / "longform.mp4"
         audio_path = self.episode_dir / "podcast_audio.mp3"
 
@@ -47,11 +48,7 @@ class PodcastFeedAgent(BaseAgent):
                 "longform.mp4 not found in episode directory: %s" % self.episode_dir
             )
 
-        if audio_path.exists():
-            self.logger.info("podcast_audio.mp3 already exists, skipping extraction")
-        else:
-            self.logger.info("Extracting audio from longform.mp4...")
-            self._extract_audio(longform_path, audio_path)
+        audio_path = self.prepare_local_audio(longform_path, audio_path)
 
         audio_size = audio_path.stat().st_size
         audio_duration = self._get_duration(audio_path)
@@ -146,27 +143,96 @@ class PodcastFeedAgent(BaseAgent):
 
     # ---- Audio extraction ----
 
-    def _extract_audio(self, video_path, audio_path):
+    def prepare_local_audio(self, video_path=None, audio_path=None):
+        """Create the upload-ready MP3 without uploading or changing the feed.
+
+        Prefer the lossless mastered mix so the podcast does not transcode the
+        AAC audio embedded in the video. The temporary output is atomically
+        renamed, so an interrupted ffmpeg run cannot leave a truncated MP3.
+        """
+        video_path = Path(video_path or self.episode_dir / "longform.mp4")
+        audio_path = Path(audio_path or self.episode_dir / "podcast_audio.mp3")
+        mix_path = self.episode_dir / "work" / "audio_mix.wav"
+        source_path = mix_path if mix_path.exists() else video_path
+
+        if not source_path.exists():
+            raise FileNotFoundError(
+                "No podcast audio source found in %s" % self.episode_dir
+            )
+
+        episode = self.load_json_safe("episode.json")
+        edits = episode.get("longform_edits", [])
+        source_stat = source_path.stat()
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "source_size": source_stat.st_size,
+                    "source_mtime_ns": source_stat.st_mtime_ns,
+                    "edits": edits,
+                    "version": 2,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        fingerprint_path = audio_path.with_suffix(".fingerprint")
+        try:
+            current_fingerprint = fingerprint_path.read_text().strip()
+        except OSError:
+            current_fingerprint = ""
+        if audio_path.exists() and current_fingerprint == fingerprint:
+            self.logger.info("podcast_audio.mp3 is current, skipping export")
+            return audio_path
+
+        self.logger.info("Encoding podcast MP3 from %s..." % source_path.name)
+        self._extract_audio(source_path, audio_path, edits=edits)
+        fingerprint_path.write_text(fingerprint)
+        return audio_path
+
+    def _extract_audio(self, video_path, audio_path, *, edits=None):
         # type: (Path, Path) -> None
+        temp_path = audio_path.with_name(audio_path.name + ".tmp.mp3")
+        audio_filter_args = ["-map", "0:a:0"]
+        if edits:
+            from lib.delivery_video import build_keep_intervals
+
+            intervals = build_keep_intervals(self._get_duration(video_path), edits)
+            chains = []
+            labels = []
+            for index, (start, end) in enumerate(intervals):
+                chains.append(
+                    f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{index}]"
+                )
+                labels.append(f"[a{index}]")
+            chains.append(f"{''.join(labels)}concat=n={len(intervals)}:v=0:a=1[outa]")
+            audio_filter_args = ["-filter_complex", ";".join(chains), "-map", "[outa]"]
         cmd = [
             "ffmpeg",
             "-y",
             "-i",
             str(video_path),
+            *audio_filter_args,
             "-vn",
             "-c:a",
             "libmp3lame",
             "-b:a",
             "192k",
             "-ar",
-            "44100",
-            str(audio_path),
+            "48000",
+            "-id3v2_version",
+            "3",
+            str(temp_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "ffmpeg audio extraction failed: %s" % result.stderr[-500:]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600, check=False
             )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            temp_path.unlink(missing_ok=True)
+            raise RuntimeError("ffmpeg audio export failed: %s" % exc) from exc
+        if result.returncode != 0:
+            temp_path.unlink(missing_ok=True)
+            raise RuntimeError("ffmpeg audio export failed: %s" % result.stderr[-500:])
+        temp_path.replace(audio_path)
 
     def _get_duration(self, audio_path):
         # type: (Path) -> float

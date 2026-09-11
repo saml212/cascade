@@ -1,37 +1,29 @@
 """Tests for lib.audio_enhance — ML denoise + ffmpeg audio enhancement pipeline."""
 
-from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from lib.audio_enhance import (
-    enhance_audio,
-    _build_static_filter_chain,
-    _build_ffmpeg_enhance_filter,
     _apply_clearervoice,
     _apply_deepfilternet,
+    _build_ffmpeg_enhance_filter,
+    _build_static_filter_chain,
+    enhance_audio,
 )
 
 
 class TestBuildStaticFilterChain:
     def test_default_filter_chain(self):
         af = _build_static_filter_chain({})
-        assert "afftdn=" in af
-        assert "adeclick=" in af
-        assert "highpass=f=80:p=2" in af
-        assert "lowpass=f=16000" in af  # New default
-        assert "acompressor=" in af
-        assert "deesser=" in af  # New
-        assert "alimiter" not in af  # Removed
-        assert "loudnorm" not in af  # Now applied separately as two-pass
+        assert af == "highpass=f=80:p=2"
 
     def test_custom_highpass(self):
         af = _build_static_filter_chain({"audio_highpass_hz": 120})
         assert "highpass=f=120:p=2" in af
 
     def test_custom_lowpass(self):
-        af = _build_static_filter_chain({"audio_lowpass_hz": 12000})
+        af = _build_static_filter_chain(
+            {"audio_enhance_mode": "restoration", "audio_lowpass_hz": 12000}
+        )
         assert "lowpass=f=12000" in af
 
     def test_disabled_highpass(self):
@@ -43,31 +35,50 @@ class TestBuildStaticFilterChain:
         assert "lowpass" not in af
 
     def test_disabled_afftdn(self):
-        af = _build_static_filter_chain({"audio_afftdn": False})
+        af = _build_static_filter_chain(
+            {"audio_enhance_mode": "restoration", "audio_afftdn": False}
+        )
         assert "afftdn" not in af
 
     def test_disabled_declick(self):
-        af = _build_static_filter_chain({"audio_declick": False})
+        af = _build_static_filter_chain(
+            {"audio_enhance_mode": "restoration", "audio_declick": False}
+        )
         assert "adeclick" not in af
 
     def test_disabled_deesser(self):
-        af = _build_static_filter_chain({"audio_deesser": False})
+        af = _build_static_filter_chain(
+            {"audio_enhance_mode": "restoration", "audio_deesser": False}
+        )
         assert "deesser" not in af
 
     def test_afftdn_lighter_with_deepfilternet(self):
         """When DeepFilterNet is active, afftdn should run lighter."""
-        af = _build_static_filter_chain({"audio_denoise_model": "deepfilternet"})
+        af = _build_static_filter_chain(
+            {
+                "audio_enhance_mode": "restoration",
+                "audio_denoise_model": "deepfilternet",
+            }
+        )
         assert "nr=6" in af
 
     def test_afftdn_full_when_no_ml(self):
-        af = _build_static_filter_chain({"audio_denoise_model": "none"})
+        af = _build_static_filter_chain(
+            {"audio_enhance_mode": "restoration", "audio_denoise_model": "none"}
+        )
         assert "nr=12" in af
 
     def test_filter_count(self):
-        """Default static chain: afftdn + adeclick + highpass + lowpass + compressor + deesser = 6."""
-        af = _build_static_filter_chain({})
+        """Restoration enables cleanup but keeps compression opt-in."""
+        af = _build_static_filter_chain({"audio_enhance_mode": "restoration"})
         parts = af.split(",")
-        assert len(parts) == 6
+        assert len(parts) == 5
+
+    def test_restoration_compressor_is_explicit(self):
+        af = _build_static_filter_chain(
+            {"audio_enhance_mode": "restoration", "audio_compressor": True}
+        )
+        assert "acompressor=" in af
 
 
 class TestBuildFfmpegEnhanceFilter:
@@ -108,7 +119,7 @@ class TestEnhanceAudio:
 
         with patch("lib.audio_enhance.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stderr="error")
-            result = enhance_audio(input_wav, output_wav, config)
+            enhance_audio(input_wav, output_wav, config)
             # Two-pass loudnorm: pass 1 (measurement) + pass 2 (normalization)
             assert mock_run.call_count == 2
             # Pass 1 should be analysis with print_format=json
@@ -119,9 +130,10 @@ class TestEnhanceAudio:
             assert pass2_cmd[0] == "ffmpeg"
             af_value = pass2_cmd[pass2_cmd.index("-af") + 1]
             assert "loudnorm" in af_value
-            assert "acompressor" in af_value
-            assert "afftdn" in af_value
-            assert "deesser" in af_value
+            assert af_value.startswith("highpass=f=80:p=2,loudnorm")
+            assert "acompressor" not in af_value
+            assert "afftdn" not in af_value
+            assert "deesser" not in af_value
             assert "alimiter" not in af_value
 
     def test_ffmpeg_failure_returns_input(self, tmp_path):

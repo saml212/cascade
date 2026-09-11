@@ -1,17 +1,17 @@
 """Tests for the stitch agent."""
 
 import json
+from unittest.mock import MagicMock, patch
+
 import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 from agents.stitch import StitchAgent
 
 
 class TestStitchAgent:
-    def _make_ingest_json(self, episode_dir, files):
+    def _make_ingest_json(self, episode_dir, files, **extra):
         with open(episode_dir / "ingest.json", "w") as f:
-            json.dump({"files": files}, f)
+            json.dump({"files": files, **extra}, f)
 
     def test_no_files_raises(self, tmp_episode_dir, sample_config):
         self._make_ingest_json(tmp_episode_dir, [])
@@ -22,7 +22,9 @@ class TestStitchAgent:
     @patch("subprocess.run")
     @patch("os.symlink")
     @patch("agents.stitch.ffprobe")
-    def test_single_file_symlinks(self, mock_probe, mock_symlink, mock_run, tmp_episode_dir, sample_config):
+    def test_single_file_symlinks(
+        self, mock_probe, mock_symlink, mock_run, tmp_episode_dir, sample_config
+    ):
         files = [{"dest_path": "/tmp/source/test.MP4", "duration_seconds": 120.0}]
         self._make_ingest_json(tmp_episode_dir, files)
 
@@ -39,7 +41,9 @@ class TestStitchAgent:
 
     @patch("subprocess.run")
     @patch("agents.stitch.ffprobe")
-    def test_multi_file_uses_ffmpeg(self, mock_probe, mock_run, tmp_episode_dir, sample_config):
+    def test_multi_file_uses_ffmpeg(
+        self, mock_probe, mock_run, tmp_episode_dir, sample_config
+    ):
         files = [
             {"dest_path": "/tmp/source/a.MP4", "duration_seconds": 60.0},
             {"dest_path": "/tmp/source/b.MP4", "duration_seconds": 60.0},
@@ -58,7 +62,9 @@ class TestStitchAgent:
 
     @patch("subprocess.run")
     @patch("agents.stitch.ffprobe")
-    def test_duration_validation_warning(self, mock_probe, mock_run, tmp_episode_dir, sample_config):
+    def test_duration_validation_warning(
+        self, mock_probe, mock_run, tmp_episode_dir, sample_config
+    ):
         files = [
             {"dest_path": "/tmp/source/a.MP4", "duration_seconds": 60.0},
             {"dest_path": "/tmp/source/b.MP4", "duration_seconds": 60.0},
@@ -77,7 +83,9 @@ class TestStitchAgent:
     @patch("subprocess.run")
     @patch("os.symlink")
     @patch("agents.stitch.ffprobe")
-    def test_result_structure(self, mock_probe, mock_symlink, mock_run, tmp_episode_dir, sample_config):
+    def test_result_structure(
+        self, mock_probe, mock_symlink, mock_run, tmp_episode_dir, sample_config
+    ):
         files = [{"dest_path": "/tmp/source/test.MP4", "duration_seconds": 120.0}]
         self._make_ingest_json(tmp_episode_dir, files)
         mock_probe.return_value = {"format": {"duration": "120.0"}, "streams": []}
@@ -92,7 +100,9 @@ class TestStitchAgent:
 
     @patch("subprocess.run")
     @patch("agents.stitch.ffprobe")
-    def test_concat_list_written(self, mock_probe, mock_run, tmp_episode_dir, sample_config):
+    def test_concat_list_written(
+        self, mock_probe, mock_run, tmp_episode_dir, sample_config
+    ):
         files = [
             {"dest_path": "/tmp/source/a.MP4", "duration_seconds": 60.0},
             {"dest_path": "/tmp/source/b.MP4", "duration_seconds": 60.0},
@@ -109,3 +119,48 @@ class TestStitchAgent:
         content = concat_file.read_text()
         assert "a.MP4" in content
         assert "b.MP4" in content
+
+    @patch("subprocess.run")
+    @patch("agents.stitch.ffprobe")
+    def test_stitch_repairs_dji_sequence_order(
+        self, mock_probe, mock_run, tmp_episode_dir, sample_config
+    ):
+        files = [
+            {
+                "filename": f"DJI_2026042912{i:02d}00_{sequence:04d}_D.MP4",
+                "dest_path": f"/tmp/{sequence:04d}.MP4",
+                "duration_seconds": 60,
+            }
+            for i, sequence in enumerate((6, 7, 9, 8))
+        ]
+        self._make_ingest_json(tmp_episode_dir, files)
+        mock_probe.return_value = {"format": {"duration": "240"}, "streams": []}
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        StitchAgent(tmp_episode_dir, sample_config).execute()
+
+        content = (tmp_episode_dir / "work" / "concat_list.txt").read_text()
+        positions = [content.index(f"/{sequence:04d}.MP4") for sequence in (6, 7, 8, 9)]
+        assert positions == sorted(positions)
+
+    @patch("subprocess.run")
+    @patch("agents.stitch.ffprobe")
+    def test_stitch_preserves_authoritative_order(
+        self, mock_probe, mock_run, tmp_episode_dir, sample_config
+    ):
+        files = [
+            {
+                "filename": f"DJI_20260429120000_{sequence:04d}_D.MP4",
+                "dest_path": f"/tmp/{sequence:04d}.MP4",
+                "duration_seconds": 60,
+            }
+            for sequence in (9, 8)
+        ]
+        self._make_ingest_json(tmp_episode_dir, files, source_order_authoritative=True)
+        mock_probe.return_value = {"format": {"duration": "120"}, "streams": []}
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        StitchAgent(tmp_episode_dir, sample_config).execute()
+
+        content = (tmp_episode_dir / "work" / "concat_list.txt").read_text()
+        assert content.index("/0009.MP4") < content.index("/0008.MP4")

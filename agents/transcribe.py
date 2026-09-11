@@ -11,9 +11,54 @@ from pathlib import Path
 import httpx
 
 from agents.base import BaseAgent
+from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
 from lib.srt import fmt_timecode
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+CAMERA_AUDIO_CACHE_VERSION = "timeline-v2"
+
+
+def remap_transcript_timestamps(data: dict, gaps: list[tuple[float, float]]) -> dict:
+    """Map decoded-sample ASR times onto the source media timeline.
+
+    Each gap is ``(collapsed_time, cumulative_source_offset)``. Deep copies
+    are intentional so callers can back up and compare the original payload.
+    """
+    import copy
+
+    result = copy.deepcopy(data)
+
+    def mapped(value: float) -> float:
+        offset = 0.0
+        for threshold, cumulative_offset in gaps:
+            if value >= threshold:
+                offset = cumulative_offset
+            else:
+                break
+        return value + offset
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"start", "end"} and isinstance(child, (int, float)):
+                    value[key] = mapped(float(child))
+                else:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(result)
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict) and isinstance(
+        metadata.get("duration"), (int, float)
+    ):
+        metadata["duration"] = mapped(float(metadata["duration"]))
+        metadata["timeline_remap"] = [
+            {"collapsed_time": threshold, "cumulative_offset": offset}
+            for threshold, offset in gaps
+        ]
+    return result
 
 
 class TranscribeAgent(BaseAgent):
@@ -28,7 +73,9 @@ class TranscribeAgent(BaseAgent):
         multichannel = False
 
         # Try multichannel (H6E per-speaker tracks)
-        if episode_data.get("audio_tracks") and episode_data.get("crop_config", {}).get("speakers"):
+        if episode_data.get("audio_tracks") and episode_data.get("crop_config", {}).get(
+            "speakers"
+        ):
             audio_path, channel_map = self._prepare_multichannel_audio(episode_data)
             multichannel = audio_path is not None
             if not multichannel:
@@ -37,16 +84,34 @@ class TranscribeAgent(BaseAgent):
         # Fallback: extract camera audio
         if not multichannel:
             audio_path = work_dir / "audio.m4a"
-            if not audio_path.exists():
+            cache_marker = work_dir / f"audio.m4a.{CAMERA_AUDIO_CACHE_VERSION}"
+            if not audio_path.exists() or not cache_marker.exists():
                 self.logger.info("Extracting audio to m4a...")
                 subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(self.episode_dir / "source_merged.mp4"),
-                     "-vn", "-c:a", "aac", "-b:a", "128k", str(audio_path)],
-                    capture_output=True, text=True, check=True,
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(self.episode_dir / "source_merged.mp4"),
+                        "-vn",
+                        "-af",
+                        CAMERA_AUDIO_TIMELINE_FILTER,
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        str(audio_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
                 )
+                cache_marker.write_text(CAMERA_AUDIO_CACHE_VERSION)
 
         audio_size_mb = audio_path.stat().st_size / 1e6
-        self.logger.info(f"Audio: {audio_size_mb:.1f} MB, mode={'multichannel' if multichannel else 'mono+diarize'}")
+        self.logger.info(
+            f"Audio: {audio_size_mb:.1f} MB, mode={'multichannel' if multichannel else 'mono+diarize'}"
+        )
 
         # Deepgram API call
         api_key = os.getenv("DEEPGRAM_API_KEY")
@@ -71,7 +136,10 @@ class TranscribeAgent(BaseAgent):
         keyterms = tc.get("keyterms", [])
         if keyterms:
             from urllib.parse import urlencode
-            url = f"{DEEPGRAM_URL}?{urlencode(params)}&" + "&".join(f"keyterm={k}" for k in keyterms)
+
+            url = f"{DEEPGRAM_URL}?{urlencode(params)}&" + "&".join(
+                f"keyterm={k}" for k in keyterms
+            )
             params = None
 
         with open(audio_path, "rb") as f:
@@ -79,10 +147,14 @@ class TranscribeAgent(BaseAgent):
 
         self.logger.info("Sending to Deepgram Nova-3...")
         resp = httpx.post(
-            url, params=params,
-            headers={"Authorization": f"Token {api_key}",
-                     "Content-Type": "audio/flac" if multichannel else "audio/mp4"},
-            content=audio_data, timeout=600.0,
+            url,
+            params=params,
+            headers={
+                "Authorization": f"Token {api_key}",
+                "Content-Type": "audio/flac" if multichannel else "audio/mp4",
+            },
+            content=audio_data,
+            timeout=600.0,
         )
         resp.raise_for_status()
         raw = resp.json()
@@ -112,9 +184,11 @@ class TranscribeAgent(BaseAgent):
         offset, tempo = sync.get("offset_seconds", 0), sync.get("tempo_factor", 1.0)
 
         # Map track_number -> dest_path (existing files only)
-        track_paths = {t["track_number"]: Path(t["dest_path"])
-                       for t in episode_data.get("audio_tracks", [])
-                       if t.get("track_number") is not None and Path(t["dest_path"]).exists()}
+        track_paths = {
+            t["track_number"]: Path(t["dest_path"])
+            for t in episode_data.get("audio_tracks", [])
+            if t.get("track_number") is not None and Path(t["dest_path"]).exists()
+        }
 
         channel_map, inputs, filters, labels = [], [], [], []
         for i, spk in enumerate(speakers):
@@ -123,7 +197,10 @@ class TranscribeAgent(BaseAgent):
                 self.logger.warning(f"Speaker {i} track {tn} not found")
                 return None, None
             channel_map.append({"index": i, "label": f"Speaker {i}", "track": tn})
-            inputs += (["-ss", str(offset)] if offset >= 0 else []) + ["-i", str(track_paths[tn])]
+            inputs += (["-ss", str(offset)] if offset >= 0 else []) + [
+                "-i",
+                str(track_paths[tn]),
+            ]
 
             f = f"[{i}:a]aformat=channel_layouts=mono"
             if offset < 0:
@@ -140,40 +217,62 @@ class TranscribeAgent(BaseAgent):
         output = self.episode_dir / "work" / "transcript_audio.flac"
 
         # 16kHz is standard for speech recognition; FLAC for ~10x smaller upload
-        cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", fc,
-               "-map", "[out]", "-c:a", "flac", "-ar", "16000"]
+        cmd = [
+            "ffmpeg",
+            "-y",
+            *inputs,
+            "-filter_complex",
+            fc,
+            "-map",
+            "[out]",
+            "-c:a",
+            "flac",
+            "-ar",
+            "16000",
+        ]
         if video_dur:
             cmd += ["-t", str(video_dur)]
         cmd.append(str(output))
 
         self.logger.info(f"Merging {n} speaker tracks into multichannel WAV...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             self.logger.error(f"Multichannel merge failed: {result.stderr[-500:]}")
             return None, None
         return output, channel_map
 
-    def _build_diarized_transcript(self, raw: dict, multichannel=False, channel_map=None) -> dict:
+    def _build_diarized_transcript(
+        self, raw: dict, multichannel=False, channel_map=None
+    ) -> dict:
         """Build speaker-labeled utterances. Same output schema for both modes."""
         speaker_key = "channel" if multichannel else "speaker"
         utterances = []
         for utt in raw.get("results", {}).get("utterances", []):
             spk = utt.get(speaker_key, 0)
-            utterances.append({
-                "speaker": spk,
-                "start": utt.get("start", 0),
-                "end": utt.get("end", 0),
-                "text": utt.get("transcript", ""),
-                "confidence": utt.get("confidence", 0),
-                "words": [
-                    {"word": w.get("word", w.get("punctuated_word", "")),
-                     "start": w.get("start", 0), "end": w.get("end", 0),
-                     "confidence": w.get("confidence", 0), "speaker": spk}
-                    for w in utt.get("words", [])
-                ],
-            })
+            utterances.append(
+                {
+                    "speaker": spk,
+                    "start": utt.get("start", 0),
+                    "end": utt.get("end", 0),
+                    "text": utt.get("transcript", ""),
+                    "confidence": utt.get("confidence", 0),
+                    "words": [
+                        {
+                            "word": w.get("word", w.get("punctuated_word", "")),
+                            "start": w.get("start", 0),
+                            "end": w.get("end", 0),
+                            "confidence": w.get("confidence", 0),
+                            "speaker": spk,
+                        }
+                        for w in utt.get("words", [])
+                    ],
+                }
+            )
 
-        result = {"mode": "multichannel" if multichannel else "diarized", "utterances": utterances}
+        result = {
+            "mode": "multichannel" if multichannel else "diarized",
+            "utterances": utterances,
+        }
         if channel_map:
             result["speaker_map"] = channel_map
         return result
@@ -206,7 +305,7 @@ class TranscribeAgent(BaseAgent):
 
         srt_lines = []
         for idx, i in enumerate(range(0, len(words), 5), 1):
-            chunk = words[i:i + 5]
+            chunk = words[i : i + 5]
             text = " ".join(w.get("punctuated_word", w.get("word", "")) for w in chunk)
             srt_lines.append(
                 f"{idx}\n{fmt_timecode(chunk[0]['start'])} --> {fmt_timecode(chunk[-1]['end'])}\n{text}\n"

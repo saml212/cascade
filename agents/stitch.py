@@ -13,6 +13,7 @@ Dependencies:
 import subprocess
 
 from agents.base import BaseAgent
+from agents.ingest import video_sort_key
 from lib.ffprobe import probe as ffprobe
 
 
@@ -22,6 +23,11 @@ class StitchAgent(BaseAgent):
     def execute(self) -> dict:
         ingest_data = self.load_json("ingest.json")
         files = ingest_data["files"]
+
+        # Defend older/disconnected manifests against unreliable embedded
+        # creation_time tags. Preserve a caller's explicit file-list order.
+        if not ingest_data.get("source_order_authoritative", False):
+            files = sorted(files, key=video_sort_key)
 
         if len(files) == 0:
             raise ValueError("No files to stitch")

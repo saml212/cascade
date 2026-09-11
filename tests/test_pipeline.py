@@ -1,18 +1,20 @@
 """Tests for the pipeline orchestrator — DAG resolution, failure handling, pause/resume."""
 
 import json
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+from agents import AGENT_REGISTRY, PIPELINE_ORDER
 from agents.pipeline import (
     AGENT_DEPS,
     NON_CRITICAL_AGENTS,
-    _slugify,
+    _cleanup_stitched_sources,
     _has_name_slug,
     _save_episode,
+    _slugify,
 )
-from agents import PIPELINE_ORDER, AGENT_REGISTRY
 
 
 class TestDagDependencies:
@@ -54,7 +56,12 @@ class TestDagDependencies:
         assert AGENT_DEPS["thumbnail_gen"] == {"transcribe"}
 
     def test_qa_depends_on_all_render_and_metadata(self):
-        assert AGENT_DEPS["qa"] == {"longform_render", "shorts_render", "metadata_gen", "thumbnail_gen"}
+        assert AGENT_DEPS["qa"] == {
+            "longform_render",
+            "shorts_render",
+            "metadata_gen",
+            "thumbnail_gen",
+        }
 
     def test_publish_depends_on_qa(self):
         assert AGENT_DEPS["publish"] == {"qa"}
@@ -169,6 +176,31 @@ class TestSaveEpisode:
         assert loaded["path"] == "/some/path"
 
 
+class TestCleanupStitchedSources:
+    def test_keeps_source_backing_single_file_symlink(self, tmp_path):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        source = source_dir / "camera.mp4"
+        source.write_bytes(b"video")
+        (tmp_path / "source_merged.mp4").symlink_to(source)
+
+        _cleanup_stitched_sources(tmp_path)
+
+        assert source.exists()
+        assert (tmp_path / "source_merged.mp4").read_bytes() == b"video"
+
+    def test_removes_source_after_real_merged_file(self, tmp_path):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        (source_dir / "camera.mp4").write_bytes(b"input")
+        (tmp_path / "source_merged.mp4").write_bytes(b"merged")
+
+        _cleanup_stitched_sources(tmp_path)
+
+        assert not source_dir.exists()
+        assert (tmp_path / "source_merged.mp4").read_bytes() == b"merged"
+
+
 class TestAgentRegistry:
     def test_all_pipeline_agents_registered(self):
         for name in PIPELINE_ORDER:
@@ -207,8 +239,10 @@ class TestPipelinePauseAtCropSetup:
             mock_cls.return_value = mock_instance
             mock_agents[name] = mock_cls
 
-        with patch("agents.pipeline.resolve_path", return_value=episodes_dir), \
-             patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents):
+        with (
+            patch("agents.pipeline.resolve_path", return_value=episodes_dir),
+            patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents),
+        ):
             result = run_pipeline(
                 source_path="/fake/source",
                 agents=["ingest", "stitch", "audio_analysis", "speaker_cut"],
@@ -218,7 +252,9 @@ class TestPipelinePauseAtCropSetup:
 
     @patch("agents.pipeline._is_cancelled", return_value=False)
     @patch("agents.pipeline.load_config")
-    def test_continues_when_crop_config_present(self, mock_config, mock_cancel, tmp_path):
+    def test_continues_when_crop_config_present(
+        self, mock_config, mock_cancel, tmp_path
+    ):
         """Pipeline should NOT pause when crop_config is set before resuming."""
         mock_config.return_value = {
             "paths": {"output_dir": str(tmp_path)},
@@ -238,8 +274,10 @@ class TestPipelinePauseAtCropSetup:
             mock_cls.return_value = mock_instance
             mock_agents[name] = mock_cls
 
-        with patch("agents.pipeline.resolve_path", return_value=episodes_dir), \
-             patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents):
+        with (
+            patch("agents.pipeline.resolve_path", return_value=episodes_dir),
+            patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents),
+        ):
             # First run pauses at crop_setup (needs crop-dependent agent to trigger pause)
             result = run_pipeline(
                 source_path="/fake/source",
@@ -295,9 +333,10 @@ class TestPipelineNonCriticalFailure:
             mock_cls.return_value = mock_instance
             mock_agents[name] = mock_cls
 
-        with patch("agents.pipeline.resolve_path", return_value=episodes_dir), \
-             patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents):
-
+        with (
+            patch("agents.pipeline.resolve_path", return_value=episodes_dir),
+            patch.dict("agents.pipeline.AGENT_REGISTRY", mock_agents),
+        ):
             ep_id = "ep_2026-01-01_120000"
             ep_dir = episodes_dir / ep_id
             ep_dir.mkdir(parents=True)

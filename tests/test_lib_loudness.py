@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 
 from lib.loudness import measure_loudness
 
-
 # ---------------------------------------------------------------------------
 # Fixture: realistic ebur128 stderr output (trimmed — just the summary block)
 # ---------------------------------------------------------------------------
@@ -58,7 +57,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'video_only.mp4':
 class TestMeasureLoudnessParsing:
     """Parsing a captured ebur128 stderr fixture."""
 
-    def _make_mock_result(self, stderr: str, returncode: int = 1):
+    def _make_mock_result(self, stderr: str, returncode: int = 0):
         m = MagicMock()
         m.returncode = returncode
         m.stderr = stderr
@@ -83,11 +82,11 @@ class TestMeasureLoudnessParsing:
             result = measure_loudness(Path("/fake/longform.mp4"))
         assert result["loudness_range_lu"] == 4.7
 
-    def test_target_lufs_is_minus_14(self):
+    def test_target_lufs_is_minus_16(self):
         with patch("lib.loudness.subprocess.run") as mock_run:
             mock_run.return_value = self._make_mock_result(_EBUR128_STDERR_WITH_SUMMARY)
             result = measure_loudness(Path("/fake/longform.mp4"))
-        assert result["target_lufs"] == -14
+        assert result["target_lufs"] == -16
 
     def test_measured_at_is_iso_utc(self):
         with patch("lib.loudness.subprocess.run") as mock_run:

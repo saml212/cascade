@@ -10,11 +10,12 @@ dicts so the test is hermetic.
 """
 
 import xml.etree.ElementTree as ET
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agents.podcast_feed import PodcastFeedAgent
-
 
 # Namespaces used to query elements from the produced XML
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
@@ -265,3 +266,82 @@ class TestSerializationFormat:
         # And the round-tripped text must equal the original.
         titles = [it.findtext("title") for it in root.find("channel").findall("item")]
         assert "Q&A with <Sam>" in titles
+
+
+class TestLocalAudioExport:
+    def test_prefers_lossless_mix_and_uses_atomic_output(self, agent, tmp_path):
+        mix = agent.episode_dir / "work" / "audio_mix.wav"
+        mix.parent.mkdir()
+        mix.write_bytes(b"wav")
+        video = agent.episode_dir / "longform.mp4"
+        video.write_bytes(b"video")
+        output = agent.episode_dir / "podcast_audio.mp3"
+
+        def finish_encode(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"mp3")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch(
+            "agents.podcast_feed.subprocess.run", side_effect=finish_encode
+        ) as run:
+            result = agent.prepare_local_audio(video, output)
+
+        cmd = run.call_args.args[0]
+        assert str(mix) in cmd
+        assert cmd[cmd.index("-ar") + 1] == "48000"
+        assert cmd[-1].endswith(".tmp.mp3")
+        assert result == output
+        assert output.read_bytes() == b"mp3"
+
+    def test_current_export_is_reused(self, agent):
+        video = agent.episode_dir / "longform.mp4"
+        video.write_bytes(b"video")
+        output = agent.episode_dir / "podcast_audio.mp3"
+
+        def finish_encode(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"mp3")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch(
+            "agents.podcast_feed.subprocess.run", side_effect=finish_encode
+        ) as run:
+            assert agent.prepare_local_audio(video, output) == output
+            assert agent.prepare_local_audio(video, output) == output
+        assert run.call_count == 1
+
+    def test_saved_edits_are_applied_to_export(self, agent):
+        video = agent.episode_dir / "longform.mp4"
+        video.write_bytes(b"video")
+        (agent.episode_dir / "episode.json").write_text(
+            '{"longform_edits":[{"type":"trim_start","seconds":104}]}'
+        )
+        output = agent.episode_dir / "podcast_audio.mp3"
+
+        def run_command(cmd, **kwargs):
+            if cmd[0] == "ffprobe":
+                return MagicMock(stdout='{"format":{"duration":"1000"}}')
+            Path(cmd[-1]).write_bytes(b"mp3")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch(
+            "agents.podcast_feed.subprocess.run", side_effect=run_command
+        ) as run:
+            agent.prepare_local_audio(video, output)
+        ffmpeg_cmd = run.call_args_list[-1].args[0]
+        graph = ffmpeg_cmd[ffmpeg_cmd.index("-filter_complex") + 1]
+        assert "atrim=start=104.0:end=1000.0" in graph
+
+    def test_failed_export_does_not_replace_existing_file(self, agent):
+        video = agent.episode_dir / "longform.mp4"
+        video.write_bytes(b"video")
+        output = agent.episode_dir / "podcast_audio.mp3"
+        output.write_bytes(b"known-good")
+        video.touch()
+
+        with patch("agents.podcast_feed.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=1, stderr="bad input")
+            with pytest.raises(RuntimeError, match="audio export failed"):
+                agent._extract_audio(video, output)
+
+        assert output.read_bytes() == b"known-good"
+        assert not output.with_name(output.name + ".tmp.mp3").exists()

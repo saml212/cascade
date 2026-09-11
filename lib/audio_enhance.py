@@ -1,22 +1,19 @@
-"""Audio enhancement — ML denoising, EQ, dynamics, two-pass loudness normalization.
+"""Transparent podcast mastering with optional restoration processing.
 
 Applied to the pre-mixed audio_mix.wav before muxing with video.
 
-Pipeline:
-1. ML denoise — DeepFilterNet 3 (default) or ClearerVoice-Studio
-   Removes wind, HVAC, mic bumps, and other non-stationary noise.
-2. ffmpeg static chain — afftdn → adeclick → highpass → lowpass → compressor → deesser
-3. Two-pass loudnorm — analysis pass measures actual loudness, normalization pass
-   applies linear offset to hit target exactly. Eliminates the ±1-2 LU drift
-   single-pass loudnorm produces.
+The default path deliberately does very little: an 80 Hz high-pass followed by
+two-pass linear loudness normalization. Destructive cleanup filters are only
+enabled when ``audio_enhance_mode = "restoration"``. Stacking automatic gain,
+denoisers, compression, and de-essing on already-levelled speaker tracks can
+create pumping, clipped consonants, and speech dropouts.
 
-Output target (default): -16 LUFS, -1.0 dBTP, LRA 7
-This is the cross-platform safe target — passes Apple ±1 dB gate, satisfies
-Spotify/YouTube/Amazon (all of which normalize down to -14).
+Output target (default): -16 LUFS, -1.0 dBTP, LRA 7.
 """
 
 import json
 import logging
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -44,9 +41,15 @@ def enhance_audio(input_path: Path, output_path: Path, config: dict) -> Path:
     work_dir = input_path.parent
     current_input = input_path
 
-    # Step 1: ML denoise (DeepFilterNet by default, ClearerVoice if specified)
-    denoise_model = processing.get("audio_denoise_model", "deepfilternet")
-    if denoise_model and denoise_model.lower() != "none":
+    mode = str(processing.get("audio_enhance_mode", "transparent")).lower()
+    if mode not in {"transparent", "restoration"}:
+        logger.warning("Unknown audio_enhance_mode=%r; using transparent", mode)
+        mode = "transparent"
+
+    # ML denoising is a rescue tool, not routine mastering. It can mistake
+    # breaths and quiet consonants for noise, especially on outdoor recordings.
+    denoise_model = processing.get("audio_denoise_model", "none")
+    if mode == "restoration" and denoise_model and denoise_model.lower() != "none":
         denoised_path = work_dir / "audio_mix_denoised.wav"
         if denoise_model.lower() == "deepfilternet":
             success = _apply_deepfilternet(current_input, denoised_path)
@@ -56,7 +59,7 @@ def enhance_audio(input_path: Path, output_path: Path, config: dict) -> Path:
             current_input = denoised_path
 
     # Step 2: ffmpeg static enhancement chain (denoise → eq → dynamics → deesser)
-    static_chain = _build_static_filter_chain(processing)
+    static_chain = _build_static_filter_chain(processing, mode=mode)
 
     # Step 3: Two-pass loudnorm (analysis → linear normalization)
     # Pass 1: measure actual loudness through the static chain
@@ -64,11 +67,15 @@ def enhance_audio(input_path: Path, output_path: Path, config: dict) -> Path:
     target_tp = processing.get("audio_target_tp", -1.0)
     target_lra = processing.get("audio_target_lra", 7)
 
-    measured = _measure_loudness(current_input, static_chain, target_lufs, target_tp, target_lra)
+    measured = _measure_loudness(
+        current_input, static_chain, target_lufs, target_tp, target_lra
+    )
     if measured:
         logger.info(
             "Pass 1 measured: I=%s LUFS, LRA=%s LU, TP=%s dBTP",
-            measured.get("input_i"), measured.get("input_lra"), measured.get("input_tp"),
+            measured.get("input_i"),
+            measured.get("input_lra"),
+            measured.get("input_tp"),
         )
         loudnorm = (
             f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
@@ -88,13 +95,23 @@ def enhance_audio(input_path: Path, output_path: Path, config: dict) -> Path:
 
     logger.info("Pass 2 enhancing with: %s", af)
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(current_input),
-        "-af", af,
-        "-c:a", "pcm_s16le", "-ar", "48000",
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(current_input),
+        "-af",
+        af,
+        "-c:a",
+        "pcm_s24le",
+        "-ar",
+        "48000",
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        logger.error("ffmpeg not found — leaving audio unmodified")
+        return current_input
     if result.returncode != 0:
         logger.error("Audio enhancement failed: %s", result.stderr[-500:])
         return current_input  # Fall back to denoised (or raw)
@@ -134,11 +151,18 @@ def _measure_loudness(
     af = static_chain + "," + analysis if static_chain else analysis
 
     cmd = [
-        "ffmpeg", "-hide_banner", "-nostats", "-i", str(input_path),
-        "-af", af,
-        "-f", "null", "-",
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-i",
+        str(input_path),
+        "-af",
+        af,
+        "-f",
+        "null",
+        "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         logger.warning("Loudnorm pass 1 ffmpeg failed: %s", result.stderr[-300:])
         return None
@@ -157,10 +181,18 @@ def _measure_loudness(
         logger.warning("Loudnorm pass 1 JSON parse failed: %s", e)
         return None
 
+    required = ("input_i", "input_lra", "input_tp", "input_thresh", "target_offset")
+    try:
+        if not all(math.isfinite(float(data[key])) for key in required):
+            raise ValueError("non-finite measurement")
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Loudnorm pass 1 returned incomplete measurements")
+        return None
+
     return data
 
 
-def _build_static_filter_chain(processing: dict) -> str:
+def _build_static_filter_chain(processing: dict, *, mode: str | None = None) -> str:
     """Build the static (non-loudnorm) part of the audio filter chain.
 
     Order matters: denoise → declick → highpass → lowpass → compressor → deesser.
@@ -169,11 +201,20 @@ def _build_static_filter_chain(processing: dict) -> str:
     Returns empty string if no filters are configured.
     """
     filters = []
+    mode = mode or str(processing.get("audio_enhance_mode", "transparent")).lower()
+
+    # A gentle rumble cut is the only default tonal processing.
+    highpass = processing.get("audio_highpass_hz", 80)
+    if highpass and highpass > 0:
+        filters.append(f"highpass=f={highpass}:p=2")
+
+    if mode != "restoration":
+        return ",".join(filters)
 
     # afftdn — FFT-based stationary noise reduction. Reduced strength when
     # DeepFilterNet 3 is active (DFN3 already handles non-stationary noise
     # so we only need a light pass for residual hiss).
-    denoise_model = processing.get("audio_denoise_model", "deepfilternet")
+    denoise_model = processing.get("audio_denoise_model", "none")
     if processing.get("audio_afftdn", True):
         if denoise_model and denoise_model.lower() == "deepfilternet":
             filters.append("afftdn=nr=6:nf=-50:tn=1")
@@ -184,19 +225,18 @@ def _build_static_filter_chain(processing: dict) -> str:
     if processing.get("audio_declick", True):
         filters.append("adeclick=threshold=5:burst=2:method=add")
 
-    # Highpass — 4-pole Butterworth removes HVAC/traffic rumble.
-    highpass = processing.get("audio_highpass_hz", 80)
-    if highpass and highpass > 0:
-        filters.append(f"highpass=f={highpass}:p=2")
-
     # Lowpass — remove high-frequency hiss while preserving "air" for headphones.
     # 16 kHz is the sweet spot: removes hiss above speech but keeps presence.
     lowpass = processing.get("audio_lowpass_hz", 16000)
     if lowpass and lowpass > 0:
         filters.append(f"lowpass=f={lowpass}")
 
-    # Compressor — gentle 3:1 to even out speaker level variation.
-    filters.append("acompressor=threshold=-20dB:ratio=3:attack=5:release=50")
+    if processing.get("audio_compressor", False):
+        threshold = processing.get("audio_compressor_threshold", -20)
+        ratio = processing.get("audio_compressor_ratio", 3)
+        filters.append(
+            f"acompressor=threshold={threshold}dB:ratio={ratio}:attack=10:release=120"
+        )
 
     # De-esser — sibilance control at 5-8 kHz where DJI Mic Mini and H6E both
     # capture S/T/Sh frequencies without natural attenuation. Placement is
@@ -262,7 +302,8 @@ def _apply_deepfilternet(input_path: Path, output_path: Path) -> bool:
         total_minutes = total_samples / sr / 60
         logger.info(
             "Loaded %.1f min audio (%d channels), processing in 5-min chunks...",
-            total_minutes, audio.shape[0],
+            total_minutes,
+            audio.shape[0],
         )
 
         # Process in 5-minute chunks to keep memory bounded.
@@ -283,7 +324,10 @@ def _apply_deepfilternet(input_path: Path, output_path: Path) -> bool:
             del chunk
             logger.info(
                 "DeepFilterNet chunk %d/%d (%.1f min → %.1f min)",
-                i + 1, n_chunks, start / sr / 60, end / sr / 60,
+                i + 1,
+                n_chunks,
+                start / sr / 60,
+                end / sr / 60,
             )
 
         # Concatenate along the time dimension
@@ -301,6 +345,7 @@ def _apply_deepfilternet(input_path: Path, output_path: Path) -> bool:
     except Exception as e:
         logger.error("DeepFilterNet failed: %s", e)
         import traceback
+
         logger.error(traceback.format_exc())
         return False
 
@@ -325,7 +370,9 @@ def _apply_clearervoice(input_path: Path, output_path: Path, model_name: str) ->
         return False
 
     try:
-        logger.info("Running ClearerVoice %s denoise (slow, may take hours)...", model_name)
+        logger.info(
+            "Running ClearerVoice %s denoise (slow, may take hours)...", model_name
+        )
         cv = ClearVoice(task="speech_enhancement", model_names=[model_name])
         with torch.no_grad():
             output_wav = cv(input_path=str(input_path), online_write=False)

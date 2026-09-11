@@ -13,6 +13,7 @@ Config:
     - paths.output_dir (episode output root)
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -20,7 +21,37 @@ from pathlib import Path
 import numpy as np
 
 from agents.base import BaseAgent
-from lib.ffprobe import probe as ffprobe, get_video_properties
+from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER
+from lib.ffprobe import get_video_properties
+from lib.ffprobe import probe as ffprobe
+
+_DJI_VIDEO_RE = re.compile(r"^DJI_(\d{14})_(\d+)_([A-Za-z])\.mp4$", re.IGNORECASE)
+_NATURAL_PART_RE = re.compile(r"(\d+)")
+
+
+def video_sort_key(path_or_info) -> tuple:
+    """Order discovered camera clips by stable filename sequence metadata."""
+    if isinstance(path_or_info, dict):
+        name = path_or_info.get("filename") or Path(path_or_info["dest_path"]).name
+        source = Path(path_or_info.get("source_path") or path_or_info["dest_path"])
+    else:
+        source = Path(path_or_info)
+        name = source.name
+    dji_match = _DJI_VIDEO_RE.match(name)
+    if dji_match:
+        timestamp, sequence, camera = dji_match.groups()
+        # Keep independent camera/session directories grouped so a sequence
+        # counter reset does not interleave separate recording sessions.
+        session = tuple(
+            int(part) if part.isdigit() else part.lower()
+            for part in _NATURAL_PART_RE.split(source.parent.name)
+        )
+        return (0, session, camera.lower(), int(sequence), timestamp, name.lower())
+    natural = tuple(
+        int(part) if part.isdigit() else part.lower()
+        for part in _NATURAL_PART_RE.split(name)
+    )
+    return (1, natural)
 
 
 class IngestAgent(BaseAgent):
@@ -29,7 +60,7 @@ class IngestAgent(BaseAgent):
     def __init__(self, episode_dir: Path, config: dict):
         super().__init__(episode_dir, config)
         self.source_path = None  # Set by pipeline orchestrator
-        self.audio_path = None   # Set by pipeline orchestrator (optional)
+        self.audio_path = None  # Set by pipeline orchestrator (optional)
 
     def execute(self) -> dict:
         if not self.source_path:
@@ -59,11 +90,19 @@ class IngestAgent(BaseAgent):
                     source_properties.get("fps", 0),
                     source_properties.get("pix_fmt", "?"),
                 )
-            except Exception as e:
+            except (
+                OSError,
+                RuntimeError,
+                subprocess.SubprocessError,
+                KeyError,
+                ValueError,
+                StopIteration,
+            ) as e:
                 self.logger.warning("Could not read source properties: %s", e)
 
         result = {
             "files": copied_files,
+            "source_order_authoritative": self._source_order_is_authoritative(),
             "file_count": len(copied_files),
             "total_duration_seconds": round(total_duration, 3),
             "total_size_bytes": total_size,
@@ -97,41 +136,58 @@ class IngestAgent(BaseAgent):
             source = Path(sp)
             if source.is_dir():
                 # Glob MP4 files (exclude macOS ._ resource forks)
-                files.extend(sorted(
-                    f for f in list(source.glob("*.MP4")) + list(source.glob("*.mp4"))
-                    if not f.name.startswith("._")
-                ))
+                files.extend(
+                    sorted(
+                        [
+                            f
+                            for f in list(source.glob("*.MP4"))
+                            + list(source.glob("*.mp4"))
+                            if not f.name.startswith("._")
+                        ],
+                        key=video_sort_key,
+                    )
+                )
             else:
                 files.append(source)
 
         if not files:
             raise FileNotFoundError(f"No MP4 files found in {raw_paths}")
 
-        # Extract creation_time via ffprobe and sort chronologically
+        # Probe metadata for the manifest. Embedded creation_time is retained
+        # for diagnostics but is not trusted for ordering; cameras sometimes
+        # write a wrong tag on one split clip.
         file_info = []
         for f in files:
             probe = ffprobe(f)
-            creation_time = probe.get("format", {}).get("tags", {}).get("creation_time", "")
+            creation_time = (
+                probe.get("format", {}).get("tags", {}).get("creation_time", "")
+            )
             duration = float(probe.get("format", {}).get("duration", 0))
-            file_info.append({
-                "source_path": str(f),
-                "filename": f.name,
-                "creation_time": creation_time,
-                "duration_seconds": round(duration, 3),
-                "size_bytes": f.stat().st_size,
-            })
+            file_info.append(
+                {
+                    "source_path": str(f),
+                    "filename": f.name,
+                    "creation_time": creation_time,
+                    "duration_seconds": round(duration, 3),
+                    "size_bytes": f.stat().st_size,
+                }
+            )
 
-        file_info.sort(key=lambda x: x["creation_time"])
-        self.logger.info(f"Found {len(file_info)} files, total {sum(f['duration_seconds'] for f in file_info):.1f}s")
+        if not self._source_order_is_authoritative():
+            file_info.sort(key=video_sort_key)
+        self.logger.info(
+            f"Found {len(file_info)} files, total {sum(f['duration_seconds'] for f in file_info):.1f}s"
+        )
 
         # Copy each file to SSD
         copied_files = []
         for idx, info in enumerate(file_info):
             src = Path(info["source_path"])
             dst = dest_dir / info["filename"]
-            self.logger.info(f"Copying {info['filename']} ({info['size_bytes'] / 1e9:.2f} GB)...")
-            self.report_progress(idx, len(file_info),
-                f"Copying {info['filename']}")
+            self.logger.info(
+                f"Copying {info['filename']} ({info['size_bytes'] / 1e9:.2f} GB)..."
+            )
+            self.report_progress(idx, len(file_info), f"Copying {info['filename']}")
             shutil.copy2(src, dst)
 
             # Validate copy with ffprobe
@@ -149,6 +205,12 @@ class IngestAgent(BaseAgent):
 
         return copied_files
 
+    def _source_order_is_authoritative(self) -> bool:
+        """An explicit list of files is a caller-supplied edit order."""
+        return isinstance(self.source_path, list) and all(
+            not Path(path).is_dir() for path in self.source_path
+        )
+
     def _copy_audio_files(self) -> dict:
         """Copy WAV files from external audio recorder."""
         audio_dir = self.episode_dir / "audio"
@@ -161,19 +223,26 @@ class IngestAgent(BaseAgent):
         # Find WAV files (Zoom H6E naming: 260311_143505_Tr1.WAV etc.)
         # Search top-level first, then subdirectories (H6E stores files in session folders)
         wav_files = sorted(
-            f for f in list(source.glob("*.WAV")) + list(source.glob("*.wav"))
+            f
+            for f in list(source.glob("*.WAV")) + list(source.glob("*.wav"))
             if not f.name.startswith("._")
         )
         if not wav_files:
             # Search one level deep (e.g., /Volumes/ZOOM_H6E/260311_162356/*.WAV)
             # Use the most recent session folder
             subdirs = sorted(
-                (d for d in source.iterdir() if d.is_dir() and not d.name.startswith((".", "TRASH", "ZOOM"))),
-                key=lambda d: d.name, reverse=True,
+                (
+                    d
+                    for d in source.iterdir()
+                    if d.is_dir() and not d.name.startswith((".", "TRASH", "ZOOM"))
+                ),
+                key=lambda d: d.name,
+                reverse=True,
             )
             for subdir in subdirs:
                 wav_files = sorted(
-                    f for f in list(subdir.glob("*.WAV")) + list(subdir.glob("*.wav"))
+                    f
+                    for f in list(subdir.glob("*.WAV")) + list(subdir.glob("*.wav"))
                     if not f.name.startswith("._")
                 )
                 if wav_files:
@@ -181,18 +250,25 @@ class IngestAgent(BaseAgent):
                     break
 
         if not wav_files:
-            raise FileNotFoundError(f"No WAV files found in {self.audio_path} or its subdirectories")
+            raise FileNotFoundError(
+                f"No WAV files found in {self.audio_path} or its subdirectories"
+            )
 
         tracks = []
         for f in wav_files:
             probe = ffprobe(f)
             audio_stream = next(
-                (s for s in probe.get("streams", []) if s.get("codec_type") == "audio"), None
+                (s for s in probe.get("streams", []) if s.get("codec_type") == "audio"),
+                None,
             )
             duration = float(probe.get("format", {}).get("duration", 0))
             channels = int(audio_stream.get("channels", 1)) if audio_stream else 1
-            sample_rate = int(audio_stream.get("sample_rate", 48000)) if audio_stream else 48000
-            bits = audio_stream.get("bits_per_raw_sample", "32") if audio_stream else "32"
+            sample_rate = (
+                int(audio_stream.get("sample_rate", 48000)) if audio_stream else 48000
+            )
+            bits = (
+                audio_stream.get("bits_per_raw_sample", "32") if audio_stream else "32"
+            )
 
             # Classify track type from filename
             name = f.stem
@@ -206,7 +282,9 @@ class IngestAgent(BaseAgent):
 
             # Copy
             dst = audio_dir / f.name
-            self.logger.info(f"Copying audio {f.name} ({f.stat().st_size / 1e6:.1f} MB)")
+            self.logger.info(
+                f"Copying audio {f.name} ({f.stat().st_size / 1e6:.1f} MB)"
+            )
             shutil.copy2(f, dst)
 
             track_info = {
@@ -237,16 +315,15 @@ class IngestAgent(BaseAgent):
         }
 
     def _sync_audio(self, video_files: list, audio_result: dict) -> dict:
-        """Sync H6E audio to camera video using GCC-PHAT + 2-anchor drift detection.
+        """Sync H6E audio to camera video using GCC-PHAT and robust clock fitting.
 
         Strategy:
             1. Find best sync track via short-window GCC-PHAT (which H6E track
                sounds most like the camera mic).
-            2. Two long-window measurements: anchor_start (first 60s), anchor_end
-               (last 60s). The offset at each anchor + the time gap between them
-               gives drift directly via slope.
-            3. Apply tempo correction only if both anchors are high-confidence
-               and the inferred drift is plausible (<500 ppm).
+            2. Measure bounded windows throughout the overlapping camera and
+               recorder duration, rejecting silent and inconsistent anchors.
+            3. Fit offset and drift across the retained anchors, then apply tempo
+               correction only when the fit is confident and plausible.
 
         GCC-PHAT (Generalized Cross-Correlation with Phase Transform) is the
         gold standard for time-delay estimation between two mics. It whitens
@@ -259,8 +336,6 @@ class IngestAgent(BaseAgent):
         """
         self.report_progress(0, 1, "Syncing audio")
 
-        merged_path = self.episode_dir / "source_merged.mp4"
-        video_path = str(merged_path) if merged_path.exists() else video_files[0]["dest_path"]
         video_duration = sum(f["duration_seconds"] for f in video_files)
 
         tracks = audio_result.get("tracks", [])
@@ -268,7 +343,23 @@ class IngestAgent(BaseAgent):
             return {"status": "no_sync_track"}
 
         sr = 16000
-        cam_full = self._extract_audio_pcm(video_path, sr)
+        # Sync runs during ingest, before the current manifest has been stitched.
+        # Build the camera clock from every current clip in manifest order; an
+        # existing source_merged.mp4 may belong to an earlier ingest attempt.
+        camera_chunks = []
+        decoded_camera_samples = 0
+        for video_file in video_files:
+            chunk = self._extract_audio_pcm(video_file["dest_path"], sr)
+            decoded_camera_samples += len(chunk)
+            expected_samples = round(float(video_file["duration_seconds"]) * sr)
+            if len(chunk) < expected_samples:
+                chunk = np.pad(chunk, (0, expected_samples - len(chunk)))
+            else:
+                chunk = chunk[:expected_samples]
+            camera_chunks.append(chunk)
+        if decoded_camera_samples < sr * 5:
+            return {"status": "too_short"}
+        cam_full = np.concatenate(camera_chunks)
         if len(cam_full) < sr * 5:
             return {"status": "too_short"}
 
@@ -276,27 +367,54 @@ class IngestAgent(BaseAgent):
         # Use 60s anchor window if available, else half of total length.
         # Whichever H6E track has the highest peak coherence wins.
         anchor_window = min(60, max(5, len(cam_full) // sr // 2))
-        self.logger.info(f"Step 1: Finding sync track via GCC-PHAT ({anchor_window}s window)...")
+        self.logger.info(
+            f"Step 1: Finding sync track via GCC-PHAT ({anchor_window}s window)..."
+        )
         cam_anchor_start = cam_full[: sr * anchor_window]
 
+        # Consecutive recorder sessions repeat Tr1/Tr2/etc. Treat each logical
+        # microphone as one continuous signal in manifest order.
+        track_groups = {}
+        for track in tracks:
+            key = (
+                track.get("track_number")
+                or track.get("track_type")
+                or track["filename"]
+            )
+            track_groups.setdefault(key, []).append(track)
+
         track_results = []
-        for t in tracks:
+        for group in track_groups.values():
+            chunks = []
             try:
-                h6e = self._extract_audio_pcm(t["dest_path"], sr)
-            except Exception as e:
-                self.logger.warning(f"  {t['filename']}: extract failed: {e}")
+                for track in group:
+                    chunks.append(self._extract_audio_pcm(track["dest_path"], sr))
+            except (OSError, RuntimeError) as e:
+                self.logger.warning("  %s: extract failed: %s", group[0]["filename"], e)
                 continue
+            h6e = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
             if len(h6e) < sr * anchor_window:
                 continue
             h6e_anchor = h6e[: sr * anchor_window]
-            offset, conf = self._gcc_phat(cam_anchor_start, h6e_anchor, sr, max_lag_s=30)
-            track_results.append({
-                "track": t,
-                "offset": offset,
-                "confidence": conf,
-                "h6e_full": h6e,
-            })
-            self.logger.info(f"  {t['filename']}: offset={offset:+.4f}s conf={conf:.4f}")
+            offset, conf = self._gcc_phat(
+                cam_anchor_start, h6e_anchor, sr, max_lag_s=30
+            )
+            track_results.append(
+                {
+                    "track": group[0],
+                    "offset": offset,
+                    "confidence": conf,
+                    "h6e_full": h6e,
+                }
+            )
+            self.logger.info(
+                "  %s (%d segment%s): offset=%+.4fs conf=%.4f",
+                group[0]["filename"],
+                len(group),
+                "s" if len(group) != 1 else "",
+                offset,
+                conf,
+            )
 
         if not track_results:
             return {"status": "no_sync_track"}
@@ -313,125 +431,128 @@ class IngestAgent(BaseAgent):
             f"start_offset={anchor_start_offset:+.6f}s conf={anchor_start_conf:.4f}"
         )
 
-        # ── Step 2: End anchor — measure offset near the end of the recording ──
-        # Take 60s windows centered ~60s before the end of both streams.
-        # Use the same alignment so the start offset roughly applies, then GCC-PHAT
-        # finds the residual delta which tells us the drift.
-        self.logger.info("Step 2: Measuring end anchor for drift detection...")
-
-        end_offset = None
-        end_conf = 0.0
-        # Anchor near the end but leave a 10s safety margin
-        end_time = max(anchor_window + 30, int(video_duration) - 90)
-        if end_time + anchor_window > video_duration:
-            end_time = max(0, int(video_duration) - anchor_window - 10)
-
-        cam_end_s = end_time * sr
-        cam_end_e = cam_end_s + anchor_window * sr
-        h6e_end_s = cam_end_s + int(anchor_start_offset * sr)
-        h6e_end_e = h6e_end_s + anchor_window * sr
-
-        if (
-            cam_end_e <= len(cam_full)
-            and 0 <= h6e_end_s
-            and h6e_end_e <= len(h6e_full)
-        ):
-            cam_end_segment = cam_full[cam_end_s:cam_end_e]
-            h6e_end_segment = h6e_full[h6e_end_s:h6e_end_e]
-            local_offset, end_conf = self._gcc_phat(
-                cam_end_segment, h6e_end_segment, sr, max_lag_s=2
-            )
-            # local_offset is the drift accumulated since the start anchor
-            end_offset = anchor_start_offset + local_offset
-            self.logger.info(
-                f"  End anchor at t={end_time}s: "
-                f"local_drift={local_offset*1000:+.1f}ms total_offset={end_offset:+.6f}s "
-                f"conf={end_conf:.4f}"
-            )
-        else:
-            self.logger.warning("  End anchor window exceeds available audio — drift detection skipped")
-
         base_result = {
             "sync_track": sync_track["filename"],
-            "video_file": Path(video_path).name,
+            "video_file": video_files[0].get("filename")
+            or Path(video_files[0]["dest_path"]).name,
             "video_duration": round(video_duration, 3),
             "confidence": round(anchor_start_conf, 6),
             "anchor_start_offset": round(anchor_start_offset, 6),
             "anchor_start_confidence": round(anchor_start_conf, 6),
         }
-
-        # ── Step 3: Decide whether to apply drift correction ──
-        # Both anchors must be high-confidence AND drift must be plausible
-        # (< 500 ppm absolute). Otherwise use start offset only.
-        MIN_CONF = 0.30
-        MAX_PLAUSIBLE_PPM = 500
-
-        if (
-            end_offset is None
-            or end_conf < MIN_CONF
-            or anchor_start_conf < MIN_CONF
-        ):
-            self.logger.warning(
-                f"Insufficient confidence for drift correction "
-                f"(start={anchor_start_conf:.3f} end={end_conf:.3f}, threshold={MIN_CONF}). "
-                f"Using start offset only."
-            )
-            status = "ok" if anchor_start_conf >= MIN_CONF else "low_confidence"
-            return {
-                **base_result,
-                "status": status,
-                "offset_seconds": round(anchor_start_offset, 6),
-                "tempo_factor": 1.0,
-                "drift_rate_ppm": 0.0,
-                "drift_total_seconds": 0.0,
-                "r_squared": 1.0 if anchor_start_conf >= MIN_CONF else 0.0,
-                "anchor_end_offset": round(end_offset, 6) if end_offset is not None else None,
-                "anchor_end_confidence": round(end_conf, 6),
-                "drift_status": "skipped_low_confidence",
-            }
-
-        # Compute drift from the two anchors
-        time_gap = end_time + anchor_window / 2 - anchor_window / 2  # midpoint to midpoint
-        slope = (end_offset - anchor_start_offset) / time_gap
-        drift_ppm = slope * 1e6
-        drift_total = slope * video_duration
-        tempo_factor = 1.0 + slope
-
-        if abs(drift_ppm) > MAX_PLAUSIBLE_PPM:
-            self.logger.warning(
-                f"Implausible drift detected ({drift_ppm:.1f} ppm > {MAX_PLAUSIBLE_PPM}). "
-                f"Likely a sync error in one anchor. Using start offset only."
-            )
-            return {
-                **base_result,
-                "status": "ok",
-                "offset_seconds": round(anchor_start_offset, 6),
-                "tempo_factor": 1.0,
-                "drift_rate_ppm": 0.0,
-                "drift_total_seconds": 0.0,
-                "r_squared": 0.0,
-                "anchor_end_offset": round(end_offset, 6),
-                "anchor_end_confidence": round(end_conf, 6),
-                "drift_status": "skipped_implausible",
-            }
-
-        self.logger.info(
-            f"Drift: {drift_total*1000:+.1f}ms over {video_duration:.0f}s "
-            f"({drift_ppm:+.2f} ppm) tempo={tempo_factor:.10f}"
+        fit = self._fit_sync_anchors(
+            cam_full, h6e_full, sr, anchor_start_offset, video_duration
         )
-
+        if fit is not None:
+            offset, slope, r_squared, points, end_conf = fit
+            drift_ppm = slope * 1e6
+            if (
+                anchor_start_conf >= 0.30
+                and abs(drift_ppm) <= 500
+                and r_squared >= 0.80
+            ):
+                return {
+                    **base_result,
+                    "status": "ok",
+                    "offset_seconds": round(offset, 6),
+                    "tempo_factor": 1.0 + slope,
+                    "drift_rate_ppm": round(drift_ppm, 4),
+                    "drift_total_seconds": round(slope * video_duration, 6),
+                    "r_squared": round(r_squared, 4),
+                    "anchor_end_offset": round(offset + slope * video_duration, 6),
+                    "anchor_end_confidence": round(end_conf, 6),
+                    "drift_status": "applied",
+                    "calibration_points": points,
+                }
+            self.logger.warning(
+                "Rejected multi-anchor fit: %.1f ppm, R² %.3f", drift_ppm, r_squared
+            )
+            return {
+                **base_result,
+                "status": "ok" if anchor_start_conf >= 0.30 else "low_confidence",
+                "offset_seconds": round(anchor_start_offset, 6),
+                "tempo_factor": 1.0,
+                "drift_rate_ppm": 0.0,
+                "drift_total_seconds": 0.0,
+                "r_squared": round(r_squared, 4),
+                "anchor_end_offset": None,
+                "anchor_end_confidence": round(end_conf, 6),
+                "drift_status": "skipped_unreliable_fit",
+                "calibration_points": points,
+            }
         return {
             **base_result,
-            "status": "ok",
+            "status": "ok" if anchor_start_conf >= 0.30 else "low_confidence",
             "offset_seconds": round(anchor_start_offset, 6),
-            "tempo_factor": tempo_factor,
-            "drift_rate_ppm": round(drift_ppm, 2),
-            "drift_total_seconds": round(drift_total, 6),
-            "r_squared": round(min(anchor_start_conf, end_conf), 4),
-            "anchor_end_offset": round(end_offset, 6),
-            "anchor_end_confidence": round(end_conf, 6),
-            "drift_status": "applied",
+            "tempo_factor": 1.0,
+            "drift_rate_ppm": 0.0,
+            "drift_total_seconds": 0.0,
+            "r_squared": 0.0,
+            "anchor_end_offset": None,
+            "anchor_end_confidence": 0.0,
+            "drift_status": "skipped_insufficient_anchors",
+            "calibration_points": 0,
         }
+
+    @classmethod
+    def _fit_sync_anchors(
+        cls,
+        camera: np.ndarray,
+        recorder: np.ndarray,
+        sr: int,
+        initial_offset: float,
+        video_duration: float,
+    ) -> tuple[float, float, float, int, float] | None:
+        """Fit offset and recorder clock drift from bounded windows."""
+        available_video = min(video_duration, len(camera) / sr)
+        window = min(30.0, max(5.0, available_video / 12))
+        last_start = available_video - window
+        if last_start <= window:
+            return None
+
+        anchors = []
+        for time_s in np.linspace(0, last_start, 9):
+            sample_count = int(window * sr)
+            cam_start = int(time_s * sr)
+            rec_start = int((time_s + initial_offset) * sr)
+            if rec_start < 0 or rec_start + sample_count > len(recorder):
+                continue
+            local_offset, confidence = cls._gcc_phat(
+                camera[cam_start : cam_start + sample_count],
+                recorder[rec_start : rec_start + sample_count],
+                sr,
+                max_lag_s=0.75,
+            )
+            if confidence >= 0.15:
+                anchors.append((time_s, initial_offset + local_offset, confidence))
+
+        if len(anchors) < 3:
+            return None
+        times = np.array([anchor[0] for anchor in anchors])
+        offsets = np.array([anchor[1] for anchor in anchors])
+        weights = np.array([anchor[2] for anchor in anchors])
+        slope, offset = np.polyfit(times, offsets, 1, w=weights)
+        predicted = offset + slope * times
+        residuals = offsets - predicted
+        keep = np.abs(residuals - np.median(residuals)) <= 0.02
+        if keep.sum() < 3:
+            return None
+        if not np.all(keep):
+            times, offsets, weights = times[keep], offsets[keep], weights[keep]
+            slope, offset = np.polyfit(times, offsets, 1, w=weights)
+            predicted = offset + slope * times
+
+        mean_offset = np.average(offsets, weights=weights)
+        denominator = np.sum(weights * (offsets - mean_offset) ** 2)
+        error = np.sum(weights * (offsets - predicted) ** 2)
+        r_squared = 1.0 - error / denominator if denominator > 1e-12 else 1.0
+        return (
+            float(offset),
+            float(slope),
+            float(r_squared),
+            len(times),
+            float(weights[-1]),
+        )
 
     @staticmethod
     def _gcc_phat(
@@ -456,6 +577,10 @@ class IngestAgent(BaseAgent):
         Reference: Knapp & Carter, "The Generalized Correlation Method for
         Estimation of Time Delay" (IEEE 1976).
         """
+        if len(ref) == 0 or len(sig) == 0:
+            return 0.0, 0.0
+        if float(np.std(ref)) < 1e-8 or float(np.std(sig)) < 1e-8:
+            return 0.0, 0.0
         n = max(len(ref), len(sig))
         # Zero-pad to next power of 2 for FFT efficiency
         fft_size = 2 ** int(np.ceil(np.log2(2 * n)))
@@ -504,11 +629,13 @@ class IngestAgent(BaseAgent):
         """FFT cross-correlation on raw waveforms. Returns (offset_seconds, confidence)."""
         a, b = a - np.mean(a), b - np.mean(b)
         fft_size = 2 ** int(np.ceil(np.log2(len(a) + len(b) - 1)))
-        cc = np.real(np.fft.ifft(np.fft.fft(a, fft_size) * np.conj(np.fft.fft(b, fft_size))))
+        cc = np.real(
+            np.fft.ifft(np.fft.fft(a, fft_size) * np.conj(np.fft.fft(b, fft_size)))
+        )
         max_idx = int(np.argmax(cc))
         if max_idx > fft_size // 2:
             max_idx -= fft_size
-        energy = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2)) + 1e-10
+        energy = np.sqrt(np.sum(a**2) * np.sum(b**2)) + 1e-10
         return max_idx / sr, float(cc[max_idx % fft_size]) / energy
 
     @staticmethod
@@ -522,7 +649,7 @@ class IngestAgent(BaseAgent):
 
         Returns (offset_seconds, confidence).
         """
-        from numpy.fft import rfft, irfft
+        from numpy.fft import irfft, rfft
 
         # Bandpass filter 200-4000Hz via FFT
         def bandpass(signal, sr, lo=200, hi=4000):
@@ -537,12 +664,13 @@ class IngestAgent(BaseAgent):
 
         # Energy envelope in 50ms windows
         win = max(1, int(sr * 0.05))
+
         def envelope(signal):
             n = len(signal) // win
             if n == 0:
                 return np.array([])
-            frames = signal[:n * win].reshape(n, win).astype(np.float64)
-            env = np.sqrt(np.mean(frames ** 2, axis=1))
+            frames = signal[: n * win].reshape(n, win).astype(np.float64)
+            env = np.sqrt(np.mean(frames**2, axis=1))
             # Normalize to unit variance
             env = env - np.mean(env)
             std = np.std(env)
@@ -557,11 +685,13 @@ class IngestAgent(BaseAgent):
 
         # Cross-correlate
         fft_size = 2 ** int(np.ceil(np.log2(len(env_a) + len(env_b) - 1)))
-        cc = np.real(np.fft.ifft(
-            np.fft.fft(env_a, fft_size) * np.conj(np.fft.fft(env_b, fft_size))
-        ))
+        cc = np.real(
+            np.fft.ifft(
+                np.fft.fft(env_a, fft_size) * np.conj(np.fft.fft(env_b, fft_size))
+            )
+        )
         # Normalize by geometric mean of energies
-        energy = np.sqrt(np.sum(env_a ** 2) * np.sum(env_b ** 2)) + 1e-10
+        energy = np.sqrt(np.sum(env_a**2) * np.sum(env_b**2)) + 1e-10
         cc_norm = cc / energy
 
         max_idx = int(np.argmax(cc_norm))
@@ -575,12 +705,26 @@ class IngestAgent(BaseAgent):
 
     def _extract_audio_pcm(self, path: str, sr: int) -> np.ndarray:
         """Extract full mono audio as float32 numpy array via ffmpeg."""
+        audio_filter = []
+        if Path(path).suffix.lower() in {".mp4", ".mov", ".m4v"}:
+            audio_filter = ["-af", CAMERA_AUDIO_TIMELINE_FILTER]
         cmd = [
-            "ffmpeg", "-y", "-i", str(path),
-            "-ar", str(sr), "-ac", "1",
-            "-f", "s16le", "-acodec", "pcm_s16le", "-",
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(path),
+            *audio_filter,
+            "-ar",
+            str(sr),
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-",
         ]
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg audio extraction failed: {result.stderr[:500]}")
         return np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)

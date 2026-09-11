@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +33,26 @@ AGENT_DEPS = {
 }
 
 NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup", "thumbnail_gen"}
+
+
+def _cleanup_stitched_sources(episode_dir: Path) -> None:
+    """Remove copied inputs unless source_merged still points into that directory."""
+    source_dir = episode_dir / "source"
+    if not source_dir.exists():
+        return
+    merged = episode_dir / "source_merged.mp4"
+    if merged.is_symlink() and merged.resolve(strict=False).is_relative_to(
+        source_dir.resolve()
+    ):
+        logger.info("Keeping source/ because source_merged.mp4 is a symlink into it")
+        return
+    import shutil
+
+    try:
+        shutil.rmtree(source_dir)
+        logger.info("Cleaned up source/ directory after stitch")
+    except OSError as e:
+        logger.warning("Failed to clean up source/ directory: %s", e)
 
 
 def load_config() -> dict:
@@ -107,6 +127,13 @@ def run_pipeline(
 
     # Store which agents were requested and reset their completion status
     episode["pipeline"]["agents_requested"] = agent_names
+    episode["status"] = "processing"
+    existing_errors = episode["pipeline"].get("errors", {})
+    episode["pipeline"]["errors"] = {
+        name: message
+        for name, message in existing_errors.items()
+        if name not in agent_names
+    }
     if agents:
         # Partial re-run: remove requested agents from completed list so they re-run cleanly
         prev_completed = episode["pipeline"].get("agents_completed", [])
@@ -213,15 +240,7 @@ def run_pipeline(
         # After stitch, remove source/ directory to reclaim ~20GB
         # (source_merged.mp4 contains everything needed downstream)
         if agent_name == "stitch":
-            source_dir = mutable["episode_dir"] / "source"
-            if source_dir.exists():
-                import shutil
-
-                try:
-                    shutil.rmtree(source_dir)
-                    logger.info(f"Cleaned up source/ directory after stitch")
-                except OSError as e:
-                    logger.warning(f"Failed to clean source/ directory: {e}")
+            _cleanup_stitched_sources(mutable["episode_dir"])
 
         # After clip_miner, rename episode dir if guest_name was extracted
         if agent_name == "clip_miner":

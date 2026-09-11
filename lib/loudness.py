@@ -5,6 +5,7 @@ this module only measures, it never modifies audio.
 """
 
 import logging
+import math
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Cascade loudness target (EBU R128 broadcast standard, widely used by podcast
 # platforms). Hardcoded for now; plumb from config if needed in the future.
-_TARGET_LUFS = -14
+_TARGET_LUFS = -16
 
 # Regexes to extract the summary block values from ebur128 stderr output.
 # We match the LAST occurrence of each because ffmpeg prints per-moment
@@ -58,18 +59,20 @@ def measure_loudness(input_path: Path) -> dict | None:
             cmd,
             capture_output=True,
             text=True,
+            timeout=600,
+            check=False,
         )
     except FileNotFoundError:
         logger.error("ffmpeg not found — cannot measure loudness")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("Loudness measurement timed out for %s", input_path)
         return None
 
     # ebur128 writes everything (including the summary) to stderr
     stderr = result.stderr
 
-    # Non-zero returncode is expected: ffmpeg exits 1 when output is /dev/null
-    # equivalent ("-f null -"). Only treat it as a hard failure when stderr
-    # contains no ebur128 output at all (e.g. no audio stream in the file).
-    if "ebur128" not in stderr and result.returncode != 0:
+    if result.returncode != 0:
         logger.warning(
             "ffmpeg ebur128 failed for %s (rc=%d): %s",
             input_path,
@@ -93,6 +96,17 @@ def measure_loudness(input_path: Path) -> dict | None:
         true_peak_dbfs = float(peak_matches[-1])
     except (ValueError, IndexError) as exc:
         logger.warning("Failed to parse ebur128 values for %s: %s", input_path, exc)
+        return None
+
+    if not all(
+        math.isfinite(value)
+        for value in (
+            integrated_lufs,
+            loudness_range_lu,
+            true_peak_dbfs,
+        )
+    ):
+        logger.warning("Non-finite ebur128 values for %s", input_path)
         return None
 
     measured_at = datetime.now(timezone.utc).isoformat()
