@@ -96,12 +96,27 @@ def test_rebase_diarized_excludes_cut_words_and_moves_later_captions():
     assert words[1]["source_start"] == 42
 
 
+def test_rebase_diarized_drops_word_when_only_tiny_fragment_is_retained():
+    diarized = {
+        "utterances": [
+            {"words": [{"word": "truncated", "start": 9.9, "end": 10.8, "speaker": 0}]}
+        ]
+    }
+    timeline = Timeline.from_edits(
+        20, [{"type": "cut", "start_seconds": 10, "end_seconds": 15}]
+    )
+
+    assert rebase_diarized(diarized, timeline)["utterances"] == []
+
+
 @pytest.mark.parametrize(
     "edits, message",
     [
         ([{"type": "fade"}], "Unsupported"),
         ([{"type": "cut", "start_seconds": 5, "end_seconds": 4}], "Invalid cut"),
         ([{"type": "trim_start", "seconds": 100}], "Invalid trim"),
+        ([{"type": "trim_start", "seconds": -1}], "Invalid trim_start"),
+        ([{"type": "trim_end", "seconds": 101}], "Invalid trim_end"),
         ([{"type": "cut", "start_seconds": 5, "end_seconds": 101}], "Invalid cut"),
     ],
 )
@@ -121,3 +136,10 @@ def test_project_drops_removed_and_tiny_records_without_mutating_input():
 
     assert timeline.project(items, minimum_duration=0.1) == []
     assert items[0]["start"] == 1.0
+
+
+def test_project_does_not_emit_records_that_only_touch_a_boundary():
+    timeline = Timeline(10, [(2, 4)])
+
+    assert timeline.project([{"start": 0, "end": 2}]) == []
+    assert timeline.project([{"start": 4, "end": 6}]) == []

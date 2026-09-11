@@ -83,14 +83,15 @@ class Timeline:
         for edit in edits:
             kind = edit.get("type")
             if kind == "trim_start":
-                trim_start = max(
-                    trim_start,
-                    _finite_number(edit.get("seconds"), "trim_start seconds"),
-                )
+                seconds = _finite_number(edit.get("seconds"), "trim_start seconds")
+                if seconds < 0 or seconds > duration + 0.01:
+                    raise ValueError(f"Invalid trim_start value {seconds:.3f}s")
+                trim_start = max(trim_start, min(seconds, duration))
             elif kind == "trim_end":
-                trim_end = min(
-                    trim_end, _finite_number(edit.get("seconds"), "trim_end seconds")
-                )
+                seconds = _finite_number(edit.get("seconds"), "trim_end seconds")
+                if seconds < 0 or seconds > duration + 0.01:
+                    raise ValueError(f"Invalid trim_end value {seconds:.3f}s")
+                trim_end = min(trim_end, min(seconds, duration))
             elif kind == "cut":
                 cut_start = _finite_number(
                     edit.get("start_seconds"), "cut start_seconds"
@@ -203,7 +204,10 @@ class Timeline:
             for span in self.spans:
                 source_start = max(item_start, span.source_start)
                 source_end = min(item_end, span.source_end)
-                if source_end - source_start < minimum_duration:
+                if (
+                    source_end <= source_start
+                    or source_end - source_start < minimum_duration
+                ):
                     continue
                 record = dict(item)
                 if output_clock:
@@ -232,8 +236,8 @@ def build_keep_intervals(
 def rebase_diarized(diarized: Mapping[str, object], timeline: Timeline) -> dict:
     """Copy a diarized transcript onto a timeline's zero-based output clock.
 
-    Words whose midpoint was removed are excluded. A word straddling an edit is
-    clipped to its largest retained piece so the caption is never duplicated.
+    Words whose midpoint was removed are excluded. A retained word straddling
+    an edit is clipped to that retained interval rather than duplicated.
     """
     result = dict(diarized)
     utterances = []
@@ -244,19 +248,17 @@ def rebase_diarized(diarized: Mapping[str, object], timeline: Timeline) -> dict:
             end = _finite_number(word.get("end"), "word end")
             if end <= start:
                 continue
-            overlaps = []
-            for span in timeline.spans:
-                overlap_start = max(start, span.source_start)
-                overlap_end = min(end, span.source_end)
-                if overlap_end > overlap_start:
-                    overlaps.append(
-                        (overlap_end - overlap_start, span, overlap_start, overlap_end)
-                    )
-            if not overlaps:
+            midpoint = start + (end - start) / 2
+            mapped_midpoint = timeline.source_to_output(midpoint)
+            if mapped_midpoint is None:
                 continue
-            _, span, source_start, source_end = max(
-                overlaps, key=lambda value: value[0]
-            )
+            for span in timeline.spans:
+                if span.source_start <= midpoint < span.source_end:
+                    source_start = max(start, span.source_start)
+                    source_end = min(end, span.source_end)
+                    break
+            else:  # pragma: no cover - source_to_output already proved membership
+                continue
             rebased = dict(word)
             rebased["source_start"] = source_start
             rebased["source_end"] = source_end
