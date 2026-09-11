@@ -573,6 +573,22 @@ class TestCanonicalRepair:
             == repaired
         )
 
+        provenance_path = tmp_episode_dir / "transcript_provenance.json"
+        provenance = json.loads(provenance_path.read_text())
+        original_provenance = json.dumps(provenance)
+        provenance["speaker_map"][1]["mapping_confidence"] = 0.01
+        provenance_path.write_text(json.dumps(provenance))
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == repaired
+        )
+        provenance["speaker_map"][1]["logical_track"] = 99
+        provenance_path.write_text(json.dumps(provenance))
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config) is None
+        )
+        provenance_path.write_text(original_provenance)
+
         (tmp_episode_dir / "transcript_corrections.json").write_text(
             json.dumps(
                 {

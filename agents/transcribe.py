@@ -570,6 +570,22 @@ def _speaker_logical_tracks(transcript: dict) -> dict[int, int]:
     return result
 
 
+def _speaker_map_identity(speaker_map: list[dict] | None) -> list[dict]:
+    """Compare who a diarization ID names without unstable overlap scores."""
+    return [
+        {
+            key: mapping.get(key)
+            for key in (
+                "index",
+                "person",
+                "logical_track",
+                "camera_channel",
+            )
+        }
+        for mapping in (speaker_map or [])
+    ]
+
+
 def analyze_transcript_coverage(
     episode_dir: Path,
     episode: dict,
@@ -817,7 +833,8 @@ def current_diarized_transcript(
         or provenance.get("asr_config_fingerprint") != expected_config
         or provenance.get("raw_transcript_sha256") != raw_hash
         or provenance.get("channel_map") != (channel_map or [])
-        or provenance.get("speaker_map") != (speaker_map or [])
+        or _speaker_map_identity(provenance.get("speaker_map"))
+        != _speaker_map_identity(speaker_map)
         or provenance.get("canonical_activity_fingerprint")
         != (activity.fingerprint if activity else None)
         or provenance.get("corrections_fingerprint") != corrections_fingerprint
