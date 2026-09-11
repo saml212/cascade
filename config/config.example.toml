@@ -61,12 +61,21 @@ smart_format = true                       # Deepgram smart formatting
 utterances = true                         # Group into utterances
 keyterms = []                             # Boost recognition of specific words, e.g. ["Todd", "Laura"]
 
+[generation]
+provider = "claude_cli"
+model = "sonnet"
+# openai_model = ""                       # Required only when provider = "openai"
+reasoning_effort = "medium"
+timeout_seconds = 180
+
+[thumbnail]
+frame_seconds = 600                       # Source-clock still used for longform art
+font_path = ""                            # Optional TrueType/OpenType brand font
+title_position = "top"                   # Per-episode override: top or bottom
+
 [clip_mining]
 method = "llm"                            # "baseline", "transcript", or "llm"
-llm_model = "claude-opus-4-6"             # Model for clip ranking + metadata
-llm_temperature = 0.3                     # LLM temperature
 boundary_snap_tolerance_seconds = 3.0     # Max distance to snap to silence
-metadata_model = "claude-sonnet-4-20250514"
 
 [chat]
 model = "claude-sonnet-4-20250514"

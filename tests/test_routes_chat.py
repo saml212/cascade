@@ -13,6 +13,7 @@ class TestChatTransport:
     def test_claude_cli_is_text_only_and_ignores_workspace_customizations(
         self, monkeypatch
     ):
+        import lib.generation as generation_mod
         import server.routes.chat as chat_mod
 
         calls = []
@@ -23,7 +24,7 @@ class TestChatTransport:
                 returncode=0, stdout='{"result":"Read-only answer"}', stderr=""
             )
 
-        monkeypatch.setattr(chat_mod.subprocess, "run", run)
+        monkeypatch.setattr(generation_mod.subprocess, "run", run)
 
         assert chat_mod._call_claude("Canonical context", [{"content": "Status?"}]) == (
             "Read-only answer"

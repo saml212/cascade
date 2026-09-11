@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import re
-import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,7 @@ from pydantic import BaseModel
 
 from agents.qa import canonical_release_metadata, quality_snapshot
 from lib.atomic_write import atomic_write_json
+from lib.generation import generate_text
 from lib.paths import get_episodes_dir
 from server.routes import clips as clips_api
 from server.routes import edits as edits_api
@@ -73,66 +73,12 @@ def _call_claude(
     timeout: float = 120.0,
 ) -> str:
     """Run one Claude CLI turn and return its text response."""
-    prompt = "\n\n".join(
-        f"<{message.get('role', 'user')}>\n{message.get('content', '')}\n"
-        f"</{message.get('role', 'user')}>"
-        for message in messages
+    return generate_text(
+        system_prompt or _TEXT_ONLY_PROMPT,
+        messages,
+        model=model,
+        timeout=timeout,
     )
-    command = [
-        "claude",
-        "-p",
-        "--output-format",
-        "json",
-        "--model",
-        model,
-        "--safe-mode",
-        "--no-session-persistence",
-        "--no-chrome",
-        "--strict-mcp-config",
-        "--disable-slash-commands",
-    ]
-    command.extend(["--system-prompt", system_prompt or _TEXT_ONLY_PROMPT])
-    # `--tools` consumes a variable-length value, so it must remain last.
-    # The empty value is Claude CLI's documented way to disable built-in tools.
-    command.extend(["--tools", ""])
-
-    try:
-        process = subprocess.run(
-            command,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "claude CLI not found on PATH. Install Claude Code to enable chat."
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"claude CLI timed out after {timeout}s") from exc
-
-    if process.returncode:
-        raise RuntimeError(
-            f"claude CLI failed (exit {process.returncode}): {process.stderr[:500]}"
-        )
-    try:
-        payload = json.loads(process.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"claude CLI returned non-JSON output: {process.stdout[:500]}"
-        ) from exc
-
-    text = payload.get("result") or payload.get("response") or ""
-    if not text and isinstance(payload.get("content"), list):
-        text = "".join(
-            block.get("text", "")
-            for block in payload["content"]
-            if isinstance(block, dict)
-        )
-    if not text:
-        raise RuntimeError(f"claude CLI response had no text: {str(payload)[:500]}")
-    return text
 
 
 def _episode_dir(episode_id: str) -> Path:

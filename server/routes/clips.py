@@ -428,34 +428,21 @@ async def reject_clip(episode_id: str, clip_id: str) -> dict:
 
 @router.post("/{clip_id}/alternative")
 async def request_alternative(episode_id: str, clip_id: str) -> dict:
-    """Request an alternative clip in place of clip_id.
-
-    This used to be a stub that returned a message about ANTHROPIC_API_KEY.
-    Cascade has since moved to subagent-driven clip mining (clip-miner runs
-    as a Claude Code subagent on Sam's Max-subscription quota, not paid API).
-    Full re-mining here would require dispatching that subagent from the
-    server, which the backend can't do directly — that's the /produce skill's
-    job.
-
-    Returns HTTP 501 with a clear message so clients can surface "feature
-    needs /produce" instead of silently failing. The response includes the
-    rejected clip's time range so /produce can re-dispatch the subagent with
-    an exclusion when Sam next runs it.
-    """
+    """Generate and append one transcript-grounded alternative candidate."""
     clips, _ = load_clips(episode_id)
-    clip, _ = find_clip(clips, clip_id)
+    find_clip(clips, clip_id)
+    ep_dir = EPISODES_DIR / episode_id
+    from agents.clip_miner import ClipMinerAgent
+    from agents.pipeline import load_config
 
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "Alternative clip generation must be driven by the /produce skill's clip-miner subagent. Mark this clip rejected and run /produce to re-mine with the exclusion.",
-            "rejected_clip_id": clip_id,
-            "excluded_range": {
-                "start": clip.get("start_seconds") or clip.get("start"),
-                "end": clip.get("end_seconds") or clip.get("end"),
-            },
-        },
-    )
+    try:
+        return await asyncio.to_thread(
+            ClipMinerAgent(ep_dir, load_config()).generate_alternative, clip_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/manual")

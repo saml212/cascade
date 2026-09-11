@@ -133,6 +133,30 @@ class TestApproveReject:
         assert resp.json()["selection_status"] == "selected"
         assert resp.json()["status"] == "pending"
 
+    def test_alternative_uses_configured_generation_path(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", SAMPLE_CLIPS)
+        generated = {
+            "rejected_clip_id": "clip_01",
+            "alternative": {"id": "clip_03", "title": "Fresh choice"},
+            "generation": {"provider": "openai", "model": "test-model"},
+        }
+
+        from agents.clip_miner import ClipMinerAgent
+
+        monkeypatch.setattr(
+            ClipMinerAgent,
+            "generate_alternative",
+            lambda _self, _clip_id: generated,
+        )
+        response = client.post("/api/episodes/ep_001/clips/clip_01/alternative")
+
+        assert response.status_code == 200
+        assert response.json() == generated
+
     def test_bulk_approval_is_atomic_when_one_render_is_stale(
         self, test_client, monkeypatch
     ):

@@ -1,271 +1,383 @@
-"""Clip miner agent — use Claude to identify the best short-form clips from the transcript.
+"""Find source-clock short-form candidates from the canonical transcript."""
 
-Inputs:
-    - diarized_transcript.json, segments.json, stitch.json
-Outputs:
-    - clips.json (ranked clips with titles, hooks, scores)
-    - episode_info.json (guest name, title, description)
-    - Updates episode.json with guest/episode metadata
-Dependencies:
-    - anthropic SDK (Claude API)
-Config:
-    - clip_mining.llm_model, clip_mining.llm_temperature
-    - clip_mining.boundary_snap_tolerance_seconds
-    - processing.clip_count, processing.clip_min_seconds, processing.clip_max_seconds
-Environment:
-    - ANTHROPIC_API_KEY
-"""
+from __future__ import annotations
 
 import json
-import os
+import math
+import re
 
 from agents.base import BaseAgent
+from lib.atomic_write import atomic_write_json
+from lib.generation import generate_structured
+
+_EPISODE_INFO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "guest_name": {"type": "string"},
+        "guest_title": {"type": "string"},
+        "episode_title": {"type": "string"},
+        "episode_description": {"type": "string"},
+    },
+    "required": [
+        "guest_name",
+        "guest_title",
+        "episode_title",
+        "episode_description",
+    ],
+    "additionalProperties": False,
+}
+_CLIP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "start_seconds": {"type": "number"},
+        "end_seconds": {"type": "number"},
+        "title": {"type": "string"},
+        "hook_text": {"type": "string"},
+        "compelling_reason": {"type": "string"},
+        "virality_score": {"type": "number"},
+    },
+    "required": [
+        "start_seconds",
+        "end_seconds",
+        "title",
+        "hook_text",
+        "compelling_reason",
+        "virality_score",
+    ],
+    "additionalProperties": False,
+}
+_CLIP_MINER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "episode_info": _EPISODE_INFO_SCHEMA,
+        "clips": {"type": "array", "items": _CLIP_SCHEMA},
+    },
+    "required": ["episode_info", "clips"],
+    "additionalProperties": False,
+}
+
+
+def _normalized(value: str) -> str:
+    return re.sub(r"[^\w']+", " ", value.casefold()).strip()
 
 
 class ClipMinerAgent(BaseAgent):
     name = "clip_miner"
 
     def execute(self) -> dict:
-        # Two-phase safety gate:
-        # 1. If clips.json is already populated (e.g. by the /produce skill's
-        #    clip-miner subagent that runs on Sam's Max-subscription quota),
-        #    skip this agent — it's idempotent, no reason to re-run.
-        # 2. If clips.json is MISSING, do NOT fall through to the paid Anthropic
-        #    API path. Cascade has moved to the subagent-driven model, so a
-        #    missing clips.json means the /produce skill failed to dispatch the
-        #    subagent first. Raise loudly so the operator knows they need to
-        #    run clip-miner via /produce (Claude Code) rather than silently
-        #    consuming API tokens. Set the env var CASCADE_ALLOW_API_CLIP_MINER=1
-        #    to explicitly opt into the legacy paid path (not recommended).
         existing = self.load_json_safe("clips.json")
-        if existing.get("clips") and len(existing["clips"]) > 0:
-            self.logger.info(
-                "clips.json already has %d clips — skipping programmatic clip_miner."
-                % len(existing["clips"])
-            )
+        if existing.get("clips"):
             return {
                 "_status": "skipped",
                 "reason": "clips.json already populated",
                 "clip_count": len(existing["clips"]),
             }
 
-        if os.getenv("CASCADE_ALLOW_API_CLIP_MINER") != "1":
-            raise RuntimeError(
-                "clips.json is missing and the paid-API clip miner is disabled. "
-                "Dispatch the clip-miner subagent via the /produce skill (runs on "
-                "Claude Code's Max-subscription quota) to produce clips.json, then "
-                "resume the pipeline with ['longform_render', ...]. "
-                "To explicitly opt into the legacy paid-API path, set "
-                "CASCADE_ALLOW_API_CLIP_MINER=1 (not recommended)."
-            )
-
-        diarized = self.load_json("diarized_transcript.json")
-        segments_data = self.load_json("segments.json")
-        stitch_data = self.load_json("stitch.json")
-
-        total_duration = stitch_data["duration_seconds"]
-        clip_count = self.get_config("processing", "clip_count", default=10)
-        clip_min = self.get_config("processing", "clip_min_seconds", default=30)
-        clip_max = self.get_config("processing", "clip_max_seconds", default=90)
-
-        # Format transcript for Claude
-        transcript_text = self._format_transcript(diarized)
-
-        # Call Claude
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY not set in environment")
-
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key)
-
-        model = self.get_config("clip_mining", "llm_model", default="claude-opus-4-6")
-        temperature = self.get_config("clip_mining", "llm_temperature", default=0.3)
-
-        # Single combined API call for episode info + clip mining
-        prompt = f"""You are an expert podcast clip editor. Analyze this transcript and:
-
-1. Extract guest/episode information from the opening
-2. Identify the {clip_count} best clips for short-form video (YouTube Shorts, TikTok, Instagram Reels)
-
-Each clip should be {clip_min}-{clip_max} seconds long and should:
-- Have a strong hook in the first 3 seconds
-- Tell a complete micro-story or make a compelling point
-- Be emotionally engaging, funny, surprising, or deeply insightful
-- End on a strong note (punchline, revelation, call-to-action)
-
-CONTENT PRIORITY: This is a Bay Area / San Francisco local podcast. While you should always prioritize the most engaging and viral content first, ensure that at least 2-3 of the {clip_count} clips focus on Bay Area, San Francisco, Oakland, or local community themes when the conversation touches on those topics. Local-focused content helps build a dedicated regional audience.
-
-The total episode duration is {total_duration:.1f} seconds.
-
-TRANSCRIPT (with timestamps and speaker labels):
-{transcript_text}
-
-Return EXACTLY a JSON object with two keys:
-
-1. "episode_info": object with:
-   - "guest_name": full name of the guest (empty string if not mentioned)
-   - "guest_title": who they are / what they do (empty string if unknown)
-   - "episode_title": suggested episode title
-   - "episode_description": 2-3 sentence description
-
-2. "clips": array of {clip_count} clips, each with:
-   - "start_seconds": number (start time in seconds)
-   - "end_seconds": number (end time in seconds)
-   - "title": string (catchy title, max 60 chars)
-   - "hook_text": string (the opening hook line)
-   - "compelling_reason": string (why this clip will perform well)
-   - "virality_score": number (1-10, how viral this clip could be)
-
-Return ONLY the JSON object, no other text."""
-
-        self.logger.info(f"Calling {model} for clip mining + episode info...")
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
+        diarized, segments_data, total_duration = self._load_inputs()
+        clip_count = int(self.get_config("processing", "clip_count", default=10))
+        parsed, provenance = self._mine(
+            diarized,
+            total_duration,
+            clip_count,
+            exclusions=[],
         )
-
-        # Parse response
-        response_text = response.content[0].text.strip()
-        # Handle markdown code blocks
-        if response_text.startswith("```"):
-            response_text = response_text.split("\n", 1)[1]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            response_text = response_text.strip()
-
-        parsed = json.loads(response_text)
-
-        # Extract episode info
-        episode_info = parsed.get(
-            "episode_info",
-            {
-                "guest_name": "",
-                "guest_title": "",
-                "episode_title": "",
-                "episode_description": "",
-            },
+        clips = self._prepare_clips(
+            parsed.get("clips", []),
+            diarized,
+            segments_data.get("segments", []),
+            total_duration,
+            exclusions=[],
         )
+        episode_info = parsed["episode_info"]
         self.save_json("episode_info.json", episode_info)
-
-        # Update episode.json with extracted info
-        episode = self.load_json_safe("episode.json")
-        if episode:
-            episode["guest_name"] = episode_info.get("guest_name", "")
-            episode["guest_title"] = episode_info.get("guest_title", "")
-            episode["episode_name"] = episode_info.get("episode_title", "")
-            episode["episode_description"] = episode_info.get("episode_description", "")
-            self.save_json("episode.json", episode)
-
-        # Extract clips
-        clips = parsed.get("clips", [])
-
-        # Snap clip boundaries to silence
-        clips = self._snap_to_silence(clips, segments_data)
-
-        # Determine dominant speaker per clip
-        segments = segments_data.get("segments", [])
-        for i, clip in enumerate(clips):
-            clip["id"] = f"clip_{i + 1:02d}"
-            clip["rank"] = i + 1
-            clip["duration"] = round(clip["end_seconds"] - clip["start_seconds"], 1)
-            clip["speaker"] = self._get_dominant_speaker(
-                clip["start_seconds"], clip["end_seconds"], segments
-            )
-            clip["status"] = "pending"
-            clip["manual"] = False
-
+        self._fill_missing_episode_info(episode_info)
         result = {
             "clips": clips,
             "clip_count": len(clips),
-            "model_used": model,
+            "model_used": provenance["model"],
+            "generation": self._generation_provenance(provenance, diarized),
         }
         self.save_json("clips.json", result)
         return result
 
+    def generate_alternative(self, clip_id: str) -> dict:
+        """Append one grounded alternative while preserving every stored candidate."""
+        stored = self.load_json("clips.json")
+        clips = stored.get("clips", [])
+        rejected = next((clip for clip in clips if clip.get("id") == clip_id), None)
+        if rejected is None:
+            raise KeyError(f"Unknown clip: {clip_id}")
+
+        diarized, segments_data, total_duration = self._load_inputs()
+        exclusions = [
+            (float(clip["start_seconds"]), float(clip["end_seconds"]))
+            for clip in clips
+            if clip.get("start_seconds") is not None
+            and clip.get("end_seconds") is not None
+        ]
+        parsed, provenance = self._mine(
+            diarized,
+            total_duration,
+            1,
+            exclusions=exclusions,
+        )
+        alternatives = self._prepare_clips(
+            parsed.get("clips", []),
+            diarized,
+            segments_data.get("segments", []),
+            total_duration,
+            exclusions=exclusions,
+        )
+        if not alternatives:
+            raise RuntimeError("Generator did not return a non-overlapping alternative")
+        if self.load_json("clips.json") != stored:
+            raise ValueError("clips.json changed while generating an alternative; retry")
+
+        rejected["status"] = "rejected"
+        rejected["selection_status"] = "rejected"
+        candidate = alternatives[0]
+        candidate["id"] = self._next_clip_id(clips)
+        candidate["rank"] = (
+            max((int(clip.get("rank", 0)) for clip in clips), default=0) + 1
+        )
+        candidate["selection_status"] = "selected"
+        candidate["alternative_for"] = clip_id
+        clips.append(candidate)
+        updated = dict(stored)
+        updated.update(
+            clips=clips,
+            clip_count=len(clips),
+            generation=self._generation_provenance(provenance, diarized),
+        )
+        atomic_write_json(self.episode_dir / "clips.json", updated)
+        return {
+            "rejected_clip_id": clip_id,
+            "alternative": candidate,
+            "generation": updated["generation"],
+        }
+
+    def _load_inputs(self) -> tuple[dict, dict, float]:
+        diarized = self.load_json("diarized_transcript.json")
+        if diarized.get("clock") != "source":
+            raise ValueError("A source-clock canonical transcript is required")
+        segments = self.load_json("segments.json")
+        if segments.get("clock") != "source":
+            raise ValueError("Source-clock speaker segments are required")
+        stitch = self.load_json("stitch.json")
+        duration = float(stitch["duration_seconds"])
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("Episode duration must be positive and finite")
+        return diarized, segments, duration
+
+    def _mine(
+        self,
+        diarized: dict,
+        total_duration: float,
+        count: int,
+        *,
+        exclusions: list[tuple[float, float]],
+    ) -> tuple[dict, dict]:
+        preferred_min = self.get_config("processing", "clip_min_seconds", default=40)
+        preferred_max = self.get_config("processing", "clip_max_seconds", default=75)
+        excluded_text = (
+            "\n".join(f"- {start:.3f}s to {end:.3f}s" for start, end in exclusions)
+            or "- none"
+        )
+        prompt = f"""Choose up to {count} strong clips from this podcast transcript.
+
+Episode duration: {total_duration:.3f} seconds.
+Preferred duration: {preferred_min}-{preferred_max} seconds. A complete thought or
+story may run 20-90 seconds; never cut a sentence merely to meet the preference.
+Return fewer clips when the transcript does not contain {count} strong choices.
+Use source timestamps exactly as supplied. Each hook_text must be exact spoken text
+inside its clip. Ground titles and reasons in the transcript; do not invent quotes,
+events, achievements, or publication links. Favor complete stories and strong endings.
+Include Bay Area material when it is among the strongest content.
+
+Do not overlap these existing candidate ranges:
+{excluded_text}
+
+SOURCE-CLOCK TRANSCRIPT:
+{self._format_transcript(diarized)}"""
+        return generate_structured(
+            self.config,
+            task="podcast_clip_candidates",
+            instructions=(
+                "Act as a careful podcast editor. Treat the supplied transcript as "
+                "the only factual source and return the requested JSON schema."
+            ),
+            prompt=prompt,
+            schema=_CLIP_MINER_SCHEMA,
+            max_output_tokens=8192,
+        )
+
+    def _prepare_clips(
+        self,
+        generated: list[dict],
+        diarized: dict,
+        segments: list[dict],
+        total_duration: float,
+        *,
+        exclusions: list[tuple[float, float]],
+    ) -> list[dict]:
+        clips = []
+        for item in generated:
+            clip = dict(item)
+            start = float(clip["start_seconds"])
+            end = float(clip["end_seconds"])
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0
+                or end <= start
+                or end > total_duration + 0.001
+                or end - start < 5
+                or end - start > 300
+            ):
+                raise ValueError(f"Generated clip has invalid bounds: {start}-{end}")
+            if any(max(start, left) < min(end, right) for left, right in exclusions):
+                continue
+
+            excerpt = self._excerpt_words(diarized, start, end)
+            if not excerpt:
+                raise ValueError(
+                    f"Generated clip {start}-{end} has no transcript words"
+                )
+            hook = str(clip.get("hook_text", "")).strip()
+            if _normalized(hook) not in _normalized(excerpt):
+                clip["proposed_hook_text"] = hook
+                clip["hook_text"] = self._opening_phrase(excerpt)
+                clip["hook_grounding"] = "replaced_with_canonical_transcript"
+            else:
+                clip["hook_grounding"] = "exact_canonical_transcript"
+            clip.update(
+                start_seconds=start,
+                end_seconds=end,
+                start=start,
+                end=end,
+                duration=round(end - start, 3),
+                speaker=self._get_dominant_speaker(start, end, segments),
+                status="pending",
+                manual=False,
+            )
+            clips.append(clip)
+        for index, clip in enumerate(clips, 1):
+            clip.setdefault("id", f"clip_{index:02d}")
+            clip.setdefault("rank", index)
+        return clips
+
+    @staticmethod
+    def _generation_provenance(provenance: dict, diarized: dict) -> dict:
+        transcript = diarized.get("provenance", {})
+        return {
+            **provenance,
+            "clock": "source",
+            "raw_transcript_sha256": transcript.get("raw_transcript_sha256"),
+            "corrections_fingerprint": transcript.get("corrections_fingerprint"),
+        }
+
+    def _fill_missing_episode_info(self, info: dict) -> None:
+        episode = self.load_json_safe("episode.json")
+        if not episode:
+            return
+        for destination, source in (
+            ("guest_name", "guest_name"),
+            ("guest_title", "guest_title"),
+            ("episode_name", "episode_title"),
+            ("episode_description", "episode_description"),
+        ):
+            if not episode.get(destination) and info.get(source):
+                episode[destination] = info[source]
+        self.save_json("episode.json", episode)
+
+    @staticmethod
+    def _next_clip_id(clips: list[dict]) -> str:
+        numbers = []
+        for clip in clips:
+            match = re.fullmatch(r"clip_(\d+)", str(clip.get("id", "")))
+            if match:
+                numbers.append(int(match.group(1)))
+        return f"clip_{max(numbers, default=0) + 1:02d}"
+
     def _format_transcript(self, diarized: dict) -> str:
         lines = []
-        for utt in diarized.get("utterances", []):
-            speaker = utt.get("speaker", "?")
-            start = utt.get("start", 0)
-            end = utt.get("end", 0)
-            text = utt.get("text", "")
-            lines.append(f"[{start:.1f}s - {end:.1f}s] Speaker {speaker}: {text}")
+        for utterance in diarized.get("utterances", []):
+            speaker = utterance.get("speaker", "?")
+            start = float(utterance.get("start", 0))
+            end = float(utterance.get("end", 0))
+            text = utterance.get("text", "")
+            lines.append(f"[{start:.3f}s-{end:.3f}s] Speaker {speaker}: {text}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _excerpt_words(diarized: dict, start: float, end: float) -> str:
+        words = [
+            word
+            for utterance in diarized.get("utterances", [])
+            for word in utterance.get("words", [])
+            if start <= (float(word["start"]) + float(word["end"])) / 2 < end
+        ]
+        words.sort(
+            key=lambda word: (
+                float(word.get("start", 0)),
+                float(word.get("end", 0)),
+                int(word.get("speaker", 0)),
+            )
+        )
+        return " ".join(
+            str(word.get("punctuated_word", word.get("word", ""))) for word in words
+        )
+
+    @staticmethod
+    def _opening_phrase(excerpt: str) -> str:
+        words = excerpt.split()
+        chosen = []
+        for word in words[:16]:
+            chosen.append(word)
+            if len(chosen) >= 5 and word.rstrip().endswith((".", "?", "!")):
+                break
+        return " ".join(chosen)
+
     def _snap_to_silence(self, clips: list, segments_data: dict) -> list:
-        """Snap clip boundaries to nearest low-energy point."""
+        """Compatibility helper for explicitly requested energy-based snapping."""
         tolerance = self.get_config(
             "clip_mining", "boundary_snap_tolerance_seconds", default=3.0
         )
-
         import numpy as np
 
-        # Try .npy format first (from optimized speaker_cut), fall back to JSON
-        left_npy = self.episode_dir / "work" / "left_rms_db.npy"
-        right_npy = self.episode_dir / "work" / "right_rms_db.npy"
+        left_path = self.episode_dir / "work" / "left_rms_db.npy"
+        right_path = self.episode_dir / "work" / "right_rms_db.npy"
         meta_path = self.episode_dir / "work" / "rms_meta.json"
-
-        if left_npy.exists() and right_npy.exists() and meta_path.exists():
-            try:
-                left_rms = np.load(str(left_npy))
-                right_rms = np.load(str(right_npy))
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                frame_sec = meta.get("frame_seconds", 0.1)
-            except (OSError, ValueError):
-                return clips
-        else:
-            # Fall back to legacy JSON format
-            rms_path = self.episode_dir / "work" / "rms_data.json"
-            if not rms_path.exists():
-                return clips
-            try:
-                with open(rms_path) as f:
-                    rms_data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                return clips
-            frame_sec = rms_data.get("frame_seconds", 0.1)
-            left_rms = np.array(rms_data.get("left_rms_db", []))
-            right_rms = np.array(rms_data.get("right_rms_db", []))
-
-        if len(left_rms) == 0 or len(right_rms) == 0:
+        if not left_path.exists() or not right_path.exists() or not meta_path.exists():
             return clips
-
-        # Combined energy
+        try:
+            left_rms = np.load(str(left_path))
+            right_rms = np.load(str(right_path))
+            with meta_path.open() as source:
+                frame_seconds = json.load(source).get("frame_seconds", 0.1)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return clips
         combined = left_rms + right_rms
-
+        if not len(combined):
+            return clips
         for clip in clips:
             for key in ("start_seconds", "end_seconds"):
-                t = clip[key]
-                lo = max(0, int((t - tolerance) / frame_sec))
-                hi = min(len(combined), int((t + tolerance) / frame_sec))
-                if lo >= hi:
-                    continue
-                window = combined[lo:hi]
-                min_idx = lo + int(np.argmin(window))
-                clip[key] = round(min_idx * frame_sec, 2)
-
+                value = float(clip[key])
+                first = max(0, int((value - tolerance) / frame_seconds))
+                last = min(len(combined), int((value + tolerance) / frame_seconds))
+                if first < last:
+                    clip[key] = round(
+                        (first + int(np.argmin(combined[first:last]))) * frame_seconds,
+                        2,
+                    )
         return clips
 
-    def _get_dominant_speaker(self, start: float, end: float, segments: list) -> str:
-        """Determine dominant speaker for a time range from segments."""
+    @staticmethod
+    def _get_dominant_speaker(start: float, end: float, segments: list) -> str:
         speaker_time = {}
-        for seg in segments:
-            seg_start = seg["start"]
-            seg_end = seg["end"]
-            overlap_start = max(start, seg_start)
-            overlap_end = min(end, seg_end)
-            if overlap_start < overlap_end:
-                speaker = seg["speaker"]
-                speaker_time[speaker] = speaker_time.get(speaker, 0) + (
-                    overlap_end - overlap_start
-                )
-
-        if not speaker_time:
-            return "BOTH"
-
-        return max(speaker_time, key=speaker_time.get)
+        for segment in segments:
+            overlap = min(end, segment["end"]) - max(start, segment["start"])
+            if overlap > 0:
+                speaker = segment["speaker"]
+                speaker_time[speaker] = speaker_time.get(speaker, 0) + overlap
+        return max(speaker_time, key=speaker_time.get) if speaker_time else "BOTH"
