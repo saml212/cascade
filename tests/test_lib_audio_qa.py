@@ -154,6 +154,34 @@ def test_consecutive_outages_remain_separate_across_short_signal_return():
     ]
 
 
+def test_finding_identity_is_stable_but_proof_binds_transcript_semantics():
+    stats = _stats()
+    _set_level(stats, 0, 1, 9, -20)
+    _set_level(stats, 1, 1, 9, -45)
+    _set_level(stats, 0, 5, 6.5, -240, digital_zero=True)
+    _set_level(stats, 1, 5, 6.5, -36)
+
+    original, _, _ = analyze_windows(
+        stats,
+        transcript=_transcript(("guest", 1, 9, "continuous")),
+        source_fingerprint="sha256:test",
+    )
+    copy_changed, _, _ = analyze_windows(
+        stats,
+        transcript=_transcript(("guest", 1, 9, "rewritten copy")),
+        source_fingerprint="sha256:test",
+    )
+    changed, _, _ = analyze_windows(
+        stats,
+        transcript=_transcript(("host", 1, 9, "rewritten copy")),
+        source_fingerprint="sha256:test",
+    )
+
+    assert original[0]["fingerprint"] == copy_changed[0]["fingerprint"]
+    assert original[0]["id"] == changed[0]["id"]
+    assert original[0]["fingerprint"] != changed[0]["fingerprint"]
+
+
 def test_normal_turn_taking_does_not_report_inactive_channels():
     stats = _stats()
     _set_level(stats, 0, 1, 4, -20)

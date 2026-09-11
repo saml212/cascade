@@ -22,6 +22,8 @@ from lib.audio_mix import (
     SELECTED_REPAIR_AUDIO_PATH,
     audio_processing_settings,
     audio_selection_settings,
+    document_fingerprint,
+    json_fingerprint,
     publish_audio_selection,
 )
 from lib.audio_qa import (
@@ -218,7 +220,7 @@ def build_audio_repair_plan(
         },
         "checks": checks,
     }
-    plan["fingerprint"] = _document_fingerprint(plan)
+    plan["fingerprint"] = document_fingerprint(plan)
     atomic_write_json(destination / "audio-repair-plan.json", plan)
     return plan
 
@@ -349,20 +351,6 @@ def _repair_dispositions(
     return dispositions
 
 
-def _document_fingerprint(document: dict) -> str:
-    payload = {
-        key: value
-        for key, value in document.items()
-        if key not in {"generated_at", "fingerprint"}
-    }
-    return _json_fingerprint(payload)
-
-
-def _json_fingerprint(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
-
-
 def render_audio_repair_candidate(
     report: dict,
     plan: dict,
@@ -470,7 +458,7 @@ def render_audio_repair_candidate(
         },
         "verification": verification,
     }
-    manifest["fingerprint"] = _document_fingerprint(manifest)
+    manifest["fingerprint"] = document_fingerprint(manifest)
     destination_manifest = Path(manifest_path or source.parent / REPAIR_CANDIDATE_PATH)
     destination_manifest.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(destination_manifest, manifest)
@@ -491,7 +479,7 @@ def select_audio_repair_candidate(
     _, provenance = _validate_current_plan(report, plan)
     if manifest.get("schema") != REPAIR_CANDIDATE_SCHEMA:
         raise ValueError("Audio repair candidate manifest is invalid")
-    if manifest.get("fingerprint") != _document_fingerprint(manifest):
+    if manifest.get("fingerprint") != document_fingerprint(manifest):
         raise ValueError("Audio repair candidate manifest fingerprint is invalid")
     if (
         manifest.get("source_report_fingerprint") != report.get("fingerprint")
@@ -599,7 +587,7 @@ def select_audio_repair_candidate(
             "verification": selected_verification,
             "perceptual_review": manifest.get("perceptual_review"),
         }
-        record["fingerprint"] = _document_fingerprint(record)
+        record["fingerprint"] = document_fingerprint(record)
         return publish_audio_selection(episode_dir, staged, record)
     finally:
         staged.unlink(missing_ok=True)
@@ -609,7 +597,7 @@ def _validate_current_plan(report: dict, plan: dict) -> tuple[Path, dict]:
     source, _, provenance = _current_report_context(report)
     if plan.get("source_report_fingerprint") != report.get("fingerprint"):
         raise ValueError("Audio repair plan is stale for the quality report")
-    if plan.get("fingerprint") != _document_fingerprint(plan):
+    if plan.get("fingerprint") != document_fingerprint(plan):
         raise ValueError("Audio repair plan fingerprint is invalid")
     if plan.get("policy", {}).get("preview_algorithm_version") != (
         PREVIEW_ALGORITHM_VERSION
@@ -772,7 +760,7 @@ def _master_candidate(raw: Path, work_dir: Path, config: dict) -> Path:
 
 
 def _config_fingerprint(config: dict) -> str:
-    return _json_fingerprint(audio_processing_settings(config))
+    return json_fingerprint(audio_processing_settings(config))
 
 
 def _bounded_asr_evidence(plan: dict, path: str | Path | None) -> dict:

@@ -21,6 +21,7 @@ from lib.audio_mix import (
     CAMERA_AUDIO_TIMELINE_FILTER,
     audio_selection_settings,
     current_audio_selection,
+    json_fingerprint,
 )
 from lib.ffprobe import file_fingerprint, get_audio_stream, media_fingerprint
 from lib.ffprobe import probe as ffprobe
@@ -1045,9 +1046,8 @@ def _build_finding(
         "estimated_recovery_gain_db": round(decision["estimated_recovery_gain_db"], 2),
     }
     duration = round(end_seconds - start_seconds, 6)
-    return {
+    finding = {
         "id": finding_id,
-        "fingerprint": finding_id,
         "kind": kind,
         "classification": decision["classification"],
         "severity": decision["severity"],
@@ -1080,6 +1080,35 @@ def _build_finding(
             ),
         },
     }
+    finding["fingerprint"] = _finding_fingerprint(finding)
+    return finding
+
+
+def _finding_fingerprint(finding: dict) -> str:
+    """Bind repair proof to the semantic evidence behind a stable finding ID."""
+    evidence = {
+        key: value
+        for key, value in (finding.get("evidence") or {}).items()
+        if key != "transcript_excerpt"
+    }
+    return json_fingerprint(
+        {
+            key: finding.get(key)
+            for key in (
+                "id",
+                "kind",
+                "classification",
+                "severity",
+                "confidence",
+                "channel",
+                "surviving_channel",
+                "source_time",
+                "edited_time",
+                "recovery",
+            )
+        }
+        | {"evidence": evidence}
+    )
 
 
 def _build_suppressed_candidate(

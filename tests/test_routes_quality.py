@@ -21,6 +21,7 @@ from lib.audio_mix import (
     SELECTED_REPAIR_AUDIO_PATH,
     audio_processing_settings,
     audio_selection_settings,
+    document_fingerprint,
 )
 from lib.delivery_video import (
     longform_render_fingerprint,
@@ -410,32 +411,31 @@ def test_repair_selection_is_inspectable_and_reversibly_cleared(quality_client):
     selected.write_bytes(b"selected repair")
     episode = json.loads((episode_dir / "episode.json").read_text())
     source_stat, selected_stat = source.stat(), selected.stat()
-    _write_json(
-        episode_dir / AUDIO_SELECTION_PATH,
-        {
-            "schema": AUDIO_SELECTION_SCHEMA,
-            "status": "review_required",
-            "release_safe": False,
-            "source": {
-                "path": str(source.resolve()),
-                "fingerprint": {
-                    "id": "sha256:source",
-                    "size_bytes": source_stat.st_size,
-                    "mtime_ns": source_stat.st_mtime_ns,
-                },
-            },
-            "audio_selection_settings": audio_selection_settings(episode),
-            "audio_processing_settings": audio_processing_settings(load_config()),
-            "selected_output": {
-                "path": str(selected.resolve()),
-                "fingerprint": {
-                    "id": "sha256:selected",
-                    "size_bytes": selected_stat.st_size,
-                    "mtime_ns": selected_stat.st_mtime_ns,
-                },
+    record = {
+        "schema": AUDIO_SELECTION_SCHEMA,
+        "status": "review_required",
+        "release_safe": False,
+        "source": {
+            "path": str(source.resolve()),
+            "fingerprint": {
+                "id": "sha256:source",
+                "size_bytes": source_stat.st_size,
+                "mtime_ns": source_stat.st_mtime_ns,
             },
         },
-    )
+        "audio_selection_settings": audio_selection_settings(episode),
+        "audio_processing_settings": audio_processing_settings(load_config()),
+        "selected_output": {
+            "path": str(selected.resolve()),
+            "fingerprint": {
+                "id": "sha256:selected",
+                "size_bytes": selected_stat.st_size,
+                "mtime_ns": selected_stat.st_mtime_ns,
+            },
+        },
+    }
+    record["fingerprint"] = document_fingerprint(record)
+    _write_json(episode_dir / AUDIO_SELECTION_PATH, record)
 
     current = client.get("/api/episodes/ep_test/audio-qc/repair-selection")
     cleared = client.delete("/api/episodes/ep_test/audio-qc/repair-selection")

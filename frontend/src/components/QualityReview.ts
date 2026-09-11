@@ -173,7 +173,7 @@ function repairCandidate(
       action
     ),
     previewPlayer(
-      'Full repair draft',
+      'Full repair draft · source timeline',
       candidate.audio_url,
       `repair-candidate:${candidate.fingerprint ?? 'unknown'}`,
       controls

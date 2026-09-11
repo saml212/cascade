@@ -19,6 +19,7 @@ from lib.audio_mix import (
     _mix_fingerprint,
     audio_processing_settings,
     audio_selection_settings,
+    document_fingerprint,
     generate_audio_mix,
     logical_track_groups,
 )
@@ -383,6 +384,7 @@ class TestRepairSelection:
                 },
             },
         }
+        record["fingerprint"] = document_fingerprint(record)
         (episode_dir / AUDIO_SELECTION_PATH).write_text(json.dumps(record))
         return selected
 
@@ -404,6 +406,22 @@ class TestRepairSelection:
         with (
             patch("lib.audio_mix._generate_audio_mix_locked") as generate_base,
             pytest.raises(ValueError, match="changed since review"),
+        ):
+            generate_audio_mix(tmp_path, episode, config)
+
+        generate_base.assert_not_called()
+
+    def test_tampered_selection_record_blocks_instead_of_falling_back(self, tmp_path):
+        episode, config = {"audio_sync": {}}, {"processing": {"audio_enhance": False}}
+        self._write_selection(tmp_path, episode, config)
+        record_path = tmp_path / AUDIO_SELECTION_PATH
+        record = json.loads(record_path.read_text())
+        record["release_safe"] = True
+        record_path.write_text(json.dumps(record))
+
+        with (
+            patch("lib.audio_mix._generate_audio_mix_locked") as generate_base,
+            pytest.raises(ValueError, match="record fingerprint is invalid"),
         ):
             generate_audio_mix(tmp_path, episode, config)
 

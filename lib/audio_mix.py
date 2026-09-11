@@ -32,6 +32,23 @@ SELECTED_REPAIR_AUDIO_PATH = Path("work/audio_repair_selected.wav")
 _audio_mix_lock = threading.Lock()
 
 
+def json_fingerprint(value: object) -> str:
+    """Return a stable SHA-256 identity for JSON-compatible data."""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def document_fingerprint(document: dict) -> str:
+    """Fingerprint a revisioned record without its timestamp or claimed identity."""
+    return json_fingerprint(
+        {
+            key: value
+            for key, value in document.items()
+            if key not in {"generated_at", "fingerprint"}
+        }
+    )
+
+
 def audio_selection_settings(episode_data: dict) -> dict:
     """Return only episode fields that can change the selected audio mix."""
     crop = episode_data.get("crop_config") or {}
@@ -116,6 +133,8 @@ def current_audio_selection(
         raise ValueError("Selected audio record is unreadable") from exc
     if not isinstance(record, dict) or record.get("schema") != AUDIO_SELECTION_SCHEMA:
         raise ValueError("Selected audio record is invalid")
+    if record.get("fingerprint") != document_fingerprint(record):
+        raise ValueError("Selected audio record fingerprint is invalid")
 
     selected = (episode_dir / SELECTED_REPAIR_AUDIO_PATH).resolve()
     output = record.get("selected_output") or {}
@@ -186,6 +205,7 @@ def publish_audio_selection(
     if (
         record.get("schema") != AUDIO_SELECTION_SCHEMA
         or Path(record.get("selected_output", {}).get("path", "")).resolve() != selected
+        or record.get("fingerprint") != document_fingerprint(record)
     ):
         raise ValueError("Selected audio record is invalid")
 
