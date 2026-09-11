@@ -217,7 +217,89 @@ def test_release_gate_ignores_findings_removed_by_edits():
 
     assert blocked["status"] == "blocked"
     assert blocked["blocking_finding_ids"] == ["kept"]
-    assert passing["safe"] is True
+    assert passing["status"] == "output_unverified"
+    assert passing["safe"] is False
+
+
+def test_release_gate_only_passes_with_current_successful_output_proof():
+    report = {
+        "fingerprint": "sha256:source-report",
+        "analysis": {"status": "complete"},
+        "scope": {
+            "selected_mix_provenance": {
+                "uses_checked_source_audio": True,
+                "fingerprint": "sha256:selected-mix",
+                "selected_output": {
+                    "fingerprint": {"id": "sha256:current-output"}
+                },
+            },
+            "outputs_checked": [
+                {
+                    "role": "selected_audio_master",
+                    "status": "pass",
+                    "source_report_fingerprint": "sha256:source-report",
+                    "selected_mix_fingerprint": "sha256:selected-mix",
+                    "fingerprint": {"id": "sha256:current-output"},
+                    "verification": {
+                        "status": "pass",
+                        "checks": [
+                            {"name": "duration", "pass": True},
+                            {"name": "continuity", "pass": True},
+                        ],
+                    },
+                }
+            ],
+        },
+        "findings": [],
+    }
+
+    assert release_gate(report)["safe"] is True
+
+    report["scope"]["outputs_checked"][0]["fingerprint"]["id"] = "sha256:old"
+    stale = release_gate(report)
+    assert stale["status"] == "output_stale"
+    assert stale["safe"] is False
+
+    proof = report["scope"]["outputs_checked"][0]
+    proof["fingerprint"]["id"] = "sha256:current-output"
+    proof["verification"]["checks"][1]["pass"] = False
+    failed = release_gate(report)
+    assert failed["status"] == "output_failed"
+    assert failed["safe"] is False
+
+
+def test_release_gate_does_not_trust_bare_resolution_statuses():
+    finding = {
+        "id": "dropout",
+        "fingerprint": "dropout",
+        "severity": "error",
+        "edited_time": {"status": "retained"},
+        "resolution": {"status": "repaired"},
+    }
+    report = {
+        "fingerprint": "sha256:report",
+        "analysis": {"status": "complete"},
+        "scope": {
+            "selected_mix_provenance": {
+                "uses_checked_source_audio": True,
+                "fingerprint": "sha256:mix",
+                "selected_output": {"fingerprint": {"id": "sha256:output"}},
+            },
+            "outputs_checked": [],
+        },
+        "findings": [finding],
+    }
+
+    assert release_gate(report)["status"] == "blocked"
+
+    finding["resolution"] = {
+        "status": "false_positive",
+        "finding_fingerprint": "dropout",
+        "reviewed_by": "editor",
+        "reviewed_at": "2026-09-11T00:00:00Z",
+        "evidence": "Audible review confirms normal turn-taking.",
+    }
+    assert release_gate(report)["status"] == "output_unverified"
 
 
 def test_release_gate_never_claims_unchecked_or_unused_audio_is_safe():
@@ -344,3 +426,36 @@ def test_grounded_preview_uses_only_surviving_source_channel(tmp_path):
     assert float(
         ffprobe(Path(result["grounded_fallback"]))["format"]["duration"]
     ) == pytest.approx(2, abs=0.03)
+
+    def decode(path: str) -> np.ndarray:
+        decoded = subprocess.run(
+            [
+                str(decoder),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path,
+                "-map",
+                "0:a:0",
+                "-ac",
+                "1",
+                "-ar",
+                "8000",
+                "-c:a",
+                "pcm_f32le",
+                "-f",
+                "f32le",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return np.frombuffer(decoded.stdout, dtype="<f4")
+
+    original = decode(result["original"])
+    fallback = decode(result["grounded_fallback"])
+    assert len(fallback) == pytest.approx(len(original), abs=1)
+    for start, end in ((0.1, 0.4), (1.6, 1.9)):
+        section = slice(round(start * 8000), round(end * 8000))
+        np.testing.assert_allclose(fallback[section], original[section], atol=2e-6)

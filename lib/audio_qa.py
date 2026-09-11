@@ -108,7 +108,11 @@ def analyze_episode_audio(
     )
     fingerprint = media_fingerprint(source, media_probe)
     decoder = resolve_ffmpeg(ffmpeg_bin)
-    mix_provenance = _mix_provenance(episode)
+    mix_provenance = _mix_provenance(
+        episode,
+        episode_dir=episode_dir,
+        source_fingerprint=fingerprint,
+    )
 
     channels = int(audio_stream.get("channels") or 0)
     if channels < 2:
@@ -452,12 +456,12 @@ def release_gate(report: dict) -> dict:
             ),
         }
 
+    proof_state, output_proof = _output_proof_state(report)
     unresolved = [
         finding
         for finding in report.get("findings", [])
         if finding.get("edited_time", {}).get("status") != "removed"
-        and finding.get("resolution", {}).get("status", "unresolved")
-        not in {"repaired", "accepted", "false_positive", "not_in_selected_mix"}
+        and not _finding_resolution_is_current(finding, output_proof)
     ]
     blocking = [
         finding["id"]
@@ -481,13 +485,97 @@ def release_gate(report: dict) -> dict:
             "review_finding_ids": review,
             "reason": "Source-channel continuity candidates still require review.",
         }
+    if proof_state != "pass":
+        messages = {
+            "missing": (
+                "output_unverified",
+                "The currently selected audio output has not been checked.",
+            ),
+            "stale": (
+                "output_stale",
+                "Audio output evidence does not match the current source analysis, mix, or master.",
+            ),
+            "failed": (
+                "output_failed",
+                "The current audio output failed continuity verification.",
+            ),
+        }
+        status, reason = messages[proof_state]
+        return {
+            "status": status,
+            "safe": False,
+            "blocking_finding_ids": [],
+            "review_finding_ids": [],
+            "reason": reason,
+        }
     return {
         "status": "pass",
         "safe": True,
         "blocking_finding_ids": [],
         "review_finding_ids": [],
-        "reason": "No unresolved channel-continuity findings remain in the edited output.",
+        "reason": "Source findings are resolved and the current audio output passed continuity verification.",
     }
+
+
+def _output_proof_state(report: dict) -> tuple[str, dict | None]:
+    """Classify evidence for the currently selected audio master."""
+    scope = report.get("scope", {})
+    provenance = scope.get("selected_mix_provenance", {})
+    selected_output = provenance.get("selected_output")
+    outputs = scope.get("outputs_checked") or []
+    if not isinstance(selected_output, dict) or not outputs:
+        return "missing", None
+
+    expected_output = (selected_output.get("fingerprint") or {}).get("id")
+    expected_mix = provenance.get("fingerprint")
+    expected_report = report.get("fingerprint")
+    for proof in outputs:
+        if not isinstance(proof, dict) or proof.get("role") != "selected_audio_master":
+            continue
+        proof_output = (proof.get("fingerprint") or {}).get("id")
+        if (
+            proof.get("source_report_fingerprint") != expected_report
+            or proof.get("selected_mix_fingerprint") != expected_mix
+            or proof_output != expected_output
+        ):
+            continue
+        verification = proof.get("verification") or {}
+        checks = verification.get("checks") or []
+        if (
+            proof.get("status") == "failed"
+            or verification.get("status") == "failed"
+            or any(check.get("pass") is False for check in checks)
+        ):
+            return "failed", proof
+        if (
+            proof.get("status") == "pass"
+            and verification.get("status") == "pass"
+            and checks
+            and all(check.get("pass") is True for check in checks)
+        ):
+            return "pass", proof
+    return "stale", None
+
+
+def _finding_resolution_is_current(finding: dict, output_proof: dict | None) -> bool:
+    resolution = finding.get("resolution") or {}
+    status = resolution.get("status", "unresolved")
+    finding_fingerprint = finding.get("fingerprint") or finding.get("id")
+    if status in {"accepted", "false_positive"}:
+        return bool(
+            resolution.get("reviewed_by")
+            and resolution.get("reviewed_at")
+            and resolution.get("evidence")
+            and resolution.get("finding_fingerprint") == finding_fingerprint
+        )
+    if output_proof is None:
+        return False
+    verification = output_proof.get("verification") or {}
+    if status == "repaired":
+        return finding.get("id") in verification.get("repaired_finding_ids", [])
+    if status == "not_in_selected_mix":
+        return finding.get("id") in verification.get("excluded_finding_ids", [])
+    return False
 
 
 def render_finding_preview(
@@ -558,9 +646,10 @@ def render_finding_preview(
         f"[0:a]{CAMERA_AUDIO_TIMELINE_FILTER},"
         "aformat=channel_layouts=stereo,asplit=2[m][s];"
         f"[m]pan=mono|c0=0.5*c0+0.5*c1,volume='{normal_weight}':eval=frame[n];"
-        f"[s]pan=mono|c0=c{survivor},volume='{fallback_weight}*{10 ** (gain_db / 20):.8f}':"
+        f"[s]pan=mono|c0=c{survivor},volume='({fallback_weight})*{10 ** (gain_db / 20):.8f}':"
         "eval=frame[r];[n][r]amix=inputs=2:duration=first:normalize=0,"
-        "alimiter=limit=0.95,pan=stereo|c0=c0|c1=c0[out]"
+        "alimiter=limit=0.95:level=false:latency=true,"
+        "pan=stereo|c0=c0|c1=c0[out]"
     )
     _checked_ffmpeg(
         [
@@ -1087,7 +1176,12 @@ def _episode_timeline(duration: float, episode: dict) -> Any | None:
     return Timeline.from_edits(duration, episode.get("longform_edits", []))
 
 
-def _mix_provenance(episode: dict) -> dict:
+def _mix_provenance(
+    episode: dict,
+    *,
+    episode_dir: Path | None = None,
+    source_fingerprint: dict | None = None,
+) -> dict:
     tracks = episode.get("audio_tracks") or []
     by_number = {
         track.get("track_number"): track
@@ -1123,7 +1217,7 @@ def _mix_provenance(episode: dict) -> dict:
     uses_camera = "camera_channel" in selected_kinds
     uses_recorder = bool(selected_kinds - {"camera_channel"})
     if uses_recorder and not uses_camera:
-        return {
+        result = {
             "kind": "external_recorder",
             "uses_checked_source_audio": False,
             "basis": "The configured mix selects only external recorder tracks.",
@@ -1132,8 +1226,8 @@ def _mix_provenance(episode: dict) -> dict:
                 for track in selected
             ],
         }
-    if uses_camera and uses_recorder:
-        return {
+    elif uses_camera and uses_recorder:
+        result = {
             "kind": "camera_and_external_recorder",
             "uses_checked_source_audio": True,
             "basis": "The configured mix includes camera-channel and external recorder tracks.",
@@ -1142,8 +1236,8 @@ def _mix_provenance(episode: dict) -> dict:
                 for track in selected
             ],
         }
-    if uses_camera:
-        return {
+    elif uses_camera:
+        result = {
             "kind": "camera_channel_extracts",
             "uses_checked_source_audio": True,
             "basis": "The configured mix selects channel extracts derived from source_merged.mp4.",
@@ -1152,12 +1246,63 @@ def _mix_provenance(episode: dict) -> dict:
                 for track in selected
             ],
         }
-    return {
-        "kind": "embedded_camera",
-        "uses_checked_source_audio": True,
-        "basis": "No usable track selection is configured; the mix falls back to embedded camera audio.",
-        "input_paths": ["source_merged.mp4"],
+    else:
+        result = {
+            "kind": "embedded_camera",
+            "uses_checked_source_audio": True,
+            "basis": "No usable track selection is configured; the mix falls back to embedded camera audio.",
+            "input_paths": ["source_merged.mp4"],
+        }
+
+    audio_selection = {
+        "audio_sync": episode.get("audio_sync") or {},
+        "audio_mix": episode.get("audio_mix") or {},
+        "speaker_tracks": [
+            {
+                "track": speaker.get("track"),
+                "volume": speaker.get("volume", 1.0),
+            }
+            for speaker in (episode.get("crop_config") or {}).get("speakers", [])
+        ],
+        "ambient_tracks": (episode.get("crop_config") or {}).get(
+            "ambient_tracks", []
+        ),
     }
+    input_fingerprints = []
+    if episode_dir is not None:
+        for value in result["input_paths"]:
+            path = Path(value)
+            if not path.is_absolute():
+                path = episode_dir / path
+            if not path.is_file():
+                continue
+            fingerprint = (
+                source_fingerprint
+                if source_fingerprint is not None
+                and path.resolve() == (episode_dir / "source_merged.mp4").resolve()
+                else media_fingerprint(path)
+            )
+            input_fingerprints.append(
+                {"path": str(path.resolve()), "fingerprint": fingerprint["id"]}
+            )
+    binding = {
+        "kind": result["kind"],
+        "uses_checked_source_audio": result["uses_checked_source_audio"],
+        "inputs": input_fingerprints or result["input_paths"],
+        "selection": audio_selection,
+    }
+    encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"), default=str)
+    result["fingerprint"] = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+    result["input_fingerprints"] = input_fingerprints
+
+    if episode_dir is not None:
+        selected_output = episode_dir / "work" / "audio_mix.wav"
+        if selected_output.is_file():
+            result["selected_output"] = {
+                "path": str(selected_output.resolve()),
+                "fingerprint": media_fingerprint(selected_output),
+            }
+    return result
 
 
 def _report_fingerprint(
@@ -1175,7 +1320,11 @@ def _report_fingerprint(
             "source": source_fingerprint,
             "transcript": transcript_fingerprint,
             "edits": edits,
-            "mix_provenance": mix_provenance,
+            "mix_provenance": {
+                key: value
+                for key, value in mix_provenance.items()
+                if key != "selected_output"
+            },
             "settings": asdict(settings),
             "findings": findings,
         },
