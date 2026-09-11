@@ -27,9 +27,10 @@ Agents run in parallel where possible (transcribe runs alongside audio analysis 
 
 ### Prerequisites
 
-- **Python 3.11+**
-- **ffmpeg** with libass (for subtitle burning) — `brew install ffmpeg` or `brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass`
-- **uv** (recommended) — `brew install uv`
+- **Python 3.11+** (`start.sh` creates a Python 3.12 environment)
+- **ffmpeg** with the `ass` subtitle filter. On Homebrew, use `brew install ffmpeg-full` and ensure that build is first on `PATH`.
+- **uv** (required by `start.sh`) — `brew install uv`
+- **Node.js + npm** — used to compile the TypeScript frontend
 
 ### Setup
 
@@ -37,7 +38,7 @@ Agents run in parallel where possible (transcribe runs alongside audio analysis 
 git clone https://github.com/saml212/cascade.git && cd cascade
 cp config/config.example.toml config/config.toml  # Edit paths & podcast info
 cp .env.example .env                               # Fill in your API keys (see below)
-./start.sh                                         # Creates venv, installs deps, opens UI
+./start.sh                                         # Repairs setup, builds UI, opens loopback server
 ```
 
 Or manually:
@@ -45,6 +46,7 @@ Or manually:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cd frontend && npm ci && npm run build && cd ..
 cp config/config.example.toml config/config.toml   # Edit paths & podcast info
 cp .env.example .env                               # Fill in API keys
 ```
@@ -53,8 +55,8 @@ cp .env.example .env                               # Fill in API keys
 
 | Key | Required | Purpose |
 |-----|----------|---------|
-| `ANTHROPIC_API_KEY` | Yes | Claude — clip mining, metadata generation, chat |
-| `DEEPGRAM_API_KEY` | Yes | Nova-3 transcription + speaker diarization |
+| `ANTHROPIC_API_KEY` | For API generation | Clip mining and automatic metadata generation |
+| `DEEPGRAM_API_KEY` | For transcription | Nova-3 transcription + speaker diarization |
 | `OPENAI_API_KEY` | No | Thumbnail generation (caricature artwork) |
 | `YOUTUBE_CLIENT_ID` | No | YouTube publishing |
 | `YOUTUBE_CLIENT_SECRET` | No | YouTube publishing |
@@ -67,7 +69,19 @@ cp .env.example .env                               # Fill in API keys
 | `UPLOAD_POST_API_KEY` | No | Upload-Post publishing |
 | `UPLOAD_POST_USER` | No | Upload-Post publishing |
 
-Only `ANTHROPIC_API_KEY` and `DEEPGRAM_API_KEY` are required for the core pipeline (ingest through QA). Publishing and RSS keys are only needed for those specific agents.
+Local import, framing, manual metadata, audio mastering, and upload-video
+preparation do not require either key. The full automated pipeline needs
+`ANTHROPIC_API_KEY` and `DEEPGRAM_API_KEY` for its generation and transcription
+stages. Episode chat uses the installed, authenticated `claude` CLI. Publishing
+and RSS keys are only needed for those specific agents.
+
+The default audio mastering path uses ffmpeg and the lean dependencies in
+`requirements.txt`. DeepFilterNet restoration is optional because its PyTorch
+runtime is large. Install it only when the configured denoise model needs it:
+
+```bash
+uv pip install --python .venv/bin/python -r requirements-restoration.txt
+```
 
 ### Run the Pipeline
 
@@ -89,9 +103,16 @@ python -m agents --source-path "/path/to/media/" --episode-id ep_2026-02-19_1200
 # Opens http://localhost:8420 automatically
 ```
 
-The web UI lets you review clips, approve/reject them, trim boundaries, chat with the AI about your episode, and trigger pipeline runs.
+The web UI uses a three-step release workflow: confirm picture and sound, edit
+episode details, then prepare and download verified local upload files. Publishing
+is a separate explicit action. FastAPI serves the canonical TypeScript/Vite app
+from `frontend/dist`; `./start.sh` rebuilds it before every launch.
 
 ## Architecture
+
+See [the system architecture](docs/architecture.md) and the
+[recovery and production workflow](docs/recovery-workflow.md) for the API and
+artifact contracts used by both the UI and autonomous agents.
 
 ```
 cascade/
@@ -114,9 +135,10 @@ cascade/
 ├── server/          # FastAPI app (port 8420)
 │   ├── app.py       # Entry point + static files
 │   └── routes/      # API endpoints (episodes, clips, pipeline, chat, trim, etc.)
-├── frontend/        # Vanilla JS SPA for clip review + chat + audio mix panel
+├── frontend/        # TypeScript + Vite SPA; FastAPI serves frontend/dist
 ├── config/          # config.toml — all settings
-├── tests/           # pytest + Jest test suites
+├── tests/           # Python pytest suite
+├── frontend/tests/  # TypeScript helper/state tests run with Node
 └── start.sh         # One-command setup + launch
 ```
 

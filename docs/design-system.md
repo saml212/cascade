@@ -327,9 +327,10 @@ What I *will* add: a small signals primitive (`signal`, `computed`, `effect` —
 - Prod build outputs to `frontend/dist/`; FastAPI serves `dist/` as static.
 - Jest stays for unit tests; add Vitest for component tests (shares Vite config).
 
-### 11.3 Parallel rollout
+### 11.3 Production frontend
 
-Keep the current `frontend/` alive as `frontend-legacy/`. New build lives in `frontend/`. A flag in FastAPI (`CASCADE_LEGACY_UI=1`) serves the old one if anything breaks mid-rollout. Flag removed once we cut over. This is cheap insurance — one `if` in `server/app.py`.
+The TypeScript application in `frontend/` is the sole UI. FastAPI serves its
+compiled `dist/` tree; `start.sh` builds it before launching the server.
 
 ### 11.4 Directory structure
 
@@ -377,7 +378,6 @@ frontend/
   package.json
   tsconfig.json
   dist/                         # build output, gitignored
-frontend-legacy/                # current app.js, frozen, removed on cutover
 ```
 
 ### 11.5 SSE-readiness
@@ -394,7 +394,7 @@ Short answers are fine.
 2. **Color: warm-dark with single amber accent** — approve, or prefer a cooler palette (more blue-leaning)?
 3. **Framework: vanilla TypeScript + signals, not React/Svelte** — approve, or want me to go to a framework? (My strong rec: vanilla.)
 4. **Build tool: Vite + compiled Tailwind** — approve? (Fixes Tailwind CDN issue.)
-5. **Parallel rollout via `frontend-legacy/` + env flag** — approve, or just replace?
+5. **Replace the previous UI after the rollout proves stable** — approve?
 6. **Right-rail agent panel reserved from day one** — approve, or wait until Phase C?
 7. **Three-column shell with 72px icon nav** — approve, or prefer a top-nav shape?
 8. **Crop Setup as a single editing surface (not steps, not tabs)** — approve, or want me to split it into Setup → Sync → Crop steps like the handoff mentioned as an option?

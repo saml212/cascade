@@ -2,6 +2,7 @@
 .env
 .env.*
 .venv/
+.venv-*/
 __pycache__/
 *.pyc
 
@@ -48,3 +49,6 @@ links/index.html
 # Render verification scratch
 tmp_render_check/
 tmp_debug/
+.playwright-mcp/
+/[0-9][0-9]-*.png
+/loop-*.png

@@ -32,17 +32,6 @@ npm run build         # tsc --noEmit then Vite, outputs to frontend/dist/
 `server/app.py` serves `frontend/dist/` by default. After `npm run build`,
 refresh the browser at http://localhost:8420 and the new UI is live.
 
-## Emergency rollback to the old UI
-
-The previous vanilla-JS monolith lives at `../frontend-legacy/`. To serve it
-instead of the new build, set the env var and restart uvicorn:
-
-```bash
-CASCADE_LEGACY_UI=1 ./start.sh
-```
-
-Unset the variable (or remove `frontend-legacy/`) to go back.
-
 ## Layout
 
 ```

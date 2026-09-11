@@ -4,7 +4,7 @@ Date: 2026-04-22
 From: the frontend redesign session
 To: the backend / producer agent maintaining `server/`, the pipeline agents in `agents/`, and `lib/`
 
-The frontend rebuild in `frontend/` is done and served by `server/app.py`. `frontend-legacy/` is the old vanilla-JS app, still on disk for emergency rollback (`CASCADE_LEGACY_UI=1`). 18 commits on `main` this session, all authored by Sam Larson only — no AI attribution. The scaffolding + design system live in `docs/design-system.md` and `frontend/README.md`; this document is focused on **what the backend needs to know**.
+The frontend rebuild in `frontend/` is done and served by `server/app.py`. The scaffolding + design system live in `docs/design-system.md` and `frontend/README.md`; this document is focused on **what the backend needs to know**.
 
 ## Summary of what shipped
 
@@ -134,7 +134,7 @@ a71a0b4  Remove dashboard row stagger — was glitchy in screenshots
 - `frontend/src/state/episodes.ts` — polling cadence (episodes list every 8s, per-episode detail every 4s). Adjust if it's too chatty.
 - `frontend/src/components/audio/` — SyncVerifier + TrackMixer, where the H6E stem resolution logic lives. If you change the `audio_tracks` shape, start here.
 - `docs/design-system.md` — visual language, typography, color tokens, components. If you touch the UI, consult it first.
-- `frontend/README.md` — dev server, prod build, legacy rollback.
+- `frontend/README.md` — dev server and production build.
 
 Build:
 
@@ -146,12 +146,6 @@ Dev server (with proxy to uvicorn on 8420):
 
 ```bash
 cd frontend && npm run dev   # http://localhost:8421
-```
-
-Rollback to legacy:
-
-```bash
-CASCADE_LEGACY_UI=1 ./start.sh
 ```
 
 That's it. The frontend is yours to iterate on; the biggest single win for Sam right now is unblocking issue #1 (audio preview perf) so the Play-to-verify-sync flow stops being theoretical.

@@ -19,10 +19,31 @@
 - `NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup"}` — failures here don't abort the pipeline.
 - `episode.json` is the master state file, updated continuously.
 
+## API and artifact contract
+
+- FastAPI is the production boundary for people, automation, and coding agents.
+  The TypeScript UI is one client of the same JSON, preview, review, and download
+  routes; an agent must not need browser DOM access to inspect media state or
+  operate the workflow.
+- Deterministic code owns timestamps, media transforms, validation, retries, and
+  duplicate protection. Agent prompts and skills own editorial judgment and
+  operating guidance.
+- Every release artifact must be traceable to the exact source, edit, audio,
+  crop, caption, and metadata revisions that produced it. Approval applies to
+  that revision and becomes stale when an input changes.
+- `episode.json` plus per-stage JSON files are the current transitional state
+  model. The production target is one artifact manifest exposed through the API
+  for the source, audio master, full episode, shorts, metadata, QA, review, and
+  distribution receipts.
+- In-process background threads currently run some media work. Autonomous
+  operation requires a durable queue that survives restarts, records
+  checkpoints before side effects, and resumes safely when media is mounted.
+
 ## Audio Mix System
 
 - Supports external multi-track audio from Zoom H6E (4 XLR + stereo mix + built-in mic).
-- Audio sync via FFT cross-correlation between camera scratch audio and H6E stereo mix.
+- Audio sync via GCC-PHAT anchors between the complete camera timeline and
+  concatenated H6E recorder sessions.
 - Per-track volume control via `POST /{episode_id}/audio-mix`.
 - Pre-mixed audio stored as `work/audio_mix.wav`, used by both render agents.
 - Speaker cut agent supports N-speaker mode using dedicated mic tracks for detection.

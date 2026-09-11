@@ -2,7 +2,8 @@
 
 ## Setup & Server
 ```bash
-./start.sh                    # Creates .venv (Python 3.12 via uv), installs deps, starts uvicorn on :8420
+./start.sh                    # Repairs/creates .venv, installs core deps, builds frontend, starts 127.0.0.1:8420
+uv pip install --python .venv/bin/python -r requirements-restoration.txt  # Optional ML restoration
 ```
 
 ## Pipeline (CLI)
@@ -14,10 +15,12 @@
 
 ## Tests
 ```bash
+uv pip install --python .venv/bin/python -r requirements-dev.txt
 .venv/bin/pytest              # All Python tests
 .venv/bin/pytest -v           # Verbose
 .venv/bin/pytest tests/test_agent_ingest.py  # Single test file
-cd frontend && npm test       # Frontend Jest tests (jsdom)
+(cd frontend && node --test tests/*.test.mjs)  # Frontend helper/state tests
+npm --prefix frontend run build               # Type-check + production bundle
 ```
 
 ## API
@@ -29,8 +32,9 @@ curl http://localhost:8420/api/episodes/ep_001/pipeline-status
 curl -X POST http://localhost:8420/api/episodes/ep_001/auto-approve
 ```
 
-## Uvicorn reload caveat
-After modifying `.py` files, `--reload` sometimes loads stale bytecode. Restart the server or clear caches:
-```bash
-find . -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; true
-```
+## Server restarts
+The normal launcher runs without `--reload`, because restarting the process
+interrupts active audio and video preparation. After changing Python code,
+wait for active jobs to finish, stop the server, and run `./start.sh` again.
+Frontend changes only require `npm --prefix frontend run build` and a browser
+refresh.
