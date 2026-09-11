@@ -18,6 +18,7 @@ from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 
+from lib.ass import CAPTION_SINGLE_LANE_VERSION, requires_single_lane_caption_timing
 from lib.atomic_write import atomic_write_json
 from lib.crop import visual_crop_state
 from lib.encoding import (
@@ -626,6 +627,24 @@ def _short_render_fingerprint(
     state["lut_sha256"] = lut_digest
     if _uses_two_person_stack(episode, processing, segments, clip):
         state["shorts_overlap_layout"] = SHORTS_TWO_PERSON_STACK_VERSION
+    try:
+        transcript = json.loads(
+            (episode_dir / "diarized_transcript.json").read_text()
+        )
+    except (OSError, json.JSONDecodeError):
+        transcript = {}
+    caption_start = clip.get("start_seconds", clip.get("start"))
+    caption_end = clip.get("end_seconds", clip.get("end"))
+    if (
+        caption_start is not None
+        and caption_end is not None
+        and requires_single_lane_caption_timing(
+            transcript,
+            float(caption_start),
+            float(caption_end),
+        )
+    ):
+        state["caption_timing"] = CAPTION_SINGLE_LANE_VERSION
     return render_fingerprint(paths, state)
 
 

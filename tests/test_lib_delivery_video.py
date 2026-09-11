@@ -216,6 +216,56 @@ def test_short_fingerprint_marks_only_sustained_two_person_overlap(tmp_path):
     assert sustained["shorts_overlap_layout"] == "two-person-stack/v1"
 
 
+def test_short_fingerprint_marks_only_clips_with_overlapping_caption_events(tmp_path):
+    (tmp_path / "source_merged.mp4").write_bytes(b"source")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    (tmp_path / "diarized_transcript.json").write_text(
+        json.dumps(
+            {
+                "utterances": [
+                    {
+                        "speaker": 0,
+                        "words": [
+                            {"word": "main", "start": 10.0, "end": 11.0}
+                        ],
+                    },
+                    {
+                        "speaker": 1,
+                        "words": [
+                            {"word": "reply", "start": 10.7, "end": 11.1}
+                        ],
+                    },
+                ]
+            }
+        )
+    )
+
+    with patch(
+        "lib.delivery_video.render_fingerprint",
+        side_effect=lambda _paths, state: state,
+    ):
+        affected = short_render_fingerprint(
+            tmp_path,
+            {},
+            {},
+            audio,
+            [],
+            {"id": "clip_01", "start_seconds": 10, "end_seconds": 12},
+        )
+        unaffected = short_render_fingerprint(
+            tmp_path,
+            {},
+            {},
+            audio,
+            [],
+            {"id": "clip_02", "start_seconds": 20, "end_seconds": 22},
+        )
+
+    assert affected["caption_timing"] == "single-lane/v1"
+    assert "caption_timing" not in unaffected
+
+
 def test_render_fingerprints_only_track_their_resolved_crop(tmp_path):
     source = tmp_path / "source_merged.mp4"
     audio = tmp_path / "audio.wav"

@@ -15,6 +15,7 @@ from lib.ass import (
     fmt_ass_time,
     generate_ass_from_diarized,
     group_words_into_phrases,
+    requires_single_lane_caption_timing,
 )
 
 # ── timecode formatting ─────────────────────────────────────────────────────
@@ -138,6 +139,49 @@ class TestGroupWordsIntoPhrases:
         phrases = group_words_into_phrases(words, clip_start=0.0)
         for i in range(len(phrases) - 1):
             assert phrases[i]["end"] <= phrases[i + 1]["start"]
+
+    def test_overlapping_speaker_words_use_one_caption_lane(self):
+        words = [
+            _word("main", 0.0, 1.0, speaker=0),
+            _word("reply", 0.7, 1.1, speaker=1),
+        ]
+
+        legacy = group_words_into_phrases(
+            words, clip_start=0.0, resolve_overlaps=False
+        )
+        phrases = group_words_into_phrases(words, clip_start=0.0)
+
+        assert legacy[0]["end"] > legacy[1]["start"]
+        assert phrases[0]["end"] < phrases[1]["start"]
+        assert [phrase["text"] for phrase in phrases] == ["main", "reply"]
+
+    def test_overlapping_same_speaker_phrases_share_the_transition(self):
+        words = [
+            _word("map", 0.0, 0.4, speaker=2),
+            _word("the", 0.4, 0.64, speaker=2),
+            _word("whole", 0.64, 1.28, speaker=2),
+            _word("path", 0.805, 1.205, speaker=2),
+            _word("of", 1.205, 1.445, speaker=2),
+            _word("the", 1.445, 1.605, speaker=2),
+        ]
+
+        phrases = group_words_into_phrases(words, clip_start=0.0)
+
+        assert phrases[0]["text"] == "map the whole"
+        assert phrases[1]["text"] == "path of the"
+        assert phrases[0]["end"] == pytest.approx(1.0325)
+        assert phrases[1]["start"] == pytest.approx(1.0525)
+
+    def test_detects_when_new_caption_timing_changes_output(self):
+        diarized = {
+            "utterances": [
+                {"speaker": 0, "words": [_word("main", 10.0, 11.0, 0)]},
+                {"speaker": 1, "words": [_word("reply", 10.7, 11.1, 1)]},
+            ]
+        }
+
+        assert requires_single_lane_caption_timing(diarized, 10.0, 12.0)
+        assert not requires_single_lane_caption_timing(diarized, 20.0, 21.0)
 
     def test_negative_relative_time_clamped(self):
         # Defensive: if a word ends up before clip_start due to fp error,
@@ -296,12 +340,12 @@ class TestGenerateAssFromDiarized:
         }
         out = tmp_path / "ordered.ass"
 
-        generate_ass_from_diarized(
-            diarized, start=100.0, end=103.0, ass_path=out
-        )
+        generate_ass_from_diarized(diarized, start=100.0, end=103.0, ass_path=out)
 
         events = [
-            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+            line
+            for line in out.read_text().splitlines()
+            if line.startswith("Dialogue:")
         ]
         assert events[0].endswith("Hello, world!")
         assert events[1].endswith("Later.")

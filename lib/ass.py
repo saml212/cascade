@@ -26,6 +26,7 @@ python-ass or pysubs2 would be more dependency than code.
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 # ── styling defaults ────────────────────────────────────────────────────────
@@ -73,6 +74,8 @@ MAX_PHRASE_DURATION = 2.5
 # Reading-speed cap: never display more than ~6 words per second (typical
 # spoken-word pace is ~3 words/sec, so this is a safety net for fast bursts).
 MAX_WORDS_PER_SECOND = 6.0
+CAPTION_SINGLE_LANE_VERSION = "single-lane/v1"
+CAPTION_EVENT_GAP_SECONDS = 0.02
 
 
 @dataclass
@@ -159,6 +162,7 @@ def group_words_into_phrases(
     *,
     clip_start: float,
     words_per_phrase: int = DEFAULT_WORDS_PER_PHRASE,
+    resolve_overlaps: bool = True,
 ) -> list[dict]:
     """Group words into display phrases. Times are returned **relative to
     clip_start** (so 0.0 = start of the rendered short, not absolute episode
@@ -226,15 +230,51 @@ def group_words_into_phrases(
 
     _flush()
 
-    # Stretch each phrase to fill the gap before the NEXT phrase (so captions
-    # don't disappear during natural reading pauses) — but cap at the next
-    # phrase's start so they never overlap.
+    # Stretch through short pauses, then fit every event into one display lane.
     for i, ph in enumerate(phrases):
         if i + 1 < len(phrases):
             next_start = phrases[i + 1]["start"]
             ph["end"] = max(ph["end"], min(ph["end"] + 0.3, next_start - 0.01))
 
+    if resolve_overlaps:
+        for index in range(len(phrases) - 1):
+            current = phrases[index]
+            following = phrases[index + 1]
+            if current["end"] <= following["start"]:
+                continue
+            if current.get("speaker") == following.get("speaker"):
+                midpoint = (current["end"] + following["start"]) / 2
+                prior_end = midpoint - CAPTION_EVENT_GAP_SECONDS / 2
+                next_start = midpoint + CAPTION_EVENT_GAP_SECONDS / 2
+                if prior_end > current["start"] and next_start < following["end"]:
+                    current["end"] = prior_end
+                    following["start"] = next_start
+                    continue
+            available_end = following["start"] - CAPTION_EVENT_GAP_SECONDS
+            if available_end > current["start"]:
+                current["end"] = available_end
+                continue
+            current["end"] = current["start"] + 0.01
+            following["start"] = current["end"] + CAPTION_EVENT_GAP_SECONDS
+            following["end"] = max(following["end"], following["start"] + 0.01)
+
     return phrases
+
+
+def requires_single_lane_caption_timing(
+    diarized: dict, start: float, end: float
+) -> bool:
+    """Return whether the legacy phrase timings would draw simultaneous text."""
+    words = _extract_words_in_range(diarized, start, end)
+    phrases = group_words_into_phrases(
+        words,
+        clip_start=start,
+        resolve_overlaps=False,
+    )
+    return any(
+        current["end"] > following["start"]
+        for current, following in pairwise(phrases)
+    )
 
 
 # ── ASS file assembly ───────────────────────────────────────────────────────
