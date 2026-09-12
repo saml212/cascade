@@ -28,6 +28,8 @@ from lib.audio_qa import (
     analyze_episode_audio,
     analyze_output_continuity,
     apply_finding_reviews,
+    apply_output_finding_reviews,
+    output_finding_review_groups,
     review_output_revision,
     selected_output_proof_status,
     transcript_analysis_fingerprint,
@@ -86,6 +88,13 @@ def _file_signature(path: Path) -> dict | None:
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def _file_content_fingerprint(path: Path) -> str | None:
+    try:
+        return file_fingerprint(path)["id"]
+    except (KeyError, OSError):
+        return None
 
 
 def _private_identity(scope: str, value: object) -> str:
@@ -422,7 +431,7 @@ def release_revision(
     payload = {
         "quality_revision": quality_revision(episode_dir, episode, config=config),
         "clip_decisions": decisions,
-        "audio_finding_reviews": _file_signature(
+        "audio_finding_reviews": _file_content_fingerprint(
             episode_dir / AUDIO_FINDING_REVIEWS_PATH
         ),
         "publish_plan": current_publish_plan(config, episode, environment=environment),
@@ -882,8 +891,10 @@ def analyze_release_audio_continuity(
     )
 
 
-def _review_output(record: dict | None) -> dict | None:
-    revision = review_output_revision(record)
+def _review_output(episode_dir: Path, record: dict | None) -> dict | None:
+    revision = review_output_revision(
+        record, output_path=episode_dir / "upload_video.mp4"
+    )
     if revision is None or not isinstance(record, dict):
         return None
     output = record.get("output") or {}
@@ -898,13 +909,12 @@ def _review_output(record: dict | None) -> dict | None:
     }
 
 
-def _finding_review_window(finding: dict, record: dict) -> dict | None:
-    ranges = (finding.get("edited_time") or {}).get("ranges") or []
-    if len(ranges) != 1:
+def _source_review_window(source_ranges: list[dict], record: dict) -> dict | None:
+    if len(source_ranges) != 1:
         return None
     try:
-        start = float(ranges[0]["source_start_seconds"])
-        end = float(ranges[0]["source_end_seconds"])
+        start = float(source_ranges[0]["start_seconds"])
+        end = float(source_ranges[0]["end_seconds"])
         interval_start, interval_end = next(
             (float(left), float(right))
             for left, right in record.get("keep_intervals", [])
@@ -931,14 +941,29 @@ def _finding_review_window(finding: dict, record: dict) -> dict | None:
     }
 
 
+def _finding_review_window(finding: dict, record: dict) -> dict | None:
+    ranges = (finding.get("edited_time") or {}).get("ranges") or []
+    return _source_review_window(
+        [
+            {
+                "start_seconds": item.get("source_start_seconds"),
+                "end_seconds": item.get("source_end_seconds"),
+            }
+            for item in ranges
+            if isinstance(item, dict)
+        ],
+        record,
+    )
+
+
 def _attach_finding_review_context(
     audio_report: dict,
     current_longform: dict | None,
+    output: dict | None,
     episode_id: str,
     *,
     qa_current: bool,
 ) -> dict:
-    output = _review_output(current_longform)
     output_proof_status = selected_output_proof_status(audio_report)
     uses_checked_source = (
         audio_report.get("scope", {})
@@ -1050,6 +1075,104 @@ def _attach_output_continuity_inspection(
     return output_continuity
 
 
+def _attach_output_review_context(
+    output_continuity: dict,
+    current_longform: dict | None,
+    output: dict | None,
+    episode_id: str,
+    *,
+    qa_current: bool,
+) -> dict:
+    output_continuity = _attach_output_continuity_inspection(
+        output_continuity, episode_id, qa_current=qa_current
+    )
+    if output_continuity.get("reviewable") is not True:
+        output_continuity["review_events"] = []
+        return output_continuity
+    artifacts = {
+        (artifact.get("role"), artifact.get("clip_id")): artifact
+        for artifact in output_continuity.get("artifacts", [])
+        if isinstance(artifact, dict)
+    }
+    selected_master = artifacts.get(("selected_audio_master", None))
+    events = []
+    findings = {
+        (str(finding.get("id")), str(finding.get("fingerprint"))): finding
+        for finding in output_continuity.get("findings", [])
+        if isinstance(finding, dict)
+    }
+    for group in output_finding_review_groups(output_continuity):
+        member_artifacts = [
+            artifacts.get((member.get("role"), member.get("clip_id")))
+            for member in group["members"]
+        ]
+        window = (
+            _source_review_window(
+                group["binding"].get("source_ranges", []), current_longform
+            )
+            if isinstance(current_longform, dict)
+            else None
+        )
+        resolutions = [
+            (
+                findings.get((member["id"], member["fingerprint"]), {}).get(
+                    "resolution"
+                )
+                or {"status": "unresolved"}
+            )
+            for member in group["members"]
+        ]
+        resolution = (
+            resolutions[0]
+            if resolutions and all(item == resolutions[0] for item in resolutions[1:])
+            else {"status": "unresolved"}
+        )
+        reason = None
+        if not qa_current:
+            reason = "Run QA for the current revision before recording a review."
+        elif not output_continuity.get("fingerprint"):
+            reason = "This output continuity report has no stable fingerprint."
+        elif (
+            not isinstance(selected_master, dict)
+            or selected_master.get("mechanically_verified") is not True
+        ):
+            reason = "The current selected master has not completed mechanical continuity checks."
+        elif any(
+            not isinstance(artifact, dict)
+            or artifact.get("mechanically_verified") is not True
+            or artifact.get("revision") != member.get("revision")
+            for artifact, member in zip(member_artifacts, group["members"], strict=True)
+        ):
+            reason = (
+                "One or more exact output artifacts have incomplete mechanical checks."
+            )
+        elif output is None or window is None:
+            reason = "A current full-output preview for this exact source range is unavailable."
+        context = {
+            "allowed": reason is None,
+            "reason": reason,
+            "report_fingerprint": output_continuity.get("fingerprint"),
+            "event_fingerprint": group["fingerprint"],
+            "output_revision": output.get("revision") if output else None,
+            "inspection_request": (
+                {
+                    "method": "GET",
+                    "endpoint": f"/api/episodes/{episode_id}/inspection/preview",
+                    "query": window,
+                }
+                if reason is None
+                else None
+            ),
+            "decision_endpoint": (
+                f"/api/episodes/{episode_id}/audio-qc/output-findings/"
+                f"{group['id']}/review"
+            ),
+        }
+        events.append({**group, "resolution": resolution, "review": context})
+    output_continuity["review_events"] = events
+    return output_continuity
+
+
 def quality_snapshot(
     episode_dir: str | Path,
     *,
@@ -1081,21 +1204,42 @@ def quality_snapshot(
     report = _load_json(episode_dir / QUALITY_REPORT_PATH)
     report_revision = report.get("quality_revision")
     qa_current = bool(report) and report_revision == current_quality_revision
+    review_document = _load_json(episode_dir / AUDIO_FINDING_REVIEWS_PATH)
+    review_output = _review_output(episode_dir, current_longform)
+    output_revision = review_output.get("revision") if review_output else None
     audio_quality = report.get("audio_quality") or _load_json(
         episode_dir / AUDIO_REPORT_PATH
     )
     audio_quality = apply_finding_reviews(
         audio_quality,
-        _load_json(episode_dir / AUDIO_FINDING_REVIEWS_PATH),
-        output_revision=review_output_revision(current_longform),
+        review_document,
+        output_revision=output_revision,
     )
     audio_quality = _attach_finding_review_context(
         audio_quality,
         current_longform,
+        review_output,
         episode.get("episode_id", episode_dir.name),
         qa_current=qa_current,
     )
     audio_gate = audio_quality.get("release_gate", {})
+    raw_output_continuity = report.get("selected_master_output_continuity")
+    output_continuity = (
+        apply_output_finding_reviews(
+            raw_output_continuity,
+            review_document,
+            output_revision=output_revision,
+        )
+        if isinstance(raw_output_continuity, dict) and raw_output_continuity
+        else {}
+    )
+    output_continuity = _attach_output_review_context(
+        output_continuity,
+        current_longform,
+        review_output,
+        episode.get("episode_id", episode_dir.name),
+        qa_current=qa_current,
+    )
     effective_checks = [dict(check) for check in report.get("checks", [])]
     for check in effective_checks:
         if check.get("name") == "audio_continuity":
@@ -1105,6 +1249,16 @@ def quality_snapshot(
                     "pass": audio_gate.get("status") == "pass",
                     "detail": audio_gate.get(
                         "reason", "Audio continuity report unavailable"
+                    ),
+                }
+            )
+        elif check.get("name") == "selected_master_output_continuity":
+            check.update(
+                {
+                    "status": output_continuity.get("status", "unknown"),
+                    "pass": output_continuity.get("safe") is True,
+                    "detail": output_continuity.get(
+                        "detail", "Output continuity report unavailable"
                     ),
                 }
             )
@@ -1324,13 +1478,35 @@ def quality_snapshot(
     findings = (
         audio_quality.get("findings", []) if isinstance(audio_quality, dict) else []
     )
-    analysis = audio_quality.get("analysis", {})
-    output_continuity = report.get("selected_master_output_continuity", {})
-    output_continuity = _attach_output_continuity_inspection(
-        output_continuity,
-        episode.get("episode_id", episode_dir.name),
-        qa_current=qa_current,
+    retained_findings = [
+        finding
+        for finding in findings
+        if (finding.get("edited_time") or {}).get("status") != "removed"
+    ]
+    projected_repaired_count = sum(
+        1
+        for finding in retained_findings
+        if (finding.get("resolution") or {}).get("status") == "repaired"
     )
+    projected_unresolved_count = sum(
+        1
+        for finding in retained_findings
+        if (finding.get("resolution") or {}).get("status", "unresolved")
+        not in {"repaired", "accepted", "false_positive", "not_in_selected_mix"}
+    )
+    use_projected_repair_counts = (
+        bool(audio_selection) and audio_selection.get("status") != "stale"
+    )
+    selected_proof = next(
+        (
+            proof
+            for proof in audio_quality.get("scope", {}).get("outputs_checked", [])
+            if isinstance(proof, dict) and proof.get("role") == "selected_audio_master"
+        ),
+        {},
+    )
+    repair_binding = selected_proof.get("verification") or {}
+    analysis = audio_quality.get("analysis", {})
     if not include_findings:
         analysis = {
             key: analysis.get(key)
@@ -1345,6 +1521,7 @@ def quality_snapshot(
         output_continuity = {
             **output_continuity,
             "findings": [],
+            "review_events": [],
             "artifacts": [
                 {**artifact, "findings": []}
                 for artifact in output_continuity.get("artifacts", [])
@@ -1396,7 +1573,7 @@ def quality_snapshot(
                 "ready": video_ready,
                 "detail": video_detail,
                 "download_url": f"/api/episodes/{episode_dir.name}/delivery/video",
-                "review_output": _review_output(current_longform),
+                "review_output": review_output,
             },
             "legacy_longform": {
                 "available": (episode_dir / "longform.mp4").is_file(),
@@ -1425,11 +1602,15 @@ def quality_snapshot(
                     "verification_status": repair_candidate.get("verification", {}).get(
                         "status"
                     ),
-                    "repaired_finding_count": len(
-                        repair_candidate.get("repaired_finding_ids", [])
+                    "repaired_finding_count": (
+                        projected_repaired_count
+                        if use_projected_repair_counts
+                        else len(repair_candidate.get("repaired_finding_ids", []))
                     ),
-                    "unresolved_finding_count": len(
-                        repair_candidate.get("unresolved_finding_ids", [])
+                    "unresolved_finding_count": (
+                        projected_unresolved_count
+                        if use_projected_repair_counts
+                        else len(repair_candidate.get("unresolved_finding_ids", []))
                     ),
                     "perceptual_review": repair_candidate.get("perceptual_review"),
                     "audio_url": (
@@ -1450,6 +1631,14 @@ def quality_snapshot(
                         "detail",
                     )
                     if key in audio_selection
+                }
+                | {
+                    "repair_binding_status": repair_binding.get(
+                        "repair_binding_status"
+                    ),
+                    "stale_repaired_finding_count": len(
+                        repair_binding.get("stale_repaired_findings", [])
+                    ),
                 }
                 if audio_selection
                 else None
@@ -1652,7 +1841,10 @@ class QAAgent(BaseAgent):
             audio_report = apply_finding_reviews(
                 audio_report,
                 _load_json(self.episode_dir / AUDIO_FINDING_REVIEWS_PATH),
-                output_revision=review_output_revision(current_review_longform),
+                output_revision=review_output_revision(
+                    current_review_longform,
+                    output_path=self.episode_dir / "upload_video.mp4",
+                ),
             )
             self.save_json(AUDIO_REPORT_PATH, audio_report)
             gate = audio_release_gate(audio_report)

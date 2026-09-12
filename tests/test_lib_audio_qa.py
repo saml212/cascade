@@ -484,29 +484,43 @@ def test_human_finding_review_requires_exact_report_finding_and_output_binding()
     assert changed_report["findings"][0]["resolution"] == {"status": "unresolved"}
 
 
-def test_review_output_revision_includes_exact_output_and_remaster_proof():
+def test_review_output_revision_includes_exact_output_and_remaster_proof(tmp_path):
+    output_path = tmp_path / "upload_video.mp4"
+    output_path.write_bytes(b"rendered output")
+    stat = output_path.stat()
     record = {
         "fingerprint": "render-inputs",
         "render_mode": "speaker_cut",
-        "output": {"size_bytes": 100, "mtime_ns": 200, "audio_codec": "aac"},
+        "output": {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "audio_codec": "aac",
+        },
         "provenance": {"audio_remaster": {"fingerprint": "mastering-v1"}},
     }
 
-    first = review_output_revision(record)
+    first = review_output_revision(record, output_path=output_path)
     changed_stat = review_output_revision(
-        {**record, "output": {**record["output"], "mtime_ns": 201}}
+        {**record, "output": {**record["output"], "mtime_ns": stat.st_mtime_ns + 1}},
+        output_path=output_path,
     )
     changed_remaster = review_output_revision(
         {
             **record,
             "provenance": {"audio_remaster": {"fingerprint": "mastering-v2"}},
-        }
+        },
+        output_path=output_path,
     )
 
     assert first and first.startswith("sha256:")
-    assert changed_stat != first
+    assert changed_stat is None
     assert changed_remaster != first
-    assert review_output_revision({"fingerprint": "render-inputs"}) is None
+    assert (
+        review_output_revision(
+            {"fingerprint": "render-inputs"}, output_path=output_path
+        )
+        is None
+    )
 
 
 def test_selected_repair_proof_requires_current_finding_fingerprints():
@@ -558,6 +572,47 @@ def test_selected_repair_proof_requires_current_finding_fingerprints():
     gate = release_gate(stale_report)
     assert gate["status"] == "blocked"
     assert gate["blocking_finding_ids"] == ["dropout"]
+    proof = stale_report["scope"]["outputs_checked"][0]
+    assert proof["status"] == "pass"
+    assert proof["verification"]["repair_binding_status"] == "stale"
+    assert proof["verification"]["repaired_findings"] == []
+    assert proof["verification"]["stale_repaired_findings"] == [
+        {"id": "dropout", "fingerprint": "dropout-v1"}
+    ]
+
+
+def test_selected_repair_proof_preserves_exact_matches_when_one_binding_changes():
+    selection = {
+        "fingerprint": "sha256:selection",
+        "selected_output": {"fingerprint": {"id": "sha256:selected-output"}},
+        "repaired_findings": [
+            {"id": "unchanged", "fingerprint": "unchanged-v1"},
+            {"id": "changed", "fingerprint": "changed-v1"},
+        ],
+        "verification": {
+            "status": "pass",
+            "checks": [{"name": "selected_copy", "pass": True}],
+        },
+    }
+    report = {
+        "fingerprint": "sha256:report-current",
+        "findings": [
+            {"id": "unchanged", "fingerprint": "unchanged-v1"},
+            {"id": "changed", "fingerprint": "changed-v2"},
+        ],
+        "scope": {"selected_mix_provenance": {"fingerprint": "sha256:selected-mix"}},
+    }
+
+    proof = _selected_repair_output_proof(report, selection)
+
+    assert proof["status"] == "pass"
+    assert proof["verification"]["repair_binding_status"] == "partial"
+    assert proof["verification"]["repaired_findings"] == [
+        {"id": "unchanged", "fingerprint": "unchanged-v1"}
+    ]
+    assert proof["verification"]["stale_repaired_findings"] == [
+        {"id": "changed", "fingerprint": "changed-v1"}
+    ]
 
 
 def test_release_gate_never_claims_unchecked_or_unused_audio_is_safe():

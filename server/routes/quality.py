@@ -68,6 +68,15 @@ class AudioFindingReviewRequest(BaseModel):
     expected_output_revision: str = Field(min_length=1)
 
 
+class AudioOutputFindingReviewRequest(BaseModel):
+    decision: Literal["accepted", "false_positive"]
+    reviewer: str = Field(min_length=1, max_length=200)
+    evidence_note: str = Field(min_length=1, max_length=2000)
+    expected_report_fingerprint: str = Field(min_length=1)
+    expected_event_fingerprint: str = Field(min_length=1)
+    expected_output_revision: str = Field(min_length=1)
+
+
 def _episode_dir(episode_id: str) -> Path:
     root = EPISODES_DIR.resolve()
     episode_dir = (root / episode_id).resolve()
@@ -97,10 +106,13 @@ def _read_finding_reviews(episode_dir: Path) -> dict:
             "schema": AUDIO_FINDING_REVIEWS_SCHEMA,
             "episode_id": episode_dir.name,
             "reviews": {},
+            "output_reviews": {},
         }
     document = _read_report(path, "Audio finding reviews")
-    if document.get("schema") != AUDIO_FINDING_REVIEWS_SCHEMA or not isinstance(
-        document.get("reviews"), dict
+    if (
+        document.get("schema") != AUDIO_FINDING_REVIEWS_SCHEMA
+        or not isinstance(document.get("reviews"), dict)
+        or not isinstance(document.get("output_reviews", {}), dict)
     ):
         raise HTTPException(status_code=500, detail="Audio finding reviews are invalid")
     return document
@@ -126,20 +138,89 @@ def _effective_audio_report(episode_dir: Path) -> dict:
     return effective
 
 
+def _current_quality_snapshot(episode_dir: Path) -> dict:
+    snapshot = quality_snapshot(episode_dir)
+    quality = snapshot.get("quality") or {}
+    if not quality.get("report_revision") or quality.get(
+        "report_revision"
+    ) != quality.get("current_revision"):
+        raise HTTPException(
+            status_code=409,
+            detail="Run QA for the current revision before recording a review",
+        )
+    return snapshot
+
+
+def _review_text(request: BaseModel) -> tuple[str, str]:
+    reviewer = str(getattr(request, "reviewer", "")).strip()
+    evidence_note = str(getattr(request, "evidence_note", "")).strip()
+    if not reviewer or not evidence_note:
+        raise HTTPException(
+            status_code=422,
+            detail="Reviewer and evidence note must contain non-whitespace text",
+        )
+    return reviewer, evidence_note
+
+
+def _bound_review_output(snapshot: dict, context: dict, expected: str) -> dict:
+    output = (
+        snapshot.get("artifacts", {}).get("release_video", {}).get("review_output")
+        or {}
+    )
+    if expected != context.get("output_revision") or expected != output.get("revision"):
+        raise HTTPException(
+            status_code=409,
+            detail="Rendered output changed; inspect the current output before reviewing",
+        )
+    return output
+
+
+def _write_finding_review(
+    episode_dir: Path,
+    namespace: str,
+    key: str,
+    review: dict,
+    revalidate,
+):
+    path = episode_dir / AUDIO_FINDING_REVIEWS_PATH
+    existed = path.is_file()
+    previous_bytes = path.read_bytes() if existed else None
+    previous = _read_finding_reviews(episode_dir)
+    document = json.loads(json.dumps(previous))
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    review["reviewed_at"] = reviewed_at
+    document.update(
+        schema=AUDIO_FINDING_REVIEWS_SCHEMA,
+        episode_id=episode_dir.name,
+        updated_at=reviewed_at,
+    )
+    document.setdefault("reviews", {})
+    document.setdefault("output_reviews", {})
+    document[namespace][key] = review
+    atomic_write_json(path, document)
+    try:
+        return revalidate(reviewed_at)
+    except Exception:
+        if previous_bytes is not None:
+            descriptor, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(previous_bytes)
+                os.replace(temporary, path)
+            except BaseException:
+                Path(temporary).unlink(missing_ok=True)
+                raise
+        else:
+            path.unlink(missing_ok=True)
+        raise
+
+
 def _record_audio_finding_review(
     episode_dir: Path, finding_id: str, request: AudioFindingReviewRequest
 ) -> dict:
     """Persist one explicit review only while all evidence bindings are current."""
     with _finding_review_lock:
-        snapshot = quality_snapshot(episode_dir)
-        quality = snapshot.get("quality") or {}
-        if not quality.get("report_revision") or quality.get(
-            "report_revision"
-        ) != quality.get("current_revision"):
-            raise HTTPException(
-                status_code=409,
-                detail="Run QA for the current revision before recording a review",
-            )
+        snapshot = _current_quality_snapshot(episode_dir)
 
         report = _read_report(episode_dir / AUDIO_REPORT_PATH, "Audio quality report")
         report_fingerprint = report.get("fingerprint")
@@ -193,59 +274,28 @@ def _record_audio_finding_review(
                 status_code=409,
                 detail=context.get("reason") or "This finding cannot be reviewed",
             )
-        snapshot_output = (
-            snapshot.get("artifacts", {}).get("release_video", {}).get("review_output")
-            or {}
+        snapshot_output = _bound_review_output(
+            snapshot, context, request.expected_output_revision
         )
-        if request.expected_output_revision != context.get(
-            "output_revision"
-        ) or request.expected_output_revision != snapshot_output.get("revision"):
-            raise HTTPException(
-                status_code=409,
-                detail="Rendered output changed; inspect the current output before reviewing",
-            )
-
-        reviewer = request.reviewer.strip()
-        evidence_note = request.evidence_note.strip()
-        if not reviewer or not evidence_note:
-            raise HTTPException(
-                status_code=422,
-                detail="Reviewer and evidence note must contain non-whitespace text",
-            )
-
-        path = episode_dir / AUDIO_FINDING_REVIEWS_PATH
-        existed = path.is_file()
-        previous = _read_finding_reviews(episode_dir)
-        document = json.loads(json.dumps(previous))
-        reviewed_at = datetime.now(timezone.utc).isoformat()
+        reviewer, evidence_note = _review_text(request)
         review = {
             "decision": request.decision,
             "source_report_fingerprint": report_fingerprint,
             "finding_fingerprint": finding_fingerprint,
             "output_revision": request.expected_output_revision,
             "reviewed_by": reviewer,
-            "reviewed_at": reviewed_at,
             "evidence_note": evidence_note,
             "inspection": {
                 "request": context.get("inspection_request"),
                 "output": snapshot_output,
             },
         }
-        document.update(
-            schema=AUDIO_FINDING_REVIEWS_SCHEMA,
-            episode_id=episode_dir.name,
-            updated_at=reviewed_at,
-        )
-        document.setdefault("reviews", {})[finding_id] = review
-        atomic_write_json(path, document)
 
-        # A render or QA job can replace evidence without taking this route's lock.
-        # Recheck after the atomic write and roll back if the decision did not bind.
-        try:
+        def revalidate(reviewed_at: str):
             current_report = _read_report(
                 episode_dir / AUDIO_REPORT_PATH, "Audio quality report"
             )
-            current_snapshot = quality_snapshot(episode_dir)
+            current_snapshot = _current_quality_snapshot(episode_dir)
             current_finding = next(
                 (
                     finding
@@ -272,12 +322,11 @@ def _record_audio_finding_review(
                     status_code=409,
                     detail="Review evidence changed while the decision was recorded; try again",
                 )
-        except Exception:
-            if existed:
-                atomic_write_json(path, previous)
-            else:
-                path.unlink(missing_ok=True)
-            raise
+            return resolution, current_snapshot
+
+        resolution, current_snapshot = _write_finding_review(
+            episode_dir, "reviews", finding_id, review, revalidate
+        )
 
         return {
             "status": "recorded",
@@ -285,6 +334,132 @@ def _record_audio_finding_review(
             "finding_id": finding_id,
             "resolution": resolution,
             "audio_release_gate": current_snapshot["audio_quality"]["release_gate"],
+            "quality": current_snapshot["quality"],
+            "publish_approval_current": current_snapshot["approvals"]["publish"][
+                "current"
+            ],
+        }
+
+
+def _record_output_finding_review(
+    episode_dir: Path, event_id: str, request: AudioOutputFindingReviewRequest
+) -> dict:
+    """Persist one semantic decision without waiving artifact proof failures."""
+    with _finding_review_lock:
+        snapshot = _current_quality_snapshot(episode_dir)
+
+        persisted = _read_report(episode_dir / QUALITY_REPORT_PATH, "Quality report")
+        raw_output = persisted.get("selected_master_output_continuity") or {}
+        visible_output = (
+            snapshot.get("audio_quality", {}).get("selected_master_output_continuity")
+            or {}
+        )
+        report_fingerprint = raw_output.get("fingerprint")
+        if (
+            not report_fingerprint
+            or request.expected_report_fingerprint != report_fingerprint
+            or visible_output.get("fingerprint") != report_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Output continuity report changed; reload the current review",
+            )
+        event = next(
+            (
+                item
+                for item in visible_output.get("review_events", [])
+                if isinstance(item, dict) and item.get("id") == event_id
+            ),
+            None,
+        )
+        if event is None:
+            raise HTTPException(
+                status_code=404, detail=f"Output finding event {event_id} not found"
+            )
+        if request.expected_event_fingerprint != event.get("fingerprint"):
+            raise HTTPException(
+                status_code=409,
+                detail="Output findings changed; reload the current review",
+            )
+        context = event.get("review") or {}
+        if context.get("allowed") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail=context.get("reason")
+                or "This output finding cannot be reviewed",
+            )
+        snapshot_output = _bound_review_output(
+            snapshot, context, request.expected_output_revision
+        )
+        reviewer, evidence_note = _review_text(request)
+        review = {
+            "decision": request.decision,
+            "output_report_fingerprint": report_fingerprint,
+            "event_fingerprint": event["fingerprint"],
+            "members": event["members"],
+            "output_revision": request.expected_output_revision,
+            "reviewed_by": reviewer,
+            "evidence_note": evidence_note,
+            "inspection": {
+                "request": context.get("inspection_request"),
+                "output": snapshot_output,
+            },
+        }
+
+        def revalidate(reviewed_at: str):
+            current_report = _read_report(
+                episode_dir / QUALITY_REPORT_PATH, "Quality report"
+            )
+            current_snapshot = _current_quality_snapshot(episode_dir)
+            current_output = (
+                current_snapshot.get("audio_quality", {}).get(
+                    "selected_master_output_continuity"
+                )
+                or {}
+            )
+            current_event = next(
+                (
+                    item
+                    for item in current_output.get("review_events", [])
+                    if isinstance(item, dict) and item.get("id") == event_id
+                ),
+                None,
+            )
+            resolution = (current_event or {}).get("resolution") or {}
+            if (
+                (current_report.get("selected_master_output_continuity") or {}).get(
+                    "fingerprint"
+                )
+                != report_fingerprint
+                or current_snapshot.get("quality", {}).get("report_revision")
+                != current_snapshot.get("quality", {}).get("current_revision")
+                or (current_event or {}).get("fingerprint")
+                != request.expected_event_fingerprint
+                or (current_event or {}).get("review", {}).get("output_revision")
+                != request.expected_output_revision
+                or resolution.get("status") != request.decision
+                or resolution.get("reviewed_at") != reviewed_at
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Review evidence changed while the decision was recorded; try again",
+                )
+            return resolution, current_output, current_snapshot
+
+        resolution, current_output, current_snapshot = _write_finding_review(
+            episode_dir, "output_reviews", event_id, review, revalidate
+        )
+
+        return {
+            "status": "recorded",
+            "episode_id": episode_dir.name,
+            "event_id": event_id,
+            "resolution": resolution,
+            "output_continuity": {
+                "status": current_output.get("status"),
+                "safe": current_output.get("safe"),
+                "detail": current_output.get("detail"),
+            },
             "quality": current_snapshot["quality"],
             "publish_approval_current": current_snapshot["approvals"]["publish"][
                 "current"
@@ -389,6 +564,19 @@ async def review_audio_finding(
     """Record one explicit finding decision against current rendered evidence."""
     return await asyncio.to_thread(
         _record_audio_finding_review, _episode_dir(episode_id), finding_id, request
+    )
+
+
+@router.post("/{episode_id}/audio-qc/output-findings/{event_id}/review")
+async def review_audio_output_finding(
+    episode_id: str, event_id: str, request: AudioOutputFindingReviewRequest
+) -> dict:
+    """Record one semantic output decision against exact current evidence."""
+    return await asyncio.to_thread(
+        _record_output_finding_review,
+        _episode_dir(episode_id),
+        event_id,
+        request,
     )
 
 

@@ -13,11 +13,18 @@ from agents.qa import (
     quality_revision,
 )
 from lib.audio_qa import (
+    AUDIO_FINDING_REVIEWS_SCHEMA,
+    OUTPUT_CONTINUITY_SCHEMA,
+    OUTPUT_CONTINUITY_VERSION,
     OUTPUT_SOURCE_MAPPING_SCHEMA,
     OutputContinuityConfig,
     WindowStats,
     analyze_output_continuity,
     analyze_output_windows,
+    apply_output_finding_reviews,
+    output_artifact_mechanically_verified,
+    output_continuity_report_fingerprint,
+    output_finding_review_groups,
 )
 from lib.delivery_video import RENDER_PIPELINE_VERSION, aac_content_timing_proof
 from lib.timeline import Timeline
@@ -100,6 +107,194 @@ def _aac_probe_data(sample_rate="48000"):
             }
         ]
     }
+
+
+def _semantic_finding(finding_id, role, revision, *, start=4.0):
+    finding = {
+        "id": finding_id,
+        "kind": "digital_zero",
+        "classification": "speech_overlapping_whole_output_silence",
+        "severity": "error",
+        "role": role,
+        "revision": revision,
+        "artifact_time": {
+            "clock": "source" if role == "selected_audio_master" else "output",
+            "start_seconds": start,
+            "end_seconds": start + 0.5,
+        },
+        "source_ranges": [{"start_seconds": start, "end_seconds": start + 0.5}],
+        "evidence": {
+            "maximum_channel_median_dbfs": -240.0,
+            "minimum_channel_zero_sample_fraction": 1.0,
+            "speech_overlap_seconds": 0.4,
+            "required_speech_overlap_seconds": 0.12,
+            "transcript_word_count": 2,
+            "transcript_excerpt": "timed words",
+        },
+        "resolution": {"status": "unresolved"},
+    }
+    finding["fingerprint"] = f"sha256:{finding_id}"
+    return finding
+
+
+def _continuity_report(root, *findings):
+    by_role = {}
+    for finding in findings:
+        by_role.setdefault((finding["role"], finding.get("clip_id")), []).append(
+            finding
+        )
+    artifacts = []
+    for (role, clip_id), members in by_role.items():
+        path = root / f"{role}-{clip_id or 'main'}.media"
+        path.write_bytes(role.encode())
+        artifact = {
+            "role": role,
+            "path": str(path),
+            "required": True,
+            "revision": members[0]["revision"],
+            "status": "failed",
+            "currentness": "current",
+            "decoded_duration_seconds": 10.0,
+            "expected_duration_seconds": 10.0,
+            "scan_identity": _scan_identity(path),
+            "findings": members,
+        }
+        if clip_id:
+            artifact["clip_id"] = clip_id
+        artifacts.append(artifact)
+    report = {
+        "schema": OUTPUT_CONTINUITY_SCHEMA,
+        "detector_version": OUTPUT_CONTINUITY_VERSION,
+        "status": "failed",
+        "safe": False,
+        "transcript_fingerprint": "sha256:transcript",
+        "timeline": {
+            "keep_intervals": [[0, 10]],
+            "output_duration_seconds": 10,
+        },
+        "settings": {"duration_tolerance_seconds": 0.25},
+        "artifacts": artifacts,
+        "findings": list(findings),
+    }
+    report["fingerprint"] = output_continuity_report_fingerprint(report)
+    return report
+
+
+def test_output_review_groups_require_exact_source_and_transcript_evidence(tmp_path):
+    master = _semantic_finding("master", "selected_audio_master", "master-rev")
+    video = _semantic_finding("video", "upload_video", "video-rev")
+    shifted = _semantic_finding(
+        "shifted", "podcast_audio", "podcast-rev", start=4.000001
+    )
+
+    groups = output_finding_review_groups(
+        _continuity_report(tmp_path, master, video, shifted)
+    )
+
+    assert sorted(len(group["members"]) for group in groups) == [1, 2]
+    grouped_ids = [{member["id"] for member in group["members"]} for group in groups]
+    assert {"master", "video"} in grouped_ids
+    assert {"shifted"} in grouped_ids
+
+
+def test_output_reviews_preserve_findings_and_cannot_waive_mechanical_errors(tmp_path):
+    master = _semantic_finding("master", "selected_audio_master", "master-rev")
+    video = _semantic_finding("video", "upload_video", "video-rev")
+    report = _continuity_report(tmp_path, master, video)
+    group = output_finding_review_groups(report)[0]
+    review = {
+        "schema": AUDIO_FINDING_REVIEWS_SCHEMA,
+        "reviews": {},
+        "output_reviews": {
+            group["id"]: {
+                "decision": "false_positive",
+                "output_report_fingerprint": report["fingerprint"],
+                "event_fingerprint": group["fingerprint"],
+                "members": group["members"],
+                "output_revision": "longform-rev",
+                "reviewed_by": "Reviewer",
+                "reviewed_at": "2026-09-11T00:00:00+00:00",
+                "evidence_note": "Verified the exact rendered passage.",
+            }
+        },
+    }
+
+    effective = apply_output_finding_reviews(
+        report, review, output_revision="longform-rev"
+    )
+
+    assert effective["status"] == "pass"
+    assert effective["safe"] is True
+    assert [finding["id"] for finding in effective["findings"]] == [
+        "master",
+        "video",
+    ]
+    assert {finding["resolution"]["status"] for finding in effective["findings"]} == {
+        "false_positive"
+    }
+    assert all(
+        artifact["detector_status"] == "failed" and artifact["status"] == "pass"
+        for artifact in effective["artifacts"]
+    )
+
+    report["artifacts"][1].update(
+        status="error",
+        currentness="stale",
+        detail="Artifact changed during decode.",
+    )
+    blocked = apply_output_finding_reviews(
+        report, review, output_revision="longform-rev"
+    )
+    assert blocked["status"] == "error"
+    assert blocked["safe"] is False
+    assert output_artifact_mechanically_verified(blocked["artifacts"][1]) is False
+
+    truncated = _continuity_report(tmp_path, master, video)
+    truncated["artifacts"][0]["decoded_duration_seconds"] = 1.0
+    truncated["fingerprint"] = output_continuity_report_fingerprint(truncated)
+    group = output_finding_review_groups(truncated)[0]
+    review["output_reviews"] = {
+        group["id"]: {
+            **next(iter(review["output_reviews"].values())),
+            "output_report_fingerprint": truncated["fingerprint"],
+            "event_fingerprint": group["fingerprint"],
+            "members": group["members"],
+        }
+    }
+    truncated_effective = apply_output_finding_reviews(
+        truncated, review, output_revision="longform-rev"
+    )
+    assert truncated_effective["safe"] is False
+    assert truncated_effective["artifacts"][0]["status"] == "stale"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report["artifacts"][1].update(detector_status="pass"),
+        lambda report: report["artifacts"][1].update(required=False),
+        lambda report: report["findings"][0]["evidence"].update(
+            speech_overlap_seconds="0.4"
+        ),
+    ],
+    ids=(
+        "injected-detector-status",
+        "optional-required-video",
+        "malformed-semantic-evidence",
+    ),
+)
+def test_output_review_rejects_malformed_detector_evidence(tmp_path, mutate):
+    master = _semantic_finding("master", "selected_audio_master", "master-rev")
+    video = _semantic_finding("video", "upload_video", "video-rev")
+    report = _continuity_report(tmp_path, master, video)
+    mutate(report)
+    report["fingerprint"] = output_continuity_report_fingerprint(report)
+
+    effective = apply_output_finding_reviews(report, None, output_revision="current")
+
+    assert effective["status"] == "error"
+    assert effective["safe"] is False
+    assert effective["reviewable"] is False
 
 
 def test_speech_dropout_is_blocking_but_natural_pause_is_not():

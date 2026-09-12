@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,7 +27,12 @@ from lib.audio_mix import (
     audio_selection_settings,
     document_fingerprint,
 )
-from lib.audio_qa import AUDIO_FINDING_REVIEWS_PATH
+from lib.audio_qa import (
+    AUDIO_FINDING_REVIEWS_PATH,
+    OUTPUT_CONTINUITY_SCHEMA,
+    OUTPUT_CONTINUITY_VERSION,
+    output_continuity_report_fingerprint,
+)
 from lib.audio_qa import release_gate as audio_release_gate
 from lib.delivery_video import (
     longform_render_fingerprint,
@@ -235,6 +241,7 @@ def _install_reviewable_report(episode_dir: Path, findings: list[dict]) -> dict:
     _write_json(episode_dir / "qa" / "audio-quality.json", report)
     episode = json.loads((episode_dir / "episode.json").read_text())
     qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    output_report = _output_continuity_report(episode_dir, [])
     qa_report.update(
         overall="fail",
         quality_revision=quality_revision(episode_dir, episode, config=load_config()),
@@ -253,12 +260,7 @@ def _install_reviewable_report(episode_dir: Path, findings: list[dict]) -> dict:
             },
         ],
         audio_quality=report,
-        selected_master_output_continuity={
-            "status": "pass",
-            "safe": True,
-            "artifacts": [],
-            "findings": [],
-        },
+        selected_master_output_continuity=output_report,
     )
     _write_json(episode_dir / "qa" / "qa.json", qa_report)
     return report
@@ -272,6 +274,190 @@ def _review_request(finding: dict, decision: str = "accepted") -> dict:
         "evidence_note": "Compared the complete retained passage in the current render.",
         "expected_report_fingerprint": review["report_fingerprint"],
         "expected_finding_fingerprint": review["finding_fingerprint"],
+        "expected_output_revision": review["output_revision"],
+    }
+
+
+def _output_finding(finding_id: str, role: str, revision: str, start=10.0) -> dict:
+    return {
+        "id": finding_id,
+        "fingerprint": f"sha256:{finding_id}",
+        "kind": "digital_zero",
+        "classification": "speech_overlapping_whole_output_silence",
+        "severity": "error",
+        "role": role,
+        "revision": revision,
+        "artifact_time": {
+            "clock": "source" if role == "selected_audio_master" else "output",
+            "start_seconds": start,
+            "end_seconds": start + 0.5,
+        },
+        "source_ranges": [{"start_seconds": start, "end_seconds": start + 0.5}],
+        "evidence": {
+            "maximum_channel_median_dbfs": -240.0,
+            "minimum_channel_zero_sample_fraction": 1.0,
+            "speech_overlap_seconds": 0.4,
+            "required_speech_overlap_seconds": 0.12,
+            "transcript_word_count": 2,
+            "transcript_excerpt": "timed words",
+        },
+        "resolution": {"status": "unresolved"},
+    }
+
+
+def _install_output_review_report(
+    episode_dir: Path,
+    findings: list[dict],
+    *,
+    artifact_statuses: dict[str, str] | None = None,
+) -> dict:
+    report = _output_continuity_report(
+        episode_dir, findings, artifact_statuses=artifact_statuses
+    )
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report.update(
+        overall="fail" if report["status"] != "pass" else "pass",
+        quality_revision=quality_revision(episode_dir, episode, config=load_config()),
+        checks=[
+            {
+                "name": "audio_continuity",
+                "status": "pass",
+                "pass": True,
+                "detail": "Source continuity passed.",
+            },
+            {
+                "name": "selected_master_output_continuity",
+                "status": report["status"],
+                "pass": report["safe"],
+                "detail": report["detail"],
+            },
+        ],
+        selected_master_output_continuity=report,
+    )
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+    return report
+
+
+def _output_continuity_report(
+    episode_dir: Path,
+    findings: list[dict],
+    *,
+    artifact_statuses: dict[str, str] | None = None,
+) -> dict:
+    artifact_statuses = artifact_statuses or {}
+    findings_by_role: dict[tuple[str, str | None], list[dict]] = {}
+    for finding in findings:
+        findings_by_role.setdefault(
+            (finding["role"], finding.get("clip_id")), []
+        ).append(finding)
+    artifacts = []
+    for (role, clip_id), members in findings_by_role.items():
+        status = artifact_statuses.get(role, "failed")
+        path = (
+            episode_dir / "work" / "audio_mix.wav"
+            if role == "selected_audio_master"
+            else episode_dir / "upload_video.mp4"
+            if role == "upload_video"
+            else episode_dir / "shorts" / f"{clip_id}.mp4"
+        )
+        stat = path.stat()
+        artifact = {
+            "role": role,
+            "path": str(path.resolve()),
+            "required": True,
+            "revision": members[0]["revision"],
+            "status": status,
+            "currentness": "current" if status in {"pass", "failed"} else status,
+            "detail": "One semantic prediction." if status == "failed" else status,
+            "findings": members if status == "failed" else [],
+        }
+        if clip_id:
+            artifact["clip_id"] = clip_id
+        if status in {"pass", "failed"}:
+            artifact.update(
+                decoded_duration_seconds=60.0,
+                expected_duration_seconds=60.0,
+                scan_identity={
+                    "resolved_path": str(path.resolve()),
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "device": stat.st_dev,
+                    "inode": stat.st_ino,
+                },
+            )
+        artifacts.append(artifact)
+    roles = {artifact["role"] for artifact in artifacts}
+    for role, path in (
+        ("selected_audio_master", episode_dir / "work" / "audio_mix.wav"),
+        ("upload_video", episode_dir / "upload_video.mp4"),
+    ):
+        if role in roles:
+            continue
+        status = artifact_statuses.get(role, "pass")
+        stat = path.stat()
+        artifact = {
+            "role": role,
+            "path": str(path.resolve()),
+            "required": True,
+            "revision": f"{role}-revision",
+            "status": status,
+            "currentness": "current" if status == "pass" else status,
+            "detail": "No semantic prediction." if status == "pass" else status,
+            "findings": [],
+        }
+        if status == "pass":
+            artifact.update(
+                decoded_duration_seconds=60.0,
+                expected_duration_seconds=60.0,
+                scan_identity={
+                    "resolved_path": str(path.resolve()),
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "device": stat.st_dev,
+                    "inode": stat.st_ino,
+                },
+            )
+        artifacts.append(artifact)
+    blocking = [artifact for artifact in artifacts if artifact["status"] != "pass"]
+    precedence = ("failed", "error", "stale", "missing", "unavailable")
+    status = next(
+        (
+            candidate
+            for candidate in precedence
+            if any(artifact["status"] == candidate for artifact in blocking)
+        ),
+        "error" if blocking else "pass",
+    )
+    report = {
+        "schema": OUTPUT_CONTINUITY_SCHEMA,
+        "detector_version": OUTPUT_CONTINUITY_VERSION,
+        "status": status,
+        "safe": status == "pass",
+        "detail": "Semantic output predictions require review.",
+        "transcript_fingerprint": "sha256:transcript",
+        "timeline": {
+            "keep_intervals": [[0, 60]],
+            "output_duration_seconds": 60,
+        },
+        "settings": {"duration_tolerance_seconds": 0.25},
+        "artifacts": artifacts,
+        "findings": findings,
+    }
+    report["fingerprint"] = output_continuity_report_fingerprint(report)
+    return report
+
+
+def _output_review_request(event: dict, decision="false_positive") -> dict:
+    review = event["review"]
+    return {
+        "decision": decision,
+        "reviewer": "Editorial reviewer",
+        "evidence_note": "Reviewed the exact current full-output passage.",
+        "expected_report_fingerprint": review["report_fingerprint"],
+        "expected_event_fingerprint": review["event_fingerprint"],
         "expected_output_revision": review["output_revision"],
     }
 
@@ -554,6 +740,285 @@ def test_finding_review_rejects_split_ranges_and_missing_output_proof(
     ][0]
     assert unverified["review"]["allowed"] is False
     assert "verified current selected audio master" in unverified["review"]["reason"]
+
+
+def test_output_finding_review_is_explicit_and_preserves_raw_evidence(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_reviewable_report(episode_dir, [])
+    report = _install_output_review_report(
+        episode_dir,
+        [
+            _output_finding("oc_master", "selected_audio_master", "master-rev"),
+            _output_finding("oc_video", "upload_video", "video-rev"),
+        ],
+    )
+    raw_qa = (episode_dir / "qa" / "qa.json").read_bytes()
+
+    before = client.get("/api/episodes/ep_test/quality").json()
+    events = before["audio_quality"]["selected_master_output_continuity"][
+        "review_events"
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert event["review"]["allowed"] is True
+    assert event["review"]["inspection_request"] == {
+        "method": "GET",
+        "endpoint": "/api/episodes/ep_test/inspection/preview",
+        "query": {
+            "target": "longform",
+            "clock": "source",
+            "seconds": 8.0,
+            "duration_seconds": 4.5,
+        },
+    }
+    assert {member["id"] for member in event["members"]} == {
+        "oc_master",
+        "oc_video",
+    }
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+    missing_action = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{event['id']}/review"
+    )
+    assert missing_action.status_code == 422
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+    recorded = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{event['id']}/review",
+        json=_output_review_request(event),
+    )
+
+    assert recorded.status_code == 200
+    assert recorded.json()["resolution"]["status"] == "false_positive"
+    assert recorded.json()["output_continuity"]["status"] == "pass"
+    assert recorded.json()["quality"]["overall"] == "pass"
+    assert recorded.json()["publish_approval_current"] is False
+    assert (episode_dir / "qa" / "qa.json").read_bytes() == raw_qa
+    document = json.loads((episode_dir / AUDIO_FINDING_REVIEWS_PATH).read_text())
+    assert document["reviews"] == {}
+    assert set(document["output_reviews"]) == {event["id"]}
+    assert (
+        document["output_reviews"][event["id"]]["output_report_fingerprint"]
+        == report["fingerprint"]
+    )
+    after = client.get("/api/episodes/ep_test/quality").json()
+    findings = after["audio_quality"]["selected_master_output_continuity"]["findings"]
+    assert len(findings) == 2
+    assert {finding["resolution"]["status"] for finding in findings} == {
+        "false_positive"
+    }
+
+
+def test_output_review_preserves_unrelated_semantic_event_and_source_gate(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    source = _install_reviewable_report(
+        episode_dir, [_reviewable_finding("source_open", 30)]
+    )
+    output = _install_output_review_report(
+        episode_dir,
+        [
+            _output_finding("oc_one", "upload_video", "video-rev", 10),
+            _output_finding("oc_two", "upload_video", "video-rev", 20),
+        ],
+    )
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report["audio_quality"] = source
+    qa_report["selected_master_output_continuity"] = output
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+    before = client.get("/api/episodes/ep_test/quality").json()
+    events = before["audio_quality"]["selected_master_output_continuity"][
+        "review_events"
+    ]
+    assert len(events) == 2
+    first = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{events[0]['id']}/review",
+        json=_output_review_request(events[0], "accepted"),
+    )
+
+    assert first.status_code == 200
+    after = client.get("/api/episodes/ep_test/quality").json()
+    output_after = after["audio_quality"]["selected_master_output_continuity"]
+    assert output_after["status"] == "failed"
+    resolutions = {
+        finding["id"]: finding["resolution"]["status"]
+        for finding in output_after["findings"]
+    }
+    reviewed_ids = {member["id"] for member in events[0]["members"]}
+    assert {resolutions[finding_id] for finding_id in reviewed_ids} == {"accepted"}
+    assert any(
+        status == "unresolved"
+        for finding_id, status in resolutions.items()
+        if finding_id not in reviewed_ids
+    )
+    assert after["audio_quality"]["release_gate"]["status"] != "pass"
+    assert after["quality"]["overall"] == "fail"
+
+
+@pytest.mark.parametrize("mechanical_status", ["error", "stale", "missing"])
+def test_output_review_rejects_mechanical_failure(quality_client, mechanical_status):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_output_review_report(
+        episode_dir,
+        [_output_finding("oc_video", "upload_video", "video-rev")],
+        artifact_statuses={"selected_audio_master": mechanical_status},
+    )
+
+    body = client.get("/api/episodes/ep_test/quality").json()
+    event = body["audio_quality"]["selected_master_output_continuity"]["review_events"][
+        0
+    ]
+    assert event["review"]["allowed"] is False
+    rejected = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{event['id']}/review",
+        json=_output_review_request(event),
+    )
+    assert rejected.status_code == 409
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+
+def test_output_review_rejects_same_stat_replacement(quality_client):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_output_review_report(
+        episode_dir,
+        [_output_finding("oc_video", "upload_video", "video-rev")],
+    )
+    event = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "selected_master_output_continuity"
+    ]["review_events"][0]
+    video = episode_dir / "upload_video.mp4"
+    original = video.stat()
+    replacement = episode_dir / "replacement.mp4"
+    replacement.write_bytes(b"changed video")
+    assert replacement.stat().st_size == original.st_size
+    replacement.replace(video)
+    os.utime(video, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    rejected = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{event['id']}/review",
+        json=_output_review_request(event),
+    )
+
+    assert rejected.status_code == 409
+    assert "incomplete mechanical checks" in rejected.json()["detail"]
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+
+def test_output_review_rejects_old_page_revision_after_current_remaster(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_output_review_report(
+        episode_dir,
+        [_output_finding("oc_video", "upload_video", "video-rev")],
+    )
+    old_event = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "selected_master_output_continuity"
+    ]["review_events"][0]
+    video = episode_dir / "upload_video.mp4"
+    original = video.stat()
+    replacement = episode_dir / "replacement.mp4"
+    replacement.write_bytes(b"changed video")
+    replacement.replace(video)
+    os.utime(video, ns=(original.st_atime_ns, original.st_mtime_ns))
+    stat = video.stat()
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    report = qa_report["selected_master_output_continuity"]
+    video_artifact = next(
+        artifact
+        for artifact in report["artifacts"]
+        if artifact["role"] == "upload_video"
+    )
+    video_artifact["scan_identity"] = {
+        "resolved_path": str(video.resolve()),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+    report["fingerprint"] = output_continuity_report_fingerprint(report)
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+    current_event = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "selected_master_output_continuity"
+    ]["review_events"][0]
+    request = _output_review_request(current_event)
+    request["expected_output_revision"] = old_event["review"]["output_revision"]
+
+    rejected = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{current_event['id']}/review",
+        json=request,
+    )
+
+    assert rejected.status_code == 409
+    assert "Rendered output changed" in rejected.json()["detail"]
+
+
+def test_output_review_rejects_replaced_report(quality_client):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_output_review_report(
+        episode_dir,
+        [_output_finding("oc_video", "upload_video", "video-rev")],
+    )
+    before = client.get("/api/episodes/ep_test/quality").json()
+    event = before["audio_quality"]["selected_master_output_continuity"][
+        "review_events"
+    ][0]
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    replacement = qa_report["selected_master_output_continuity"]
+    replacement["transcript_fingerprint"] = "sha256:replacement"
+    replacement["fingerprint"] = output_continuity_report_fingerprint(replacement)
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+    response = client.post(
+        f"/api/episodes/ep_test/audio-qc/output-findings/{event['id']}/review",
+        json=_output_review_request(event),
+    )
+
+    assert response.status_code == 409
+    assert "report changed" in response.json()["detail"]
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+
+def test_rejected_review_transaction_restores_release_revision(quality_client):
+    _client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    sidecar = episode_dir / AUDIO_FINDING_REVIEWS_PATH
+    _write_json(
+        sidecar,
+        {
+            "schema": "cascade.audio-finding-reviews/v1",
+            "episode_id": "ep_test",
+            "reviews": {"existing": {"decision": "accepted"}},
+            "output_reviews": {},
+        },
+    )
+    before_bytes = sidecar.read_bytes()
+    before_revision = release_revision(episode_dir)
+
+    with pytest.raises(RuntimeError, match="concurrent replacement"):
+        quality._write_finding_review(
+            episode_dir,
+            "output_reviews",
+            "new",
+            {"decision": "false_positive"},
+            lambda _reviewed_at: (_ for _ in ()).throw(
+                RuntimeError("concurrent replacement")
+            ),
+        )
+
+    assert sidecar.read_bytes() == before_bytes
+    assert release_revision(episode_dir) == before_revision
 
 
 def test_output_continuity_failures_expose_bounded_canonical_inspection(

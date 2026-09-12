@@ -34,10 +34,17 @@ from lib.ffprobe import probe as ffprobe
 REPORT_SCHEMA = "cascade.audio-quality/v1"
 OUTPUT_CONTINUITY_SCHEMA = "cascade.output-audio-continuity/v1"
 OUTPUT_SOURCE_MAPPING_SCHEMA = "cascade.output-audio-source-mapping/v1"
+OUTPUT_SEMANTIC_CLASSIFICATION = "speech_overlapping_whole_output_silence"
+OUTPUT_SEMANTIC_EVIDENCE_FIELDS = (
+    "speech_overlap_seconds",
+    "required_speech_overlap_seconds",
+    "transcript_word_count",
+    "transcript_excerpt",
+)
 AUDIO_FINDING_REVIEWS_PATH = Path("qa/audio-finding-reviews.json")
 AUDIO_FINDING_REVIEWS_SCHEMA = "cascade.audio-finding-reviews/v1"
 DETECTOR_VERSION = "1.2"
-OUTPUT_CONTINUITY_VERSION = "2"
+OUTPUT_CONTINUITY_VERSION = "3"
 PREVIEW_ALGORITHM_VERSION = "5"
 TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD = "sha256-audio-word-timing-speaker/v1"
 REPAIR_FADE_SECONDS = 0.08
@@ -307,23 +314,27 @@ def _selected_repair_output_proof(report: dict, selection: dict) -> dict:
         for item in selection.get("repaired_findings", [])
         if isinstance(item, dict)
     }
-    bindings_current = bool(selected) and selected.issubset(current)
+    matched = selected & current
+    stale = selected - current
     verification = json.loads(json.dumps(selection.get("verification") or {}))
-    verification["status"] = (
-        "pass" if bindings_current and verification.get("status") == "pass" else "stale"
+    verification["repair_binding_status"] = (
+        "current" if not stale else "partial" if matched else "stale"
     )
-    verification["repair_binding_status"] = "current" if bindings_current else "stale"
     verification["repaired_findings"] = [
         {"id": finding_id, "fingerprint": fingerprint}
-        for finding_id, fingerprint in sorted(selected)
+        for finding_id, fingerprint in sorted(matched)
+    ]
+    verification["stale_repaired_findings"] = [
+        {"id": finding_id, "fingerprint": fingerprint}
+        for finding_id, fingerprint in sorted(stale)
     ]
     verification["repaired_finding_ids"] = sorted(
-        finding_id for finding_id, _ in selected
+        finding_id for finding_id, _ in matched
     )
     verification["excluded_finding_ids"] = []
     return {
         "role": "selected_audio_master",
-        "status": verification["status"],
+        "status": verification.get("status", "stale"),
         "source_report_fingerprint": report.get("fingerprint"),
         "selected_mix_fingerprint": report.get("scope", {})
         .get("selected_mix_provenance", {})
@@ -432,6 +443,41 @@ def decode_audio_windows(
     )
 
 
+def _output_continuity_summary(artifacts: list[dict]) -> tuple[str, str]:
+    blocking = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("required", True) and artifact.get("status") != "pass"
+    ]
+    precedence = ("failed", "error", "stale", "missing", "unavailable")
+    status = (
+        next(
+            (
+                candidate
+                for candidate in precedence
+                if any(artifact.get("status") == candidate for artifact in blocking)
+            ),
+            "error",
+        )
+        if blocking
+        else "pass"
+    )
+    detail = (
+        "All current selected and delivery audio passed continuity analysis."
+        if status == "pass"
+        else "; ".join(
+            "{}{}: {} ({})".format(
+                artifact.get("role", "artifact"),
+                f"/{artifact['clip_id']}" if artifact.get("clip_id") else "",
+                artifact.get("status", "unknown"),
+                artifact.get("detail", "no detail"),
+            )
+            for artifact in blocking
+        )
+    )
+    return status, detail
+
+
 def analyze_output_continuity(
     targets: list[dict],
     transcript: dict,
@@ -469,6 +515,7 @@ def analyze_output_continuity(
                 "status",
                 "detail",
                 "source_mapping",
+                "scan_identity",
             )
             if key in target
         }
@@ -559,37 +606,7 @@ def analyze_output_continuity(
             all_findings.extend(findings)
         artifacts.append(artifact)
 
-    blocking = [
-        artifact
-        for artifact in artifacts
-        if artifact.get("required", True) and artifact.get("status") != "pass"
-    ]
-    precedence = ("failed", "error", "stale", "missing", "unavailable")
-    status = (
-        next(
-            (
-                candidate
-                for candidate in precedence
-                if any(artifact.get("status") == candidate for artifact in blocking)
-            ),
-            "error",
-        )
-        if blocking
-        else "pass"
-    )
-    detail = (
-        "All current selected and delivery audio passed continuity analysis."
-        if status == "pass"
-        else "; ".join(
-            "{}{}: {} ({})".format(
-                artifact.get("role", "artifact"),
-                f"/{artifact['clip_id']}" if artifact.get("clip_id") else "",
-                artifact.get("status", "unknown"),
-                artifact.get("detail", "no detail"),
-            )
-            for artifact in blocking
-        )
-    )
+    status, detail = _output_continuity_summary(artifacts)
     report = {
         "schema": OUTPUT_CONTINUITY_SCHEMA,
         "detector_version": OUTPUT_CONTINUITY_VERSION,
@@ -606,36 +623,40 @@ def analyze_output_continuity(
         "artifacts": artifacts,
         "findings": all_findings,
     }
-    report["fingerprint"] = json_fingerprint(
-        {
-            key: report[key]
-            for key in (
-                "schema",
-                "detector_version",
-                "status",
-                "transcript_fingerprint",
-                "timeline",
-                "settings",
-                "artifacts",
-            )
-        }
-    )
+    report["fingerprint"] = output_continuity_report_fingerprint(report)
     return report
 
 
 def _scan_identity(path: Path) -> dict | None:
     try:
         resolved = path.resolve(strict=True)
-        stat = resolved.stat()
+        before = resolved.stat()
+        if path.resolve(strict=True) != resolved:
+            return None
+        after = resolved.stat()
     except (OSError, RuntimeError):
+        return None
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
         return None
     return {
         "resolved_path": str(resolved),
-        "size_bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "ctime_ns": stat.st_ctime_ns,
-        "device": stat.st_dev,
-        "inode": stat.st_ino,
+        "size_bytes": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
+        "device": after.st_dev,
+        "inode": after.st_ino,
     }
 
 
@@ -1138,7 +1159,7 @@ def release_gate(report: dict) -> dict:
     }
 
 
-def review_output_revision(record: dict | None) -> str | None:
+def review_output_revision(record: dict | None, *, output_path: Path) -> str | None:
     """Bind a finding review to the exact current longform output evidence."""
     if not isinstance(record, dict) or not record.get("fingerprint"):
         return None
@@ -1147,11 +1168,18 @@ def review_output_revision(record: dict | None) -> str | None:
         isinstance(output.get(key), int) for key in ("size_bytes", "mtime_ns")
     ):
         return None
+    identity = _scan_identity(output_path)
+    if identity is None or (
+        output.get("size_bytes") != identity.get("size_bytes")
+        or output.get("mtime_ns") != identity.get("mtime_ns")
+    ):
+        return None
     return json_fingerprint(
         {
             "render_fingerprint": record["fingerprint"],
             "render_mode": record.get("render_mode"),
             "output": output,
+            "artifact_identity": identity,
             "audio_remaster": (record.get("provenance") or {}).get("audio_remaster"),
         }
     )
@@ -1160,6 +1188,431 @@ def review_output_revision(record: dict | None) -> str | None:
 def selected_output_proof_status(report: dict) -> str:
     """Return whether source QA is bound to a verified selected audio master."""
     return _output_proof_state(report)[0]
+
+
+def output_continuity_report_fingerprint(report: dict) -> str:
+    """Recompute the detector-owned output report identity."""
+    return json_fingerprint(
+        {
+            key: report[key]
+            for key in (
+                "schema",
+                "detector_version",
+                "status",
+                "transcript_fingerprint",
+                "timeline",
+                "settings",
+                "artifacts",
+            )
+        }
+    )
+
+
+def output_artifact_mechanically_verified(
+    artifact: dict, *, duration_tolerance_seconds: float = 0.0
+) -> bool:
+    """Return whether currentness, decode, and duration checks completed."""
+    detector_status = artifact.get("detector_status", artifact.get("status"))
+    try:
+        decoded = float(artifact["decoded_duration_seconds"])
+        expected = float(artifact["expected_duration_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    path = artifact.get("path")
+    recorded_identity = artifact.get("scan_identity")
+    return (
+        artifact.get("currentness") == "current"
+        and detector_status in {"pass", "failed"}
+        and math.isfinite(decoded)
+        and math.isfinite(expected)
+        and decoded > 0
+        and expected > 0
+        and decoded + duration_tolerance_seconds >= expected
+        and isinstance(artifact.get("revision"), str)
+        and bool(artifact["revision"])
+        and isinstance(path, str)
+        and isinstance(recorded_identity, dict)
+        and _scan_identity(Path(path)) == recorded_identity
+    )
+
+
+def _output_review_report_error(report: dict, detail: str) -> dict:
+    report.update(
+        status="error",
+        safe=False,
+        detail=f"Output continuity review evidence is invalid: {detail}",
+        reviewable=False,
+    )
+    return report
+
+
+def _finite_number(value: object, *, minimum: float) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= minimum
+    )
+
+
+def _validate_output_review_report(report: dict) -> str | None:
+    if report.get("schema") != OUTPUT_CONTINUITY_SCHEMA:
+        return "schema is unsupported"
+    if report.get("detector_version") != OUTPUT_CONTINUITY_VERSION:
+        return "detector version is stale"
+    artifacts = report.get("artifacts")
+    findings = report.get("findings")
+    settings = report.get("settings")
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or not all(isinstance(item, dict) for item in artifacts)
+        or not isinstance(findings, list)
+        or not all(isinstance(item, dict) for item in findings)
+        or not isinstance(settings, dict)
+    ):
+        return "artifact or finding collections are malformed"
+    if any(
+        not isinstance(artifact.get("role"), str)
+        or not artifact.get("role")
+        or not isinstance(artifact.get("required", True), bool)
+        or "detector_status" in artifact
+        or (
+            artifact.get("clip_id") is not None
+            and not isinstance(artifact.get("clip_id"), str)
+        )
+        for artifact in artifacts
+    ):
+        return "artifact identities are invalid"
+    artifact_keys = [
+        (artifact["role"], artifact.get("clip_id")) for artifact in artifacts
+    ]
+    if len(set(artifact_keys)) != len(artifact_keys):
+        return "artifact identities are duplicated"
+    if not {
+        ("selected_audio_master", None),
+        ("upload_video", None),
+    }.issubset(set(artifact_keys)):
+        return "required selected-master or upload-video evidence is missing"
+    if any(
+        artifact.get("required") is not True
+        for artifact in artifacts
+        if (artifact["role"], artifact.get("clip_id"))
+        in {("selected_audio_master", None), ("upload_video", None)}
+    ):
+        return "selected-master and upload-video evidence must be required"
+    if any(
+        not isinstance(finding.get("id"), str)
+        or not finding.get("id")
+        or not isinstance(finding.get("fingerprint"), str)
+        or not finding.get("fingerprint")
+        or not isinstance(finding.get("revision"), str)
+        or not finding.get("revision")
+        or not isinstance(finding.get("role"), str)
+        or not finding.get("role")
+        or (
+            finding.get("clip_id") is not None
+            and not isinstance(finding.get("clip_id"), str)
+        )
+        for finding in findings
+    ):
+        return "finding identities are invalid"
+    for finding in findings:
+        evidence = finding.get("evidence")
+        ranges = finding.get("source_ranges")
+        if (
+            finding.get("classification") != OUTPUT_SEMANTIC_CLASSIFICATION
+            or not isinstance(evidence, dict)
+            or not isinstance(ranges, list)
+            or not ranges
+            or not all(
+                isinstance(item, dict)
+                and _finite_number(item.get("start_seconds"), minimum=0)
+                and _finite_number(item.get("end_seconds"), minimum=0)
+                and item["end_seconds"] > item["start_seconds"]
+                for item in ranges
+            )
+            or not _finite_number(evidence.get("speech_overlap_seconds"), minimum=0)
+            or not _finite_number(
+                evidence.get("required_speech_overlap_seconds"), minimum=0
+            )
+            or isinstance(evidence.get("transcript_word_count"), bool)
+            or not isinstance(evidence.get("transcript_word_count"), int)
+            or evidence["transcript_word_count"] < 0
+            or not isinstance(evidence.get("transcript_excerpt"), str)
+        ):
+            return "semantic finding evidence is invalid"
+    finding_keys = [(finding["id"], finding["fingerprint"]) for finding in findings]
+    if len(set(finding_keys)) != len(finding_keys):
+        return "finding identities are missing or duplicated"
+    nested = []
+    for artifact in artifacts:
+        if artifact.get("status") not in {
+            "pass",
+            "failed",
+            "error",
+            "stale",
+            "missing",
+            "unavailable",
+            "not_required",
+        }:
+            return "artifact status is invalid"
+        artifact_findings = artifact.get("findings")
+        if not isinstance(artifact_findings, list) or not all(
+            isinstance(item, dict) for item in artifact_findings
+        ):
+            return "artifact findings are malformed"
+        if (artifact.get("status") == "failed") != bool(artifact_findings):
+            return "artifact status and semantic findings are inconsistent"
+        if artifact.get("status") in {"pass", "failed"} and (
+            artifact.get("currentness") != "current"
+            or not isinstance(artifact.get("path"), str)
+            or not isinstance(artifact.get("scan_identity"), dict)
+            or not isinstance(artifact.get("revision"), str)
+            or not artifact.get("revision")
+            or not isinstance(artifact.get("decoded_duration_seconds"), (int, float))
+            or not isinstance(artifact.get("expected_duration_seconds"), (int, float))
+        ):
+            return "completed artifact proof is incomplete"
+        for finding in artifact_findings:
+            if (
+                finding.get("role") != artifact.get("role")
+                or finding.get("clip_id") != artifact.get("clip_id")
+                or finding.get("revision") != artifact.get("revision")
+            ):
+                return "finding artifact binding is inconsistent"
+            nested.append(finding)
+
+    def canonical(item: dict) -> str:
+        return json.dumps(item, sort_keys=True, separators=(",", ":"))
+
+    if sorted(map(canonical, nested)) != sorted(map(canonical, findings)):
+        return "top-level and artifact findings do not match"
+    try:
+        expected_fingerprint = output_continuity_report_fingerprint(report)
+    except (KeyError, TypeError, ValueError):
+        return "fingerprint inputs are incomplete"
+    if report.get("fingerprint") != expected_fingerprint:
+        return "report fingerprint does not match detector evidence"
+    expected_status, _ = _output_continuity_summary(artifacts)
+    if report.get("status") != expected_status or report.get("safe") is not (
+        expected_status == "pass"
+    ):
+        return "report status does not match artifact evidence"
+    return None
+
+
+def output_finding_review_groups(report: dict) -> list[dict]:
+    """Group only findings with identical source and transcript evidence."""
+    grouped: dict[str, dict] = {}
+    for finding in report["findings"]:
+        binding = {
+            "classification": OUTPUT_SEMANTIC_CLASSIFICATION,
+            "source_ranges": finding["source_ranges"],
+            "transcript_evidence": {
+                key: finding["evidence"][key] for key in OUTPUT_SEMANTIC_EVIDENCE_FIELDS
+            },
+        }
+        binding_fingerprint = json_fingerprint(binding)
+        group = grouped.setdefault(
+            binding_fingerprint,
+            {
+                "id": f"ocg_{binding_fingerprint.removeprefix('sha256:')[:16]}",
+                "binding": binding,
+                "members": [],
+            },
+        )
+        group["members"].append(
+            {
+                "id": str(finding["id"]),
+                "fingerprint": finding["fingerprint"],
+                "revision": finding["revision"],
+                "role": finding.get("role"),
+                **(
+                    {"clip_id": str(finding["clip_id"])}
+                    if finding.get("clip_id")
+                    else {}
+                ),
+            }
+        )
+    groups = []
+    for group in grouped.values():
+        group["members"].sort(
+            key=lambda member: (
+                str(member.get("role", "")),
+                str(member.get("clip_id", "")),
+                member["id"],
+            )
+        )
+        group["fingerprint"] = json_fingerprint(
+            {"binding": group["binding"], "members": group["members"]}
+        )
+        groups.append(group)
+    return sorted(groups, key=lambda group: group["id"])
+
+
+def apply_output_finding_reviews(
+    report: dict, review_document: dict | None, *, output_revision: str | None
+) -> dict:
+    """Overlay exact output-semantic decisions without waiving mechanical errors."""
+    result = copy.deepcopy(report)
+    invalid = _validate_output_review_report(result)
+    if invalid:
+        return _output_review_report_error(result, invalid)
+    result["reviewable"] = True
+    try:
+        duration_tolerance = float(
+            result.get("settings", {}).get("duration_tolerance_seconds", 0.0)
+        )
+    except (TypeError, ValueError):
+        return _output_review_report_error(result, "duration tolerance is invalid")
+    if not math.isfinite(duration_tolerance) or duration_tolerance < 0:
+        return _output_review_report_error(result, "duration tolerance is invalid")
+    artifacts_by_key = {
+        (artifact.get("role"), artifact.get("clip_id")): artifact
+        for artifact in result["artifacts"]
+    }
+    selected_master = artifacts_by_key.get(("selected_audio_master", None))
+    mechanical_by_key = {
+        key: output_artifact_mechanically_verified(
+            artifact, duration_tolerance_seconds=duration_tolerance
+        )
+        for key, artifact in artifacts_by_key.items()
+    }
+    for key, artifact in artifacts_by_key.items():
+        artifact["mechanically_verified"] = mechanical_by_key[key]
+    finding_lists = [result.get("findings", [])]
+    finding_lists.extend(
+        artifact.get("findings", [])
+        for artifact in result.get("artifacts", [])
+        if isinstance(artifact, dict)
+    )
+    for findings in finding_lists:
+        if not isinstance(findings, list):
+            continue
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            if (finding.get("resolution") or {}).get("status") in {
+                "accepted",
+                "false_positive",
+            }:
+                finding["resolution"] = {"status": "unresolved"}
+
+    reviews = (
+        review_document.get("output_reviews", {})
+        if isinstance(review_document, dict)
+        and review_document.get("schema") == AUDIO_FINDING_REVIEWS_SCHEMA
+        else {}
+    )
+    resolutions: dict[tuple[str, str], dict] = {}
+    if isinstance(reviews, dict) and output_revision:
+        for group in output_finding_review_groups(result):
+            review = reviews.get(group["id"])
+            member_artifacts = [
+                artifacts_by_key.get((member.get("role"), member.get("clip_id")))
+                for member in group["members"]
+            ]
+            if (
+                not isinstance(review, dict)
+                or not all(
+                    (
+                        review.get("decision") in {"accepted", "false_positive"},
+                        review.get("output_report_fingerprint")
+                        == result.get("fingerprint"),
+                        review.get("event_fingerprint") == group["fingerprint"],
+                        review.get("members") == group["members"],
+                        review.get("output_revision") == output_revision,
+                        bool(str(review.get("reviewed_by", "")).strip()),
+                        bool(str(review.get("evidence_note", "")).strip()),
+                        bool(review.get("reviewed_at")),
+                    )
+                )
+                or not (
+                    isinstance(selected_master, dict)
+                    and mechanical_by_key.get(("selected_audio_master", None)) is True
+                    and all(
+                        isinstance(artifact, dict)
+                        and artifact.get("revision") == member.get("revision")
+                        and mechanical_by_key.get(
+                            (member.get("role"), member.get("clip_id"))
+                        )
+                        is True
+                        for artifact, member in zip(
+                            member_artifacts, group["members"], strict=True
+                        )
+                    )
+                )
+            ):
+                continue
+            resolution = {
+                "status": review["decision"],
+                "reviewed_by": review["reviewed_by"],
+                "reviewed_at": review["reviewed_at"],
+                "evidence": {
+                    "note": review["evidence_note"],
+                    "output_report_fingerprint": review["output_report_fingerprint"],
+                    "event_fingerprint": review["event_fingerprint"],
+                    "output_revision": review["output_revision"],
+                    "inspection": review.get("inspection"),
+                },
+            }
+            for member in group["members"]:
+                resolutions[(member["id"], member["fingerprint"])] = resolution
+
+    for findings in finding_lists:
+        if not isinstance(findings, list):
+            continue
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            resolution = resolutions.get(
+                (str(finding.get("id")), str(finding.get("fingerprint")))
+            )
+            if resolution:
+                finding["resolution"] = copy.deepcopy(resolution)
+
+    for artifact in result.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        detector_status = artifact.get("detector_status", artifact.get("status"))
+        artifact["detector_status"] = detector_status
+        artifact["status"] = detector_status
+        findings = artifact.get("findings", [])
+        mechanically_verified = mechanical_by_key.get(
+            (artifact.get("role"), artifact.get("clip_id")), False
+        )
+        if detector_status in {"pass", "failed"} and not mechanically_verified:
+            artifact.update(
+                status="stale",
+                detail="Artifact changed after output continuity analysis.",
+            )
+        elif (
+            detector_status == "failed"
+            and mechanically_verified
+            and isinstance(findings, list)
+            and findings
+            and all(
+                isinstance(finding, dict)
+                and (finding.get("resolution") or {}).get("status")
+                in {"accepted", "false_positive"}
+                for finding in findings
+            )
+        ):
+            artifact.update(
+                status="pass",
+                detail=(
+                    f"{len(findings)} semantic continuity finding(s) explicitly "
+                    "reviewed for the current output."
+                ),
+            )
+
+    status, detail = _output_continuity_summary(result["artifacts"])
+    result["detector_status"] = result.get("detector_status", result.get("status"))
+    result["status"] = status
+    result["safe"] = status == "pass"
+    result["detail"] = detail
+    return result
 
 
 def apply_finding_reviews(
