@@ -1,9 +1,7 @@
 """Tests for the QA agent."""
 
 import json
-import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from agents.qa import QAAgent
 
@@ -104,6 +102,8 @@ class TestQAAgent:
     def test_missing_shorts_detected(
         self, tmp_episode_dir, sample_config, sample_clips
     ):
+        for clip in sample_clips:
+            clip["selection_status"] = "selected"
         self._setup_full_episode(tmp_episode_dir, sample_clips)
         # Remove one short
         (tmp_episode_dir / "shorts" / "clip_02.mp4").unlink()
@@ -148,6 +148,7 @@ class TestQAAgent:
                 "end_seconds": 10,
                 "duration": 10.0,
                 "status": "pending",
+                "selection_status": "selected",
             },
         ]
         self._setup_full_episode(tmp_episode_dir, clips)
@@ -178,6 +179,90 @@ class TestQAAgent:
 
         assert result["warning_count"] > 0
 
+    def test_rejected_clips_do_not_block_selected_render_or_metadata(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        sample_clips[0]["selection_status"] = "selected"
+        sample_clips[1].update(selection_status="rejected", status="rejected")
+        sample_config["platforms"] = {"youtube": {"enabled": True}}
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        (tmp_episode_dir / "shorts" / "clip_02.mp4").unlink()
+        metadata = {
+            "longform": {"title": "Test", "description": "Description"},
+            "clips": [
+                {
+                    "id": "clip_01",
+                    "youtube": {"title": "Selected", "description": "Copy"},
+                }
+            ],
+        }
+        (tmp_episode_dir / "metadata" / "metadata.json").write_text(
+            json.dumps(metadata)
+        )
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+
+        agent = QAAgent(tmp_episode_dir, sample_config)
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
+            result = agent.execute()
+
+        by_name = {check["name"]: check for check in result["checks"]}
+        assert by_name["all_shorts_rendered"]["pass"] is True
+        assert by_name["all_shorts_rendered"]["detail"].startswith("1/1 selected")
+        assert by_name["metadata_valid"]["pass"] is True
+        assert result["overall"] == "pass"
+
+    def test_recorder_mix_camera_continuity_is_recorded_as_skipped(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+
+        agent = QAAgent(tmp_episode_dir, sample_config)
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={
+                    "status": "not_applicable",
+                    "safe": None,
+                    "reason": "Selected recorder mix does not use camera audio",
+                },
+            ),
+        ):
+            result = agent.execute()
+
+        assert result["overall"] == "pass"
+        assert not any(c["name"] == "audio_continuity" for c in result["checks"])
+        assert result["skipped_checks"] == [
+            {
+                "name": "audio_continuity",
+                "status": "not_applicable",
+                "pass": None,
+                "detail": "Selected recorder mix does not use camera audio",
+            }
+        ]
+        assert result["skipped_check_count"] == 1
+
     def test_qa_json_saved(self, tmp_episode_dir, sample_config, sample_clips):
         self._setup_full_episode(tmp_episode_dir, sample_clips)
 
@@ -206,3 +291,59 @@ class TestQAAgent:
             agent.execute()
 
         assert (tmp_episode_dir / "qa" / "qa.json").exists()
+
+    def test_clip_boundary_words_are_nonblocking_revisioned_warnings(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        sample_clips[0]["selection_status"] = "selected"
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        transcript = {
+            "clock": "source",
+            "utterances": [
+                {
+                    "speaker": 0,
+                    "words": [
+                        {
+                            "word": "partial",
+                            "start": 59.9,
+                            "end": 60.2,
+                            "confidence": 0.96,
+                        }
+                    ],
+                }
+            ],
+        }
+        (tmp_episode_dir / "diarized_transcript.json").write_text(
+            json.dumps(transcript)
+        )
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+
+        agent = QAAgent(tmp_episode_dir, sample_config)
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.current_diarized_transcript", return_value=transcript),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
+            result = agent.execute()
+
+        evidence = result["clip_boundary_evidence"]
+        assert evidence["current"] is True
+        assert evidence["status"] == "review_required"
+        assert evidence["transcript_revision"].startswith("sha256:")
+        warning = next(
+            item
+            for item in result["warnings"]
+            if item["name"] == "clip_boundary_clip_01"
+        )
+        assert warning["evidence"]["findings"][0]["word"]["word"] == "partial"
+        assert result["overall"] == "pass"

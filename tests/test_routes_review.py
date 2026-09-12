@@ -132,6 +132,103 @@ def test_review_distinguishes_missing_short_from_stale(test_client):
     }
 
 
+def test_inspection_reports_revision_bound_clip_boundary_evidence(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    clip = {
+        "id": "clip_01",
+        "start_seconds": 10.0,
+        "end_seconds": 20.0,
+        "selection_status": "selected",
+    }
+    _write_clips(episode_dir, [clip])
+    transcript = {
+        "clock": "source",
+        "utterances": [
+            {
+                "speaker": 2,
+                "words": [
+                    {
+                        "word": "where",
+                        "start": 9.8,
+                        "end": 10.1,
+                        "confidence": 0.97,
+                    }
+                ],
+            }
+        ],
+    }
+    (episode_dir / "diarized_transcript.json").write_text(json.dumps(transcript))
+
+    from agents import qa
+
+    monkeypatch.setattr(qa, "current_diarized_transcript", lambda *_args: transcript)
+    inspection_response = client.get("/api/episodes/ep_001/inspection/clip-boundaries")
+
+    assert inspection_response.status_code == 200
+    evidence = inspection_response.json()
+    assert evidence["current"] is True
+    assert evidence["status"] == "review_required"
+    assert evidence["transcript_revision"].startswith("sha256:")
+    finding = evidence["clips"][0]["findings"][0]
+    assert finding["word"]["word"] == "where"
+    assert finding["word"]["confidence"] == 0.97
+    assert finding["word"]["speaker"] == 2
+    assert finding["inspection_request"] == {
+        "method": "GET",
+        "endpoint": "/api/episodes/ep_001/inspection/preview",
+        "query": {
+            "target": "source",
+            "clock": "source",
+            "seconds": 8.0,
+            "duration_seconds": 4.0,
+        },
+    }
+
+    first_clip_revision = evidence["clips"][0]["clip_revision"]
+    _write_clips(
+        episode_dir,
+        [
+            {
+                "id": "clip_01",
+                "start_seconds": 10.2,
+                "end_seconds": 20.0,
+                "selection_status": "selected",
+            }
+        ],
+    )
+    changed = client.get("/api/episodes/ep_001/inspection/clip-boundaries").json()
+    assert changed["transcript_revision"] == evidence["transcript_revision"]
+    assert changed["clips"][0]["clip_revision"] != first_clip_revision
+
+    monkeypatch.setattr(qa, "current_diarized_transcript", lambda *_args: None)
+    unavailable = client.get("/api/episodes/ep_001/inspection/clip-boundaries").json()
+    assert unavailable["current"] is False
+    assert unavailable["status"] == "unavailable"
+
+
+def test_review_survives_invalid_selected_audio(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    _write_clips(
+        episode_dir,
+        [{"id": "clip_01", "start_seconds": 10.0, "end_seconds": 20.0}],
+    )
+
+    from server.routes import review
+
+    def stale_selection(*_args):
+        raise ValueError("stale selected audio")
+
+    monkeypatch.setattr(review, "selected_audio_source", stale_selection)
+    response = client.get("/api/episodes/ep_001/review")
+
+    assert response.status_code == 200
+    assert response.json()["clips"][0]["review"]["render"]["current"] is False
+
+
 def test_inspection_preview_maps_output_across_source_cut(test_client, monkeypatch):
     client, episodes_dir = test_client
     episode_dir = _create_episode(episodes_dir, "ep_001")

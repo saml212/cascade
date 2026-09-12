@@ -17,11 +17,13 @@ from agents.qa import (
     PLATFORM_COPY_FIELDS,
     canonical_release_metadata,
     clip_review_revision,
+    current_clip_boundary_evidence,
     editorial_revision,
 )
 from agents.speaker_cut import current_speaker_segments
 from agents.transcribe import current_diarized_transcript
 from lib.audio_mix import selected_audio_source
+from lib.clips import clip_selection_status
 from lib.delivery_video import (
     current_longform_render,
     current_short_render,
@@ -137,20 +139,10 @@ def _approval_state(clip: dict, render: dict, metadata: dict) -> dict:
     return {"status": "current" if current else "stale", "current": current}
 
 
-def _selection_status(clip: dict) -> str:
-    status = clip.get("selection_status")
-    if status in {"selected", "rejected"}:
-        return status
-    if clip.get("status") == "approved":
-        return "selected"
-    if clip.get("status") == "rejected":
-        return "rejected"
-    return "unselected"
-
-
 def _expected_fingerprints(
     episode_dir: Path, episode: dict, clips: list[dict], config: dict
 ) -> tuple[str | None, dict[str, str | None]]:
+    audio = None
     try:
         audio = selected_audio_source(episode_dir, episode, config) or (
             episode_dir / "work" / "audio_mix.wav"
@@ -163,7 +155,7 @@ def _expected_fingerprints(
         if isinstance(current_segments, dict)
         else []
     )
-    if not audio.is_file() or not segments:
+    if audio is None or not audio.is_file() or not segments:
         return None, {str(clip.get("id")): None for clip in clips}
     try:
         current_longform = current_longform_render(
@@ -195,6 +187,32 @@ def _expected_fingerprints(
     return longform, shorts
 
 
+def _boundary_evidence_with_inspection(
+    episode_id: str,
+    episode_dir: Path,
+    episode: dict,
+    clips: list[dict],
+    config: dict,
+) -> dict:
+    evidence = current_clip_boundary_evidence(episode_dir, episode, config, clips)
+    endpoint = f"/api/episodes/{quote(episode_id, safe='')}/inspection/preview"
+    for clip in evidence["clips"]:
+        for finding in clip["findings"]:
+            finding["inspection_request"] = {
+                "method": "GET",
+                "endpoint": endpoint,
+                "query": {
+                    "target": "source",
+                    "clock": "source",
+                    "seconds": round(
+                        max(0.0, float(finding["boundary_seconds"]) - 2.0), 3
+                    ),
+                    "duration_seconds": 4.0,
+                },
+            }
+    return evidence
+
+
 @router.get("/{episode_id}/review")
 async def review_state(episode_id: str) -> dict:
     """Return reviewable files, their freshness, copy, and approval state."""
@@ -215,7 +233,6 @@ async def review_state(episode_id: str) -> dict:
     expected_longform, expected_shorts = _expected_fingerprints(
         episode_dir, episode, clips, config
     )
-
     canonical = _with_media_url(
         render_artifact_state(
             episode_dir,
@@ -265,7 +282,7 @@ async def review_state(episode_id: str) -> dict:
                 **clip,
                 "metadata": {key: value for key, value in copy.items() if key != "id"},
                 "review": {
-                    "selection": {"status": _selection_status(clip)},
+                    "selection": {"status": clip_selection_status(clip)},
                     "render": render,
                     "approval": _approval_state(clip, render, copy),
                     "metadata": _metadata_state(copy, destinations),
@@ -275,7 +292,7 @@ async def review_state(episode_id: str) -> dict:
         )
 
     selection_counts = {
-        status: sum(_selection_status(clip) == status for clip in clips)
+        status: sum(clip_selection_status(clip) == status for clip in clips)
         for status in ("selected", "unselected", "rejected")
     }
     return {
@@ -481,6 +498,16 @@ async def inspection_shot_plan(episode_id: str) -> dict:
         "cascade.shot-plan/v1",
         "shot_plan",
         current_speaker_segments,
+    )
+
+
+@router.get("/{episode_id}/inspection/clip-boundaries")
+async def inspection_clip_boundaries(episode_id: str) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    episode = _read_json(episode_dir / "episode.json", {})
+    clips = _stored_clips(episode_dir)
+    return _boundary_evidence_with_inspection(
+        episode_id, episode_dir, episode, clips, load_config()
     )
 
 

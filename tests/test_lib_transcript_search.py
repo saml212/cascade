@@ -1,41 +1,162 @@
 """Tests for lib.transcript_search."""
 
-import pytest
-
 from lib.transcript_search import (
-    Word,
-    Match,
+    clip_boundary_evidence,
+    expand_to_sentence,
     flatten_transcript,
+    hybrid_search,
     search_exact,
     search_fuzzy,
-    hybrid_search,
-    expand_to_sentence,
 )
 
 
-def _make_diarized(text: str, speaker: int = 0, start: float = 0.0, word_dur: float = 0.3) -> dict:
+def test_clip_boundary_evidence_is_strict_confident_and_revision_bound():
+    diarized = {
+        "utterances": [
+            {
+                "speaker": 0,
+                "words": [
+                    {
+                        "word": "where",
+                        "punctuated_word": "where",
+                        "start": 9.8,
+                        "end": 10.1,
+                        "confidence": 0.98,
+                    },
+                    {
+                        "word": "one",
+                        "start": 19.7,
+                        "end": 20.0,
+                        "confidence": 0.99,
+                    },
+                    {
+                        "word": "and",
+                        "start": 19.955,
+                        "end": 20.2,
+                        "confidence": 0.91,
+                        "speaker": 1,
+                        "suspect": True,
+                        "alternatives": ["end"],
+                    },
+                    {
+                        "word": "uncertain",
+                        "start": 29.9,
+                        "end": 30.2,
+                        "confidence": 0.4,
+                    },
+                    {
+                        "word": "touch",
+                        "start": 39.9,
+                        "end": 40.006,
+                        "confidence": 0.99,
+                    },
+                    {
+                        "word": "discarded",
+                        "start": 39.8,
+                        "end": 40.2,
+                        "confidence": 0.95,
+                    },
+                    {
+                        "word": "exact",
+                        "start": 40.0,
+                        "end": 40.3,
+                        "confidence": 0.99,
+                    },
+                ],
+            }
+        ]
+    }
+    clips = [
+        {
+            "id": "clip_01",
+            "start_seconds": 10.0,
+            "end_seconds": 20.0,
+            "selection_status": "selected",
+        },
+        {
+            "id": "clip_02",
+            "start_seconds": 30.0,
+            "end_seconds": 40.0,
+            "selection_status": "rejected",
+        },
+    ]
+
+    evidence = clip_boundary_evidence(diarized, clips)
+
+    assert evidence["status"] == "review_required"
+    assert evidence["confidence_threshold"] == 0.8
+    assert evidence["timestamp_tolerance_seconds"] == 0.03
+    assert evidence["finding_count"] == 2
+    assert evidence["detail_finding_count"] == 3
+    first = evidence["clips"][0]
+    assert first["status"] == "review_required"
+    assert [finding["boundary"] for finding in first["findings"]] == [
+        "start",
+        "end",
+    ]
+    end_finding = first["findings"][1]
+    assert end_finding["word"] == {
+        "word": "and",
+        "punctuated_word": "and",
+        "start_seconds": 19.955,
+        "end_seconds": 20.2,
+        "confidence": 0.91,
+        "speaker": 1,
+        "utterance_index": 0,
+        "word_index": 2,
+        "suspect": True,
+        "alternatives": ["end"],
+    }
+    assert end_finding["overlapping_transcript_interval_count"] == 1
+    assert end_finding["overlapping_transcript_intervals"][0]["word"] == "one"
+    assert evidence["clips"][1]["finding_count"] == 1
+    assert evidence["clips"][1]["actionable"] is False
+    assert evidence["clips"][1]["low_confidence_straddle_count"] == 1
+    assert evidence["clips"][1]["timestamp_tolerance_suppressed_count"] == 1
+
+    changed = clip_boundary_evidence(
+        diarized,
+        [
+            {
+                "id": "clip_01",
+                "start_seconds": 10.0,
+                "end_seconds": 20.1,
+                "selection_status": "selected",
+            }
+        ],
+    )
+    assert changed["clips"][0]["clip_revision"] != first["clip_revision"]
+
+
+def _make_diarized(
+    text: str, speaker: int = 0, start: float = 0.0, word_dur: float = 0.3
+) -> dict:
     """Build a single-utterance diarized transcript from a sentence."""
     words_list = text.split()
     words = []
     t = start
     for w in words_list:
-        words.append({
-            "word": w,
-            "start": t,
-            "end": t + word_dur,
-            "speaker": speaker,
-            "confidence": 0.95,
-        })
+        words.append(
+            {
+                "word": w,
+                "start": t,
+                "end": t + word_dur,
+                "speaker": speaker,
+                "confidence": 0.95,
+            }
+        )
         t += word_dur + 0.05  # small gap between words
     return {
-        "utterances": [{
-            "speaker": speaker,
-            "start": start,
-            "end": t,
-            "text": text,
-            "confidence": 0.95,
-            "words": words,
-        }]
+        "utterances": [
+            {
+                "speaker": speaker,
+                "start": start,
+                "end": t,
+                "text": text,
+                "confidence": 0.95,
+                "words": words,
+            }
+        ]
     }
 
 
@@ -159,9 +280,9 @@ class TestSearchFuzzy:
 
 class TestHybridSearch:
     def test_exact_ranks_above_fuzzy(self):
-        words = flatten_transcript(_make_diarized(
-            "i love eating pizza on friday and pizza on saturday"
-        ))
+        words = flatten_transcript(
+            _make_diarized("i love eating pizza on friday and pizza on saturday")
+        )
         matches = hybrid_search("pizza on", words, max_results=5)
         assert len(matches) >= 1
         # Exact matches should be first
@@ -191,6 +312,6 @@ class TestExpandToSentence:
     def test_stops_at_utterance_boundary(self):
         words = flatten_transcript(_make_multi_utterance_diarized())
         matches = search_exact("you", words)
-        start, end = expand_to_sentence(matches[0], words, pad_seconds=0)
+        _start, end = expand_to_sentence(matches[0], words, pad_seconds=0)
         # Should not cross into utterance 1 (different speaker)
         assert end <= words[4].end + 0.001  # last word of utterance 0

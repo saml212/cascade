@@ -8,16 +8,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agents.base import BaseAgent
+from agents.transcribe import current_diarized_transcript
 from lib.audio_mix import current_audio_selection, selected_audio_source
 from lib.audio_qa import TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD, analyze_episode_audio
 from lib.audio_qa import release_gate as audio_release_gate
+from lib.clips import is_selected_clip
 from lib.delivery_video import (
     current_episode_longform_render,
     current_short_render,
     read_render_manifest,
 )
 from lib.ffprobe import probe as ffprobe
+from lib.media_inspection import file_revision
 from lib.timeline import Timeline
+from lib.transcript_search import clip_boundary_evidence
 
 QUALITY_SCHEMA = "cascade.release-quality/v1"
 QUALITY_REPORT_PATH = Path("qa/qa.json")
@@ -263,6 +267,38 @@ def clip_review_revision(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def current_clip_boundary_evidence(
+    episode_dir: str | Path,
+    episode: dict,
+    config: dict,
+    clips: list[dict],
+) -> dict:
+    """Return nonblocking clip-boundary evidence from the current transcript."""
+    episode_dir = Path(episode_dir)
+    unavailable = clip_boundary_evidence({}, clips)
+    try:
+        transcript = current_diarized_transcript(episode_dir, episode, config)
+        if transcript is None:
+            raise ValueError("Current source-clock transcript is unavailable")
+        transcript_revision = file_revision(episode_dir / "diarized_transcript.json")
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+        unavailable.update(
+            current=False,
+            status="unavailable",
+            transcript_revision=None,
+            detail=str(exc),
+        )
+        for clip in unavailable["clips"]:
+            clip.update(status="unavailable", transcript_revision=None)
+        return unavailable
+
+    evidence = clip_boundary_evidence(transcript, clips)
+    evidence.update(current=True, transcript_revision=transcript_revision)
+    for clip in evidence["clips"]:
+        clip["transcript_revision"] = transcript_revision
+    return evidence
 
 
 def _render_status(
@@ -547,6 +583,7 @@ def quality_snapshot(episode_dir: str | Path, *, include_findings: bool = True) 
             "generated_at": report.get("generated_at"),
             "overall": report.get("overall"),
             "checks": report.get("checks", []),
+            "skipped_checks": report.get("skipped_checks", []),
         },
         "release_gate": {
             "status": release_status,
@@ -636,6 +673,7 @@ class QAAgent(BaseAgent):
 
     def execute(self) -> dict:
         checks: list[dict] = []
+        skipped_checks: list[dict] = []
         warnings: list[dict] = []
         episode = self.load_json_safe("episode.json")
         release_video = self.episode_dir / "upload_video.mp4"
@@ -711,23 +749,27 @@ class QAAgent(BaseAgent):
 
         clips_data = self.load_json_safe("clips.json", {"clips": []})
         clips = clips_data.get("clips", [])
+        selected_clips = [clip for clip in clips if is_selected_clip(clip)]
         if clips:
             missing = [
                 clip["id"]
-                for clip in clips
+                for clip in selected_clips
                 if not (self.episode_dir / "shorts" / f"{clip['id']}.mp4").exists()
             ]
             checks.append(
                 {
                     "name": "all_shorts_rendered",
                     "pass": not missing,
-                    "detail": f"{len(clips) - len(missing)}/{len(clips)} rendered"
+                    "detail": (
+                        f"{len(selected_clips) - len(missing)}/"
+                        f"{len(selected_clips)} selected clips rendered"
+                    )
                     + (f", missing: {missing}" if missing else ""),
                 }
             )
             minimum = self.get_config("processing", "clip_min_seconds", default=30)
             maximum = self.get_config("processing", "clip_max_seconds", default=90)
-            for clip in clips:
+            for clip in selected_clips:
                 duration = clip.get("duration", 0)
                 if duration < minimum or duration > maximum:
                     warnings.append(
@@ -745,6 +787,31 @@ class QAAgent(BaseAgent):
                 }
             )
 
+        boundary_evidence = current_clip_boundary_evidence(
+            self.episode_dir, episode, self.config, clips
+        )
+        if boundary_evidence["status"] == "review_required":
+            for clip in boundary_evidence["clips"]:
+                if not clip["actionable"]:
+                    continue
+                warnings.append(
+                    {
+                        "name": f"clip_boundary_{clip['clip_id']}",
+                        "detail": (
+                            f"{clip['finding_count']} high-confidence transcript word "
+                            "interval(s) cross a clip boundary; inspect before approval"
+                        ),
+                        "evidence": clip,
+                    }
+                )
+        elif clips and boundary_evidence["status"] == "unavailable":
+            warnings.append(
+                {
+                    "name": "clip_boundary_evidence_unavailable",
+                    "detail": boundary_evidence["detail"],
+                }
+            )
+
         transcript = self.episode_dir / "subtitles" / "transcript.srt"
         checks.append(
             {
@@ -754,7 +821,7 @@ class QAAgent(BaseAgent):
             }
         )
         metadata = canonical_release_metadata(self.episode_dir, episode, clips)
-        metadata_issues = release_metadata_issues(metadata, clips, self.config)
+        metadata_issues = release_metadata_issues(metadata, selected_clips, self.config)
         metadata_valid = not metadata_issues
         checks.append(
             {
@@ -790,10 +857,16 @@ class QAAgent(BaseAgent):
                 ffmpeg_bin=self.get_config("tools", "ffmpeg", default=None),
             )
             gate = audio_release_gate(audio_report)
-            checks.append(
+            target = (
+                skipped_checks if gate.get("status") == "not_applicable" else checks
+            )
+            target.append(
                 {
                     "name": "audio_continuity",
-                    "pass": gate.get("status") == "pass",
+                    "status": gate.get("status", "unknown"),
+                    "pass": None
+                    if gate.get("status") == "not_applicable"
+                    else gate.get("status") == "pass",
                     "detail": gate.get("reason", "Audio continuity report unavailable"),
                 }
             )
@@ -815,10 +888,13 @@ class QAAgent(BaseAgent):
             "release_revision": release_revision(self.episode_dir, episode),
             "overall": "pass" if hard_pass else "fail",
             "checks": checks,
+            "skipped_checks": skipped_checks,
             "warnings": warnings,
             "hard_checks_passed": sum(1 for check in checks if check["pass"]),
             "hard_checks_total": len(checks),
+            "skipped_check_count": len(skipped_checks),
             "warning_count": len(warnings),
+            "clip_boundary_evidence": boundary_evidence,
             "audio_quality": audio_report,
         }
         self.save_json(QUALITY_REPORT_PATH, result)

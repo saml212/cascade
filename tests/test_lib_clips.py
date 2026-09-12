@@ -1,10 +1,23 @@
 """Tests for lib.clips module."""
 
 import json
-import pytest
-from pathlib import Path
 
-from lib.clips import normalize_clip, load_clips, save_clips
+from lib.clips import (
+    clip_selection_status,
+    is_selected_clip,
+    load_clips,
+    normalize_clip,
+    save_clips,
+)
+
+
+def test_clip_selection_status_requires_selection_and_rejection_wins():
+    assert clip_selection_status({"status": "pending"}) == "unselected"
+    assert clip_selection_status({"selection_status": "selected"}) == "selected"
+    assert clip_selection_status({"status": "approved"}) == "selected"
+    contradictory = {"selection_status": "selected", "status": "rejected"}
+    assert clip_selection_status(contradictory) == "rejected"
+    assert is_selected_clip(contradictory) is False
 
 
 class TestNormalizeClip:
@@ -39,7 +52,12 @@ class TestNormalizeClip:
         assert "start_seconds" not in result
 
     def test_preserves_other_fields(self):
-        clip = {"start_seconds": 10.0, "end_seconds": 20.0, "title": "My Clip", "score": 8}
+        clip = {
+            "start_seconds": 10.0,
+            "end_seconds": 20.0,
+            "title": "My Clip",
+            "score": 8,
+        }
         result = normalize_clip(clip)
         assert result["title"] == "My Clip"
         assert result["score"] == 8

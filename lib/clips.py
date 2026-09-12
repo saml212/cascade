@@ -6,6 +6,22 @@ from pathlib import Path
 from lib.atomic_write import atomic_write_json
 
 
+def clip_selection_status(clip: dict) -> str:
+    """Return the canonical editorial selection state for a clip."""
+    selection = clip.get("selection_status")
+    status = clip.get("status")
+    if selection == "rejected" or status == "rejected":
+        return "rejected"
+    if selection == "selected" or status == "approved":
+        return "selected"
+    return "unselected"
+
+
+def is_selected_clip(clip: dict) -> bool:
+    """Return whether a nonrejected clip is selected for release work."""
+    return clip_selection_status(clip) == "selected"
+
+
 def normalize_clip(clip: dict) -> dict:
     """Ensure clips have both start/end and start_seconds/end_seconds.
 
