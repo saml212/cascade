@@ -601,7 +601,7 @@ def test_transcript_correction_api_rejects_stale_revision_before_writing(
     assert not (episode_dir / "transcript_corrections.json").exists()
 
 
-def test_transcript_correction_api_restores_every_artifact_when_rebuild_fails(
+def test_transcript_correction_api_preserves_a_concurrent_transcript_generation(
     test_client, monkeypatch
 ):
     client, episodes_dir = test_client
@@ -614,12 +614,10 @@ def test_transcript_correction_api_restores_every_artifact_when_rebuild_fails(
         "subtitles/transcript.srt",
         "segments.json",
     )
-    original = {}
     for name in artifact_names:
         path = episode_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        original[name] = f"original {name}".encode()
-        path.write_bytes(original[name])
+        path.write_text(f"original {name}")
 
     from lib.media_inspection import file_revision
     from server.routes import review
@@ -646,8 +644,51 @@ def test_transcript_correction_api_restores_every_artifact_when_rebuild_fails(
     assert response.json()["detail"] == "invalid correction"
     assert not (episode_dir / "transcript_corrections.json").exists()
     assert raw_path.read_text() == "concurrent new raw generation"
-    for name, content in original.items():
-        assert (episode_dir / name).read_bytes() == content
+    for name in artifact_names:
+        assert (episode_dir / name).read_text() == f"changed {name}"
+
+
+def test_transcript_correction_api_restores_derived_artifacts_on_local_failure(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    (episode_dir / "transcript.json").write_text("unchanged raw")
+    artifact_names = (
+        "diarized_transcript.json",
+        "transcript_provenance.json",
+        "subtitles/transcript.srt",
+        "segments.json",
+    )
+    for name in artifact_names:
+        path = episode_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original {name}")
+
+    from lib.media_inspection import file_revision
+    from server.routes import review
+
+    expected_revision = file_revision(episode_dir / "diarized_transcript.json")
+    monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})
+
+    def fail_after_partial_writes(directory, _config):
+        for name in artifact_names:
+            (directory / name).write_text(f"changed {name}")
+        raise ValueError("invalid correction")
+
+    monkeypatch.setattr(review, "repair_existing_transcript", fail_after_partial_writes)
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/corrections",
+        json={
+            "expected_revision": expected_revision,
+            "operations": [{"id": "new", "op": "replace_word"}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert not (episode_dir / "transcript_corrections.json").exists()
+    for name in artifact_names:
+        assert (episode_dir / name).read_text() == f"original {name}"
 
 
 def test_transcript_correction_api_requires_unique_operation_ids(

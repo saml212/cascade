@@ -256,7 +256,22 @@ def _apply_transcript_corrections(
                     "Rebuilt speaker alignment did not pass currentness checks"
                 )
         except BaseException:
-            _restore_transcript_artifacts(snapshot)
+            try:
+                raw_changed = (
+                    file_revision(episode_dir / "transcript.json").removeprefix(
+                        "sha256:"
+                    )
+                    != corrections["raw_transcript_sha256"]
+                )
+            except OSError:
+                raw_changed = True
+            if raw_changed:
+                correction_path = episode_dir / "transcript_corrections.json"
+                _restore_transcript_artifacts(
+                    {correction_path: snapshot[correction_path]}
+                )
+            else:
+                _restore_transcript_artifacts(snapshot)
             raise
 
         return {
