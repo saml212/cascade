@@ -24,15 +24,20 @@ from lib.audio_mix import (
     current_audio_selection,
     json_fingerprint,
 )
+from lib.delivery_video import (
+    RENDER_PIPELINE_VERSION,
+    aac_content_timing_proof,
+)
 from lib.ffprobe import file_fingerprint, get_audio_stream, media_fingerprint
 from lib.ffprobe import probe as ffprobe
 
 REPORT_SCHEMA = "cascade.audio-quality/v1"
 OUTPUT_CONTINUITY_SCHEMA = "cascade.output-audio-continuity/v1"
+OUTPUT_SOURCE_MAPPING_SCHEMA = "cascade.output-audio-source-mapping/v1"
 AUDIO_FINDING_REVIEWS_PATH = Path("qa/audio-finding-reviews.json")
 AUDIO_FINDING_REVIEWS_SCHEMA = "cascade.audio-finding-reviews/v1"
 DETECTOR_VERSION = "1.2"
-OUTPUT_CONTINUITY_VERSION = "1"
+OUTPUT_CONTINUITY_VERSION = "2"
 PREVIEW_ALGORITHM_VERSION = "5"
 TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD = "sha256-audio-word-timing-speaker/v1"
 REPAIR_FADE_SECONDS = 0.08
@@ -463,6 +468,7 @@ def analyze_output_continuity(
                 "revision",
                 "status",
                 "detail",
+                "source_mapping",
             )
             if key in target
         }
@@ -493,6 +499,12 @@ def analyze_output_continuity(
             )
             artifacts.append(artifact)
             continue
+        try:
+            content_offset_seconds = _verified_content_offset_seconds(target, timeline)
+        except (TypeError, ValueError) as exc:
+            artifact.update(status="error", detail=str(exc), findings=[])
+            artifacts.append(artifact)
+            continue
         path = Path(target["path"])
         if target.get("scan_identity") != _scan_identity(path):
             artifact.update(
@@ -507,7 +519,7 @@ def analyze_output_continuity(
             expected_duration = (
                 timeline.source_duration
                 if target["clock"] == "source"
-                else timeline.duration
+                else timeline.duration + content_offset_seconds
             )
             if stats.duration + settings.duration_tolerance_seconds < expected_duration:
                 raise ValueError(
@@ -522,6 +534,7 @@ def analyze_output_continuity(
                 artifact_clock=target["clock"],
                 role=target["role"],
                 revision=target.get("revision"),
+                content_offset_seconds=content_offset_seconds,
                 config=settings,
             )
             if target.get("scan_identity") != _scan_identity(path):
@@ -612,15 +625,53 @@ def analyze_output_continuity(
 
 def _scan_identity(path: Path) -> dict | None:
     try:
-        stat = path.stat()
-    except OSError:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+    except (OSError, RuntimeError):
         return None
     return {
+        "resolved_path": str(resolved),
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
         "device": stat.st_dev,
         "inode": stat.st_ino,
     }
+
+
+def _verified_content_offset_seconds(target: dict, timeline: Any) -> float:
+    role = target.get("role")
+    if role not in {"upload_video", "short"}:
+        return 0.0
+    mapping = target.get("source_mapping")
+    if not isinstance(mapping, dict):
+        raise TypeError("Video audio source mapping proof is unavailable.")
+    expected_intervals = [list(item) for item in timeline.keep_intervals]
+    expected_timing = aac_content_timing_proof()
+    provenance = mapping.get("timing_provenance")
+    verified_stream = provenance.get("stream") if isinstance(provenance, dict) else None
+    if (
+        mapping.get("schema") != OUTPUT_SOURCE_MAPPING_SCHEMA
+        or mapping.get("pipeline_version") != RENDER_PIPELINE_VERSION
+        or mapping.get("source_intervals") != expected_intervals
+        or mapping.get("audio_codec") != "aac"
+        or mapping.get("audio_sample_rate_hz") != expected_timing["sample_rate_hz"]
+        or mapping.get("audio_timing") != expected_timing
+        or not isinstance(provenance, dict)
+        or provenance.get("method")
+        not in {"render-manifest/v1", "source-clock-v3-current-stream/v1"}
+        or provenance.get("media_identity") != target.get("scan_identity")
+        or verified_stream
+        != {
+            "codec_name": "aac",
+            "sample_rate_hz": expected_timing["sample_rate_hz"],
+            "start_pts": 0,
+            "time_base": "1/48000",
+            "initial_padding": 0,
+        }
+    ):
+        raise ValueError("Video audio source mapping proof is invalid or stale.")
+    return float(mapping["audio_timing"]["content_offset_seconds"])
 
 
 def analyze_output_windows(
@@ -632,18 +683,34 @@ def analyze_output_windows(
     artifact_clock: str,
     role: str,
     revision: str | None = None,
+    content_offset_seconds: float = 0.0,
     config: OutputContinuityConfig | None = None,
 ) -> list[dict]:
     """Return transcript-grounded spans where every output channel is quiet."""
     settings = config or OutputContinuityConfig(frame_seconds=stats.frame_seconds)
     if artifact_clock not in {"source", "output"}:
         raise ValueError(f"Unsupported artifact clock: {artifact_clock}")
+    if (
+        not math.isfinite(content_offset_seconds)
+        or content_offset_seconds < 0
+        or (artifact_clock == "source" and content_offset_seconds != 0)
+    ):
+        raise ValueError("Artifact content offset is invalid")
     if stats.rms_dbfs.ndim != 2 or stats.rms_dbfs.shape[1] != 2:
         raise ValueError("Output continuity statistics must contain two channels")
     if not (stats.rms_dbfs.shape == stats.peak.shape == stats.zero_fraction.shape):
         raise ValueError("Output continuity statistics have inconsistent shapes")
 
     projected = timeline.project(words, output_clock=artifact_clock == "output")
+    if content_offset_seconds:
+        projected = [
+            {
+                **word,
+                "start": word["start"] + content_offset_seconds,
+                "end": word["end"] + content_offset_seconds,
+            }
+            for word in projected
+        ]
     exact = np.max(stats.peak, axis=1) <= settings.exact_zero_peak
     near = np.max(stats.rms_dbfs, axis=1) <= settings.near_zero_dbfs
     findings = []
@@ -667,7 +734,11 @@ def analyze_output_windows(
             continue
 
         source_ranges = _artifact_source_ranges(
-            timeline, start_seconds, end_seconds, artifact_clock
+            timeline,
+            start_seconds,
+            end_seconds,
+            artifact_clock,
+            content_offset_seconds,
         )
         episode_output_ranges = _episode_output_ranges(episode_timeline, source_ranges)
         kind = "digital_zero" if bool(np.all(exact[start:end])) else "near_zero"
@@ -678,6 +749,7 @@ def analyze_output_windows(
             kind,
             round(start_seconds, 6),
             round(end_seconds, 6),
+            round(content_offset_seconds, 9),
         ]
         finding = {
             "id": "oc_"
@@ -745,7 +817,11 @@ def _interval_overlap_seconds(start: float, end: float, words: list[dict]) -> fl
 
 
 def _artifact_source_ranges(
-    timeline: Any, start: float, end: float, clock: str
+    timeline: Any,
+    start: float,
+    end: float,
+    clock: str,
+    content_offset_seconds: float = 0.0,
 ) -> list[dict]:
     if clock == "source":
         clipped_start = max(0.0, start)
@@ -756,6 +832,8 @@ def _artifact_source_ranges(
             else []
         )
     else:
+        start = max(0.0, start - content_offset_seconds)
+        end = min(timeline.duration, end - content_offset_seconds)
         ranges = []
         for span in timeline.spans:
             output_start = max(start, span.output_start)

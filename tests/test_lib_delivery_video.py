@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+import wave
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,8 +14,10 @@ import pytest
 
 from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.delivery_video import (
+    AAC_ENCODER_DELAY_SAMPLES,
     _audio_filter_graph,
     _short_render_fingerprint,
+    aac_content_timing_proof,
     build_keep_intervals,
     build_render_segments,
     concat_video_segments,
@@ -473,6 +476,7 @@ def test_mux_two_pass_normalizes_retained_timeline_and_records_final_proof(tmp_p
     assert commands[1][commands[1].index("-map") + 3] == "[mastered]"
     assert media["audio_loudness"]["verification"]["safe"] is True
     assert media["audio_mastering"]["method"] == "ffmpeg-loudnorm-two-pass/v1"
+    assert media["audio_timing"] == aac_content_timing_proof()
     assert output.read_bytes() == b"mastered"
 
 
@@ -802,6 +806,94 @@ def test_mux_preserves_fractional_frame_rate_video_tail(tmp_path):
     assert video_packet_signature(output) == before
     assert media["video_copy_verification"]["status"] == "pass"
     assert media["video_copy_verification"]["output"]["packet_count"] == 34
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_mux_records_native_aac_content_delay_across_an_edit(tmp_path):
+    sample_rate = 48_000
+    source_samples = np.random.default_rng(42).integers(
+        -12_000, 12_001, size=2 * sample_rate, dtype=np.int16
+    )
+    audio = tmp_path / "source.wav"
+    with wave.open(str(audio), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(source_samples.astype("<i2").tobytes())
+
+    video = tmp_path / "video.mp4"
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=96x54:rate=30:duration=1.3",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            video,
+        ],
+        check=True,
+    )
+    timeline = Timeline(2, [(0.2, 0.8), (1.2, 1.8)])
+    rendered = tmp_path / "rendered.mp4"
+
+    media = mux_timeline_audio(video, audio, rendered, timeline)
+    decoded = np.frombuffer(
+        subprocess.run(
+            [
+                ffmpeg_executable(),
+                "-v",
+                "error",
+                "-i",
+                rendered,
+                "-map",
+                "0:a:0",
+                "-f",
+                "f32le",
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                "-",
+            ],
+            capture_output=True,
+            check=True,
+        ).stdout,
+        dtype="<f4",
+    )
+    expected = (
+        np.concatenate(
+            (
+                source_samples[round(0.2 * sample_rate) : round(0.8 * sample_rate)],
+                source_samples[round(1.2 * sample_rate) : round(1.8 * sample_rate)],
+            )
+        ).astype(np.float32)
+        / 32768
+    )
+
+    comparison_length = expected.size - 2048
+    reference = expected[:comparison_length]
+    correlations = []
+    for lag in range(900, 1151):
+        observed = decoded[lag : lag + comparison_length]
+        correlations.append(
+            float(np.dot(reference, observed))
+            / float(np.linalg.norm(reference) * np.linalg.norm(observed))
+        )
+    best_lag = 900 + int(np.argmax(correlations))
+
+    assert best_lag == AAC_ENCODER_DELAY_SAMPLES
+    assert correlations[best_lag - 900] > 0.9
+    assert media["audio_timing"] == aac_content_timing_proof()
 
 
 def test_manifest_updates_survive_multiple_writer_processes(tmp_path):

@@ -42,6 +42,9 @@ from lib.timeline import (  # noqa: F401
 
 RENDER_MANIFEST_NAME = "render_manifest.json"
 RENDER_PIPELINE_VERSION = "source-clock/v3"
+AAC_CONTENT_TIMING_SCHEMA = "cascade.ffmpeg-aac-content-timing/v1"
+AAC_OUTPUT_SAMPLE_RATE = 48_000
+AAC_ENCODER_DELAY_SAMPLES = 1_024
 SHORTS_TWO_PERSON_STACK_VERSION = "two-person-stack/v1"
 ASPECT_CROP_FINGERPRINT_VERSION = "aspect-crop/v1"
 LONGFORM_TRIM_REUSE_VERSION = "verified-terminal-prefix/v1"
@@ -50,6 +53,17 @@ SCRATCH_RESERVE_BYTES = 10_000_000_000
 _manifest_lock = threading.Lock()
 _render_locks_guard = threading.Lock()
 _render_locks: dict[str, threading.Lock] = {}
+
+
+def aac_content_timing_proof() -> dict:
+    """Describe the content delay retained by the controlled delivery mux."""
+    return {
+        "schema": AAC_CONTENT_TIMING_SCHEMA,
+        "method": "ffmpeg-native-aac-use-editlist-0/v1",
+        "sample_rate_hz": AAC_OUTPUT_SAMPLE_RATE,
+        "content_offset_samples": AAC_ENCODER_DELAY_SAMPLES,
+        "content_offset_seconds": AAC_ENCODER_DELAY_SAMPLES / AAC_OUTPUT_SAMPLE_RATE,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -527,7 +541,7 @@ def mux_timeline_audio(
                 "-b:a",
                 audio_bitrate,
                 "-ar",
-                "48000",
+                str(AAC_OUTPUT_SAMPLE_RATE),
                 *([] if verify_video_copy else ["-shortest"]),
                 "-use_editlist",
                 "0",
@@ -540,6 +554,7 @@ def mux_timeline_audio(
             check=True,
         )
         media = validate_av_output(temp, timeline.duration)
+        media["audio_timing"] = aac_content_timing_proof()
         if loudness_policy is not None:
             media["audio_loudness"] = require_delivery_loudness(
                 measure_loudness(temp, ffmpeg_bin=ffmpeg_executable()), loudness_policy
@@ -573,7 +588,11 @@ def validate_av_output(path: Path, expected_duration: float) -> dict:
     )
     if video is None or audio is None:
         raise RuntimeError("Rendered media must contain video and audio")
-    if video.get("codec_name") != "h264" or audio.get("codec_name") != "aac":
+    if (
+        video.get("codec_name") != "h264"
+        or audio.get("codec_name") != "aac"
+        or str(audio.get("sample_rate")) != str(AAC_OUTPUT_SAMPLE_RATE)
+    ):
         raise RuntimeError("Rendered media codec validation failed")
 
     container_duration = float(result["format"]["duration"])
@@ -598,6 +617,7 @@ def validate_av_output(path: Path, expected_duration: float) -> dict:
         "height": int(video["height"]),
         "video_codec": "h264",
         "audio_codec": "aac",
+        "audio_sample_rate_hz": AAC_OUTPUT_SAMPLE_RATE,
     }
 
 

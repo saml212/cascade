@@ -1,20 +1,25 @@
 """Regression tests for transcript-grounded delivery audio continuity."""
 
+import os
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from agents.qa import (
     _output_continuity_targets,
+    _render_audio_mapping,
     clip_review_revision,
     quality_revision,
 )
 from lib.audio_qa import (
+    OUTPUT_SOURCE_MAPPING_SCHEMA,
     OutputContinuityConfig,
     WindowStats,
     analyze_output_continuity,
     analyze_output_windows,
 )
+from lib.delivery_video import RENDER_PIPELINE_VERSION, aac_content_timing_proof
 from lib.timeline import Timeline
 
 FRAME_SECONDS = 0.1
@@ -46,12 +51,54 @@ def _word(start, end, text="speech"):
 
 
 def _scan_identity(path):
-    stat = path.stat()
+    resolved = path.resolve(strict=True)
+    stat = resolved.stat()
     return {
+        "resolved_path": str(resolved),
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
         "device": stat.st_dev,
         "inode": stat.st_ino,
+    }
+
+
+def _video_source_mapping(timeline, path):
+    timing = aac_content_timing_proof()
+    identity = _scan_identity(path)
+    return {
+        "schema": OUTPUT_SOURCE_MAPPING_SCHEMA,
+        "pipeline_version": RENDER_PIPELINE_VERSION,
+        "source_intervals": [list(item) for item in timeline.keep_intervals],
+        "audio_codec": "aac",
+        "audio_sample_rate_hz": timing["sample_rate_hz"],
+        "audio_timing": timing,
+        "timing_provenance": {
+            "method": "render-manifest/v1",
+            "media_identity": identity,
+            "stream": {
+                "codec_name": "aac",
+                "sample_rate_hz": timing["sample_rate_hz"],
+                "start_pts": 0,
+                "time_base": "1/48000",
+                "initial_padding": 0,
+            },
+        },
+    }
+
+
+def _aac_probe_data(sample_rate="48000"):
+    return {
+        "streams": [
+            {
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "sample_rate": sample_rate,
+                "start_pts": 0,
+                "time_base": "1/48000",
+                "initial_padding": 0,
+            }
+        ]
     }
 
 
@@ -146,6 +193,103 @@ def test_edited_output_maps_silence_back_through_an_interior_cut():
     ]
 
 
+def test_encoded_video_uses_render_timeline_and_proven_content_offset(tmp_path):
+    path = tmp_path / "upload_video.mp4"
+    path.write_bytes(b"current")
+    editorial_timeline = Timeline(12, [(0, 4), (6, 12)])
+    render_timeline = Timeline(12, [(0.01, 3.99), (6.01, 12)])
+    frame_seconds = 0.01
+    frames = round(10 / frame_seconds)
+    rms = np.full((frames, 2), -20.0)
+    peak = np.full((frames, 2), 0.1)
+    zero = np.zeros((frames, 2))
+    stats = WindowStats(frame_seconds, rms, peak, zero)
+    first = round(4.21 / frame_seconds)
+    last = round(4.62 / frame_seconds)
+    stats.rms_dbfs[first:last, :] = -240
+    stats.peak[first:last, :] = 0
+    stats.zero_fraction[first:last, :] = 1
+    target = {
+        "role": "upload_video",
+        "path": str(path),
+        "clock": "output",
+        "required": True,
+        "revision": "sha256:current",
+        "status": "current",
+        "detail": "current",
+        "timeline": render_timeline,
+        "source_mapping": _video_source_mapping(render_timeline, path),
+        "scan_identity": _scan_identity(path),
+    }
+    settings = OutputContinuityConfig(
+        frame_seconds=frame_seconds,
+        min_issue_seconds=0.3,
+        bridge_seconds=0,
+    )
+
+    with patch("lib.audio_qa.decode_audio_windows", return_value=stats):
+        report = analyze_output_continuity(
+            [target],
+            {"utterances": [{"speaker": "host", "words": [_word(6.22, 6.60)]}]},
+            episode_timeline=editorial_timeline,
+            transcript_fingerprint="sha256:transcript",
+            config=settings,
+        )
+
+    finding = report["findings"][0]
+    assert finding["artifact_time"] == {
+        "clock": "output",
+        "start_seconds": 4.21,
+        "end_seconds": 4.62,
+        "duration_seconds": 0.41,
+    }
+    assert finding["source_ranges"][0]["start_seconds"] == pytest.approx(6.218667)
+    assert finding["source_ranges"][0]["end_seconds"] == pytest.approx(6.628667)
+    assert finding["episode_output_ranges"][0]["start_seconds"] == pytest.approx(
+        4.218667
+    )
+    assert finding["episode_output_ranges"][0]["end_seconds"] == pytest.approx(4.628667)
+
+
+@pytest.mark.parametrize("proof_state", ["missing", "stale"])
+def test_current_video_without_exact_source_mapping_proof_fails_closed(
+    tmp_path, proof_state
+):
+    path = tmp_path / "upload_video.mp4"
+    path.write_bytes(b"current")
+    timeline = Timeline.from_edits(10, [])
+    target = {
+        "role": "upload_video",
+        "path": str(path),
+        "clock": "output",
+        "required": True,
+        "revision": "sha256:current",
+        "status": "current",
+        "detail": "current",
+        "timeline": timeline,
+        "scan_identity": _scan_identity(path),
+    }
+    if proof_state == "stale":
+        target["source_mapping"] = {
+            **_video_source_mapping(timeline, path),
+            "source_intervals": [[0, 9]],
+        }
+
+    with patch("lib.audio_qa.decode_audio_windows") as decode:
+        report = analyze_output_continuity(
+            [target],
+            {"utterances": [{"speaker": "host", "words": [_word(1, 2)]}]},
+            episode_timeline=timeline,
+            transcript_fingerprint="sha256:transcript",
+            config=SETTINGS,
+        )
+
+    assert report["status"] == "error"
+    assert report["safe"] is False
+    assert "source mapping proof" in report["artifacts"][0]["detail"]
+    decode.assert_not_called()
+
+
 def test_short_output_uses_clip_local_clock_and_global_episode_mapping():
     episode_timeline = Timeline.from_edits(
         12, [{"type": "cut", "start_seconds": 4.0, "end_seconds": 6.0}]
@@ -212,6 +356,7 @@ def test_truncated_current_artifact_cannot_pass(tmp_path):
         "status": "current",
         "detail": "current",
         "timeline": timeline,
+        "source_mapping": _video_source_mapping(timeline, path),
         "scan_identity": _scan_identity(path),
     }
 
@@ -256,6 +401,7 @@ def test_unknown_required_currentness_status_fails_closed(tmp_path):
 def test_artifact_replaced_during_decode_is_not_certified(tmp_path):
     path = tmp_path / "upload_video.mp4"
     path.write_bytes(b"before")
+    original_stat = path.stat()
     timeline = Timeline.from_edits(10, [])
     target = {
         "role": "upload_video",
@@ -266,11 +412,18 @@ def test_artifact_replaced_during_decode_is_not_certified(tmp_path):
         "status": "current",
         "detail": "current",
         "timeline": timeline,
+        "source_mapping": _video_source_mapping(timeline, path),
         "scan_identity": _scan_identity(path),
     }
 
     def replace_artifact(*args, **kwargs):
-        path.write_bytes(b"replacement is longer")
+        replacement = tmp_path / "replacement.mp4"
+        replacement.write_bytes(b"after!")
+        os.utime(
+            replacement,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        replacement.replace(path)
         return _stats(duration=10)
 
     with patch("lib.audio_qa.decode_audio_windows", side_effect=replace_artifact):
@@ -284,6 +437,37 @@ def test_artifact_replaced_during_decode_is_not_certified(tmp_path):
 
     assert report["status"] == "error"
     assert "changed while" in report["artifacts"][0]["detail"]
+
+
+def test_legacy_video_mapping_rejects_symlink_retarget_during_probe(tmp_path):
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    logical = tmp_path / "upload_video.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"other")
+    logical.symlink_to(first)
+    stat = logical.stat()
+    record = {
+        "pipeline_version": RENDER_PIPELINE_VERSION,
+        "keep_intervals": [[0, 10]],
+        "output_duration_seconds": 10,
+        "output": {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "audio_codec": "aac",
+        },
+    }
+
+    def retarget(_path):
+        logical.unlink()
+        logical.symlink_to(second)
+        return _aac_probe_data()
+
+    with (
+        patch("agents.qa.ffprobe", side_effect=retarget),
+        pytest.raises(ValueError, match="timing evidence"),
+    ):
+        _render_audio_mapping(logical, record, "keep_intervals", 10)
 
 
 def test_target_resolution_uses_current_selected_repair_not_base_mix(tmp_path):
@@ -320,6 +504,135 @@ def test_target_resolution_uses_current_selected_repair_not_base_mix(tmp_path):
     assert master["status"] == "current"
     assert master["path"] == str(selected.resolve())
     assert master["path"] != str(base.resolve())
+
+
+def test_video_targets_use_exact_manifest_source_intervals(tmp_path):
+    episode_dir = tmp_path / "episode"
+    (episode_dir / "work").mkdir(parents=True)
+    (episode_dir / "shorts").mkdir()
+    selected = episode_dir / "work" / "audio_repair_selected.wav"
+    upload = episode_dir / "upload_video.mp4"
+    short = episode_dir / "shorts" / "clip_01.mp4"
+    selected.write_bytes(b"selected")
+    upload.write_bytes(b"longform")
+    short.write_bytes(b"short")
+    selected_stat = selected.stat()
+    selection = {
+        "fingerprint": "sha256:selection",
+        "selected_output": {
+            "path": str(selected),
+            "fingerprint": {
+                "size_bytes": selected_stat.st_size,
+                "mtime_ns": selected_stat.st_mtime_ns,
+            },
+        },
+    }
+    timing = aac_content_timing_proof()
+
+    def record(path, field, intervals, *, include_timing):
+        stat = path.stat()
+        render_timeline = Timeline(12, intervals)
+        output = {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "audio_codec": "aac",
+        }
+        if include_timing:
+            output.update(
+                audio_sample_rate_hz=timing["sample_rate_hz"],
+                audio_timing=timing,
+            )
+        return {
+            "pipeline_version": RENDER_PIPELINE_VERSION,
+            field: intervals,
+            "output_duration_seconds": round(render_timeline.duration, 3),
+            "output": output,
+        }
+
+    longform_intervals = [[0.01, 3.99], [6.01, 12]]
+    short_intervals = [[6.21, 7.19]]
+    longform = record(
+        upload, "keep_intervals", longform_intervals, include_timing=False
+    )
+    short_record = record(
+        short, "clip_source_intervals", short_intervals, include_timing=True
+    )
+    editorial = Timeline(12, [(0, 4), (6, 12)])
+    clips = [
+        {
+            "id": "clip_01",
+            "start_seconds": 6.2,
+            "end_seconds": 7.2,
+            "selection_status": "selected",
+        }
+    ]
+
+    with (
+        patch("agents.qa.current_audio_selection", return_value=selection),
+        patch(
+            "agents.qa._render_status",
+            return_value=(longform, {"clip_01": short_record}),
+        ),
+        patch("agents.qa.ffprobe", return_value=_aac_probe_data()),
+    ):
+        targets = _output_continuity_targets(
+            episode_dir, {}, clips, {"platforms": {}}, editorial
+        )
+
+    upload_target = next(item for item in targets if item["role"] == "upload_video")
+    short_target = next(item for item in targets if item["role"] == "short")
+    assert upload_target["status"] == "current"
+    assert list(upload_target["timeline"].keep_intervals) == [
+        tuple(item) for item in longform_intervals
+    ]
+    assert upload_target["source_mapping"]["audio_timing"] == timing
+    assert (
+        upload_target["source_mapping"]["timing_provenance"]["method"]
+        == "source-clock-v3-current-stream/v1"
+    )
+    assert short_target["status"] == "current"
+    assert list(short_target["timeline"].keep_intervals) == [
+        tuple(item) for item in short_intervals
+    ]
+    assert (
+        short_target["source_mapping"]["timing_provenance"]["method"]
+        == "render-manifest/v1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("record_changes", "output_changes", "stream_rate"),
+    [
+        ({"pipeline_version": "source-clock/v2"}, {}, "48000"),
+        ({"output_duration_seconds": 9}, {}, "48000"),
+        ({}, {"size_bytes": 999}, "48000"),
+        ({}, {}, "44100"),
+    ],
+)
+def test_legacy_video_mapping_rejects_unknown_or_stale_evidence(
+    tmp_path, record_changes, output_changes, stream_rate
+):
+    path = tmp_path / "upload_video.mp4"
+    path.write_bytes(b"current")
+    stat = path.stat()
+    record = {
+        "pipeline_version": RENDER_PIPELINE_VERSION,
+        "keep_intervals": [[0, 10]],
+        "output_duration_seconds": 10,
+        "output": {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "audio_codec": "aac",
+            **output_changes,
+        },
+        **record_changes,
+    }
+
+    with (
+        patch("agents.qa.ffprobe", return_value=_aac_probe_data(stream_rate)),
+        pytest.raises(ValueError, match="Video render"),
+    ):
+        _render_audio_mapping(path, record, "keep_intervals", 10)
 
 
 def test_quality_revision_binds_transcript_mp3_and_render_output(tmp_path):

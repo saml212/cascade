@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from lib.audio_qa import (
     AUDIO_FINDING_REVIEWS_PATH,
     OUTPUT_CONTINUITY_SCHEMA,
     OUTPUT_CONTINUITY_VERSION,
+    OUTPUT_SOURCE_MAPPING_SCHEMA,
     TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD,
     analyze_episode_audio,
     analyze_output_continuity,
@@ -33,11 +35,13 @@ from lib.audio_qa import (
 from lib.audio_qa import release_gate as audio_release_gate
 from lib.clips import is_selected_clip
 from lib.delivery_video import (
+    RENDER_PIPELINE_VERSION,
+    aac_content_timing_proof,
     current_episode_longform_render,
     current_short_render,
     read_render_manifest,
 )
-from lib.ffprobe import file_fingerprint
+from lib.ffprobe import file_fingerprint, get_audio_stream
 from lib.ffprobe import probe as ffprobe
 from lib.timeline import Timeline
 from lib.transcript_search import clip_boundary_evidence
@@ -524,6 +528,107 @@ def _render_status(
         return None, {}
 
 
+def _continuity_scan_identity(path: Path) -> dict:
+    resolved = path.resolve(strict=True)
+    stat = resolved.stat()
+    return {
+        "resolved_path": str(resolved),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+
+
+def _verified_render_audio_stream(path: Path, output: dict) -> tuple[dict, dict]:
+    """Probe one stat-bound render without trusting a symlink or file race."""
+    try:
+        resolved = path.resolve(strict=True)
+        before = _continuity_scan_identity(resolved)
+        if (
+            output.get("size_bytes") != before["size_bytes"]
+            or output.get("mtime_ns") != before["mtime_ns"]
+        ):
+            raise ValueError("Video render changed after its manifest was recorded.")
+        audio = get_audio_stream(ffprobe(resolved))
+        after = _continuity_scan_identity(resolved)
+        if (
+            path.resolve(strict=True) != resolved
+            or after != before
+            or audio.get("codec_name") != "aac"
+            or str(audio.get("sample_rate")) != "48000"
+            or int(audio.get("start_pts", -1)) != 0
+            or str(audio.get("time_base")) != "1/48000"
+            or int(audio.get("initial_padding", -1)) != 0
+        ):
+            raise ValueError("Video render AAC timing evidence is invalid or stale.")
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("Video render"):
+            raise
+        raise ValueError("Video render AAC timing evidence is unavailable.") from exc
+    return audio, before
+
+
+def _render_audio_mapping(
+    path: Path, record: dict, interval_field: str, source_duration: float
+) -> tuple[Timeline, dict]:
+    output = record.get("output") or {}
+    timing = output.get("audio_timing")
+    expected_timing = aac_content_timing_proof()
+    if record.get("pipeline_version") != RENDER_PIPELINE_VERSION:
+        raise ValueError("Video render has no current audio timing proof.")
+    try:
+        timeline = Timeline(source_duration, record[interval_field])
+        recorded_duration = float(record["output_duration_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Video render source mapping is unavailable.") from exc
+    if not math.isclose(recorded_duration, timeline.duration, abs_tol=0.001):
+        raise ValueError("Video render source mapping is stale.")
+    if output.get("audio_codec") != "aac":
+        raise ValueError("Video render has no current audio timing proof.")
+    audio, media_identity = _verified_render_audio_stream(path, output)
+    if (
+        output.get("audio_sample_rate_hz") == expected_timing["sample_rate_hz"]
+        and timing == expected_timing
+    ):
+        proof_method = "render-manifest/v1"
+    elif "audio_sample_rate_hz" not in output and "audio_timing" not in output:
+        # source-clock/v3 introduced this exact native-AAC/-use_editlist 0 mux.
+        # Its older records omitted timing metadata, so bind the compatibility
+        # proof to the current manifest, file identity, and actual AAC stream.
+        timing = expected_timing
+        proof_method = "source-clock-v3-current-stream/v1"
+    else:
+        raise ValueError("Video render has no current audio timing proof.")
+    return timeline, {
+        "schema": OUTPUT_SOURCE_MAPPING_SCHEMA,
+        "pipeline_version": RENDER_PIPELINE_VERSION,
+        "source_intervals": [list(item) for item in timeline.keep_intervals],
+        "audio_codec": "aac",
+        "audio_sample_rate_hz": expected_timing["sample_rate_hz"],
+        "audio_timing": timing,
+        "timing_provenance": {
+            "method": proof_method,
+            "media_identity": media_identity,
+            "stream": {
+                "codec_name": audio["codec_name"],
+                "sample_rate_hz": int(audio["sample_rate"]),
+                "start_pts": int(audio["start_pts"]),
+                "time_base": audio["time_base"],
+                "initial_padding": int(audio["initial_padding"]),
+            },
+        },
+    }
+
+
 def _continuity_target(
     path: Path,
     *,
@@ -535,44 +640,35 @@ def _continuity_target(
     stale_detail: str,
     clip_id: str | None = None,
 ) -> dict:
-    signature = _file_signature(path)
     target = {
         "role": role,
-        "path": str(path.resolve()),
+        "path": str(path.absolute()),
         "clock": clock,
         "required": True,
         "timeline": timeline,
     }
     if clip_id is not None:
         target["clip_id"] = clip_id
-    if signature is None or signature["size_bytes"] <= 0:
+    try:
+        scan_identity = _continuity_scan_identity(path)
+    except (OSError, RuntimeError):
         target.update(status="missing", detail=f"{path.name} is missing.")
         return target
-    try:
-        stat = path.stat()
-    except OSError:
-        target.update(
-            status="stale",
-            detail="Artifact changed while its currentness proof was resolved.",
-        )
+    if scan_identity["size_bytes"] <= 0 or not path.is_file():
+        target.update(status="missing", detail=f"{path.name} is missing.")
         return target
-    target["scan_identity"] = {
-        "size_bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "device": stat.st_dev,
-        "inode": stat.st_ino,
-    }
+    target["scan_identity"] = scan_identity
     recorded_output = proof.get("output") if isinstance(proof, dict) else None
     if isinstance(proof, dict) and "selected_output" in proof:
         recorded_output = (proof.get("selected_output") or {}).get("fingerprint")
     if isinstance(recorded_output, dict) and (
-        recorded_output.get("size_bytes") != stat.st_size
-        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
+        recorded_output.get("size_bytes") != scan_identity["size_bytes"]
+        or recorded_output.get("mtime_ns") != scan_identity["mtime_ns"]
     ):
         current = False
         stale_detail = "Artifact changed after its currentness proof was recorded."
     target["revision"] = _private_identity(
-        "output-continuity-artifact", {"file": signature, "proof": proof}
+        "output-continuity-artifact", {"file": scan_identity, "proof": proof}
     )
     target.update(
         status="current" if current else "stale",
@@ -636,17 +732,34 @@ def _output_continuity_targets(
         if master_ready
         else (None, {})
     )
-    targets.append(
-        _continuity_target(
-            episode_dir / "upload_video.mp4",
-            role="upload_video",
-            clock="output",
-            timeline=timeline,
-            current=longform_record is not None,
-            proof=longform_record,
-            stale_detail="Canonical upload video is stale for current release inputs.",
-        )
+    longform_timeline = timeline
+    longform_mapping = None
+    longform_mapping_error = None
+    if longform_record is not None:
+        try:
+            longform_timeline, longform_mapping = _render_audio_mapping(
+                episode_dir / "upload_video.mp4",
+                longform_record,
+                "keep_intervals",
+                timeline.source_duration,
+            )
+        except ValueError as exc:
+            longform_mapping_error = str(exc)
+    upload_target = _continuity_target(
+        episode_dir / "upload_video.mp4",
+        role="upload_video",
+        clock="output",
+        timeline=longform_timeline,
+        current=longform_record is not None and longform_mapping_error is None,
+        proof=longform_record,
+        stale_detail=longform_mapping_error
+        or "Canonical upload video is stale for current release inputs.",
     )
+    if longform_mapping is not None:
+        upload_target["source_mapping"] = longform_mapping
+    if longform_mapping_error is not None and upload_target["status"] != "missing":
+        upload_target["status"] = "unavailable"
+    targets.append(upload_target)
 
     for clip in selected_clips:
         clip_id = str(clip["id"])
@@ -669,18 +782,34 @@ def _output_continuity_targets(
             )
             continue
         short_record = short_records.get(clip_id)
-        targets.append(
-            _continuity_target(
-                episode_dir / "shorts" / f"{clip_id}.mp4",
-                role="short",
-                clip_id=clip_id,
-                clock="output",
-                timeline=clip_timeline,
-                current=short_record is not None,
-                proof=short_record,
-                stale_detail="Selected short is stale for current release inputs.",
-            )
+        short_mapping = None
+        short_mapping_error = None
+        if short_record is not None:
+            try:
+                clip_timeline, short_mapping = _render_audio_mapping(
+                    episode_dir / "shorts" / f"{clip_id}.mp4",
+                    short_record,
+                    "clip_source_intervals",
+                    timeline.source_duration,
+                )
+            except ValueError as exc:
+                short_mapping_error = str(exc)
+        short_target = _continuity_target(
+            episode_dir / "shorts" / f"{clip_id}.mp4",
+            role="short",
+            clip_id=clip_id,
+            clock="output",
+            timeline=clip_timeline,
+            current=short_record is not None and short_mapping_error is None,
+            proof=short_record,
+            stale_detail=short_mapping_error
+            or "Selected short is stale for current release inputs.",
         )
+        if short_mapping is not None:
+            short_target["source_mapping"] = short_mapping
+        if short_mapping_error is not None and short_target["status"] != "missing":
+            short_target["status"] = "unavailable"
+        targets.append(short_target)
 
     podcast_path = episode_dir / "podcast_audio.mp3"
     rss_enabled = (
