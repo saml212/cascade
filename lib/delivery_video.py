@@ -528,7 +528,7 @@ def mux_timeline_audio(
                 audio_bitrate,
                 "-ar",
                 "48000",
-                "-shortest",
+                *([] if verify_video_copy else ["-shortest"]),
                 "-use_editlist",
                 "0",
                 "-movflags",

@@ -742,6 +742,68 @@ def test_mux_normalizes_aac_and_copies_video_packets(tmp_path):
     assert media["audio_loudness"]["true_peak_dbfs"] <= -1
 
 
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_mux_preserves_fractional_frame_rate_video_tail(tmp_path):
+    video = tmp_path / "fractional-video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "output.mp4"
+    duration = 1.11
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=96x54:rate=30000/1001:duration={duration}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-bf",
+            "0",
+            "-g",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            video,
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:a",
+            "pcm_s16le",
+            audio,
+        ],
+        check=True,
+    )
+
+    before = video_packet_signature(video)
+    media = mux_timeline_audio(
+        video,
+        audio,
+        output,
+        Timeline.from_edits(duration),
+        verify_video_copy=True,
+    )
+
+    assert video_packet_signature(output) == before
+    assert media["video_copy_verification"]["status"] == "pass"
+    assert media["video_copy_verification"]["output"]["packet_count"] == 34
+
+
 def test_manifest_updates_survive_multiple_writer_processes(tmp_path):
     (tmp_path / "shorts").mkdir()
     clip_ids = [f"clip_{index:02d}" for index in range(8)]
