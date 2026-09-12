@@ -9,18 +9,56 @@ The `_build_feed_xml` method is called directly with hand-built episode
 dicts so the test is hermetic.
 """
 
+import json
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agents.podcast_feed import PodcastFeedAgent
+from agents.podcast_feed import (
+    PodcastFeedAgent,
+    current_podcast_audio,
+    podcast_audio_input,
+    podcast_source_fingerprint,
+)
 
 # Namespaces used to query elements from the produced XML
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 ATOM = "http://www.w3.org/2005/Atom"
 NS = {"itunes": ITUNES, "atom": ATOM}
+
+
+def _publish_config():
+    return {
+        "platforms": {"podcast_rss": {"enabled": True}},
+        "podcast": {
+            "title": "The Local",
+            "description": "Bay Area conversations.",
+            "author": "Sam Larson",
+            "artwork_url": "https://media.example.invalid/artwork.jpg",
+            "link": "https://example.invalid",
+            "owner_email": "sam@example.invalid",
+            "r2": {
+                "bucket": "test-bucket",
+                "public_url": "https://media.example.invalid",
+            },
+        },
+    }
+
+
+def _prepare_current_audio(agent):
+    mix = agent.episode_dir / "work" / "audio_mix.wav"
+    mix.parent.mkdir(exist_ok=True)
+    mix.write_bytes(b"wav")
+
+    def finish_to_output(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"prepared mp3")
+        return MagicMock(returncode=0, stderr="")
+
+    with patch("agents.podcast_feed.subprocess.run", side_effect=finish_to_output):
+        return agent.prepare_local_audio()
 
 
 @pytest.fixture
@@ -292,8 +330,15 @@ class TestLocalAudioExport:
         assert cmd[-1].endswith(".tmp.mp3")
         assert result == output
         assert output.read_bytes() == b"mp3"
+        proof = json.loads(output.with_suffix(".fingerprint").read_text())
+        assert proof["source_fingerprint"] == podcast_source_fingerprint(
+            agent.episode_dir, {}, {}
+        )
 
     def test_current_export_is_reused(self, agent):
+        mix = agent.episode_dir / "work" / "audio_mix.wav"
+        mix.parent.mkdir()
+        mix.write_bytes(b"wav")
         video = agent.episode_dir / "longform.mp4"
         video.write_bytes(b"video")
         output = agent.episode_dir / "podcast_audio.mp3"
@@ -310,6 +355,9 @@ class TestLocalAudioExport:
         assert run.call_count == 1
 
     def test_saved_edits_are_applied_to_export(self, agent):
+        mix = agent.episode_dir / "work" / "audio_mix.wav"
+        mix.parent.mkdir()
+        mix.write_bytes(b"wav")
         video = agent.episode_dir / "longform.mp4"
         video.write_bytes(b"video")
         (agent.episode_dir / "episode.json").write_text(
@@ -345,3 +393,232 @@ class TestLocalAudioExport:
 
         assert output.read_bytes() == b"known-good"
         assert not output.with_name(output.name + ".tmp.mp3").exists()
+
+    def test_replaced_same_stat_output_is_reencoded(self, agent):
+        mix = agent.episode_dir / "work" / "audio_mix.wav"
+        mix.parent.mkdir()
+        mix.write_bytes(b"wav")
+        output = agent.episode_dir / "podcast_audio.mp3"
+
+        def finish_encode(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"good")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch(
+            "agents.podcast_feed.subprocess.run", side_effect=finish_encode
+        ) as run:
+            agent.prepare_local_audio(audio_path=output)
+            recorded = output.stat()
+            output.write_bytes(b"evil")
+            os.utime(output, ns=(recorded.st_atime_ns, recorded.st_mtime_ns))
+            assert current_podcast_audio(agent.episode_dir, {}, {}) is None
+            agent.prepare_local_audio(audio_path=output)
+
+        assert run.call_count == 2
+        assert output.read_bytes() == b"good"
+
+    def test_legacy_longform_is_never_an_audio_source(self, agent):
+        (agent.episode_dir / "longform.mp4").write_bytes(b"legacy")
+
+        assert podcast_audio_input(agent.episode_dir, {}, {}) is None
+        with pytest.raises(FileNotFoundError, match="selected/base audio"):
+            agent.prepare_local_audio()
+
+    def test_manifest_backed_canonical_video_is_edited_clock_fallback(self, agent):
+        video = agent.episode_dir / "upload_video.mp4"
+        video.write_bytes(b"canonical")
+        stat = video.stat()
+        (agent.episode_dir / "render_manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "clock": "source",
+                    "shorts": {},
+                    "longform": {
+                        "path": video.name,
+                        "render_mode": "speaker_cut",
+                        "fingerprint": "render-fingerprint",
+                        "output": {
+                            "size_bytes": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                        },
+                    },
+                }
+            )
+        )
+        (agent.episode_dir / "episode.json").write_text(
+            json.dumps({"longform_edits": [{"type": "trim_start", "seconds": 10}]})
+        )
+
+        def finish_encode(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"mp3")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch(
+            "agents.podcast_feed.subprocess.run", side_effect=finish_encode
+        ) as run:
+            agent.prepare_local_audio()
+
+        command = run.call_args.args[0]
+        assert str(video) in command
+        assert "-filter_complex" not in command
+        assert current_podcast_audio(agent.episode_dir, None, {}) is None
+        assert (
+            current_podcast_audio(agent.episode_dir, None, {}, release_gate_safe=True)
+            == agent.episode_dir / "podcast_audio.mp3"
+        )
+
+
+class TestPublishingGate:
+    def _agent(self, tmp_path, *, config=None, episode=None):
+        episode_dir = tmp_path / "episodes" / "ep_test"
+        episode_dir.mkdir(parents=True)
+        (episode_dir / "episode.json").write_text(
+            json.dumps(
+                episode
+                or {
+                    "episode_id": "ep_test",
+                    "title": "Episode title",
+                    "description": "Episode description",
+                    "created_at": "2026-09-11T00:00:00+00:00",
+                }
+            )
+        )
+        return PodcastFeedAgent(episode_dir, config or _publish_config())
+
+    def test_blocked_release_never_reaches_local_or_network_work(self, tmp_path):
+        agent = self._agent(tmp_path)
+        blocked = {
+            "release_gate": {
+                "safe": False,
+                "status": "approval_required",
+                "blockers": [{"message": "Approve this exact release revision."}],
+            }
+        }
+        with (
+            pytest.raises(RuntimeError, match="release gate blocked"),
+            patch("agents.podcast_feed.quality_snapshot", return_value=blocked) as gate,
+            patch("agents.podcast_feed.current_podcast_audio") as current_audio,
+            patch.object(agent, "_upload_file_to_r2") as upload_audio,
+            patch.object(agent, "_upload_to_r2") as upload_feed,
+        ):
+            agent.execute()
+
+        gate.assert_called_once_with(agent.episode_dir, config=agent.config)
+        current_audio.assert_not_called()
+        upload_audio.assert_not_called()
+        upload_feed.assert_not_called()
+        assert not (agent.episode_dir / "feed.xml").exists()
+
+    def test_disabled_rss_refuses_even_with_safe_release_snapshot(self, tmp_path):
+        config = _publish_config()
+        config["platforms"]["podcast_rss"]["enabled"] = False
+        agent = self._agent(tmp_path, config=config)
+        with (
+            pytest.raises(RuntimeError, match="podcast_rss.enabled"),
+            patch(
+                "agents.podcast_feed.quality_snapshot",
+                return_value={"release_gate": {"safe": True, "status": "ready"}},
+            ),
+            patch.object(agent, "_upload_file_to_r2") as upload_audio,
+            patch.object(agent, "_upload_to_r2") as upload_feed,
+        ):
+            agent.execute()
+
+        upload_audio.assert_not_called()
+        upload_feed.assert_not_called()
+
+    def test_stale_mp3_is_rejected_before_network(self, tmp_path):
+        agent = self._agent(tmp_path)
+        output = _prepare_current_audio(agent)
+        recorded = output.stat()
+        output.write_bytes(b"replaced mp3")
+        os.utime(output, ns=(recorded.st_atime_ns, recorded.st_mtime_ns))
+
+        with (
+            pytest.raises(RuntimeError, match="missing or stale"),
+            patch(
+                "agents.podcast_feed.quality_snapshot",
+                return_value={"release_gate": {"safe": True, "status": "ready"}},
+            ),
+            patch.object(agent, "_upload_file_to_r2") as upload_audio,
+            patch.object(agent, "_upload_to_r2") as upload_feed,
+        ):
+            agent.execute()
+
+        upload_audio.assert_not_called()
+        upload_feed.assert_not_called()
+
+    def test_metadata_and_config_are_validated_before_network(self, tmp_path):
+        config = _publish_config()
+        config["podcast"]["artwork_url"] = ""
+        agent = self._agent(tmp_path, config=config)
+        with (
+            pytest.raises(RuntimeError, match="artwork_url"),
+            patch(
+                "agents.podcast_feed.quality_snapshot",
+                return_value={"release_gate": {"safe": True, "status": "ready"}},
+            ),
+            patch.object(agent, "_upload_file_to_r2") as upload_audio,
+            patch.object(agent, "_upload_to_r2") as upload_feed,
+        ):
+            agent.execute()
+
+        upload_audio.assert_not_called()
+        upload_feed.assert_not_called()
+
+    def test_episode_copy_is_validated_before_audio_or_network(self, tmp_path):
+        agent = self._agent(
+            tmp_path,
+            episode={"episode_id": "ep_test", "title": "Episode", "description": ""},
+        )
+        with (
+            pytest.raises(
+                RuntimeError, match="Episode metadata is missing: description"
+            ),
+            patch(
+                "agents.podcast_feed.quality_snapshot",
+                return_value={"release_gate": {"safe": True, "status": "ready"}},
+            ),
+            patch("agents.podcast_feed.current_podcast_audio") as current_audio,
+            patch.object(agent, "_upload_file_to_r2") as upload_audio,
+            patch.object(agent, "_upload_to_r2") as upload_feed,
+        ):
+            agent.execute()
+
+        current_audio.assert_not_called()
+        upload_audio.assert_not_called()
+        upload_feed.assert_not_called()
+
+    def test_current_approved_audio_and_feed_upload_in_order(
+        self, tmp_path, monkeypatch
+    ):
+        agent = self._agent(tmp_path)
+        audio = _prepare_current_audio(agent)
+        monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+        monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+        events = []
+
+        def upload_audio(bucket, path, key, content_type):
+            assert path == audio
+            events.append(("audio", bucket, key, content_type))
+
+        def upload_feed(bucket, key, data, content_type):
+            assert b"Episode title" in data
+            events.append(("feed", bucket, key, content_type))
+
+        with (
+            patch(
+                "agents.podcast_feed.quality_snapshot",
+                return_value={"release_gate": {"safe": True, "status": "ready"}},
+            ),
+            patch.object(agent, "_get_duration", return_value=120.5),
+            patch.object(agent, "_collect_all_episodes", return_value=[]),
+            patch.object(agent, "_upload_file_to_r2", side_effect=upload_audio),
+            patch.object(agent, "_upload_to_r2", side_effect=upload_feed),
+        ):
+            result = agent.execute()
+
+        assert [event[0] for event in events] == ["audio", "feed"]
+        assert result["episode_id"] == "ep_test"
+        assert result["duration_seconds"] == 120

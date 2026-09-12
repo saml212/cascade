@@ -16,7 +16,12 @@ from pydantic import BaseModel
 
 from agents.longform_render import render_longform
 from agents.pipeline import load_config
-from agents.podcast_feed import PodcastFeedAgent
+from agents.podcast_feed import (
+    PODCAST_AUDIO_PROCESSING_KEYS,
+    PodcastFeedAgent,
+    current_podcast_audio,
+    podcast_source_fingerprint as _source_fingerprint,
+)
 from agents.qa import quality_snapshot
 from agents.speaker_cut import current_speaker_segments
 from agents.transcribe import current_diarized_transcript
@@ -93,59 +98,6 @@ def _file_stat(path: Path) -> dict:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-_DELIVERY_PROCESSING_KEYS = (
-    "audio_enhance",
-    "audio_enhance_mode",
-    "audio_target_lufs",
-    "audio_target_lra",
-    "audio_target_tp",
-    "audio_highpass_hz",
-    "audio_per_speaker_leveling",
-    "audio_per_speaker_dynaudnorm",
-    "audio_denoise_model",
-    "use_hardware_accel",
-)
-
-
-def _source_fingerprint(
-    episode_dir: Path, episode: dict, config: dict | None = None
-) -> str:
-    """Fingerprint metadata and existing media inputs that affect the mix."""
-    paths = [episode_dir / "source_merged.mp4"]
-    for track in episode.get("audio_tracks", []):
-        value = track.get("dest_path") or track.get("path")
-        if value:
-            paths.append(Path(value))
-    inputs = [
-        {"path": str(path.resolve()), **_file_stat(path)}
-        for path in sorted(set(paths))
-        if path.exists()
-    ]
-    payload = {
-        "episode": {
-            "audio_selection": audio_selection_settings(episode),
-            "audio_tracks": episode.get("audio_tracks"),
-            "duration_seconds": episode.get("duration_seconds"),
-            "longform_edits": episode.get("longform_edits"),
-            "source_properties": episode.get("source_properties"),
-        },
-        "inputs": inputs,
-    }
-    selected_audio = selected_audio_source(episode_dir, episode, config)
-    if selected_audio is not None:
-        payload["selected_audio"] = {
-            "path": str(selected_audio.resolve()),
-            **_file_stat(selected_audio),
-        }
-    if config is not None:
-        payload["processing"] = {
-            key: config.get("processing", {}).get(key)
-            for key in _DELIVERY_PROCESSING_KEYS
-        }
-    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
 def _legacy_source_fingerprint(
     episode_dir: Path, episode: dict, config: dict | None = None
 ) -> str:
@@ -177,7 +129,7 @@ def _legacy_source_fingerprint(
     if config is not None:
         payload["processing"] = {
             key: config.get("processing", {}).get(key)
-            for key in _DELIVERY_PROCESSING_KEYS
+            for key in PODCAST_AUDIO_PROCESSING_KEYS
         }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -309,25 +261,15 @@ def _refresh_status(episode_dir: Path) -> dict:
             }
             _write_status(episode_dir, status)
     elif status.get("status") == "ready":
-        audio_path = episode_dir / "podcast_audio.mp3"
         audio_input_error = None
         try:
-            selected_audio = selected_audio_source(episode_dir, episode, config)
             stored_fingerprint = status.get("source_fingerprint")
             current_fingerprint = _source_fingerprint(episode_dir, episode, config)
-            legacy_fingerprints = set()
-            if selected_audio is None:
-                legacy_fingerprints = {
-                    _source_fingerprint(episode_dir, episode),
-                    _legacy_source_fingerprint(episode_dir, episode, config),
-                    _legacy_source_fingerprint(episode_dir, episode),
-                }
-            if stored_fingerprint in legacy_fingerprints:
-                status["source_fingerprint"] = current_fingerprint
-                stored_fingerprint = current_fingerprint
-                _write_status(episode_dir, status)
+            audio_path = current_podcast_audio(
+                episode_dir, episode, config, verify_content=False
+            )
             stale = (
-                not audio_path.exists()
+                audio_path is None
                 or status.get("output_stat") != _file_stat(audio_path)
                 or stored_fingerprint != current_fingerprint
             )
@@ -427,6 +369,11 @@ def _prepare_delivery(episode_id: str) -> None:
         audio_path = PodcastFeedAgent(episode_dir, config).prepare_local_audio()
         if not audio_path.exists() or audio_path.stat().st_size == 0:
             raise RuntimeError("Podcast MP3 was not created")
+        if (
+            current_podcast_audio(episode_dir, episode, config, verify_content=False)
+            != audio_path
+        ):
+            raise RuntimeError("Podcast MP3 proof is missing or stale")
 
         agent = PodcastFeedAgent(episode_dir, config)
         duration = agent._get_duration(audio_path)

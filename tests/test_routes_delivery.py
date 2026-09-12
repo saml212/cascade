@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import json
+import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -79,9 +81,9 @@ def test_audio_source_fingerprint_tracks_selected_repair(delivery):
     selected.parent.mkdir()
     selected.write_bytes(b"reviewed repair")
 
-    with patch.object(mod, "selected_audio_source", return_value=None):
+    with patch("agents.podcast_feed.selected_audio_source", return_value=None):
         base_fingerprint = mod._source_fingerprint(episode_dir, episode, {})
-    with patch.object(mod, "selected_audio_source", return_value=selected):
+    with patch("agents.podcast_feed.selected_audio_source", return_value=selected):
         selected_fingerprint = mod._source_fingerprint(episode_dir, episode, {})
 
     assert selected_fingerprint != base_fingerprint
@@ -389,6 +391,7 @@ def test_worker_persists_verified_ready_status(delivery):
         ),
         patch.object(mod, "generate_audio_mix", return_value=mix),
         patch.object(mod, "PodcastFeedAgent", return_value=fake_agent),
+        patch.object(mod, "current_podcast_audio", return_value=mp3),
         patch.object(mod, "measure_loudness", return_value=metrics),
     ):
         mod._running.add("ep_test")
@@ -467,6 +470,7 @@ def test_worker_rejects_out_of_range_loudness(delivery):
         patch.object(mod, "load_config", return_value={}),
         patch.object(mod, "generate_audio_mix", return_value=mix),
         patch.object(mod, "PodcastFeedAgent", return_value=fake_agent),
+        patch.object(mod, "current_podcast_audio", return_value=mp3),
         patch.object(mod, "measure_loudness", return_value=metrics),
     ):
         mod._prepare_delivery("ep_test")
@@ -490,6 +494,7 @@ def test_worker_rejects_truncated_audio(delivery):
         patch.object(mod, "load_config", return_value={}),
         patch.object(mod, "generate_audio_mix", return_value=mix),
         patch.object(mod, "PodcastFeedAgent", return_value=fake_agent),
+        patch.object(mod, "current_podcast_audio", return_value=mp3),
         patch.object(mod, "measure_loudness", return_value={}),
     ):
         mod._prepare_delivery("ep_test")
@@ -516,20 +521,57 @@ def test_status_marks_interrupted_job_failed(delivery):
 def test_status_marks_changed_output_stale(delivery):
     client, mod, episodes_dir = delivery
     episode_dir = make_episode(episodes_dir)
+    mix = episode_dir / "work" / "audio_mix.wav"
+    mix.parent.mkdir()
+    mix.write_bytes(b"mix")
     audio = episode_dir / "podcast_audio.mp3"
-    audio.write_bytes(b"original")
     episode = json.loads((episode_dir / "episode.json").read_text())
+    config = mod.load_config()
+
+    def finish_audio(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"original")
+        return subprocess.CompletedProcess(command, 0, stderr="")
+
+    with patch("agents.podcast_feed.subprocess.run", side_effect=finish_audio):
+        mod.PodcastFeedAgent(episode_dir, config).prepare_local_audio()
     mod._write_status(
         episode_dir,
         {
             "status": "ready",
             "episode_id": "ep_test",
-            "source_fingerprint": mod._source_fingerprint(episode_dir, episode),
+            "source_fingerprint": mod._source_fingerprint(episode_dir, episode, config),
             "output_stat": mod._file_stat(audio),
         },
     )
     audio.write_bytes(b"changed output")
     response = client.get("/api/episodes/ep_test/delivery")
+    assert response.json()["status"] == "not_prepared"
+    assert response.json()["stale"] is True
+
+
+def test_status_marks_legacy_source_only_audio_proof_stale(delivery):
+    client, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    mix = episode_dir / "work" / "audio_mix.wav"
+    mix.parent.mkdir()
+    mix.write_bytes(b"mix")
+    audio = episode_dir / "podcast_audio.mp3"
+    audio.write_bytes(b"legacy output")
+    audio.with_suffix(".fingerprint").write_text("source-only-fingerprint")
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    config = mod.load_config()
+    mod._write_status(
+        episode_dir,
+        {
+            "status": "ready",
+            "source_fingerprint": mod._source_fingerprint(episode_dir, episode, config),
+            "output_stat": mod._file_stat(audio),
+        },
+    )
+
+    response = client.get("/api/episodes/ep_test/delivery")
+
+    assert response.status_code == 200
     assert response.json()["status"] == "not_prepared"
     assert response.json()["stale"] is True
 
@@ -551,9 +593,8 @@ def test_status_surfaces_stale_selected_repair(delivery):
         },
     )
 
-    with patch.object(
-        mod,
-        "selected_audio_source",
+    with patch(
+        "agents.podcast_feed.selected_audio_source",
         side_effect=ValueError("Selected repair audio has changed since review"),
     ):
         response = client.get("/api/episodes/ep_test/delivery")

@@ -1,7 +1,7 @@
 """Podcast feed agent — extract audio, generate RSS feed, upload to Cloudflare R2.
 
 Inputs:
-    - longform.mp4, episode.json
+    - selected/base audio or canonical upload_video.mp4, episode.json
 Outputs:
     - podcast_audio.mp3 (extracted audio)
     - feed.xml (RSS feed, also uploaded to R2)
@@ -26,73 +26,322 @@ from xml.dom import minidom
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from agents.base import BaseAgent
-from lib.audio_mix import selected_audio_source
+from agents.qa import canonical_release_metadata, quality_snapshot
+from lib.atomic_write import atomic_write_json
+from lib.audio_mix import audio_selection_settings, selected_audio_source
+from lib.delivery_video import read_render_manifest, render_artifact_state
+from lib.ffprobe import file_fingerprint
+
+PODCAST_AUDIO_PROOF_SCHEMA = "cascade.podcast-audio/v1"
+PODCAST_AUDIO_ENCODE_VERSION = 3
+PODCAST_AUDIO_PROCESSING_KEYS = (
+    "audio_enhance",
+    "audio_enhance_mode",
+    "audio_target_lufs",
+    "audio_target_lra",
+    "audio_target_tp",
+    "audio_highpass_hz",
+    "audio_per_speaker_leveling",
+    "audio_per_speaker_dynaudnorm",
+    "audio_denoise_model",
+    "use_hardware_accel",
+)
+
+
+def _file_identity(path: Path) -> dict:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _episode_data(episode_dir: Path, episode: dict | None) -> dict:
+    if episode is not None:
+        return episode
+    try:
+        return json.loads((episode_dir / "episode.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def podcast_source_fingerprint(
+    episode_dir: str | Path,
+    episode: dict,
+    config: dict | None = None,
+) -> str:
+    """Fingerprint every current input that can change prepared podcast audio."""
+    episode_dir = Path(episode_dir)
+    paths = [episode_dir / "source_merged.mp4"]
+    for track in episode.get("audio_tracks", []):
+        value = track.get("dest_path") or track.get("path")
+        if value:
+            paths.append(Path(value))
+    inputs = [_file_identity(path) for path in sorted(set(paths)) if path.exists()]
+    payload = {
+        "episode": {
+            "audio_selection": audio_selection_settings(episode),
+            "audio_tracks": episode.get("audio_tracks"),
+            "duration_seconds": episode.get("duration_seconds"),
+            "longform_edits": episode.get("longform_edits"),
+            "source_properties": episode.get("source_properties"),
+        },
+        "inputs": inputs,
+    }
+    selected_audio = selected_audio_source(episode_dir, episode, config)
+    if selected_audio is not None:
+        payload["selected_audio"] = _file_identity(selected_audio)
+    if config is not None:
+        payload["processing"] = {
+            key: config.get("processing", {}).get(key)
+            for key in PODCAST_AUDIO_PROCESSING_KEYS
+        }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def podcast_audio_input(
+    episode_dir: str | Path,
+    episode: dict | None = None,
+    config: dict | None = None,
+) -> dict | None:
+    """Resolve the only media sources allowed to produce the podcast MP3."""
+    episode_dir = Path(episode_dir)
+    episode = _episode_data(episode_dir, episode)
+    selected = selected_audio_source(episode_dir, episode, config)
+    if selected is not None:
+        return {"path": selected, "kind": "selected_repair", "clock": "source"}
+
+    base_mix = episode_dir / "work" / "audio_mix.wav"
+    if base_mix.is_file() and base_mix.stat().st_size > 0:
+        try:
+            mix_fingerprint = base_mix.with_suffix(".fingerprint").read_text().strip()
+        except OSError:
+            mix_fingerprint = None
+        return {
+            "path": base_mix,
+            "kind": "base_mix",
+            "clock": "source",
+            "mix_fingerprint": mix_fingerprint,
+        }
+
+    # A canonical render is an edited-clock fallback. A legacy longform.mp4 is
+    # deliberately excluded because it is not a release candidate.
+    video = episode_dir / "upload_video.mp4"
+    record = read_render_manifest(episode_dir).get("longform", {})
+    if record.get("path") != video.name:
+        return None
+    state = render_artifact_state(
+        episode_dir,
+        video,
+        record,
+        expected_fingerprint=record.get("fingerprint"),
+        expected_mode="speaker_cut",
+    )
+    if not state["current"]:
+        return None
+    return {
+        "path": video,
+        "kind": "canonical_longform",
+        "clock": "edited",
+        "render_fingerprint": record["fingerprint"],
+        "requires_release_gate": True,
+    }
+
+
+def podcast_audio_fingerprint(
+    episode_dir: str | Path,
+    episode: dict | None = None,
+    config: dict | None = None,
+    *,
+    input_record: dict | None = None,
+) -> str | None:
+    """Fingerprint the source, edit timeline, and fixed podcast encode policy."""
+    episode_dir = Path(episode_dir)
+    episode = _episode_data(episode_dir, episode)
+    input_record = input_record or podcast_audio_input(episode_dir, episode, config)
+    if input_record is None:
+        return None
+    path = Path(input_record["path"])
+    payload = {
+        "version": PODCAST_AUDIO_ENCODE_VERSION,
+        "source_fingerprint": podcast_source_fingerprint(episode_dir, episode, config),
+        "input": {
+            "kind": input_record["kind"],
+            "clock": input_record["clock"],
+            "identity": _file_identity(path),
+            "mix_fingerprint": input_record.get("mix_fingerprint"),
+            "render_fingerprint": input_record.get("render_fingerprint"),
+        },
+        "edits": (
+            episode.get("longform_edits", [])
+            if input_record["clock"] == "source"
+            else []
+        ),
+        "encoding": {"codec": "libmp3lame", "bitrate": "192k", "sample_rate": 48000},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def current_podcast_audio(
+    episode_dir: str | Path,
+    episode: dict | None = None,
+    config: dict | None = None,
+    audio_path: str | Path | None = None,
+    *,
+    release_gate_safe: bool = False,
+    verify_content: bool = True,
+) -> Path | None:
+    """Return an exact current MP3; video fallbacks also require a safe release gate."""
+    episode_dir = Path(episode_dir)
+    episode = _episode_data(episode_dir, episode)
+    audio_path = Path(audio_path or episode_dir / "podcast_audio.mp3")
+    input_record = podcast_audio_input(episode_dir, episode, config)
+    if (
+        input_record
+        and input_record.get("requires_release_gate")
+        and not release_gate_safe
+    ):
+        return None
+    expected = podcast_audio_fingerprint(
+        episode_dir, episode, config, input_record=input_record
+    )
+    if expected is None:
+        return None
+    try:
+        proof = json.loads(audio_path.with_suffix(".fingerprint").read_text())
+        recorded_output = proof["output"]
+        stat = audio_path.stat()
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError, TypeError):
+        return None
+    if (
+        proof.get("schema") != PODCAST_AUDIO_PROOF_SCHEMA
+        or proof.get("fingerprint") != expected
+        or Path(recorded_output.get("path", "")).resolve() != audio_path.resolve()
+        or recorded_output.get("size_bytes") != stat.st_size
+        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
+    ):
+        return None
+    if not verify_content:
+        return audio_path
+    try:
+        actual_output = file_fingerprint(audio_path)
+    except OSError:
+        return None
+    return audio_path if actual_output == recorded_output.get("fingerprint") else None
 
 
 class PodcastFeedAgent(BaseAgent):
     name = "podcast_feed"
 
-    def execute(self) -> dict:
-        podcast_cfg = self.config.get("podcast", {})
-        r2_cfg = podcast_cfg.get("r2", {})
-
-        # Load episode metadata
+    def _publication_inputs(self) -> dict:
+        """Validate the approved release and all RSS inputs before any upload."""
         episode = self.load_json("episode.json")
         episode_id = episode.get("episode_id", self.episode_dir.name)
-
-        # --- Step 1: Prepare upload-ready audio locally ---
-        longform_path = self.episode_dir / "longform.mp4"
-        audio_path = self.episode_dir / "podcast_audio.mp3"
-
-        if not longform_path.exists():
-            raise FileNotFoundError(
-                "longform.mp4 not found in episode directory: %s" % self.episode_dir
+        gate = quality_snapshot(self.episode_dir, config=self.config)["release_gate"]
+        if not gate.get("safe"):
+            reasons = "; ".join(
+                item.get("message", "")
+                for item in gate.get("blockers", [])
+                if item.get("message")
+            )
+            detail = f" — {reasons}" if reasons else ""
+            raise RuntimeError(
+                f"release gate blocked ({gate.get('status', 'unknown')}){detail}"
             )
 
-        audio_path = self.prepare_local_audio(longform_path, audio_path)
+        if (
+            self.config.get("platforms", {}).get("podcast_rss", {}).get("enabled")
+            is not True
+        ):
+            raise RuntimeError("platforms.podcast_rss.enabled is not true")
 
-        audio_size = audio_path.stat().st_size
-        audio_duration = self._get_duration(audio_path)
-        self.logger.info(
-            "Audio: %.1f MB, %d seconds" % (audio_size / 1e6, audio_duration)
-        )
-
-        # --- Step 2: Upload MP3 to R2 ---
-        self.logger.info("Uploading MP3 to Cloudflare R2...")
+        podcast_cfg = self.config.get("podcast", {})
+        r2_cfg = podcast_cfg.get("r2", {})
         bucket = r2_cfg.get("bucket", "")
         public_url = r2_cfg.get("public_url", "").rstrip("/")
-
         if not bucket:
             raise RuntimeError("podcast.r2.bucket not set in config.toml")
         if not public_url:
             raise RuntimeError("podcast.r2.public_url not set in config.toml")
 
-        audio_key = "audio/%s.mp3" % episode_id
-        self._upload_file_to_r2(
-            bucket, audio_path, audio_key, content_type="audio/mpeg"
-        )
-        audio_url = "%s/%s" % (public_url, audio_key)
-        self.logger.info("MP3 uploaded: %s" % audio_url)
+        missing_channel = [
+            field
+            for field in (
+                "title",
+                "description",
+                "author",
+                "artwork_url",
+                "link",
+                "owner_email",
+            )
+            if not podcast_cfg.get(field)
+        ]
+        if missing_channel:
+            raise RuntimeError(
+                "Podcast config is missing: {}".format(", ".join(missing_channel))
+            )
 
-        # --- Step 3: Build and upload RSS feed ---
+        metadata = canonical_release_metadata(self.episode_dir, episode, [])
+        longform_metadata = metadata.get("longform", {})
+        ep_title = longform_metadata.get("title")
+        ep_description = longform_metadata.get("description")
+        missing_episode = [
+            field
+            for field, value in (
+                ("title", ep_title),
+                ("description", ep_description),
+            )
+            if not value
+        ]
+        if missing_episode:
+            raise RuntimeError(
+                "Episode metadata is missing: {}".format(", ".join(missing_episode))
+            )
+        return {
+            "episode": episode,
+            "episode_id": episode_id,
+            "podcast": podcast_cfg,
+            "bucket": bucket,
+            "public_url": public_url,
+            "title": ep_title,
+            "description": ep_description,
+        }
+
+    def execute(self) -> dict:
+        inputs = self._publication_inputs()
+        episode = inputs["episode"]
+        episode_id = inputs["episode_id"]
+        podcast_cfg = inputs["podcast"]
+        bucket = inputs["bucket"]
+        public_url = inputs["public_url"]
+
+        audio_path = current_podcast_audio(
+            self.episode_dir, episode, self.config, release_gate_safe=True
+        )
+        if audio_path is None:
+            raise RuntimeError(
+                "Podcast MP3 is missing or stale. Prepare it with "
+                f"POST /api/episodes/{episode_id}/delivery/prepare before publishing."
+            )
+        audio_size = audio_path.stat().st_size
+        audio_duration = self._get_duration(audio_path)
+        self.logger.info("Audio: %.1f MB, %d seconds", audio_size / 1e6, audio_duration)
+
+        # Build and validate the complete feed before the first network mutation.
         self.logger.info("Building RSS feed with all episodes...")
         episodes_root = self.episode_dir.parent  # Parent dir contains all episodes
         all_episodes = self._collect_all_episodes(episodes_root, podcast_cfg)
-
-        # Require episode_name before publishing to RSS
-        ep_title = episode.get("episode_name", "") or episode.get("title", "")
-        if not ep_title:
-            raise RuntimeError(
-                "Episode name is required before publishing to podcast feed. "
-                "Set it in the UI or episode.json."
-            )
+        audio_key = f"audio/{episode_id}.mp3"
+        audio_url = f"{public_url}/{audio_key}"
 
         # Update/add the current episode's podcast data
         current_ep = {
             "episode_id": episode_id,
-            "title": ep_title,
-            "description": episode.get("episode_description", "")
-            or self._get_episode_description(episode),
+            "title": inputs["title"],
+            "description": inputs["description"],
             "audio_url": audio_url,
             "audio_size": audio_size,
             "duration_seconds": int(audio_duration),
@@ -114,23 +363,28 @@ class PodcastFeedAgent(BaseAgent):
         # Sort by pub_date descending (newest first)
         all_episodes.sort(key=lambda e: e.get("pub_date", ""), reverse=True)
 
-        feed_url = "%s/feed.xml" % public_url
+        feed_url = f"{public_url}/feed.xml"
         feed_xml = self._build_feed_xml(podcast_cfg, all_episodes, feed_url=feed_url)
+        self._require_r2_credentials()
 
         # Write feed locally for reference
         local_feed = self.episode_dir / "feed.xml"
         local_feed.write_text(feed_xml, encoding="utf-8")
 
-        # Upload feed.xml to R2
+        self.logger.info("Uploading MP3 to Cloudflare R2...")
+        self._upload_file_to_r2(
+            bucket, audio_path, audio_key, content_type="audio/mpeg"
+        )
+        self.logger.info(f"MP3 uploaded: {audio_url}")
+
         self._upload_to_r2(
             bucket,
             "feed.xml",
             feed_xml.encode("utf-8"),
             content_type="application/rss+xml; charset=utf-8",
         )
-        self.logger.info("Feed uploaded: %s" % feed_url)
+        self.logger.info(f"Feed uploaded: {feed_url}")
 
-        # --- Step 4: Save podcast_feed.json in episode directory ---
         result = {
             "audio_url": audio_url,
             "feed_url": feed_url,
@@ -147,48 +401,62 @@ class PodcastFeedAgent(BaseAgent):
     def prepare_local_audio(self, video_path=None, audio_path=None):
         """Create the upload-ready MP3 without uploading or changing the feed.
 
-        Prefer the lossless mastered mix so the podcast does not transcode the
-        AAC audio embedded in the video. The temporary output is atomically
-        renamed, so an interrupted ffmpeg run cannot leave a truncated MP3.
+        ``video_path`` remains accepted for old callers but is never used to
+        select legacy longform.mp4. Source resolution is selected repair, base
+        mix, then a manifest-backed canonical upload_video.mp4.
         """
-        video_path = Path(video_path or self.episode_dir / "longform.mp4")
         audio_path = Path(audio_path or self.episode_dir / "podcast_audio.mp3")
         episode = self.load_json_safe("episode.json")
-        mix_path = selected_audio_source(self.episode_dir, episode, self.config) or (
-            self.episode_dir / "work" / "audio_mix.wav"
-        )
-        source_path = mix_path if mix_path.exists() else video_path
-
-        if not source_path.exists():
+        input_record = podcast_audio_input(self.episode_dir, episode, self.config)
+        if input_record is None:
             raise FileNotFoundError(
-                "No podcast audio source found in %s" % self.episode_dir
+                "No selected/base audio or current canonical upload_video.mp4 found "
+                f"in {self.episode_dir}"
             )
-
-        edits = episode.get("longform_edits", [])
-        source_stat = source_path.stat()
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "source_size": source_stat.st_size,
-                    "source_mtime_ns": source_stat.st_mtime_ns,
-                    "edits": edits,
-                    "version": 2,
-                },
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
-        fingerprint_path = audio_path.with_suffix(".fingerprint")
-        try:
-            current_fingerprint = fingerprint_path.read_text().strip()
-        except OSError:
-            current_fingerprint = ""
-        if audio_path.exists() and current_fingerprint == fingerprint:
+        source_path = Path(input_record["path"])
+        fingerprint = podcast_audio_fingerprint(
+            self.episode_dir,
+            episode,
+            self.config,
+            input_record=input_record,
+        )
+        if (
+            current_podcast_audio(self.episode_dir, episode, self.config, audio_path)
+            is not None
+        ):
             self.logger.info("podcast_audio.mp3 is current, skipping export")
             return audio_path
 
-        self.logger.info("Encoding podcast MP3 from %s..." % source_path.name)
+        self.logger.info(f"Encoding podcast MP3 from {source_path.name}...")
+        edits = (
+            episode.get("longform_edits", [])
+            if input_record["clock"] == "source"
+            else []
+        )
         self._extract_audio(source_path, audio_path, edits=edits)
-        fingerprint_path.write_text(fingerprint)
+        output_fingerprint = file_fingerprint(audio_path)
+        atomic_write_json(
+            audio_path.with_suffix(".fingerprint"),
+            {
+                "schema": PODCAST_AUDIO_PROOF_SCHEMA,
+                "fingerprint": fingerprint,
+                "source_fingerprint": podcast_source_fingerprint(
+                    self.episode_dir, episode, self.config
+                ),
+                "source": {
+                    "kind": input_record["kind"],
+                    "clock": input_record["clock"],
+                    **_file_identity(source_path),
+                },
+                "output": {
+                    "path": str(audio_path.resolve()),
+                    "size_bytes": output_fingerprint["size_bytes"],
+                    "mtime_ns": output_fingerprint["mtime_ns"],
+                    "fingerprint": output_fingerprint,
+                },
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return audio_path
 
     def _extract_audio(self, video_path, audio_path, *, edits=None):
@@ -254,17 +522,9 @@ class PodcastFeedAgent(BaseAgent):
 
     # ---- Cloudflare R2 REST API helpers ----
 
-    def _upload_to_r2(self, bucket, key, data, content_type="application/octet-stream"):
-        # type: (str, str, bytes, str) -> None
-        """Upload bytes to Cloudflare R2 via the Cloudflare REST API.
-
-        Uses: PUT /client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{key}
-        """
-        import httpx
-
+    def _require_r2_credentials(self):
         account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
         api_token = os.getenv("CLOUDFLARE_API_TOKEN", "")
-
         if not account_id:
             raise RuntimeError("CLOUDFLARE_ACCOUNT_ID not set in .env")
         if not api_token:
@@ -273,6 +533,17 @@ class PodcastFeedAgent(BaseAgent):
                 "create one at https://dash.cloudflare.com/profile/api-tokens "
                 "with Account > R2 Storage > Edit permission"
             )
+        return account_id, api_token
+
+    def _upload_to_r2(self, bucket, key, data, content_type="application/octet-stream"):
+        # type: (str, str, bytes, str) -> None
+        """Upload bytes to Cloudflare R2 via the Cloudflare REST API.
+
+        Uses: PUT /client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{key}
+        """
+        import httpx
+
+        account_id, api_token = self._require_r2_credentials()
 
         url = (
             "https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s/objects/%s"

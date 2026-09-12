@@ -132,10 +132,18 @@ class TestListEpisodes:
         video.write_bytes(b"video")
         canonical.write_bytes(b"canonical")
         import server.routes.episodes as episodes_mod
+        from agents.podcast_feed import PodcastFeedAgent
         from server.routes.delivery import _source_fingerprint
 
         episode = json.loads((ep_dir / "episode.json").read_text())
         config = episodes_mod.load_config()
+
+        def finish_audio(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"audio")
+            return subprocess.CompletedProcess(command, 0, stderr="")
+
+        with patch("agents.podcast_feed.subprocess.run", side_effect=finish_audio):
+            PodcastFeedAgent(ep_dir, config).prepare_local_audio()
         (ep_dir / "delivery.json").write_text(
             json.dumps(
                 {

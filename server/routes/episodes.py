@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from agents.pipeline import load_config
+from agents.podcast_feed import current_podcast_audio
 from agents.qa import quality_snapshot
 from agents.speaker_cut import current_speaker_segments, rebind_visual_crop_segments
 from lib.atomic_write import atomic_write_json
@@ -31,7 +32,6 @@ from lib.crop import speaker_crop_state, visual_crop_state
 from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
 from lib.ffprobe import get_dimensions
 from server.routes.delivery import (
-    _source_fingerprint,
     _video_fingerprint,
     migrate_unchanged_delivery_audio_fingerprint,
 )
@@ -90,18 +90,20 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
     # File existence and stat comparisons are cheap and prevent other screens
     # from presenting a deleted or replaced artifact as verified and ready.
     if snapshot.get("status") == "ready":
-        audio = ep_dir / "podcast_audio.mp3"
-        stat = raw.get("output_stat")
-        if not audio.exists() or not isinstance(stat, dict):
+        try:
+            current_audio = current_podcast_audio(
+                ep_dir,
+                episode,
+                processing_config,
+                verify_content=False,
+            )
+        except (OSError, TypeError, ValueError):
+            current_audio = None
+        if current_audio is None or raw.get("output_stat") != {
+            "size": current_audio.stat().st_size,
+            "mtime_ns": current_audio.stat().st_mtime_ns,
+        }:
             snapshot["status"] = "not_prepared"
-        else:
-            actual = audio.stat()
-            if stat != {"size": actual.st_size, "mtime_ns": actual.st_mtime_ns}:
-                snapshot["status"] = "not_prepared"
-            elif raw.get("source_fingerprint") != _source_fingerprint(
-                ep_dir, episode, processing_config
-            ):
-                snapshot["status"] = "not_prepared"
     if snapshot.get("video_status") == "ready":
         video = ep_dir / "upload_video.mp4"
         stat = raw.get("video_output_stat")
@@ -125,9 +127,10 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
                     if canonical_audio is not None and canonical_audio.exists()
                     else None
                 )
-                if not expected_fingerprint or raw.get(
-                    "video_source_fingerprint"
-                ) != expected_fingerprint:
+                if (
+                    not expected_fingerprint
+                    or raw.get("video_source_fingerprint") != expected_fingerprint
+                ):
                     snapshot["video_status"] = "not_prepared"
     return snapshot
 
