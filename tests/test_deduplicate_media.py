@@ -264,13 +264,55 @@ def test_equal_metadata_does_not_rewrite_clone_metadata(tmp_path, monkeypatch):
         raise AssertionError("identical metadata must not be rewritten")
 
     monkeypatch.setattr(apfs_clone, "_fcopyfile", unexpected_metadata_copy)
-    replace_with_clone(source_snapshot, target_snapshot)
+    result = replace_with_clone(source_snapshot, target_snapshot)
 
     assert snapshot_path(target)["sha256"] == source_snapshot["sha256"]
     assert target.stat().st_ino not in {
         source_snapshot["inode"],
         target_snapshot["inode"],
     }
+    assert result["system_xattr_changes"] == []
+
+
+def test_only_inode_provenance_may_change_during_clone():
+    expected = {
+        "size_bytes": 1026755072,
+        "mode": 0o700,
+        "uid": 501,
+        "gid": 20,
+        "mtime_ns": 1773276784000000000,
+        "flags": 0,
+        "xattrs": [
+            {
+                "name": "com.apple.provenance",
+                "size_bytes": 11,
+                "sha256": hashlib.sha256(
+                    bytes.fromhex("0102007c05c2c960a50211")
+                ).hexdigest(),
+            }
+        ],
+    }
+    actual = json.loads(json.dumps(expected))
+    actual["xattrs"][0]["sha256"] = hashlib.sha256(
+        bytes.fromhex("01020043758024f311838c")
+    ).hexdigest()
+
+    differences, changes = apfs_clone._metadata_differences(actual, expected)
+
+    assert differences == []
+    assert changes == [
+        {
+            "name": "com.apple.provenance",
+            "expected_sha256": expected["xattrs"][0]["sha256"],
+            "installed_sha256": actual["xattrs"][0]["sha256"],
+            "size_bytes": 11,
+            "reason": "macOS regenerated inode provenance during APFS clone",
+        }
+    ]
+
+    actual["xattrs"][0]["name"] = "user.provenance"
+    differences, _ = apfs_clone._metadata_differences(actual, expected)
+    assert differences == ["xattrs:com.apple.provenance", "xattrs:user.provenance"]
 
 
 def test_full_preflight_finds_late_stale_target_before_any_replacement(tmp_path):

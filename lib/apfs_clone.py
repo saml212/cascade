@@ -314,6 +314,42 @@ def _metadata(snapshot: dict) -> dict:
     return {key: snapshot[key] for key in keys}
 
 
+def _metadata_differences(actual: dict, expected: dict) -> tuple[list[str], list[dict]]:
+    actual_metadata = _metadata(actual)
+    expected_metadata = _metadata(expected)
+    differences = [
+        key
+        for key in expected_metadata
+        if key != "xattrs" and actual_metadata[key] != expected_metadata[key]
+    ]
+    actual_xattrs = {item["name"]: item for item in actual_metadata["xattrs"]}
+    expected_xattrs = {item["name"]: item for item in expected_metadata["xattrs"]}
+    system_changes = []
+    for name in sorted(actual_xattrs.keys() | expected_xattrs.keys()):
+        actual_xattr = actual_xattrs.get(name)
+        expected_xattr = expected_xattrs.get(name)
+        if actual_xattr == expected_xattr:
+            continue
+        if (
+            name == "com.apple.provenance"
+            and actual_xattr is not None
+            and expected_xattr is not None
+            and actual_xattr["size_bytes"] == expected_xattr["size_bytes"] == 11
+        ):
+            system_changes.append(
+                {
+                    "name": name,
+                    "expected_sha256": expected_xattr["sha256"],
+                    "installed_sha256": actual_xattr["sha256"],
+                    "size_bytes": 11,
+                    "reason": "macOS regenerated inode provenance during APFS clone",
+                }
+            )
+            continue
+        differences.append(f"xattrs:{name}")
+    return differences, system_changes
+
+
 def _same_open_file(file_fd: int, directory_fd: int, name: bytes) -> bool:
     opened = os.fstat(file_fd)
     current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -417,14 +453,10 @@ def replace_with_clone(source: dict, target: dict) -> dict:
             cloned = snapshot_fd(temp_fd, dst)
             if cloned["sha256"] != src_actual["sha256"]:
                 raise CloneSafetyError("cloned content hash does not match source")
-            cloned_metadata = _metadata(cloned)
-            target_metadata = _metadata(dst_actual)
-            if cloned_metadata != target_metadata:
-                differences = [
-                    key
-                    for key in target_metadata
-                    if cloned_metadata[key] != target_metadata[key]
-                ]
+            differences, system_xattr_changes = _metadata_differences(
+                cloned, dst_actual
+            )
+            if differences:
                 raise CloneSafetyError(
                     "clone does not preserve target metadata: " + ", ".join(differences)
                 )
@@ -494,6 +526,7 @@ def replace_with_clone(source: dict, target: dict) -> dict:
                 "old_inode": dst_actual["inode"],
                 "new_inode": cloned["inode"],
                 "source_inode": src_actual["inode"],
+                "system_xattr_changes": system_xattr_changes,
             }
         except BaseException:
             if swapped:

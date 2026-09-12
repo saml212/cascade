@@ -38,6 +38,7 @@ from lib.timeline import (  # noqa: F401
     Timeline,
     build_keep_intervals,
     quantize_timestamp,
+    rebase_diarized,
 )
 
 RENDER_MANIFEST_NAME = "render_manifest.json"
@@ -48,6 +49,7 @@ AAC_ENCODER_DELAY_SAMPLES = 1_024
 SHORTS_TWO_PERSON_STACK_VERSION = "two-person-stack/v1"
 ASPECT_CROP_FINGERPRINT_VERSION = "aspect-crop/v1"
 LONGFORM_TRIM_REUSE_VERSION = "verified-terminal-prefix/v1"
+TRANSCRIPT_RENDER_REUSE_VERSION = "verified-transcript-rebind/v1"
 OUTPUT_RESERVE_BYTES = 1_000_000_000
 SCRATCH_RESERVE_BYTES = 10_000_000_000
 _manifest_lock = threading.Lock()
@@ -654,11 +656,15 @@ def render_fingerprint(paths: list[Path], state: dict) -> str:
 
 
 def _render_inputs(
-    episode_dir: Path, audio_path: Path, config: dict
+    episode_dir: Path,
+    audio_path: Path,
+    config: dict,
+    *,
+    include_transcript: bool = True,
 ) -> tuple[list[Path], str | None]:
     paths = [episode_dir / "source_merged.mp4", audio_path]
     transcript = episode_dir / "diarized_transcript.json"
-    if transcript.exists():
+    if include_transcript and transcript.exists():
         paths.append(transcript)
     lut = resolve_lut_path(config)
     if lut is not None:
@@ -729,9 +735,12 @@ def _longform_render_fingerprint(
     *,
     render_mode: str = "speaker_cut",
     legacy_crop: bool = False,
+    include_transcript: bool = True,
 ) -> str:
     config = render_config_for_episode(episode, config)
-    paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
+    paths, lut_digest = _render_inputs(
+        episode_dir, audio_path, config, include_transcript=include_transcript
+    )
     processing = config.get("processing", {})
     state = {
         "pipeline_version": RENDER_PIPELINE_VERSION,
@@ -782,6 +791,8 @@ def _short_render_fingerprint(
     clip: dict,
     *,
     legacy_crop: bool = False,
+    include_transcript: bool = True,
+    caption_input: list[tuple] | None = None,
 ) -> str:
     config = render_config_for_episode(episode, config)
     processing = config.get("processing", {})
@@ -811,10 +822,18 @@ def _short_render_fingerprint(
         },
         "encoding": get_video_encoding_policy(config, "shorts"),
     }
-    paths, lut_digest = _render_inputs(episode_dir, audio_path, config)
+    paths, lut_digest = _render_inputs(
+        episode_dir, audio_path, config, include_transcript=include_transcript
+    )
     state["lut_sha256"] = lut_digest
     if _uses_two_person_stack(episode, processing, segments, clip):
         state["shorts_overlap_layout"] = SHORTS_TWO_PERSON_STACK_VERSION
+    if caption_input is not None:
+        state["caption_input"] = {
+            "version": CAPTION_SINGLE_LANE_VERSION,
+            "words": caption_input,
+        }
+        return render_fingerprint(paths, state)
     try:
         transcript = json.loads((episode_dir / "diarized_transcript.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -1264,6 +1283,235 @@ def current_short_render(
         if state["current"]:
             return record
     return None
+
+
+def _transcript_caption_input(diarized: dict, timeline: Timeline) -> list[tuple]:
+    words = [
+        (
+            word.get("punctuated_word") or word.get("word", ""),
+            word.get("start"),
+            word.get("end"),
+            word.get("speaker", utterance.get("speaker")),
+        )
+        for utterance in rebase_diarized(diarized, timeline).get("utterances", [])
+        for word in utterance.get("words", [])
+    ]
+    return sorted(words, key=lambda word: (word[1], word[2]))
+
+
+def _transcript_render_decision(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    diarized: dict,
+    timeline: Timeline,
+    fps: str,
+    clip: dict | None,
+) -> str:
+    # Equality before the deterministic short overlap policy is conservative:
+    # equal frame cuts and policy inputs guarantee equal final crop choices.
+    frame_cuts = build_render_segments(timeline, segments, frame_rate=fps)
+    if clip is not None:
+        return _short_render_fingerprint(
+            episode_dir,
+            episode,
+            config,
+            audio_path,
+            frame_cuts,
+            clip,
+            include_transcript=False,
+            caption_input=_transcript_caption_input(diarized, timeline),
+        )
+    return _longform_render_fingerprint(
+        episode_dir,
+        episode,
+        config,
+        audio_path,
+        frame_cuts,
+        include_transcript=False,
+    )
+
+
+def _transcript_reuse_timeline(
+    episode_dir: Path, episode: dict
+) -> tuple[Timeline, str]:
+    source = probe(episode_dir / "source_merged.mp4")
+    video = next(
+        stream for stream in source["streams"] if stream["codec_type"] == "video"
+    )
+    fps = source_fps(video, episode)
+    timeline = Timeline.from_edits(
+        float(source["format"]["duration"]), episode.get("longform_edits", [])
+    ).quantize(fps)
+    return timeline, fps
+
+
+def _clip_timeline(timeline: Timeline, fps: str, clip: dict | None) -> Timeline:
+    return (
+        timeline
+        if clip is None
+        else timeline.slice(
+            float(clip["start_seconds"]), float(clip["end_seconds"])
+        ).quantize(fps)
+    )
+
+
+def capture_transcript_render_reuse_proof(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    clips: list[dict],
+) -> dict:
+    """Capture only current artifact bindings before a transcript transaction."""
+    proof = {
+        "version": TRANSCRIPT_RENDER_REUSE_VERSION,
+        "renders": [],
+    }
+    try:
+        config = render_config_for_episode(episode, config)
+        diarized = json.loads((episode_dir / "diarized_transcript.json").read_text())
+        timeline, fps = _transcript_reuse_timeline(episode_dir, episode)
+        decision_inputs = (episode_dir, episode, config, audio_path, segments, diarized)
+        for clip in [None, *clips]:
+            record = (
+                current_longform_render(
+                    episode_dir, episode, config, audio_path, segments
+                )
+                if clip is None
+                else current_short_render(
+                    episode_dir, episode, config, audio_path, segments, clip
+                )
+            )
+            burned = (record or {}).get("captions", {}).get("burned_in")
+            if record is None or burned != (clip is not None):
+                continue
+            if clip is None and config.get("processing", {}).get(
+                "longform_burn_captions", False
+            ):
+                continue
+            target_timeline = _clip_timeline(timeline, fps, clip)
+            proof["renders"].append(
+                {
+                    "clip_id": None if clip is None else str(clip["id"]),
+                    "fingerprint": record["fingerprint"],
+                    "output": record.get("output"),
+                    "decision": _transcript_render_decision(
+                        *decision_inputs,
+                        target_timeline,
+                        fps,
+                        clip,
+                    ),
+                }
+            )
+    except (OSError, StopIteration, TypeError, ValueError):
+        proof["renders"] = []
+    return proof
+
+
+def migrate_unchanged_transcript_render_fingerprints(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    clips: list[dict],
+    proof: dict,
+) -> dict:
+    """Rebind captured renders only when their effective inputs still match."""
+    result = {
+        "version": TRANSCRIPT_RENDER_REUSE_VERSION,
+        "manifest_updated": False,
+        "longform_migrated": False,
+        "shorts_migrated": [],
+    }
+    if (
+        not isinstance(proof, dict)
+        or proof.get("version") != result["version"]
+        or not proof.get("renders")
+    ):
+        return result
+    try:
+        diarized = json.loads((episode_dir / "diarized_transcript.json").read_text())
+        timeline, fps = _transcript_reuse_timeline(episode_dir, episode)
+    except (OSError, StopIteration, TypeError, ValueError):
+        return result
+    clips_by_id = {str(clip.get("id")): clip for clip in clips if clip.get("id")}
+    decision_inputs = (episode_dir, episode, config, audio_path, segments, diarized)
+    with _file_lock(episode_dir / ".render_manifest.lock", _manifest_lock):
+        manifest = read_render_manifest(episode_dir)
+        for captured in proof.get("renders", []):
+            clip_id = captured.get("clip_id")
+            clip = None if clip_id is None else clips_by_id.get(str(clip_id))
+            if clip_id is not None and clip is None:
+                continue
+            try:
+                decision = _transcript_render_decision(
+                    *decision_inputs,
+                    _clip_timeline(timeline, fps, clip),
+                    fps,
+                    clip,
+                )
+                if captured.get("decision") != decision:
+                    continue
+                fingerprint = (
+                    longform_render_fingerprint(
+                        episode_dir, episode, config, audio_path, segments
+                    )
+                    if clip is None
+                    else short_render_fingerprint(
+                        episode_dir, episode, config, audio_path, segments, clip
+                    )
+                )
+            except (OSError, StopIteration, TypeError, ValueError):
+                continue
+            record = (
+                manifest.get("longform", {})
+                if clip is None
+                else manifest.get("shorts", {}).get(str(clip["id"]), {})
+            )
+            output = (
+                episode_dir / "upload_video.mp4"
+                if clip is None
+                else episode_dir / "shorts" / f"{clip['id']}.mp4"
+            )
+            state = render_artifact_state(
+                episode_dir,
+                output,
+                record,
+                expected_fingerprint=captured.get("fingerprint"),
+                expected_mode="speaker_cut" if clip is None else "speaker_cut_short",
+            )
+            if (
+                not state["current"]
+                or record.get("output") != captured.get("output")
+                or fingerprint == captured.get("fingerprint")
+            ):
+                continue
+            prior_migration = record.get("fingerprint_migration")
+            record["fingerprint"] = fingerprint
+            record["fingerprint_migration"] = {
+                "version": result["version"],
+                "reason": "effective_render_inputs_unchanged",
+                "from": captured["fingerprint"],
+                "to": fingerprint,
+                "decision": captured["decision"],
+            }
+            if prior_migration:
+                record["fingerprint_migration"]["previous"] = prior_migration
+            if clip is None:
+                result["longform_migrated"] = True
+            else:
+                result["shorts_migrated"].append(str(clip["id"]))
+        result["manifest_updated"] = bool(
+            result["longform_migrated"] or result["shorts_migrated"]
+        )
+        if result["manifest_updated"]:
+            atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
+    return result
 
 
 def migrate_unchanged_short_crop_fingerprints(

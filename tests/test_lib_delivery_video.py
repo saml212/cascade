@@ -15,11 +15,13 @@ import pytest
 from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.delivery_video import (
     AAC_ENCODER_DELAY_SAMPLES,
+    TRANSCRIPT_RENDER_REUSE_VERSION,
     _audio_filter_graph,
     _short_render_fingerprint,
     aac_content_timing_proof,
     build_keep_intervals,
     build_render_segments,
+    capture_transcript_render_reuse_proof,
     concat_video_segments,
     current_longform_render,
     current_short_render,
@@ -27,6 +29,7 @@ from lib.delivery_video import (
     longform_render_fingerprint,
     longform_trim_reuse_fingerprint,
     migrate_unchanged_short_crop_fingerprints,
+    migrate_unchanged_transcript_render_fingerprints,
     mux_timeline_audio,
     prepare_longform_trim_reuse,
     record_longform_render,
@@ -60,6 +63,95 @@ def _record_short_in_process(args):
         media={"duration_seconds": 1},
     )
     return clip_id
+
+
+_REUSE_PROBE = {
+    "format": {"duration": "30"},
+    "streams": [{"codec_type": "video", "r_frame_rate": "30/1"}],
+}
+
+
+def _transcript_reuse_inputs(tmp_path):
+    (tmp_path / "shorts").mkdir()
+    (tmp_path / "subtitles").mkdir()
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio_mix.wav"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    transcript = {
+        "utterances": [
+            {
+                "speaker": "speaker_0",
+                "words": [
+                    {
+                        "word": "alpha",
+                        "punctuated_word": "Alpha",
+                        "start": 2.0,
+                        "end": 2.4,
+                    },
+                    {
+                        "word": "bravo",
+                        "punctuated_word": "bravo.",
+                        "start": 12.0,
+                        "end": 12.5,
+                    },
+                ],
+            }
+        ]
+    }
+    (tmp_path / "diarized_transcript.json").write_text(json.dumps(transcript))
+    episode = {
+        "crop_config": {"wide_zoom": 1},
+        "longform_edits": [],
+        "delivery_burn_captions": False,
+    }
+    config = {"processing": {"use_hardware_accel": False}}
+    segments = [
+        {"start": 0, "end": 10.001, "speaker": "speaker_0"},
+        {"start": 10.001, "end": 30, "speaker": "speaker_1"},
+    ]
+    clips = [
+        {"id": "clip_a", "start_seconds": 1, "end_seconds": 5},
+        {"id": "clip_b", "start_seconds": 11, "end_seconds": 15},
+    ]
+    timeline = Timeline.from_edits(30).quantize("30/1")
+    (tmp_path / "upload_video.mp4").write_bytes(b"longform")
+    (tmp_path / "subtitles" / "longform.ass").write_text("long captions")
+    record_longform_render(
+        tmp_path,
+        fingerprint=longform_render_fingerprint(
+            tmp_path, episode, config, audio, segments
+        ),
+        render_mode="speaker_cut",
+        timeline=timeline,
+        media={"duration_seconds": 30},
+        captions={
+            "path": "subtitles/longform.ass",
+            "format": "ass",
+            "burned_in": False,
+        },
+    )
+    for clip in clips:
+        clip_id = clip["id"]
+        (tmp_path / "shorts" / f"{clip_id}.mp4").write_bytes(clip_id.encode())
+        (tmp_path / "subtitles" / f"{clip_id}.ass").write_text("captions")
+        record_short_render(
+            tmp_path,
+            clip_id,
+            fingerprint=short_render_fingerprint(
+                tmp_path, episode, config, audio, segments, clip
+            ),
+            timeline=timeline.slice(
+                clip["start_seconds"], clip["end_seconds"]
+            ).quantize("30/1"),
+            media={"duration_seconds": 4},
+            captions={
+                "path": f"subtitles/{clip_id}.ass",
+                "format": "ass",
+                "burned_in": True,
+            },
+        )
+    return episode, config, audio, segments, clips, transcript
 
 
 def test_keep_intervals_applies_trims_and_cuts():
@@ -387,6 +479,174 @@ def test_verified_legacy_short_migrates_after_longform_only_crop_edit(tmp_path):
     record = manifest["shorts"]["clip_01"]
     assert record["fingerprint_migration"]["from"] == legacy
     assert clip["approved_render_fingerprint"] == "reviewed-old-fingerprint"
+
+
+def test_transcript_reuse_preserves_only_unaffected_render_decisions(tmp_path):
+    episode, config, audio, segments, clips, transcript = _transcript_reuse_inputs(
+        tmp_path
+    )
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        proof = capture_transcript_render_reuse_proof(
+            tmp_path, episode, config, audio, segments, clips
+        )
+
+    original_manifest = json.loads((tmp_path / "render_manifest.json").read_text())
+    output_stats = {
+        path: path.stat()
+        for path in [
+            tmp_path / "upload_video.mp4",
+            tmp_path / "shorts" / "clip_a.mp4",
+            tmp_path / "shorts" / "clip_b.mp4",
+        ]
+    }
+    transcript["utterances"][0]["words"][0]["punctuated_word"] = "Corrected alpha"
+    (tmp_path / "diarized_transcript.json").write_text(json.dumps(transcript))
+    quantized_same_segments = [
+        {"start": 0, "end": 10.002, "speaker": "speaker_0"},
+        {"start": 10.002, "end": 30, "speaker": "speaker_1"},
+    ]
+
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        result = migrate_unchanged_transcript_render_fingerprints(
+            tmp_path,
+            episode,
+            config,
+            audio,
+            quantized_same_segments,
+            clips,
+            proof,
+        )
+
+    assert result == {
+        "version": TRANSCRIPT_RENDER_REUSE_VERSION,
+        "manifest_updated": True,
+        "longform_migrated": True,
+        "shorts_migrated": ["clip_b"],
+    }
+    manifest = json.loads((tmp_path / "render_manifest.json").read_text())
+    assert (
+        manifest["shorts"]["clip_a"]["fingerprint"]
+        == original_manifest["shorts"]["clip_a"]["fingerprint"]
+    )
+    for scope, record in (
+        ("longform", manifest["longform"]),
+        ("clip_b", manifest["shorts"]["clip_b"]),
+    ):
+        migration = record["fingerprint_migration"]
+        assert migration["from"] != migration["to"] == record["fingerprint"]
+        assert migration["decision"]
+        assert scope in {"longform", "clip_b"}
+    assert current_longform_render(
+        tmp_path, episode, config, audio, quantized_same_segments
+    )
+    assert current_short_render(
+        tmp_path, episode, config, audio, quantized_same_segments, clips[1]
+    )
+    assert (
+        current_short_render(
+            tmp_path, episode, config, audio, quantized_same_segments, clips[0]
+        )
+        is None
+    )
+    for path, before in output_stats.items():
+        after = path.stat()
+        assert (after.st_size, after.st_mtime_ns) == (
+            before.st_size,
+            before.st_mtime_ns,
+        )
+
+
+def test_transcript_reuse_rejects_changed_speaker_cut_and_stale_record(tmp_path):
+    episode, config, audio, segments, clips, _ = _transcript_reuse_inputs(tmp_path)
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        proof = capture_transcript_render_reuse_proof(
+            tmp_path, episode, config, audio, segments, clips
+        )
+    changed = [{"start": 0, "end": 30, "speaker": "speaker_1"}]
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        result = migrate_unchanged_transcript_render_fingerprints(
+            tmp_path, episode, config, audio, changed, clips, proof
+        )
+    assert result["longform_migrated"] is False
+
+    manifest_path = tmp_path / "render_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["longform"]["fingerprint"] = "already-stale"
+    manifest_path.write_text(json.dumps(manifest))
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        stale_proof = capture_transcript_render_reuse_proof(
+            tmp_path, episode, config, audio, segments, []
+        )
+    assert stale_proof["renders"] == []
+
+
+@pytest.mark.parametrize("changed_input", ["crop", "source", "audio", "encoding"])
+def test_transcript_reuse_rejects_changed_static_input(tmp_path, changed_input):
+    episode, config, audio, segments, clips, transcript = _transcript_reuse_inputs(
+        tmp_path
+    )
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        proof = capture_transcript_render_reuse_proof(
+            tmp_path, episode, config, audio, segments, clips
+        )
+    transcript["utterances"][0]["words"][0]["punctuated_word"] = "Corrected alpha"
+    (tmp_path / "diarized_transcript.json").write_text(json.dumps(transcript))
+    if changed_input == "crop":
+        episode = {
+            **episode,
+            "crop_config": {"wide_zoom": 1.2, "speaker_l_center_x": 50},
+        }
+    elif changed_input == "source":
+        (tmp_path / "source_merged.mp4").write_bytes(b"changed source")
+    elif changed_input == "audio":
+        audio.write_bytes(b"changed audio")
+    else:
+        config = {
+            "processing": {
+                "use_hardware_accel": False,
+                "video_bitrate": "8M",
+                "shorts_video_bitrate": "8M",
+            }
+        }
+
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        result = migrate_unchanged_transcript_render_fingerprints(
+            tmp_path, episode, config, audio, segments, clips, proof
+        )
+    assert result == {
+        "version": TRANSCRIPT_RENDER_REUSE_VERSION,
+        "manifest_updated": False,
+        "longform_migrated": False,
+        "shorts_migrated": [],
+    }
+
+
+def test_transcript_reuse_manifest_write_failure_propagates_without_partial_write(
+    tmp_path,
+):
+    episode, config, audio, segments, clips, transcript = _transcript_reuse_inputs(
+        tmp_path
+    )
+    with patch("lib.delivery_video.probe", return_value=_REUSE_PROBE):
+        proof = capture_transcript_render_reuse_proof(
+            tmp_path, episode, config, audio, segments, clips
+        )
+    transcript["utterances"][0]["words"][0]["punctuated_word"] = "Corrected alpha"
+    (tmp_path / "diarized_transcript.json").write_text(json.dumps(transcript))
+    manifest_path = tmp_path / "render_manifest.json"
+    before = manifest_path.read_bytes()
+
+    with (
+        patch("lib.delivery_video.probe", return_value=_REUSE_PROBE),
+        patch(
+            "lib.delivery_video.atomic_write_json", side_effect=OSError("write failed")
+        ),
+        pytest.raises(OSError, match="write failed"),
+    ):
+        migrate_unchanged_transcript_render_fingerprints(
+            tmp_path, episode, config, audio, segments, clips, proof
+        )
+    assert manifest_path.read_bytes() == before
 
 
 def test_fingerprint_marks_missing_inputs_without_raising(tmp_path):
