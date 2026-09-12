@@ -43,6 +43,7 @@ _AUDIO_CONTENT_TYPES = {
 }
 CAMERA_AUDIO_CACHE_VERSION = "source-clock-v3"
 TRANSCRIPT_CANONICAL_VERSION = "source-clock-v3"
+TRANSCRIPT_CLOCK_MAPPING_VERSION = 1
 _TRANSCRIPT_AUDIO_VERSION = "logical-tracks-v3"
 _TRACK_WINDOW_VERSION = "source-track-window-v2"
 _TRANSCRIPT_COVERAGE_VERSION = "source-clock-v1"
@@ -131,15 +132,31 @@ def _utterances_from_words(words: list[dict]) -> list[dict]:
     return utterances
 
 
+def _map_transcript_timestamps(data: dict, mapper) -> dict:
+    """Deep-copy a raw ASR document and map every numeric timestamp."""
+    result = deepcopy(data)
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"start", "end"} and isinstance(child, (int, float)):
+                    value[key] = mapper(float(child))
+                else:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(result)
+    return result
+
+
 def remap_transcript_timestamps(data: dict, gaps: list[tuple[float, float]]) -> dict:
     """Map decoded-sample ASR times onto the source media timeline.
 
     Each gap is ``(collapsed_time, cumulative_source_offset)``. Deep copies
     are intentional so callers can back up and compare the original payload.
     """
-    import copy
-
-    result = copy.deepcopy(data)
 
     def mapped(value: float) -> float:
         offset = 0.0
@@ -150,18 +167,7 @@ def remap_transcript_timestamps(data: dict, gaps: list[tuple[float, float]]) -> 
                 break
         return value + offset
 
-    def walk(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"start", "end"} and isinstance(child, (int, float)):
-                    value[key] = mapped(float(child))
-                else:
-                    walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(result)
+    result = _map_transcript_timestamps(data, mapped)
     metadata = result.get("metadata")
     if isinstance(metadata, dict) and isinstance(
         metadata.get("duration"), (int, float)
@@ -171,6 +177,146 @@ def remap_transcript_timestamps(data: dict, gaps: list[tuple[float, float]]) -> 
             {"collapsed_time": threshold, "cumulative_offset": offset}
             for threshold, offset in gaps
         ]
+    return result
+
+
+def transcript_repair_revisions(episode_dir: Path) -> dict:
+    """Return revision guards for raw ASR, its input, and source media."""
+    episode_dir = Path(episode_dir)
+    raw_path = episode_dir / "transcript.json"
+    raw = json.loads(raw_path.read_text())
+    paths = (
+        ("source", "source_media", episode_dir / "source_merged.mp4"),
+        (
+            "asr_input",
+            "asr_input",
+            episode_dir
+            / "work"
+            / ("transcript_audio.flac" if _raw_is_multichannel(raw) else "audio.m4a"),
+        ),
+    )
+    result = {"raw_transcript_revision": f"sha256:{_file_sha256(raw_path)}"}
+    for name, revision_name, path in paths:
+        stat = path.stat()
+        identity = {
+            "relative_path": str(path.relative_to(episode_dir)),
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        result[f"{name}_identity"] = identity
+        result[f"{revision_name}_revision"] = f"sha256:{_stable_hash(identity)}"
+    return result
+
+
+_CLOCK_MAPPING_FORMULA = (
+    "source_seconds = source_seconds_per_asr_second * "
+    "asr_seconds + source_offset_seconds"
+)
+
+
+def _clock_mapping_values(document: dict) -> tuple[float, float, float]:
+    if (
+        document.get("version") != TRANSCRIPT_CLOCK_MAPPING_VERSION
+        or document.get("clock") != "source"
+        or document.get("input_clock") != "stored_asr"
+        or document.get("formula") != _CLOCK_MAPPING_FORMULA
+    ):
+        raise ValueError("Transcript clock mapping schema is invalid")
+    try:
+        scale = float(document["source_seconds_per_asr_second"])
+        offset = float(document["source_offset_seconds"])
+        duration = float(document["source_duration_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Transcript clock mapping values are invalid") from exc
+    if not math.isfinite(scale) or not 0.99 <= scale <= 1.01:
+        raise ValueError("Transcript clock scale must be between 0.99 and 1.01")
+    if not math.isfinite(offset) or not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Transcript clock offset and duration must be finite")
+    if abs(offset) > duration:
+        raise ValueError("Transcript clock offset cannot exceed source duration")
+    for name in ("source", "asr_input"):
+        identity = document.get(f"{name}_identity")
+        fingerprint = document.get(f"{name}_content_fingerprint")
+        if not isinstance(identity, dict) or not isinstance(fingerprint, dict):
+            raise TypeError(f"{name} clock binding must be an object")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(fingerprint.get("id", ""))):
+            raise ValueError(f"{name} content fingerprint is invalid")
+        if (fingerprint.get("size_bytes"), fingerprint.get("mtime_ns")) != (
+            identity.get("size_bytes"),
+            identity.get("mtime_ns"),
+        ):
+            raise ValueError(f"{name} content fingerprint identity is stale")
+    evidence = document.get("evidence")
+    if (
+        not isinstance(evidence, dict)
+        or not str(evidence.get("method", "")).strip()
+        or not str(evidence.get("summary", "")).strip()
+        or isinstance(evidence.get("anchor_count"), bool)
+        or not isinstance(evidence.get("anchor_count"), int)
+        or evidence["anchor_count"] < 2
+    ):
+        raise ValueError("Transcript clock mapping needs two grounded evidence anchors")
+    return scale, offset, duration
+
+
+def build_transcript_clock_mapping(
+    episode_dir: Path,
+    *,
+    source_seconds_per_asr_second: float,
+    source_offset_seconds: float,
+    source_duration_seconds: float,
+    source_content_fingerprint: dict,
+    asr_input_content_fingerprint: dict,
+    evidence: dict,
+) -> dict:
+    """Build a source-bound affine map without modifying episode artifacts."""
+    revisions = transcript_repair_revisions(episode_dir)
+    document = {
+        "version": TRANSCRIPT_CLOCK_MAPPING_VERSION,
+        "clock": "source",
+        "input_clock": "stored_asr",
+        "formula": _CLOCK_MAPPING_FORMULA,
+        "source_seconds_per_asr_second": source_seconds_per_asr_second,
+        "source_offset_seconds": source_offset_seconds,
+        "source_duration_seconds": source_duration_seconds,
+        **revisions,
+        "source_content_fingerprint": deepcopy(source_content_fingerprint),
+        "asr_input_content_fingerprint": deepcopy(asr_input_content_fingerprint),
+        "evidence": deepcopy(evidence),
+    }
+    _clock_mapping_values(document)
+    document["fingerprint"] = f"sha256:{_stable_hash(document)}"
+    return document
+
+
+def validate_transcript_clock_mapping(episode_dir: Path, document: dict) -> dict:
+    if not isinstance(document, dict):
+        raise TypeError("Transcript clock mapping must be a JSON object")
+    payload = dict(document)
+    fingerprint = payload.pop("fingerprint", None)
+    if fingerprint != f"sha256:{_stable_hash(payload)}":
+        raise ValueError("Transcript clock mapping fingerprint is invalid")
+    _clock_mapping_values(document)
+    current = transcript_repair_revisions(episode_dir)
+    if any(document.get(key) != value for key, value in current.items()):
+        raise RuntimeError("Transcript clock mapping inputs have changed")
+    return document
+
+
+def _apply_transcript_clock_mapping(raw: dict, mapping: dict) -> dict:
+    scale, offset, duration = _clock_mapping_values(mapping)
+
+    def mapped(value: float) -> float:
+        value = scale * value + offset
+        if not math.isfinite(value) or not -1e-3 <= value <= duration + 1e-3:
+            raise ValueError("Transcript clock mapping leaves source bounds")
+        return max(0.0, min(value, duration))
+
+    result = _map_transcript_timestamps(raw, mapped)
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        metadata["duration"] = duration
+        metadata["clock_mapping_fingerprint"] = mapping["fingerprint"]
     return result
 
 
@@ -877,7 +1023,12 @@ def analyze_transcript_coverage(
     return report
 
 
-def repair_existing_transcript(episode_dir: Path, config: dict) -> dict:
+def repair_existing_transcript(
+    episode_dir: Path,
+    config: dict,
+    *,
+    clock_mapping_document: dict | None = None,
+) -> dict:
     """Canonicalize a stored ASR response without uploading audio again.
 
     This is the API-friendly repair path for historical episodes. It preserves
@@ -892,13 +1043,39 @@ def repair_existing_transcript(episode_dir: Path, config: dict) -> dict:
     input_fingerprint = _transcription_audio_fingerprint(
         agent.episode_dir, episode, channel_map
     )
+    config_fingerprint = _asr_config_fingerprint(config, multichannel)
+    raw_hash = _file_sha256(agent.episode_dir / "transcript.json")
+    provenance = agent.load_json_safe("transcript_provenance.json")
+    mapping = None
+    if clock_mapping_document is not None:
+        mapping = validate_transcript_clock_mapping(
+            agent.episode_dir, clock_mapping_document
+        )
+    elif provenance.get("clock_mapping") is not None:
+        mapping = validate_transcript_clock_mapping(
+            agent.episode_dir, provenance["clock_mapping"]
+        )
+    elif not (
+        provenance.get("version") == TRANSCRIPT_CANONICAL_VERSION
+        and provenance.get("clock") == "source"
+        and provenance.get("asr_input_fingerprint") == input_fingerprint
+        and provenance.get("asr_config_fingerprint") == config_fingerprint
+        and provenance.get("raw_transcript_sha256") == raw_hash
+        and provenance.get("channel_map") == (channel_map or [])
+    ):
+        raise RuntimeError(
+            "Stored ASR clock lineage is unknown; submit a guarded transcript "
+            "clock mapping before repair"
+        )
+    canonical_raw = _apply_transcript_clock_mapping(raw, mapping) if mapping else raw
     return agent._save_canonical_outputs(
-        raw,
+        canonical_raw,
         multichannel,
         channel_map,
         input_fingerprint,
-        _asr_config_fingerprint(config, multichannel),
+        config_fingerprint,
         reused_raw=True,
+        clock_mapping=mapping,
     )
 
 
@@ -928,6 +1105,23 @@ def current_diarized_transcript(
         return None
     corrections = _load_corrections(agent.episode_dir)
     corrections_fingerprint = _stable_hash(corrections) if corrections else None
+    mapping = None
+    stored_mapping = provenance.get("clock_mapping")
+    if stored_mapping is not None:
+        try:
+            mapping = validate_transcript_clock_mapping(
+                agent.episode_dir, stored_mapping
+            )
+            raw = _apply_transcript_clock_mapping(raw, mapping)
+        except (
+            FileNotFoundError,
+            json.JSONDecodeError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            return None
     speaker_map = (
         channel_map if multichannel else agent._infer_diarized_speaker_map(raw)
     )
@@ -943,6 +1137,7 @@ def current_diarized_transcript(
         or _speaker_map_identity(provenance.get("speaker_map"))
         != _speaker_map_identity(speaker_map)
         or provenance.get("corrections_fingerprint") != corrections_fingerprint
+        or provenance.get("clock_mapping") != mapping
     ):
         return None
     expected_activity = activity.fingerprint if activity else None
@@ -1028,8 +1223,14 @@ class TranscribeAgent(BaseAgent):
         )
 
         audio_size_mb = 0.0
+        clock_mapping = None
         if reuse_raw:
             raw = self.load_json("transcript.json")
+            if provenance.get("clock_mapping") is not None:
+                clock_mapping = validate_transcript_clock_mapping(
+                    self.episode_dir, provenance["clock_mapping"]
+                )
+                raw = _apply_transcript_clock_mapping(raw, clock_mapping)
             self.logger.info("Reusing source-current Deepgram response")
         else:
             if multichannel:
@@ -1060,6 +1261,7 @@ class TranscribeAgent(BaseAgent):
             input_fingerprint,
             config_fingerprint,
             reused_raw=reuse_raw,
+            clock_mapping=clock_mapping,
         )
         result["audio_size_mb"] = round(audio_size_mb, 1)
         result["mode"] = "multichannel" if multichannel else "diarized"
@@ -2006,6 +2208,7 @@ class TranscribeAgent(BaseAgent):
         config_fingerprint: str,
         *,
         reused_raw: bool,
+        clock_mapping: dict | None = None,
     ) -> dict:
         activity = self._load_source_activity(channel_map)
         speaker_map = (
@@ -2043,6 +2246,7 @@ class TranscribeAgent(BaseAgent):
             "channel_map": channel_map or [],
             "speaker_map": speaker_map or [],
             "raw_reused_without_api": reused_raw,
+            "clock_mapping": deepcopy(clock_mapping) if clock_mapping else None,
         }
         diarized["provenance"] = provenance
         self.save_json("diarized_transcript.json", diarized)

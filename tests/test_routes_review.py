@@ -2,7 +2,9 @@
 
 # ruff: noqa: F811 - imported pytest fixture is intentionally shadowed
 
+import hashlib
 import json
+import os
 import threading
 
 from tests.test_routes_episodes import _create_episode, test_client  # noqa: F401
@@ -21,6 +23,61 @@ def _record(path, fingerprint, mode):
         "output": {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns},
         "completed_at": "2026-09-11T12:00:00+00:00",
     }
+
+
+def _stub_transcript_media_probe(monkeypatch, review, source, duration=5.0):
+    asr_input = source.parent / "work" / "audio.m4a"
+    asr_input.parent.mkdir(exist_ok=True)
+    asr_input.write_bytes(b"ASR input")
+    monkeypatch.setattr(
+        review,
+        "probe",
+        lambda path: {"format": {"duration": str(duration)}},
+    )
+
+    def fingerprint(path, _probe_data):
+        stat = path.stat()
+        return {
+            "id": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+            "method": "sha256-full/test",
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+
+    monkeypatch.setattr(review, "media_fingerprint", fingerprint)
+
+
+def _clock_repair_request(guards, *, scale=1.0, offset=0.0):
+    return {
+        "expected_binding_revision": guards["binding_revision"],
+        "source_seconds_per_asr_second": scale,
+        "source_offset_seconds": offset,
+        "evidence": {
+            "method": "grounded correlation anchors",
+            "anchor_count": 3,
+            "summary": "Three retained source/ASR matches",
+            "fit_r_squared": 0.999,
+        },
+    }
+
+
+def _transcript_clock_repair_fixture(test_client, monkeypatch, raw=None):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001", {"duration_seconds": 5.0})
+    source = episode_dir / "source_merged.mp4"
+    source.write_bytes(b"source media")
+    raw_path = episode_dir / "transcript.json"
+    raw_bytes = json.dumps(
+        raw or {"results": {"utterances": []}}, separators=(",", ":")
+    ).encode()
+    raw_path.write_bytes(raw_bytes)
+
+    from server.routes import review
+
+    _stub_transcript_media_probe(monkeypatch, review, source)
+    inspected = client.get("/api/episodes/ep_001/inspection/transcript/repair")
+    assert inspected.status_code == 200
+    return client, episode_dir, source, raw_path, raw_bytes, inspected.json(), review
 
 
 def test_review_builds_snapshot_off_the_event_loop(test_client, monkeypatch):
@@ -468,6 +525,124 @@ def test_inspection_exposes_only_current_transcript_and_shot_plan(
 
     monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: None)
     assert client.get("/api/episodes/ep_001/inspection/transcript").status_code == 409
+
+
+def test_transcript_clock_repair_api_applies_affine_mapping_and_exposes_guards(
+    test_client, monkeypatch
+):
+    raw = {
+        "metadata": {"duration": 2.0},
+        "results": {
+            "utterances": [
+                {
+                    "speaker": 0,
+                    "start": 0.5,
+                    "end": 1.0,
+                    "transcript": "Hello",
+                    "confidence": 0.99,
+                    "words": [
+                        {
+                            "word": "hello",
+                            "start": 0.5,
+                            "end": 1.0,
+                            "confidence": 0.99,
+                            "speaker": 0,
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+    client, episode_dir, _, _, raw_bytes, guards, _ = _transcript_clock_repair_fixture(
+        test_client, monkeypatch, raw
+    )
+    assert guards["mapping"] is None
+    assert guards["transcript_current"] is False
+
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/repair",
+        json=_clock_repair_request(guards, scale=1.01, offset=0.1),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["raw_transcript_unchanged"] is True
+    assert payload["source_media_unchanged"] is True
+    assert payload["mapping"]["formula"].startswith("source_seconds =")
+    assert (episode_dir / "transcript.json").read_bytes() == raw_bytes
+    diarized = json.loads((episode_dir / "diarized_transcript.json").read_text())
+    assert diarized["utterances"][0]["start"] == 0.605
+    assert diarized["utterances"][0]["end"] == 1.11
+    assert diarized["provenance"]["clock_mapping"] == payload["mapping"]
+
+    current = client.get("/api/episodes/ep_001/inspection/transcript/repair")
+    assert current.status_code == 200
+    assert current.json()["mapping_current"] is True
+    assert current.json()["transcript_current"] is True
+    assert current.json()["mapping"] == payload["mapping"]
+
+
+def test_transcript_clock_repair_rejects_stale_raw_and_source_guards(
+    test_client, monkeypatch
+):
+    client, episode_dir, source, raw_path, _, original, _ = (
+        _transcript_clock_repair_fixture(test_client, monkeypatch)
+    )
+    request = _clock_repair_request(original)
+
+    raw_path.write_text(raw_path.read_text() + "\n")
+    stale_raw = client.post(
+        "/api/episodes/ep_001/inspection/transcript/repair", json=request
+    )
+    assert stale_raw.status_code == 409
+    assert "repair inputs changed" in stale_raw.json()["detail"].lower()
+    assert not (episode_dir / "transcript_provenance.json").exists()
+
+    refreshed = client.get("/api/episodes/ep_001/inspection/transcript/repair").json()
+    request = _clock_repair_request(refreshed)
+    source_stat = source.stat()
+    source.write_bytes(b"source mediX")
+    os.utime(source, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+    stale_source = client.post(
+        "/api/episodes/ep_001/inspection/transcript/repair", json=request
+    )
+    assert stale_source.status_code == 409
+    assert "repair inputs changed" in stale_source.json()["detail"].lower()
+    assert not (episode_dir / "transcript_provenance.json").exists()
+
+
+def test_transcript_clock_repair_restores_derived_artifacts_on_failure(
+    test_client, monkeypatch
+):
+    client, episode_dir, _, raw_path, raw_bytes, guards, review = (
+        _transcript_clock_repair_fixture(test_client, monkeypatch)
+    )
+    artifact_names = (
+        "diarized_transcript.json",
+        "transcript_provenance.json",
+        "subtitles/transcript.srt",
+        "segments.json",
+    )
+    for name in artifact_names:
+        path = episode_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original {name}")
+
+    def fail_after_partial_writes(directory, _config, **_kwargs):
+        for name in artifact_names:
+            (directory / name).write_text(f"changed {name}")
+        raise ValueError("invalid mapped transcript")
+
+    monkeypatch.setattr(review, "repair_existing_transcript", fail_after_partial_writes)
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/repair",
+        json=_clock_repair_request(guards),
+    )
+
+    assert response.status_code == 422
+    assert raw_path.read_bytes() == raw_bytes
+    for name in artifact_names:
+        assert (episode_dir / name).read_text() == f"original {name}"
 
 
 def test_transcript_correction_api_upserts_without_losing_existing_operations(

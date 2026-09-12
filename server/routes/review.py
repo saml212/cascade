@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import subprocess
@@ -25,9 +26,15 @@ from agents.qa import (
     editorial_revision,
 )
 from agents.speaker_cut import current_speaker_segments
-from agents.transcribe import current_diarized_transcript, repair_existing_transcript
+from agents.transcribe import (
+    build_transcript_clock_mapping,
+    current_diarized_transcript,
+    repair_existing_transcript,
+    transcript_repair_revisions,
+    validate_transcript_clock_mapping,
+)
 from lib.atomic_write import atomic_write_json
-from lib.audio_mix import selected_audio_source
+from lib.audio_mix import json_fingerprint, selected_audio_source
 from lib.clips import clip_selection_status
 from lib.delivery_video import (
     current_longform_render,
@@ -37,6 +44,7 @@ from lib.delivery_video import (
     render_artifact_state,
     short_render_fingerprint,
 )
+from lib.ffprobe import media_fingerprint, probe
 from lib.media_inspection import (
     InspectionTarget,
     file_revision,
@@ -69,6 +77,21 @@ _DERIVED_TRANSCRIPT_ARTIFACTS = (
 class TranscriptCorrectionsRequest(BaseModel):
     expected_revision: str
     operations: list[dict] = Field(min_length=1, max_length=100)
+
+
+class TranscriptClockEvidence(BaseModel):
+    method: str = Field(min_length=1, max_length=200)
+    anchor_count: int = Field(ge=2, le=10000)
+    summary: str = Field(min_length=1, max_length=2000)
+    fit_r_squared: float | None = Field(default=None, ge=0, le=1)
+    artifact_references: list[str] = Field(default_factory=list, max_length=20)
+
+
+class TranscriptClockRepairRequest(BaseModel):
+    expected_binding_revision: str = Field(min_length=1)
+    source_seconds_per_asr_second: float = Field(ge=0.99, le=1.01)
+    source_offset_seconds: float
+    evidence: TranscriptClockEvidence
 
 
 class _TranscriptRevisionConflict(RuntimeError):
@@ -154,6 +177,129 @@ def _restore_transcript_artifacts(snapshot: dict[Path, bytes | None]) -> None:
         )
 
 
+def _snapshot_transcript_artifacts(episode_dir: Path) -> dict[Path, bytes | None]:
+    paths = [episode_dir / relative for relative in _DERIVED_TRANSCRIPT_ARTIFACTS]
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def _transcript_media_state(episode_dir: Path) -> dict:
+    before = transcript_repair_revisions(episode_dir)
+    source = episode_dir / "source_merged.mp4"
+    asr_input = episode_dir / before["asr_input_identity"]["relative_path"]
+    source_probe = probe(source)
+    duration = float(source_probe.get("format", {}).get("duration", 0))
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Source media duration is unavailable")
+    source_content = media_fingerprint(source, source_probe)
+    asr_content = media_fingerprint(asr_input, probe(asr_input))
+    after = transcript_repair_revisions(episode_dir)
+    if before != after:
+        raise OSError("Transcript or source media changed during inspection")
+    return {
+        **after,
+        "source_duration_seconds": duration,
+        "source_content_fingerprint": source_content,
+        "asr_input_content_fingerprint": asr_content,
+    }
+
+
+def _transcript_repair_document(episode_dir: Path, config: dict) -> dict:
+    state = _transcript_media_state(episode_dir)
+    provenance = _read_json(episode_dir / "transcript_provenance.json", {})
+    mapping = provenance.get("clock_mapping")
+    mapping_current = False
+    if mapping is not None:
+        try:
+            mapping = validate_transcript_clock_mapping(episode_dir, mapping)
+            mapping_current = (
+                mapping["source_content_fingerprint"]["id"]
+                == state["source_content_fingerprint"]["id"]
+                and mapping["asr_input_content_fingerprint"]["id"]
+                == state["asr_input_content_fingerprint"]["id"]
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+    episode = _read_json(episode_dir / "episode.json", {})
+    current = current_diarized_transcript(episode_dir, episode, config) is not None
+    transcript_path = episode_dir / "diarized_transcript.json"
+    return {
+        "schema": "cascade.transcript-clock-repair/v1",
+        "clock": "source",
+        **state,
+        "binding_revision": json_fingerprint(state),
+        "mapping_current": mapping_current,
+        "mapping": mapping,
+        "transcript_current": current,
+        "transcript_revision": (
+            file_revision(transcript_path) if transcript_path.is_file() else None
+        ),
+    }
+
+
+def _apply_transcript_clock_repair(
+    episode_dir: Path, config: dict, request: TranscriptClockRepairRequest
+) -> dict:
+    with _transcript_corrections_lock:
+        before = _transcript_media_state(episode_dir)
+        if request.expected_binding_revision != json_fingerprint(before):
+            raise _TranscriptRevisionConflict(
+                "Transcript repair inputs changed; inspect the repair state again"
+            )
+
+        mapping = build_transcript_clock_mapping(
+            episode_dir,
+            source_seconds_per_asr_second=request.source_seconds_per_asr_second,
+            source_offset_seconds=request.source_offset_seconds,
+            source_duration_seconds=before["source_duration_seconds"],
+            source_content_fingerprint=before["source_content_fingerprint"],
+            asr_input_content_fingerprint=before["asr_input_content_fingerprint"],
+            evidence=request.evidence.model_dump(exclude_none=True),
+        )
+        snapshot = _snapshot_transcript_artifacts(episode_dir)
+        try:
+            result = repair_existing_transcript(
+                episode_dir,
+                config,
+                clock_mapping_document=mapping,
+            )
+            after = _transcript_media_state(episode_dir)
+            if json_fingerprint(after) != json_fingerprint(before):
+                raise RuntimeError(
+                    "Transcript or source media changed during local repair"
+                )
+            episode = _read_json(episode_dir / "episode.json", {})
+            if current_diarized_transcript(episode_dir, episode, config) is None:
+                raise RuntimeError(
+                    "Repaired transcript did not pass currentness checks"
+                )
+        except BaseException:
+            try:
+                inputs_unchanged = json_fingerprint(
+                    _transcript_media_state(episode_dir)
+                ) == json_fingerprint(before)
+            except (
+                json.JSONDecodeError,
+                OSError,
+                subprocess.CalledProcessError,
+                TypeError,
+                ValueError,
+            ):
+                inputs_unchanged = False
+            if inputs_unchanged:
+                _restore_transcript_artifacts(snapshot)
+            raise
+
+        return {
+            "mapping": mapping,
+            "transcript_revision": file_revision(
+                episode_dir / "diarized_transcript.json"
+            ),
+            "speaker_alignment": result.get("speaker_alignment"),
+            "raw_transcript_unchanged": True,
+            "source_media_unchanged": True,
+        }
+
+
 def _apply_transcript_corrections(
     episode_dir: Path,
     config: dict,
@@ -231,10 +377,7 @@ def _apply_transcript_corrections(
             }
 
         corrections = {**corrections, "operations": operations}
-        paths = [episode_dir / relative for relative in _DERIVED_TRANSCRIPT_ARTIFACTS]
-        snapshot = {
-            path: path.read_bytes() if path.exists() else None for path in paths
-        }
+        snapshot = _snapshot_transcript_artifacts(episode_dir)
         try:
             atomic_write_json(episode_dir / "transcript_corrections.json", corrections)
             result = repair_existing_transcript(episode_dir, config)
@@ -714,6 +857,56 @@ async def inspection_transcript(episode_id: str) -> dict:
         "transcript",
         current_diarized_transcript,
     )
+
+
+@router.get("/{episode_id}/inspection/transcript/repair")
+async def inspection_transcript_repair(episode_id: str) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    try:
+        document = await asyncio.to_thread(
+            _transcript_repair_document, episode_dir, load_config()
+        )
+    except (
+        FileNotFoundError,
+        OSError,
+        subprocess.CalledProcessError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {**document, "episode_id": episode_id}
+
+
+@router.post("/{episode_id}/inspection/transcript/repair")
+async def apply_inspection_transcript_repair(
+    episode_id: str, request: TranscriptClockRepairRequest
+) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    try:
+        result = await asyncio.to_thread(
+            _apply_transcript_clock_repair,
+            episode_dir,
+            load_config(),
+            request,
+        )
+    except _TranscriptRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (
+        FileNotFoundError,
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "schema": "cascade.transcript-clock-repair/v1",
+        "episode_id": episode_id,
+        "clock": "source",
+        "current": True,
+        **result,
+    }
 
 
 @router.get("/{episode_id}/inspection/transcript/corrections")

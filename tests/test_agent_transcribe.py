@@ -14,6 +14,7 @@ from agents.transcribe import (
     _raw_is_multichannel,
     _utterances_from_words,
     analyze_transcript_coverage,
+    build_transcript_clock_mapping,
     current_diarized_transcript,
     export_logical_track_window,
     remap_transcript_timestamps,
@@ -415,6 +416,46 @@ def _write_activity(ep_dir, channel_levels):
         np.save(ep_dir / "work" / f"speaker_{index}_rms_db.npy", np.full(30, level))
 
 
+def _write_clock_mapping(
+    episode_dir, *, duration, scale=1.0, offset=0.0, anchor_count=2
+):
+    source = episode_dir / "source_merged.mp4"
+    if not source.exists():
+        source.write_bytes(b"source media")
+    raw = json.loads((episode_dir / "transcript.json").read_text())
+    asr_input = (
+        episode_dir
+        / "work"
+        / ("transcript_audio.flac" if _raw_is_multichannel(raw) else "audio.m4a")
+    )
+    if not asr_input.exists():
+        asr_input.write_bytes(b"ASR input")
+
+    def fingerprint(path):
+        stat = path.stat()
+        return {
+            "id": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+            "method": "sha256-full/test",
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+
+    mapping = build_transcript_clock_mapping(
+        episode_dir,
+        source_seconds_per_asr_second=scale,
+        source_offset_seconds=offset,
+        source_duration_seconds=duration,
+        source_content_fingerprint=fingerprint(source),
+        asr_input_content_fingerprint=fingerprint(asr_input),
+        evidence={
+            "method": "test anchors",
+            "anchor_count": anchor_count,
+            "summary": "Fixture clock relationship",
+        },
+    )
+    return mapping
+
+
 def _multichannel_episode(ep_dir):
     tracks = []
     for track in (1, 3, 2):
@@ -585,8 +626,11 @@ class TestCanonicalRepair:
         raw_text = json.dumps(raw, separators=(",", ":"))
         (tmp_episode_dir / "transcript.json").write_text(raw_text)
         _write_activity(tmp_episode_dir, (0.0, 20.0, 18.0))
+        mapping = _write_clock_mapping(tmp_episode_dir, duration=3.0)
 
-        result = repair_existing_transcript(tmp_episode_dir, sample_config)
+        result = repair_existing_transcript(
+            tmp_episode_dir, sample_config, clock_mapping_document=mapping
+        )
         repaired = json.loads(
             (tmp_episode_dir / "diarized_transcript.json").read_text()
         )
@@ -743,6 +787,59 @@ class TestCanonicalRepair:
             current_diarized_transcript(tmp_episode_dir, episode, sample_config) is None
         )
 
+    def test_historical_repair_requires_clock_lineage(
+        self, tmp_episode_dir, sample_config
+    ):
+        (tmp_episode_dir / "source_merged.mp4").write_bytes(b"source")
+        (tmp_episode_dir / "episode.json").write_text(
+            json.dumps({"duration_seconds": 5.0})
+        )
+        raw = json.dumps(MONO_RESPONSE, separators=(",", ":")).encode()
+        (tmp_episode_dir / "transcript.json").write_bytes(raw)
+
+        with pytest.raises(RuntimeError, match="clock lineage is unknown"):
+            repair_existing_transcript(tmp_episode_dir, sample_config)
+
+        assert (tmp_episode_dir / "transcript.json").read_bytes() == raw
+        assert not (tmp_episode_dir / "transcript_provenance.json").exists()
+
+    def test_affine_clock_mapping_preserves_raw_and_binds_currentness(
+        self, tmp_episode_dir, sample_config
+    ):
+        source = tmp_episode_dir / "source_merged.mp4"
+        source.write_bytes(b"source")
+        episode = {"duration_seconds": 5.0}
+        (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+        raw = json.dumps(MONO_RESPONSE, separators=(",", ":")).encode()
+        (tmp_episode_dir / "transcript.json").write_bytes(raw)
+        mapping = _write_clock_mapping(
+            tmp_episode_dir, duration=5.0, scale=1.01, offset=0.1
+        )
+
+        repair_existing_transcript(
+            tmp_episode_dir, sample_config, clock_mapping_document=mapping
+        )
+
+        repaired = json.loads(
+            (tmp_episode_dir / "diarized_transcript.json").read_text()
+        )
+        words = [
+            word for utterance in repaired["utterances"] for word in utterance["words"]
+        ]
+        assert words[0]["start"] == pytest.approx(0.605)
+        assert words[-1]["end"] == pytest.approx(1.918)
+        assert (tmp_episode_dir / "transcript.json").read_bytes() == raw
+        assert repaired["provenance"]["clock_mapping"] == mapping
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config)
+            == repaired
+        )
+
+        (tmp_episode_dir / "work" / "audio.m4a").write_bytes(b"different ASR input")
+        assert (
+            current_diarized_transcript(tmp_episode_dir, episode, sample_config) is None
+        )
+
     @patch("agents.transcribe.httpx.post")
     @patch("agents.transcribe.subprocess.run")
     def test_repaired_response_is_reused_without_audio_or_network(
@@ -753,7 +850,10 @@ class TestCanonicalRepair:
             json.dumps({"duration_seconds": 2.0})
         )
         (tmp_episode_dir / "transcript.json").write_text(json.dumps(MONO_RESPONSE))
-        repair_existing_transcript(tmp_episode_dir, sample_config)
+        mapping = _write_clock_mapping(tmp_episode_dir, duration=2.0)
+        repair_existing_transcript(
+            tmp_episode_dir, sample_config, clock_mapping_document=mapping
+        )
 
         result = TranscribeAgent(tmp_episode_dir, sample_config).execute()
 
