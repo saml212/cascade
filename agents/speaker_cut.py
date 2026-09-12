@@ -19,6 +19,7 @@ from agents.base import BaseAgent
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import logical_track_groups
 from lib.crop import compute_crop, resolve_speaker, speaker_crop_state
+from lib.ffprobe import file_fingerprint
 
 DOMINANCE_DB = 6.0
 SPEAKER_CUT_VERSION = "source-clock-v3"
@@ -100,11 +101,7 @@ def speaker_cut_fingerprint(
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return file_fingerprint(path)["id"].removeprefix("sha256:")
 
 
 def transcript_alignment_fingerprint(

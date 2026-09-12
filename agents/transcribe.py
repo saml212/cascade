@@ -26,6 +26,7 @@ import numpy as np
 from agents.base import BaseAgent
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import CAMERA_AUDIO_TIMELINE_FILTER, logical_track_groups
+from lib.ffprobe import file_fingerprint
 from lib.srt import fmt_timecode
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
@@ -68,11 +69,7 @@ def _file_identity(path: Path) -> dict:
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return file_fingerprint(path)["id"].removeprefix("sha256:")
 
 
 def _audio_content_type(path: Path) -> str:

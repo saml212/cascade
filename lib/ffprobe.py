@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import os
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -133,17 +135,58 @@ def media_fingerprint(path: str | Path, probe_data: dict | None = None) -> dict:
     }
 
 
-def file_fingerprint(path: str | Path) -> dict:
-    """Return a full SHA-256 content fingerprint and current file stat."""
-    path = Path(path)
+def _file_identity(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _hash_open_file(handle) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    stat = path.stat()
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=256)
+def _file_digest(resolved_path: str, identity: tuple[int, int, int, int, int]) -> str:
+    path = Path(resolved_path)
+    try:
+        with path.open("rb") as handle:
+            if _file_identity(os.fstat(handle.fileno())) != identity:
+                raise OSError
+            digest = _hash_open_file(handle)
+            if _file_identity(os.fstat(handle.fileno())) != identity:
+                raise OSError
+        if _file_identity(path.stat()) != identity:
+            raise OSError
+    except OSError as exc:
+        raise OSError(f"{path} changed while its fingerprint was read") from exc
+    return digest
+
+
+def file_fingerprint(path: str | Path) -> dict:
+    """Return a cached full SHA-256 only when the file identity stays stable."""
+    requested = Path(path)
+    resolved = requested.resolve(strict=True)
+    initial = resolved.stat()
+    identity = _file_identity(initial)
+    digest = _file_digest(str(resolved), identity)
+    try:
+        final_resolved = requested.resolve(strict=True)
+        final = _file_identity(final_resolved.stat())
+    except OSError as exc:
+        raise OSError(f"{requested} changed while its fingerprint was read") from exc
+    if final_resolved != resolved or final != identity:
+        raise OSError(f"{requested} changed while its fingerprint was read")
+
     return {
-        "id": f"sha256:{digest.hexdigest()}",
+        "id": f"sha256:{digest}",
         "method": "sha256-full/v1",
-        "size_bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
+        "size_bytes": initial.st_size,
+        "mtime_ns": initial.st_mtime_ns,
     }
