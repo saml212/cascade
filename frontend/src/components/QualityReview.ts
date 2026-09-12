@@ -2,6 +2,9 @@ import { Button } from './Button';
 import { h } from '../lib/dom';
 import {
   api,
+  type InspectionRequest,
+  type OutputContinuityFinding,
+  type OutputContinuityReport,
   type QualityFinding,
   type QualitySnapshot,
 } from '../lib/api';
@@ -17,6 +20,8 @@ interface QualityReviewOptions {
 
 export interface QualityReviewControls {
   previews: Map<string, HTMLAudioElement>;
+  inspectionPreviews?: Map<string, HTMLVideoElement>;
+  reviewDrafts?: Map<string, { reviewer: string; evidenceNote: string }>;
   visibleFindingCount?: number;
   showResolvedFindings?: boolean;
 }
@@ -117,8 +122,22 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
           onUpdated
         )
       : null,
+    !compact && quality?.audio_quality.selected_master_output_continuity
+      ? outputContinuityReview(
+          episodeId,
+          quality.audio_quality.selected_master_output_continuity,
+          controls
+        )
+      : null,
     !compact && findings.length
-      ? findingList(findings, revision, controls, cameraSourceOnly)
+      ? findingList(
+          episodeId,
+          findings,
+          revision,
+          controls,
+          onUpdated,
+          cameraSourceOnly
+        )
       : null
   );
 }
@@ -200,9 +219,11 @@ function repairCandidate(
 }
 
 function findingList(
+  episodeId: string,
   findings: QualityFinding[],
   revision: string,
   controls?: QualityReviewControls,
+  onUpdated?: () => void | Promise<void>,
   cameraSourceOnly = false
 ): HTMLElement {
   const panel = h('div', {
@@ -224,7 +245,9 @@ function findingList(
           ? 'Camera-source findings · not used by selected mix'
           : 'Continuity findings requiring review'
       ),
-      ...visible.map((finding) => findingCard(finding, revision, controls)),
+      ...visible.map((finding) =>
+        findingCard(episodeId, finding, revision, controls, onUpdated)
+      ),
     ];
     if (available.length > visible.length) {
       children.push(
@@ -275,9 +298,11 @@ function needsFindingReview(finding: QualityFinding): boolean {
 }
 
 function findingCard(
+  episodeId: string,
   finding: QualityFinding,
   revision: string,
-  controls?: QualityReviewControls
+  controls?: QualityReviewControls,
+  onUpdated?: () => void | Promise<void>
 ): HTMLElement {
   const source = finding.source_time;
   const edited = finding.edited_time;
@@ -333,10 +358,362 @@ function findingCard(
             `${revision}:${finding.id}:grounded-fallback`,
             controls
           )
-        : null
+        : null,
+      findingReviewAction(episodeId, finding, controls, onUpdated)
     )
   );
 }
+
+
+function findingReviewAction(
+  episodeId: string,
+  finding: QualityFinding,
+  controls?: QualityReviewControls,
+  onUpdated?: () => void | Promise<void>
+): HTMLElement | null {
+  const context = finding.review;
+  if (!context) return null;
+  const resolution = finding.resolution;
+  const outputRevision = context.output_revision;
+  const existingDecision = new Set(['accepted', 'false_positive']).has(
+    resolution?.status ?? ''
+  );
+  if (!context.allowed || !outputRevision || !context.inspection_request) {
+    return h(
+      'div',
+      {
+        class:
+          'rounded-md border border-border-subtle bg-surface-1 px-3 py-2 text-body-sm text-ink-tertiary',
+      },
+      context.reason ?? 'A current rendered-output review is unavailable.'
+    );
+  }
+
+  const inspectionRequest = context.inspection_request;
+  const identity = `finding-review:${context.report_fingerprint}:${context.finding_fingerprint}:${outputRevision}`;
+  const previewMap = inspectionPreviewMap(controls);
+  const draftMap = reviewDraftMap(controls);
+  const draft = draftMap.get(identity) ?? { reviewer: '', evidenceNote: '' };
+  draftMap.set(identity, draft);
+  const container = h('div', {
+    class: 'rounded-md border border-accent/30 bg-accent/5 px-3 py-3 grid gap-3',
+  });
+
+  const render = (): void => {
+    const video = previewMap.get(identity);
+    const children: Node[] = [
+      h(
+        'div',
+        { class: 'text-heading-sm uppercase text-ink-tertiary' },
+        'Review current rendered output'
+      ),
+      h(
+        'p',
+        { class: 'text-body-sm text-ink-secondary' },
+        'This decision applies to this source finding and the exact current full render. It does not approve publishing or waive selected-master or rendered-output continuity failures.'
+      ),
+    ];
+    if (existingDecision) {
+      children.push(
+        h(
+          'p',
+          { class: 'text-body-sm text-ink-secondary' },
+          `Recorded as ${resolution?.status?.replace('_', ' ')} by ${resolution?.reviewed_by ?? 'reviewer'}${
+            resolution?.evidence?.note ? `: ${resolution.evidence.note}` : '.'
+          }`
+        )
+      );
+    }
+    if (!video) {
+      const load = Button({
+        variant: 'secondary',
+        size: 'sm',
+        label: 'Load exact full-output preview',
+        onClick: async () => {
+          load.disabled = true;
+          load.textContent = 'Preparing bounded preview…';
+          try {
+            const result = await api.inspectionPreview(
+              episodeId,
+              inspectionRequest.query
+            );
+            const player = h('video', {
+              controls: true,
+              playsinline: true,
+              preload: 'metadata',
+              src: result.asset.url,
+              class: 'w-full rounded-md bg-black',
+            }) as HTMLVideoElement;
+            previewMap.set(identity, player);
+            render();
+          } catch (error) {
+            showToast((error as Error).message, 'error');
+            load.disabled = false;
+            load.textContent = 'Load exact full-output preview';
+          }
+        },
+      });
+      children.push(load);
+      container.replaceChildren(...children);
+      return;
+    }
+
+    const reviewer = h('input', {
+      type: 'text',
+      value: draft.reviewer,
+      placeholder: 'Reviewer name',
+      class:
+        'w-full rounded-md border border-border bg-surface-1 px-3 py-2 text-body text-ink-primary',
+      oninput: (event: Event) => {
+        draft.reviewer = (event.target as HTMLInputElement).value;
+      },
+    }) as HTMLInputElement;
+    const note = h('textarea', {
+      rows: 3,
+      value: draft.evidenceNote,
+      placeholder: 'What did you verify in this exact rendered passage?',
+      class:
+        'w-full rounded-md border border-border bg-surface-1 px-3 py-2 text-body text-ink-primary',
+      oninput: (event: Event) => {
+        draft.evidenceNote = (event.target as HTMLTextAreaElement).value;
+      },
+    }) as HTMLTextAreaElement;
+    const actions: HTMLButtonElement[] = [];
+    const submit = async (
+      decision: 'accepted' | 'false_positive'
+    ): Promise<void> => {
+      if (!draft.reviewer.trim() || !draft.evidenceNote.trim()) {
+        showToast('Enter the reviewer and the evidence you verified.', 'error');
+        return;
+      }
+      actions.forEach((button) => {
+        button.disabled = true;
+      });
+      try {
+        await api.reviewAudioFinding(episodeId, finding.id, {
+          decision,
+          reviewer: draft.reviewer.trim(),
+          evidence_note: draft.evidenceNote.trim(),
+          expected_report_fingerprint: context.report_fingerprint,
+          expected_finding_fingerprint: context.finding_fingerprint,
+          expected_output_revision: outputRevision,
+        });
+        showToast('Finding review recorded for the current output.', 'success');
+        await onUpdated?.();
+      } catch (error) {
+        showToast((error as Error).message, 'error');
+        actions.forEach((button) => {
+          button.disabled = false;
+        });
+      }
+    };
+    const accept = Button({
+      variant: 'secondary',
+      size: 'sm',
+      label: 'Accept issue for this render',
+      onClick: () => submit('accepted'),
+    });
+    const falsePositive = Button({
+      variant: 'secondary',
+      size: 'sm',
+      label: 'Mark false positive for this render',
+      onClick: () => submit('false_positive'),
+    });
+    actions.push(accept, falsePositive);
+    children.push(
+      h(
+        'label',
+        { class: 'text-body-sm text-ink-tertiary flex flex-col gap-1' },
+        'Exact current longform output',
+        video
+      ),
+      reviewer,
+      note,
+      h('div', { class: 'flex gap-2 flex-wrap' }, accept, falsePositive)
+    );
+    container.replaceChildren(...children);
+  };
+  render();
+  return container;
+}
+
+
+function outputContinuityReview(
+  episodeId: string,
+  report: OutputContinuityReport,
+  controls?: QualityReviewControls
+): HTMLElement | null {
+  const artifacts = (report.artifacts ?? []).filter(
+    (artifact) => artifact.status !== 'pass'
+  );
+  const findings = report.findings ?? [];
+  if (
+    (!report.status || report.status === 'pass') &&
+    !artifacts.length &&
+    !findings.length
+  ) {
+    return null;
+  }
+  return h(
+    'div',
+    { class: 'border-t border-border-subtle pt-4 flex flex-col gap-3' },
+    h(
+      'div',
+      { class: 'text-heading-sm uppercase text-ink-tertiary' },
+      'Selected-master and output continuity'
+    ),
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-secondary' },
+      report.current === false
+        ? 'This output-continuity report is stale. Run QA before using its timestamps or previews.'
+        : report.detail ?? 'Current output continuity evidence is incomplete.'
+    ),
+    ...artifacts.map((artifact) =>
+      h(
+        'div',
+        {
+          class:
+            'rounded-md border border-status-danger/30 bg-status-danger/5 px-3 py-2 text-body-sm text-ink-secondary',
+        },
+        `${outputRole(artifact.role, artifact.clip_id)} · ${artifact.status ?? 'unknown'} · ${artifact.detail ?? 'No diagnostic detail.'}`
+      )
+    ),
+    ...findings.map((finding) =>
+      outputContinuityFinding(episodeId, finding, controls)
+    ),
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-tertiary' },
+      'These are hard output checks. Source-finding review decisions cannot waive them.'
+    )
+  );
+}
+
+
+function outputContinuityFinding(
+  episodeId: string,
+  finding: OutputContinuityFinding,
+  controls?: QualityReviewControls
+): HTMLElement {
+  const time = finding.artifact_time;
+  const identity = `output-continuity:${finding.fingerprint ?? finding.id}`;
+  return h(
+    'details',
+    { class: 'rounded-md border border-status-danger/30 bg-surface-2 px-4 py-3' },
+    h(
+      'summary',
+      { class: 'cursor-pointer text-body text-ink-primary font-medium' },
+      `${outputRole(finding.role, finding.clip_id)} · ${finding.kind ?? 'continuity failure'} · ${timeRange(time?.start_seconds, time?.end_seconds)} (${time?.clock ?? 'unknown'} clock)`
+    ),
+    h(
+      'div',
+      { class: 'mt-3 grid gap-3' },
+      finding.evidence?.transcript_excerpt
+        ? h(
+            'blockquote',
+            { class: 'text-body-sm text-ink-secondary border-l-2 border-border pl-3' },
+            finding.evidence.transcript_excerpt
+          )
+        : null,
+      finding.inspection_request
+        ? lazyInspectionPreview(
+            episodeId,
+            finding.inspection_request,
+            identity,
+            'Inspect exact current output',
+            controls
+          )
+        : h(
+            'p',
+            { class: 'text-body-sm text-ink-tertiary' },
+            'No bounded canonical preview is available for this artifact. Repair or regenerate it, then rerun QA.'
+          )
+    )
+  );
+}
+
+
+function lazyInspectionPreview(
+  episodeId: string,
+  request: InspectionRequest,
+  identity: string,
+  label: string,
+  controls?: QualityReviewControls
+): HTMLElement {
+  const previewMap = inspectionPreviewMap(controls);
+  const container = h('div', { class: 'grid gap-2' });
+  const render = (): void => {
+    const video = previewMap.get(identity);
+    if (video) {
+      container.replaceChildren(
+        h(
+          'label',
+          { class: 'text-body-sm text-ink-tertiary flex flex-col gap-1' },
+          label,
+          video
+        )
+      );
+      return;
+    }
+    const load = Button({
+      variant: 'secondary',
+      size: 'sm',
+      label,
+      onClick: async () => {
+        load.disabled = true;
+        try {
+          const result = await api.inspectionPreview(episodeId, request.query);
+          previewMap.set(
+            identity,
+            h('video', {
+              controls: true,
+              playsinline: true,
+              preload: 'metadata',
+              src: result.asset.url,
+              class: 'w-full rounded-md bg-black',
+            }) as HTMLVideoElement
+          );
+          render();
+        } catch (error) {
+          showToast((error as Error).message, 'error');
+          load.disabled = false;
+        }
+      },
+    });
+    container.replaceChildren(load);
+  };
+  render();
+  return container;
+}
+
+
+function inspectionPreviewMap(
+  controls?: QualityReviewControls
+): Map<string, HTMLVideoElement> {
+  if (!controls) return new Map();
+  controls.inspectionPreviews ??= new Map();
+  return controls.inspectionPreviews;
+}
+
+
+function reviewDraftMap(
+  controls?: QualityReviewControls
+): Map<string, { reviewer: string; evidenceNote: string }> {
+  if (!controls) return new Map();
+  controls.reviewDrafts ??= new Map();
+  return controls.reviewDrafts;
+}
+
+
+function outputRole(role?: string, clipId?: string): string {
+  if (role === 'selected_audio_master') return 'Selected audio master';
+  if (role === 'upload_video') return 'Full upload video';
+  if (role === 'podcast_audio') return 'Podcast MP3';
+  if (role === 'short') return `Short${clipId ? ` ${clipId}` : ''}`;
+  return role?.replaceAll('_', ' ') ?? 'Output artifact';
+}
+
 
 function findingLabel(finding: QualityFinding): string {
   if (finding.classification === 'probable_dropout') return 'Probable audio dropout';

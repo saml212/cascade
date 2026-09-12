@@ -23,8 +23,11 @@ from lib.audio_mix import (
     audio_selection_settings,
     document_fingerprint,
 )
+from lib.audio_qa import AUDIO_FINDING_REVIEWS_PATH
+from lib.audio_qa import release_gate as audio_release_gate
 from lib.delivery_video import (
     longform_render_fingerprint,
+    read_render_manifest,
     record_longform_render,
     record_short_render,
     short_render_fingerprint,
@@ -172,6 +175,104 @@ def _seed_release(episodes_dir: Path, *, qa_overall: str = "pass") -> Path:
     return episode_dir
 
 
+def _reviewable_finding(finding_id: str, start: float) -> dict:
+    return {
+        "id": finding_id,
+        "fingerprint": f"fingerprint-{finding_id}",
+        "kind": "sharp_level_collapse",
+        "classification": "candidate_discontinuity",
+        "severity": "warning",
+        "confidence": 0.8,
+        "source_time": {
+            "start_seconds": start,
+            "end_seconds": start + 1,
+            "duration_seconds": 1,
+        },
+        "edited_time": {
+            "status": "retained",
+            "ranges": [
+                {
+                    "start_seconds": start,
+                    "end_seconds": start + 1,
+                    "source_start_seconds": start,
+                    "source_end_seconds": start + 1,
+                }
+            ],
+        },
+        "resolution": {"status": "unresolved"},
+    }
+
+
+def _install_reviewable_report(episode_dir: Path, findings: list[dict]) -> dict:
+    report = _audio_report(episode_dir, findings)
+    report.update(
+        analysis={"status": "complete", "finding_count": len(findings)},
+        scope={
+            "selected_mix_provenance": {
+                "uses_checked_source_audio": True,
+                "fingerprint": "mix-current",
+                "selected_output": {"fingerprint": {"id": "master-current"}},
+            },
+            "outputs_checked": [
+                {
+                    "role": "selected_audio_master",
+                    "status": "pass",
+                    "source_report_fingerprint": "report-1",
+                    "selected_mix_fingerprint": "mix-current",
+                    "fingerprint": {"id": "master-current"},
+                    "verification": {
+                        "status": "pass",
+                        "checks": [{"name": "exact_bytes", "pass": True}],
+                    },
+                }
+            ],
+        },
+    )
+    report["release_gate"] = audio_release_gate(report)
+    _write_json(episode_dir / "qa" / "audio-quality.json", report)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report.update(
+        overall="fail",
+        quality_revision=quality_revision(episode_dir, episode, config=load_config()),
+        checks=[
+            {
+                "name": "audio_continuity",
+                "status": report["release_gate"]["status"],
+                "pass": False,
+                "detail": report["release_gate"]["reason"],
+            },
+            {
+                "name": "selected_master_output_continuity",
+                "status": "pass",
+                "pass": True,
+                "detail": "Current selected and rendered audio passed.",
+            },
+        ],
+        audio_quality=report,
+        selected_master_output_continuity={
+            "status": "pass",
+            "safe": True,
+            "artifacts": [],
+            "findings": [],
+        },
+    )
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+    return report
+
+
+def _review_request(finding: dict, decision: str = "accepted") -> dict:
+    review = finding["review"]
+    return {
+        "decision": decision,
+        "reviewer": "Editorial reviewer",
+        "evidence_note": "Compared the complete retained passage in the current render.",
+        "expected_report_fingerprint": review["report_fingerprint"],
+        "expected_finding_fingerprint": review["finding_fingerprint"],
+        "expected_output_revision": review["output_revision"],
+    }
+
+
 def test_quality_api_reports_current_release_ready(quality_client):
     client, episodes_dir = quality_client
     _seed_release(episodes_dir)
@@ -222,6 +323,249 @@ def test_quality_api_exposes_failed_report_and_findings(quality_client):
     assert body["quality"]["status"] == "blocked"
     assert body["audio_quality"]["findings"][0]["id"] == "aq_blocked"
     assert body["release_gate"]["safe"] is False
+
+
+def test_finding_review_is_explicit_and_exposes_current_output_inspection(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_reviewable_report(episode_dir, [_reviewable_finding("aq_one", 10)])
+
+    body = client.get("/api/episodes/ep_test/quality").json()
+    finding = body["audio_quality"]["findings"][0]
+
+    assert finding["review"]["allowed"] is True
+    assert finding["review"]["inspection_request"] == {
+        "method": "GET",
+        "endpoint": "/api/episodes/ep_test/inspection/preview",
+        "query": {
+            "target": "longform",
+            "clock": "source",
+            "seconds": 8.0,
+            "duration_seconds": 5.0,
+        },
+    }
+    assert finding["review"]["output_revision"].startswith("sha256:")
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+    missing_action = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_one/review"
+    )
+
+    assert missing_action.status_code == 422
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+
+def test_finding_review_preserves_unrelated_findings_and_updates_quality_gate(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    report = _install_reviewable_report(
+        episode_dir,
+        [_reviewable_finding("aq_one", 10), _reviewable_finding("aq_two", 20)],
+    )
+    raw_report = (episode_dir / "qa" / "audio-quality.json").read_bytes()
+    before = client.get("/api/episodes/ep_test/quality").json()
+    by_id = {item["id"]: item for item in before["audio_quality"]["findings"]}
+
+    first = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_one/review",
+        json=_review_request(by_id["aq_one"]),
+    )
+
+    assert first.status_code == 200
+    assert first.json()["resolution"]["status"] == "accepted"
+    assert first.json()["publish_approval_current"] is False
+    assert (episode_dir / "qa" / "audio-quality.json").read_bytes() == raw_report
+    current = client.get("/api/episodes/ep_test/quality").json()
+    assert current["release_gate"]["revision"] != before["release_gate"]["revision"]
+    current_by_id = {item["id"]: item for item in current["audio_quality"]["findings"]}
+    assert current_by_id["aq_one"]["resolution"]["status"] == "accepted"
+    assert current_by_id["aq_two"]["resolution"]["status"] == "unresolved"
+    document = json.loads((episode_dir / AUDIO_FINDING_REVIEWS_PATH).read_text())
+    assert set(document["reviews"]) == {"aq_one"}
+    assert (
+        document["reviews"]["aq_one"]["source_report_fingerprint"]
+        == report["fingerprint"]
+    )
+
+    second = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_two/review",
+        json=_review_request(by_id["aq_two"], "false_positive"),
+    )
+
+    assert second.status_code == 200
+    assert second.json()["audio_release_gate"]["status"] == "pass"
+    assert second.json()["quality"]["overall"] == "pass"
+    assert second.json()["quality"]["status"] == "passed"
+    effective = client.get("/api/episodes/ep_test/audio-qc").json()
+    effective_by_id = {item["id"]: item for item in effective["findings"]}
+    assert effective_by_id["aq_one"]["resolution"]["status"] == "accepted"
+    assert effective_by_id["aq_two"]["resolution"]["status"] == "false_positive"
+
+
+def test_finding_review_rejects_changed_output_and_stale_report(quality_client):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    _install_reviewable_report(episode_dir, [_reviewable_finding("aq_one", 10)])
+    finding = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "findings"
+    ][0]
+    request = _review_request(finding)
+
+    manifest = read_render_manifest(episode_dir)
+    (episode_dir / "upload_video.mp4").write_bytes(b"replacement output")
+    record_longform_render(
+        episode_dir,
+        fingerprint=manifest["longform"]["fingerprint"],
+        render_mode="speaker_cut",
+        timeline=Timeline(60, [(0, 60)]),
+        media={"duration_seconds": 60},
+    )
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report["quality_revision"] = quality_revision(
+        episode_dir, episode, config=load_config()
+    )
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+    changed_output = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_one/review", json=request
+    )
+
+    assert changed_output.status_code == 409
+    assert "Rendered output changed" in changed_output.json()["detail"]
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+    episode_dir = _seed_release(episodes_dir)
+    report = _install_reviewable_report(
+        episode_dir, [_reviewable_finding("aq_one", 10)]
+    )
+    finding = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "findings"
+    ][0]
+    request = _review_request(finding)
+    report["fingerprint"] = "report-replaced"
+    _write_json(episode_dir / "qa" / "audio-quality.json", report)
+
+    stale_report = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_one/review", json=request
+    )
+
+    assert stale_report.status_code == 409
+    assert "report changed" in stale_report.json()["detail"]
+    assert not (episode_dir / AUDIO_FINDING_REVIEWS_PATH).exists()
+
+
+def test_finding_review_rejects_split_ranges_and_missing_output_proof(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    split = _reviewable_finding("aq_split", 10)
+    split["edited_time"] = {
+        "status": "split",
+        "ranges": [
+            {
+                "start_seconds": 10,
+                "end_seconds": 10.4,
+                "source_start_seconds": 10,
+                "source_end_seconds": 10.4,
+            },
+            {
+                "start_seconds": 10.4,
+                "end_seconds": 11,
+                "source_start_seconds": 10.6,
+                "source_end_seconds": 11.2,
+            },
+        ],
+    }
+    _install_reviewable_report(episode_dir, [split])
+    finding = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "findings"
+    ][0]
+    assert finding["review"]["allowed"] is False
+    assert "multiple retained ranges" in finding["review"]["reason"]
+    rejected = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_split/review",
+        json=_review_request(finding),
+    )
+    assert rejected.status_code == 409
+
+    episode_dir = _seed_release(episodes_dir)
+    report = _install_reviewable_report(
+        episode_dir, [_reviewable_finding("aq_unverified", 10)]
+    )
+    report["scope"]["outputs_checked"] = []
+    report["release_gate"] = audio_release_gate(report)
+    _write_json(episode_dir / "qa" / "audio-quality.json", report)
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report["audio_quality"] = report
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+    unverified = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "findings"
+    ][0]
+    assert unverified["review"]["allowed"] is False
+    assert "verified current selected audio master" in unverified["review"]["reason"]
+
+
+def test_output_continuity_failures_expose_bounded_canonical_inspection(
+    quality_client,
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report["overall"] = "fail"
+    qa_report["selected_master_output_continuity"] = {
+        "status": "failed",
+        "safe": False,
+        "detail": "Current upload contains speech-overlapping silence.",
+        "artifacts": [
+            {
+                "role": "upload_video",
+                "status": "failed",
+                "detail": "One span detected.",
+            }
+        ],
+        "findings": [
+            {
+                "id": "oc_one",
+                "fingerprint": "oc-fingerprint",
+                "role": "upload_video",
+                "artifact_time": {
+                    "clock": "output",
+                    "start_seconds": 10,
+                    "end_seconds": 11,
+                },
+            }
+        ],
+    }
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+    continuity = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "selected_master_output_continuity"
+    ]
+
+    assert continuity["findings"][0]["inspection_request"] == {
+        "method": "GET",
+        "endpoint": "/api/episodes/ep_test/inspection/preview",
+        "query": {
+            "target": "longform",
+            "clock": "output",
+            "seconds": 8.0,
+            "duration_seconds": 5.0,
+        },
+    }
+    assert continuity["artifacts"][0]["status"] == "failed"
+
+    (episode_dir / "upload_video.mp4").write_bytes(b"replacement")
+    stale = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "selected_master_output_continuity"
+    ]
+    assert stale["current"] is False
+    assert "inspection_request" not in stale["findings"][0]
 
 
 def test_finding_preview_uses_report_owned_source_and_scoped_output(

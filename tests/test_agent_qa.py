@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from agents.qa import QAAgent
+from lib.audio_qa import AUDIO_FINDING_REVIEWS_PATH, AUDIO_FINDING_REVIEWS_SCHEMA
 
 
 @pytest.fixture(autouse=True)
@@ -306,6 +307,77 @@ class TestQAAgent:
             agent.execute()
 
         assert (tmp_episode_dir / "qa" / "qa.json").exists()
+
+    def test_qa_rerun_keeps_review_only_for_the_same_output(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        report = {
+            "fingerprint": "report-v1",
+            "analysis": {"status": "complete"},
+            "scope": {"selected_mix_provenance": {}},
+            "findings": [
+                {
+                    "id": "aq_one",
+                    "fingerprint": "finding-v1",
+                    "severity": "warning",
+                    "edited_time": {"status": "retained"},
+                    "resolution": {"status": "unresolved"},
+                }
+            ],
+        }
+        (tmp_episode_dir / AUDIO_FINDING_REVIEWS_PATH).write_text(
+            json.dumps(
+                {
+                    "schema": AUDIO_FINDING_REVIEWS_SCHEMA,
+                    "reviews": {
+                        "aq_one": {
+                            "decision": "accepted",
+                            "source_report_fingerprint": "report-v1",
+                            "finding_fingerprint": "finding-v1",
+                            "output_revision": "render-v1",
+                            "reviewed_by": "Editor",
+                            "reviewed_at": "2026-09-11T00:00:00+00:00",
+                            "evidence_note": "Reviewed current output.",
+                        }
+                    },
+                }
+            )
+        )
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+        agent = QAAgent(tmp_episode_dir, sample_config)
+
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value=report),
+            patch("agents.qa.review_output_revision", return_value="render-v1"),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
+            agent.execute()
+        saved = json.loads((tmp_episode_dir / "qa" / "audio-quality.json").read_text())
+        assert saved["findings"][0]["resolution"]["status"] == "accepted"
+
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value=report),
+            patch("agents.qa.review_output_revision", return_value="render-v2"),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
+            agent.execute()
+        saved = json.loads((tmp_episode_dir / "qa" / "audio-quality.json").read_text())
+        assert saved["findings"][0]["resolution"] == {"status": "unresolved"}
 
     def test_clip_boundary_words_are_nonblocking_revisioned_warnings(
         self, tmp_episode_dir, sample_config, sample_clips

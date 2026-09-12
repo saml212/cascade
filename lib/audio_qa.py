@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -28,6 +29,8 @@ from lib.ffprobe import probe as ffprobe
 
 REPORT_SCHEMA = "cascade.audio-quality/v1"
 OUTPUT_CONTINUITY_SCHEMA = "cascade.output-audio-continuity/v1"
+AUDIO_FINDING_REVIEWS_PATH = Path("qa/audio-finding-reviews.json")
+AUDIO_FINDING_REVIEWS_SCHEMA = "cascade.audio-finding-reviews/v1"
 DETECTOR_VERSION = "1.2"
 OUTPUT_CONTINUITY_VERSION = "1"
 PREVIEW_ALGORITHM_VERSION = "5"
@@ -1055,6 +1058,95 @@ def release_gate(report: dict) -> dict:
         "review_finding_ids": [],
         "reason": "Source findings are resolved and the current audio output passed continuity verification.",
     }
+
+
+def review_output_revision(record: dict | None) -> str | None:
+    """Bind a finding review to the exact current longform output evidence."""
+    if not isinstance(record, dict) or not record.get("fingerprint"):
+        return None
+    output = record.get("output")
+    if not isinstance(output, dict) or not all(
+        isinstance(output.get(key), int) for key in ("size_bytes", "mtime_ns")
+    ):
+        return None
+    return json_fingerprint(
+        {
+            "render_fingerprint": record["fingerprint"],
+            "render_mode": record.get("render_mode"),
+            "output": output,
+            "audio_remaster": (record.get("provenance") or {}).get("audio_remaster"),
+        }
+    )
+
+
+def selected_output_proof_status(report: dict) -> str:
+    """Return whether source QA is bound to a verified selected audio master."""
+    return _output_proof_state(report)[0]
+
+
+def apply_finding_reviews(
+    report: dict, review_document: dict | None, *, output_revision: str | None
+) -> dict:
+    """Overlay only human decisions bound to this report, finding, and output."""
+    result = copy.deepcopy(report)
+    findings = result.get("findings", [])
+    if not isinstance(findings, list):
+        findings = []
+        result["findings"] = findings
+
+    # Human waivers are valid only through the separate revision-bound record.
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        if (finding.get("resolution") or {}).get("status") in {
+            "accepted",
+            "false_positive",
+        }:
+            finding["resolution"] = {"status": "unresolved"}
+
+    reviews = (
+        review_document.get("reviews", {})
+        if isinstance(review_document, dict)
+        and review_document.get("schema") == AUDIO_FINDING_REVIEWS_SCHEMA
+        else {}
+    )
+    if isinstance(reviews, dict) and output_revision:
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            existing_status = (finding.get("resolution") or {}).get("status")
+            if existing_status not in {None, "unresolved"}:
+                continue
+            review = reviews.get(str(finding.get("id")))
+            finding_fingerprint = finding.get("fingerprint")
+            if not isinstance(review, dict) or not all(
+                (
+                    bool(finding_fingerprint),
+                    review.get("decision") in {"accepted", "false_positive"},
+                    review.get("source_report_fingerprint")
+                    == result.get("fingerprint"),
+                    review.get("finding_fingerprint") == finding_fingerprint,
+                    review.get("output_revision") == output_revision,
+                    bool(str(review.get("reviewed_by", "")).strip()),
+                    bool(str(review.get("evidence_note", "")).strip()),
+                    bool(review.get("reviewed_at")),
+                )
+            ):
+                continue
+            finding["resolution"] = {
+                "status": review["decision"],
+                "finding_fingerprint": finding_fingerprint,
+                "reviewed_by": review["reviewed_by"],
+                "reviewed_at": review["reviewed_at"],
+                "evidence": {
+                    "note": review["evidence_note"],
+                    "source_report_fingerprint": review["source_report_fingerprint"],
+                    "output_revision": review["output_revision"],
+                    "inspection": review.get("inspection"),
+                },
+            }
+    result["release_gate"] = release_gate(result)
+    return result
 
 
 def _output_proof_state(report: dict) -> tuple[str, dict | None]:

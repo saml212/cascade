@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -18,11 +19,15 @@ from lib.audio_mix import (
     selected_audio_source,
 )
 from lib.audio_qa import (
+    AUDIO_FINDING_REVIEWS_PATH,
     OUTPUT_CONTINUITY_SCHEMA,
     OUTPUT_CONTINUITY_VERSION,
     TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD,
     analyze_episode_audio,
     analyze_output_continuity,
+    apply_finding_reviews,
+    review_output_revision,
+    selected_output_proof_status,
     transcript_analysis_fingerprint,
 )
 from lib.audio_qa import release_gate as audio_release_gate
@@ -32,7 +37,8 @@ from lib.delivery_video import (
     current_short_render,
     read_render_manifest,
 )
-from lib.ffprobe import file_fingerprint, probe as ffprobe
+from lib.ffprobe import file_fingerprint
+from lib.ffprobe import probe as ffprobe
 from lib.timeline import Timeline
 from lib.transcript_search import clip_boundary_evidence
 
@@ -412,6 +418,9 @@ def release_revision(
     payload = {
         "quality_revision": quality_revision(episode_dir, episode, config=config),
         "clip_decisions": decisions,
+        "audio_finding_reviews": _file_signature(
+            episode_dir / AUDIO_FINDING_REVIEWS_PATH
+        ),
         "publish_plan": current_publish_plan(config, episode, environment=environment),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -744,6 +753,174 @@ def analyze_release_audio_continuity(
     )
 
 
+def _review_output(record: dict | None) -> dict | None:
+    revision = review_output_revision(record)
+    if revision is None or not isinstance(record, dict):
+        return None
+    output = record.get("output") or {}
+    return {
+        "revision": revision,
+        "render_fingerprint": record.get("fingerprint"),
+        "output_stat": {
+            "size_bytes": output.get("size_bytes"),
+            "mtime_ns": output.get("mtime_ns"),
+        },
+        "completed_at": record.get("completed_at"),
+    }
+
+
+def _finding_review_window(finding: dict, record: dict) -> dict | None:
+    ranges = (finding.get("edited_time") or {}).get("ranges") or []
+    if len(ranges) != 1:
+        return None
+    try:
+        start = float(ranges[0]["source_start_seconds"])
+        end = float(ranges[0]["source_end_seconds"])
+        interval_start, interval_end = next(
+            (float(left), float(right))
+            for left, right in record.get("keep_intervals", [])
+            if float(left) <= start < end <= float(right)
+        )
+    except (KeyError, StopIteration, TypeError, ValueError):
+        return None
+    finding_duration = end - start
+    if (
+        not all(math.isfinite(value) for value in (start, end))
+        or finding_duration <= 0
+        or finding_duration > 30
+    ):
+        return None
+    preview_start = max(interval_start, start - min(2.0, 30.0 - finding_duration))
+    preview_end = min(interval_end, end + min(2.0, 30.0 - (end - preview_start)))
+    if preview_end < end or preview_end <= preview_start:
+        return None
+    return {
+        "target": "longform",
+        "clock": "source",
+        "seconds": round(preview_start, 6),
+        "duration_seconds": round(preview_end - preview_start, 6),
+    }
+
+
+def _attach_finding_review_context(
+    audio_report: dict,
+    current_longform: dict | None,
+    episode_id: str,
+    *,
+    qa_current: bool,
+) -> dict:
+    output = _review_output(current_longform)
+    output_proof_status = selected_output_proof_status(audio_report)
+    uses_checked_source = (
+        audio_report.get("scope", {})
+        .get("selected_mix_provenance", {})
+        .get("uses_checked_source_audio")
+    )
+    for finding in audio_report.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        window = (
+            _finding_review_window(finding, current_longform)
+            if isinstance(current_longform, dict)
+            else None
+        )
+        resolution = (finding.get("resolution") or {}).get("status", "unresolved")
+        reason = None
+        if not qa_current:
+            reason = "Run QA for the current revision before recording a review."
+        elif uses_checked_source is not True:
+            reason = "This source-channel check does not apply to the selected mix."
+        elif output_proof_status != "pass":
+            reason = "Run QA with a verified current selected audio master before recording a review."
+        elif not audio_report.get("fingerprint") or not finding.get("fingerprint"):
+            reason = "This report or finding has no stable review fingerprint."
+        elif (finding.get("edited_time") or {}).get("status") == "removed":
+            reason = "This finding was removed by the current edit."
+        elif (finding.get("edited_time") or {}).get("status") == "split":
+            reason = "This finding spans multiple retained ranges and needs separate review evidence."
+        elif output is None or window is None:
+            reason = "A current rendered output containing this finding is unavailable."
+        elif resolution not in {"unresolved", "accepted", "false_positive"}:
+            reason = f"This finding is already resolved as {resolution}."
+        finding["review"] = {
+            "allowed": reason is None,
+            "reason": reason,
+            "report_fingerprint": audio_report.get("fingerprint"),
+            "finding_fingerprint": finding.get("fingerprint"),
+            "output_revision": output.get("revision") if output else None,
+            "inspection_request": (
+                {
+                    "method": "GET",
+                    "endpoint": f"/api/episodes/{episode_id}/inspection/preview",
+                    "query": window,
+                }
+                if window and qa_current
+                else None
+            ),
+            "decision_endpoint": (
+                f"/api/episodes/{episode_id}/audio-qc/findings/"
+                f"{finding.get('id')}/review"
+            ),
+        }
+    return audio_report
+
+
+def _attach_output_continuity_inspection(
+    output_continuity: dict, episode_id: str, *, qa_current: bool
+) -> dict:
+    """Expose bounded canonical inspection requests for hard output findings."""
+    output_continuity["current"] = qa_current
+    for finding in output_continuity.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        finding.pop("inspection_request", None)
+        if not qa_current:
+            continue
+        role = finding.get("role")
+        artifact_time = finding.get("artifact_time") or {}
+        try:
+            start = float(artifact_time["start_seconds"])
+            end = float(artifact_time["end_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (start, end)) or end <= start:
+            continue
+        target = None
+        clip_id = None
+        clock = str(artifact_time.get("clock", "output"))
+        if role == "selected_audio_master":
+            target, clock = "longform", "source"
+            source_ranges = finding.get("source_ranges") or []
+            if len(source_ranges) != 1:
+                continue
+            try:
+                start = float(source_ranges[0]["start_seconds"])
+                end = float(source_ranges[0]["end_seconds"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        elif role == "upload_video":
+            target = "longform"
+        elif role == "short" and finding.get("clip_id"):
+            target, clip_id = "short", str(finding["clip_id"])
+        if target is None or clock not in {"source", "output"}:
+            continue
+        padding = 0.0 if clock == "source" else 2.0
+        query = {
+            "target": target,
+            "clock": clock,
+            "seconds": round(max(0.0, start - padding), 6),
+            "duration_seconds": round(min(30.0, end - start + padding * 2), 6),
+        }
+        if clip_id:
+            query["clip_id"] = clip_id
+        finding["inspection_request"] = {
+            "method": "GET",
+            "endpoint": f"/api/episodes/{episode_id}/inspection/preview",
+            "query": query,
+        }
+    return output_continuity
+
+
 def quality_snapshot(
     episode_dir: str | Path,
     *,
@@ -774,6 +951,43 @@ def quality_snapshot(
     )
     report = _load_json(episode_dir / QUALITY_REPORT_PATH)
     report_revision = report.get("quality_revision")
+    qa_current = bool(report) and report_revision == current_quality_revision
+    audio_quality = report.get("audio_quality") or _load_json(
+        episode_dir / AUDIO_REPORT_PATH
+    )
+    audio_quality = apply_finding_reviews(
+        audio_quality,
+        _load_json(episode_dir / AUDIO_FINDING_REVIEWS_PATH),
+        output_revision=review_output_revision(current_longform),
+    )
+    audio_quality = _attach_finding_review_context(
+        audio_quality,
+        current_longform,
+        episode.get("episode_id", episode_dir.name),
+        qa_current=qa_current,
+    )
+    audio_gate = audio_quality.get("release_gate", {})
+    effective_checks = [dict(check) for check in report.get("checks", [])]
+    for check in effective_checks:
+        if check.get("name") == "audio_continuity":
+            check.update(
+                {
+                    "status": audio_gate.get("status", "unknown"),
+                    "pass": audio_gate.get("status") == "pass",
+                    "detail": audio_gate.get(
+                        "reason", "Audio continuity report unavailable"
+                    ),
+                }
+            )
+    effective_overall = (
+        (
+            "pass"
+            if all(check.get("pass") is True for check in effective_checks)
+            else "fail"
+        )
+        if effective_checks
+        else report.get("overall")
+    )
 
     blockers: list[dict] = []
     if not report:
@@ -794,7 +1008,7 @@ def quality_snapshot(
                 "message": "Release inputs changed after the last QA run.",
             }
         )
-    elif report.get("overall") != "pass":
+    elif effective_overall != "pass":
         quality_status = "blocked"
         blockers.append(
             {
@@ -959,9 +1173,6 @@ def quality_snapshot(
     else:
         release_status = "ready"
 
-    audio_quality = report.get("audio_quality") or _load_json(
-        episode_dir / AUDIO_REPORT_PATH
-    )
     repair_candidate = _load_json(
         episode_dir / "qa" / "audio-repair" / "audio-repair-candidate.json"
     )
@@ -985,8 +1196,12 @@ def quality_snapshot(
         audio_quality.get("findings", []) if isinstance(audio_quality, dict) else []
     )
     analysis = audio_quality.get("analysis", {})
-    audio_gate = audio_quality.get("release_gate", {})
     output_continuity = report.get("selected_master_output_continuity", {})
+    output_continuity = _attach_output_continuity_inspection(
+        output_continuity,
+        episode.get("episode_id", episode_dir.name),
+        qa_current=qa_current,
+    )
     if not include_findings:
         analysis = {
             key: analysis.get(key)
@@ -1023,8 +1238,8 @@ def quality_snapshot(
             "current_revision": current_quality_revision,
             "report_revision": report_revision,
             "generated_at": report.get("generated_at"),
-            "overall": report.get("overall"),
-            "checks": report.get("checks", []),
+            "overall": effective_overall,
+            "checks": effective_checks,
             "skipped_checks": report.get("skipped_checks", []),
         },
         "release_gate": {
@@ -1052,6 +1267,7 @@ def quality_snapshot(
                 "ready": video_ready,
                 "detail": video_detail,
                 "download_url": f"/api/episodes/{episode_dir.name}/delivery/video",
+                "review_output": _review_output(current_longform),
             },
             "legacy_longform": {
                 "available": (episode_dir / "longform.mp4").is_file(),
@@ -1066,6 +1282,7 @@ def quality_snapshot(
             "missing_short_ids": missing_shorts,
         },
         "audio_quality": {
+            "report_fingerprint": audio_quality.get("fingerprint"),
             "release_gate": audio_gate,
             "analysis": analysis,
             "finding_count": len(findings),
@@ -1298,9 +1515,17 @@ class QAAgent(BaseAgent):
             audio_report = analyze_episode_audio(
                 self.episode_dir,
                 timeline=timeline,
-                report_path=self.episode_dir / AUDIO_REPORT_PATH,
                 ffmpeg_bin=self.get_config("tools", "ffmpeg", default=None),
             )
+            current_review_longform, _ = _render_status(
+                self.episode_dir, episode, clips, self.config
+            )
+            audio_report = apply_finding_reviews(
+                audio_report,
+                _load_json(self.episode_dir / AUDIO_FINDING_REVIEWS_PATH),
+                output_revision=review_output_revision(current_review_longform),
+            )
+            self.save_json(AUDIO_REPORT_PATH, audio_report)
             gate = audio_release_gate(audio_report)
             target = (
                 skipped_checks if gate.get("status") == "not_applicable" else checks

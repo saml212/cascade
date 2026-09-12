@@ -11,16 +11,19 @@ import numpy as np
 import pytest
 
 from lib.audio_qa import (
+    AUDIO_FINDING_REVIEWS_SCHEMA,
     PREVIEW_ALGORITHM_VERSION,
     WindowStats,
     _apply_repair_resolutions,
     _mix_provenance,
     _selected_repair_output_proof,
     analyze_windows,
+    apply_finding_reviews,
     decode_audio_windows,
     media_fingerprint,
     release_gate,
     render_finding_preview,
+    review_output_revision,
     transcript_analysis_fingerprint,
 )
 from lib.audio_repair import build_audio_repair_plan
@@ -415,6 +418,95 @@ def test_release_gate_does_not_trust_bare_resolution_statuses():
         "evidence": "Audible review confirms normal turn-taking.",
     }
     assert release_gate(report)["status"] == "output_unverified"
+
+
+def test_human_finding_review_requires_exact_report_finding_and_output_binding():
+    finding = {
+        "id": "dropout",
+        "fingerprint": "dropout-v1",
+        "severity": "warning",
+        "edited_time": {"status": "retained"},
+        "resolution": {"status": "unresolved"},
+    }
+    report = {
+        "fingerprint": "report-v1",
+        "analysis": {"status": "complete"},
+        "scope": {
+            "selected_mix_provenance": {
+                "uses_checked_source_audio": True,
+                "fingerprint": "mix-v1",
+                "selected_output": {"fingerprint": {"id": "master-v1"}},
+            },
+            "outputs_checked": [
+                {
+                    "role": "selected_audio_master",
+                    "status": "pass",
+                    "source_report_fingerprint": "report-v1",
+                    "selected_mix_fingerprint": "mix-v1",
+                    "fingerprint": {"id": "master-v1"},
+                    "verification": {
+                        "status": "pass",
+                        "checks": [{"pass": True}],
+                    },
+                }
+            ],
+        },
+        "findings": [finding],
+    }
+    review = {
+        "schema": AUDIO_FINDING_REVIEWS_SCHEMA,
+        "reviews": {
+            "dropout": {
+                "decision": "accepted",
+                "source_report_fingerprint": "report-v1",
+                "finding_fingerprint": "dropout-v1",
+                "output_revision": "render-v1",
+                "reviewed_by": "Editor",
+                "reviewed_at": "2026-09-11T00:00:00+00:00",
+                "evidence_note": "Reviewed the complete passage.",
+                "inspection": {"target": "longform"},
+            }
+        },
+    }
+
+    current = apply_finding_reviews(report, review, output_revision="render-v1")
+    changed_output = apply_finding_reviews(current, review, output_revision="render-v2")
+    changed_report = apply_finding_reviews(
+        {**report, "fingerprint": "report-v2"},
+        review,
+        output_revision="render-v1",
+    )
+
+    assert current["findings"][0]["resolution"]["status"] == "accepted"
+    assert current["release_gate"]["status"] == "pass"
+    assert changed_output["findings"][0]["resolution"] == {"status": "unresolved"}
+    assert changed_output["release_gate"]["status"] == "review_required"
+    assert changed_report["findings"][0]["resolution"] == {"status": "unresolved"}
+
+
+def test_review_output_revision_includes_exact_output_and_remaster_proof():
+    record = {
+        "fingerprint": "render-inputs",
+        "render_mode": "speaker_cut",
+        "output": {"size_bytes": 100, "mtime_ns": 200, "audio_codec": "aac"},
+        "provenance": {"audio_remaster": {"fingerprint": "mastering-v1"}},
+    }
+
+    first = review_output_revision(record)
+    changed_stat = review_output_revision(
+        {**record, "output": {**record["output"], "mtime_ns": 201}}
+    )
+    changed_remaster = review_output_revision(
+        {
+            **record,
+            "provenance": {"audio_remaster": {"fingerprint": "mastering-v2"}},
+        }
+    )
+
+    assert first and first.startswith("sha256:")
+    assert changed_stat != first
+    assert changed_remaster != first
+    assert review_output_revision({"fingerprint": "render-inputs"}) is None
 
 
 def test_selected_repair_proof_requires_current_finding_fingerprints():

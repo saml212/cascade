@@ -108,6 +108,84 @@ export interface QualityFinding extends UnknownRecord {
     source?: string;
     grounded_fallback?: string;
   };
+  resolution?: {
+    status?: string;
+    reviewed_by?: string;
+    reviewed_at?: string;
+    evidence?: { note?: string; output_revision?: string };
+  };
+  review?: AudioFindingReviewContext;
+}
+
+export interface InspectionRequest {
+  method: 'GET';
+  endpoint: string;
+  query: {
+    target: 'source' | 'longform' | 'short';
+    clock: 'source' | 'output';
+    seconds: number;
+    duration_seconds: number;
+    clip_id?: string;
+  };
+}
+
+export interface ReviewOutputIdentity extends UnknownRecord {
+  revision: string;
+  render_fingerprint?: string;
+  output_stat: { size_bytes: number; mtime_ns: number };
+  completed_at?: string;
+}
+
+export interface AudioFindingReviewContext extends UnknownRecord {
+  allowed: boolean;
+  reason?: string | null;
+  report_fingerprint: string;
+  finding_fingerprint: string;
+  output_revision?: string | null;
+  inspection_request?: InspectionRequest | null;
+  decision_endpoint: string;
+}
+
+export interface OutputContinuityFinding extends UnknownRecord {
+  id: string;
+  role: string;
+  clip_id?: string;
+  kind?: string;
+  severity?: string;
+  artifact_time?: {
+    clock: 'source' | 'output';
+    start_seconds: number;
+    end_seconds: number;
+    duration_seconds?: number;
+  };
+  evidence?: { transcript_excerpt?: string } & UnknownRecord;
+  inspection_request?: InspectionRequest;
+}
+
+export interface OutputContinuityReport extends UnknownRecord {
+  current?: boolean;
+  status?: string;
+  safe?: boolean;
+  detail?: string;
+  artifacts?: Array<{
+    role?: string;
+    clip_id?: string;
+    status?: string;
+    detail?: string;
+  } & UnknownRecord>;
+  findings?: OutputContinuityFinding[];
+}
+
+export interface MediaInspection extends UnknownRecord {
+  target: 'source' | 'longform' | 'short';
+  clip_id?: string | null;
+  artifact: { current: true; fingerprint: string; duration_seconds: number };
+  asset: {
+    url: string;
+    media_type: string;
+    duration_seconds?: number;
+    cached?: boolean;
+  };
 }
 
 export interface AudioRepairCandidate extends UnknownRecord {
@@ -139,7 +217,12 @@ export interface QualitySnapshot extends UnknownRecord {
     blockers: QualityBlocker[];
   };
   artifacts: {
-    release_video: { ready: boolean; detail: string; download_url: string };
+    release_video: {
+      ready: boolean;
+      detail: string;
+      download_url: string;
+      review_output?: ReviewOutputIdentity | null;
+    };
     legacy_longform: {
       available: boolean;
       review_url: string;
@@ -153,6 +236,7 @@ export interface QualitySnapshot extends UnknownRecord {
     missing_short_ids: string[];
   };
   audio_quality: {
+    report_fingerprint?: string;
     release_gate: UnknownRecord;
     analysis: UnknownRecord;
     finding_count: number;
@@ -164,6 +248,7 @@ export interface QualitySnapshot extends UnknownRecord {
       release_safe?: boolean;
       detail?: string;
     } | null;
+    selected_master_output_continuity?: OutputContinuityReport;
   };
 }
 
@@ -355,6 +440,16 @@ export const api = {
     request<EpisodeReviewState>('GET', `/api/episodes/${id}/review`),
   runQuality: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/run-agent/qa`, {}),
+  inspectionPreview: (id: string, query: InspectionRequest['query']) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined) params.set(key, String(value));
+    }
+    return request<MediaInspection>(
+      'GET',
+      `/api/episodes/${id}/inspection/preview?${params.toString()}`
+    );
+  },
   selectAudioRepairCandidate: (id: string) =>
     request<UnknownRecord>(
       'POST',
@@ -364,6 +459,23 @@ export const api = {
     request<UnknownRecord>(
       'DELETE',
       `/api/episodes/${id}/audio-qc/repair-selection`
+    ),
+  reviewAudioFinding: (
+    id: string,
+    findingId: string,
+    body: {
+      decision: 'accepted' | 'false_positive';
+      reviewer: string;
+      evidence_note: string;
+      expected_report_fingerprint: string;
+      expected_finding_fingerprint: string;
+      expected_output_revision: string;
+    }
+  ) =>
+    request<UnknownRecord>(
+      'POST',
+      `/api/episodes/${id}/audio-qc/findings/${findingId}/review`,
+      body
     ),
 
   /* Pipeline */
