@@ -1,215 +1,449 @@
+import {
+  QualityReview,
+  type QualityReviewControls,
+} from '../../components/QualityReview';
+import {
+  api,
+  type DeliveryStatus,
+  type QualitySnapshot,
+} from '../../lib/api';
 import { h } from '../../lib/dom';
-import { formatOffsetMs, formatRelative } from '../../lib/format';
+import {
+  formatDuration,
+  formatOffsetMs,
+  formatRelative,
+} from '../../lib/format';
+import { link } from '../../lib/router';
+import { effect, onCleanup, signal } from '../../lib/signals';
+import { stableControl, type StableControl } from '../../lib/stable-control';
+
+interface AudioControls {
+  master?: StableControl<HTMLAudioElement>;
+  quality: QualityReviewControls;
+}
 
 export function renderAudio(
   target: HTMLElement,
-  ep: Record<string, unknown>,
-  _episodeId: string
+  episode: Record<string, unknown>,
+  episodeId: string
 ): void {
-  const sync = ep.audio_sync as Record<string, unknown> | undefined;
-  const loudness = ep.audio_loudness as Record<string, unknown> | undefined;
-  const cropConfig = ep.crop_config as Record<string, unknown> | undefined;
-  const speakers = (cropConfig?.speakers as Array<Record<string, unknown>>) ?? [];
-  const ambient = (cropConfig?.ambient_tracks as Array<Record<string, unknown>>) ?? [];
+  const quality = signal<QualitySnapshot | null>(
+    (episode.quality as QualitySnapshot | null | undefined) ?? null
+  );
+  const delivery = signal<DeliveryStatus | null>(
+    (episode.delivery as DeliveryStatus | null | undefined) ?? null
+  );
+  const loadError = signal<string | null>(null);
+  const controls: AudioControls = { quality: { previews: new Map() } };
+  let disposed = false;
+  onCleanup(() => {
+    disposed = true;
+  });
 
-  target.replaceChildren(
-    h(
-      'div',
-      { class: 'flex flex-col gap-6' },
-      sync
-        ? h(
-            'div',
-            { class: 'panel p-6' },
-            h('h3', { class: 'text-heading-md text-ink-primary mb-3' }, 'H6E sync'),
-            h(
-              'div',
-              { class: 'grid grid-cols-3 gap-5 text-body' },
-              syncStat('Offset', formatOffsetMs(sync.offset_seconds as number)),
-              syncStat(
-                'Confidence',
-                sync.confidence != null
-                  ? `${Math.round((sync.confidence as number) * 100)}%`
-                  : '—'
-              ),
-              syncStat(
-                'Drift',
-                sync.drift_rate_ppm != null
-                  ? `${(sync.drift_rate_ppm as number).toFixed(1)} ppm`
-                  : '—'
-              )
-            )
-          )
-        : null,
-      loudnessPanel(loudness),
-      speakers.length > 0
-        ? h(
-            'div',
-            { class: 'panel p-6' },
-            h('h3', { class: 'text-heading-md text-ink-primary mb-3' }, 'Speakers'),
-            ...speakers.map((s, i) =>
-              h(
-                'div',
-                {
-                  class:
-                    'flex items-center justify-between py-2 border-b border-border-subtle last:border-0',
-                },
-                h(
-                  'div',
-                  { class: 'flex items-center gap-3' },
-                  h('span', {
-                    class: 'w-2.5 h-2.5 rounded-full',
-                    style: { background: `var(--speaker-${((i % 4) + 1) as 1 | 2 | 3 | 4})` },
-                  }),
-                  h('span', { class: 'text-body text-ink-primary' }, (s.label as string) || `Speaker ${i + 1}`)
-                ),
-                h(
-                  'span',
-                  { class: 'text-code text-ink-tertiary font-mono tabular' },
-                  s.track != null ? `Track ${s.track}` : '—'
-                )
-              )
-            )
-          )
-        : null,
-      ambient.length > 0
-        ? h(
-            'div',
-            { class: 'panel p-6' },
-            h('h3', { class: 'text-heading-md text-ink-primary mb-3' }, 'Ambient'),
-            ...ambient.map((a) =>
-              h(
-                'div',
-                {
-                  class:
-                    'flex items-center justify-between py-2 text-body text-ink-secondary',
-                },
-                h('span', null, (a.stem as string) || `Track ${a.track_number}`),
-                h(
-                  'span',
-                  { class: 'text-code font-mono tabular' },
-                  `vol ${((a.volume as number) ?? 0).toFixed(2)}`
-                )
-              )
-            )
-          )
-        : null,
-      !sync && speakers.length === 0
-        ? h(
-            'div',
-            { class: 'panel p-10 text-center' },
-            h(
+  const refresh = async (): Promise<void> => {
+    try {
+      const [nextQuality, nextDelivery] = await Promise.all([
+        api.quality(episodeId),
+        api.deliveryStatus(episodeId),
+      ]);
+      if (disposed) return;
+      quality.set(nextQuality);
+      delivery.set(nextDelivery);
+      loadError.set(null);
+    } catch (error) {
+      if (!disposed) loadError.set((error as Error).message);
+    }
+  };
+
+  effect(() => {
+    const currentQuality = quality();
+    const currentDelivery = delivery();
+    const error = loadError();
+    target.replaceChildren(
+      h(
+        'div',
+        { class: 'flex flex-col gap-6' },
+        error
+          ? h(
               'div',
               {
                 class:
-                  'font-display text-display-md text-ink-secondary mb-2',
+                  'rounded-md border border-status-danger/30 bg-status-danger/10 px-4 py-3 text-body text-status-danger',
+                role: 'alert',
               },
-              'Audio hasn’t been set up yet.'
-            ),
-            h(
-              'p',
-              { class: 'text-body text-ink-tertiary' },
-              'Visit Crop setup to verify sync and assign speakers to tracks.'
+              `Could not refresh current audio state: ${error}`
             )
-          )
-        : null
+          : null,
+        audioSourcePanel(episode, currentQuality),
+        masterPanel(episodeId, currentDelivery, controls),
+        QualityReview({
+          episodeId,
+          quality: currentQuality,
+          onUpdated: refresh,
+          controls: controls.quality,
+        }),
+        routingPanel(episode)
+      )
+    );
+  });
+
+  void refresh();
+}
+
+function audioSourcePanel(
+  episode: Record<string, unknown>,
+  quality: QualitySnapshot | null
+): HTMLElement {
+  const inventory = audioInventory(episode);
+  const selection = quality?.audio_quality.repair_selection;
+  const selectedRepair =
+    selection?.status && selection.status !== 'not_selected' ? selection : null;
+  const [sourceLabel, sourceDetail] = selectedRepair
+    ? repairDescription(selectedRepair)
+    : baseSourceDescription(inventory);
+
+  return h(
+    'section',
+    { class: 'panel p-6' },
+    h(
+      'div',
+      { class: 'text-heading-sm uppercase text-ink-tertiary' },
+      'Selected audio source'
+    ),
+    h(
+      'div',
+      { class: 'font-display text-display-md text-ink-primary mt-1' },
+      sourceLabel
+    ),
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-secondary mt-2 max-w-[720px]' },
+      sourceDetail
     )
   );
 }
 
-function syncStat(label: string, value: string): HTMLElement {
-  return h(
-    'div',
-    null,
-    h('div', { class: 'text-heading-sm uppercase text-ink-tertiary mb-1' }, label),
-    h('div', { class: 'text-body-lg text-ink-primary font-mono tabular' }, value)
-  );
-}
-
-function loudnessPanel(loudness: Record<string, unknown> | undefined): HTMLElement | null {
-  if (!loudness) {
-    return h(
-      'div',
-      { class: 'panel p-6' },
-      h('h3', { class: 'text-heading-md text-ink-primary mb-3' }, 'Loudness'),
-      h(
-        'p',
-        { class: 'text-body text-ink-tertiary italic' },
-        'Loudness measurement pending — will appear after longform render.'
-      )
-    );
-  }
-
-  const integrated = finiteNumber(loudness.integrated_lufs);
-  const truePeak = finiteNumber(loudness.true_peak_dbfs);
-  const lra = finiteNumber(loudness.loudness_range_lu);
-  const target = finiteNumber(loudness.target_lufs);
-  const measuredAt = loudness.measured_at as string | undefined;
-
-  const delta = integrated != null && target != null
-    ? Math.abs(integrated - target)
-    : Number.POSITIVE_INFINITY;
-  const lufsColorClass =
-    delta <= 1
-      ? 'text-status-success'
-      : delta <= 3
-      ? 'text-status-warning'
-      : 'text-status-danger';
-
-  const integratedStr = integrated?.toFixed(1) ?? '—';
-  const truePeakStr = truePeak == null
-    ? '—'
-    : (truePeak >= 0 ? '+' : '') + truePeak.toFixed(1);
-  const lraStr = lra?.toFixed(1) ?? '—';
-  // target.toFixed already carries the sign — don't double-prefix below.
-  const targetStr = target?.toFixed(0) ?? '—';
+function masterPanel(
+  episodeId: string,
+  delivery: DeliveryStatus | null,
+  controls: AudioControls
+): HTMLElement {
+  const current = delivery?.status === 'ready' && !delivery.stale;
+  const playable = Boolean(delivery?.download_url);
+  const title = current
+    ? 'Current podcast master'
+    : playable
+      ? 'Previous podcast master · inputs changed'
+      : delivery?.status === 'preparing'
+        ? 'Preparing podcast master'
+        : delivery?.status === 'failed'
+          ? 'Podcast master preparation failed'
+          : 'Podcast master not prepared';
+  const detail = current
+    ? 'These measurements and this player describe the current selected audio and episode range.'
+    : playable
+      ? 'These measurements belong to the previous MP3. Prepare again before release to apply the current selected audio and episode range.'
+      : delivery?.status === 'preparing'
+        ? 'Mixing, mastering, encoding, and checking the finished MP3.'
+        : 'Prepare local release files to create and measure the podcast MP3.';
 
   return h(
-    'div',
-    { class: 'panel p-6' },
-    h('h3', { class: 'text-heading-md text-ink-primary mb-4' }, 'Loudness'),
-    // Big headline number
+    'section',
+    { class: 'panel p-6 flex flex-col gap-4' },
     h(
       'div',
-      { class: 'flex items-baseline gap-2 mb-1' },
+      { class: 'flex items-start justify-between gap-4 flex-wrap' },
       h(
-        'span',
-        { class: `font-display text-display-xl font-semibold tabular ${lufsColorClass}` },
-        integratedStr
+        'div',
+        null,
+        h(
+          'div',
+          { class: 'text-heading-sm uppercase text-ink-tertiary' },
+          'Delivery master'
+        ),
+        h(
+          'div',
+          { class: 'font-display text-display-md text-ink-primary mt-1' },
+          title
+        ),
+        h(
+          'p',
+          { class: 'text-body-sm text-ink-secondary mt-2 max-w-[680px]' },
+          detail
+        )
       ),
       h(
-        'span',
-        { class: 'text-heading-md text-ink-tertiary' },
-        'LUFS'
+        'a',
+        {
+          ...link(`/episodes/${episodeId}/delivery`),
+          class:
+            'inline-flex h-9 items-center rounded-md border border-border bg-surface-2 px-3 text-body-sm text-ink-primary hover:bg-surface-3',
+        },
+        'Open release preparation'
       )
     ),
-    // Secondary stats row
-    h(
-      'div',
-      { class: 'flex gap-6 mt-3 mb-4' },
-      miniStat('True peak', `${truePeakStr} dBFS`),
-      miniStat('LRA', `${lraStr} LU`),
-      miniStat('Target', `${targetStr} LUFS`)
-    ),
-    // Footer
-    measuredAt
+    delivery && playable
       ? h(
           'div',
-          { class: 'text-body-sm text-ink-tertiary border-t border-border-subtle pt-3' },
-          `Measured ${formatRelative(measuredAt)}`
+          { class: 'grid grid-cols-2 sm:grid-cols-4 gap-3' },
+          measurement('Duration', formatDuration(delivery.duration_seconds)),
+          measurement('Integrated', numberUnit(delivery.integrated_lufs, ' LUFS')),
+          measurement('True peak', numberUnit(delivery.true_peak_dbfs, ' dBFS')),
+          measurement('Loudness range', numberUnit(delivery.loudness_range_lu, ' LU'))
+        )
+      : null,
+    delivery && playable ? masterPlayer(delivery, controls) : null,
+    delivery?.completed_at && playable
+      ? h(
+          'div',
+          { class: 'text-body-sm text-ink-tertiary' },
+          `${current ? 'Measured' : 'Previous file measured'} ${formatRelative(
+            delivery.completed_at
+          )}`
         )
       : null
   );
 }
 
-function miniStat(label: string, value: string): HTMLElement {
+function masterPlayer(
+  delivery: DeliveryStatus,
+  controls: AudioControls
+): HTMLAudioElement {
+  const identity = `${delivery.download_url ?? ''}:${delivery.completed_at ?? ''}`;
+  const current = delivery.status === 'ready' && !delivery.stale;
+  controls.master = stableControl(controls.master, identity, () =>
+    h('audio', {
+      controls: true,
+      preload: 'metadata',
+      src: delivery.download_url,
+      class: 'w-full',
+      'aria-label': current ? 'Current podcast master' : 'Previous podcast master',
+    }) as HTMLAudioElement
+  );
+  return controls.master.value;
+}
+
+function routingPanel(episode: Record<string, unknown>): HTMLElement {
+  const inventory = audioInventory(episode);
+  const sync = episode.audio_sync as Record<string, unknown> | undefined;
+  const cropConfig = episode.crop_config as Record<string, unknown> | undefined;
+  const speakers =
+    (cropConfig?.speakers as Array<Record<string, unknown>> | undefined) ?? [];
+  const ambient =
+    (cropConfig?.ambient_tracks as Array<Record<string, unknown>> | undefined) ?? [];
+  const offset = finiteNumber(sync?.offset_seconds);
+  const confidence = finiteNumber(sync?.confidence);
+  const drift = finiteNumber(sync?.drift_rate_ppm);
+
+  return h(
+    'section',
+    { class: 'panel p-6 flex flex-col gap-4' },
+    h(
+      'div',
+      null,
+      h(
+        'div',
+        { class: 'text-heading-sm uppercase text-ink-tertiary' },
+        'Input routing'
+      ),
+      h(
+        'div',
+        { class: 'text-body text-ink-secondary mt-1' },
+        inventory.fileCount
+          ? inventorySummary(inventory)
+          : 'No extracted track inventory'
+      )
+    ),
+    sync
+      ? h(
+          'div',
+          { class: 'grid grid-cols-3 gap-4 rounded-md bg-surface-2 px-4 py-3' },
+          measurement(
+            'Sync offset',
+            formatOffsetMs(offset)
+          ),
+          measurement(
+            'Confidence',
+            confidence == null ? '—' : `${Math.round(confidence * 100)}%`
+          ),
+          measurement(
+            'Drift',
+            drift == null ? '—' : `${drift.toFixed(1)} ppm`
+          )
+        )
+      : h(
+          'p',
+          { class: 'text-body-sm text-ink-tertiary' },
+          inventory.cameraChannels > 0 && inventory.recorderTracks === 0
+            ? 'Camera audio is already on the video source clock.'
+            : 'Recorder sync has not been recorded.'
+        ),
+    speakers.length
+      ? h(
+          'div',
+          { class: 'divide-y divide-border-subtle' },
+          ...speakers.map((speaker, index) =>
+            h(
+              'div',
+              { class: 'flex items-center gap-3 py-2.5' },
+              h('span', {
+                class: 'w-2.5 h-2.5 rounded-full',
+                style: { background: `var(--speaker-${(index % 4) + 1})` },
+              }),
+              h(
+                'span',
+                { class: 'text-body text-ink-primary flex-1' },
+                String(speaker.label || `Speaker ${index + 1}`)
+              ),
+              h(
+                'span',
+                { class: 'text-code-sm text-ink-tertiary font-mono tabular' },
+                speaker.track != null
+                  ? `Recorder track ${speaker.track}`
+                  : inventory.cameraChannels > 0 && inventory.recorderTracks === 0
+                    ? 'Camera mix'
+                    : 'No dedicated track'
+              )
+            )
+          )
+        )
+      : h(
+          'p',
+          { class: 'text-body-sm text-ink-tertiary' },
+          'No speaker-to-track assignments are available.'
+        ),
+    ambient.length
+      ? h(
+          'div',
+          { class: 'border-t border-border-subtle pt-3' },
+          h(
+            'div',
+            { class: 'text-heading-sm uppercase text-ink-tertiary mb-2' },
+            'Ambient tracks'
+          ),
+          ...ambient.map((track) =>
+            h(
+              'div',
+              { class: 'flex justify-between gap-4 py-1 text-body-sm' },
+              h(
+                'span',
+                { class: 'text-ink-secondary' },
+                String(track.stem || `Track ${track.track_number ?? '—'}`)
+              ),
+              h(
+                'span',
+                { class: 'font-mono tabular text-ink-tertiary' },
+                `Volume ${numberUnit(track.volume, '')}`
+              )
+            )
+          )
+        )
+      : null
+  );
+}
+
+interface AudioInventory {
+  cameraChannels: number;
+  fileCount: number;
+  recorderTracks: number;
+}
+
+function audioInventory(episode: Record<string, unknown>): AudioInventory {
+  const tracks =
+    (episode.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
+  const recorderTracks = new Set(
+    tracks
+      .filter((track) => track.track_type === 'input')
+      .map((track) => finiteNumber(track.track_number))
+      .filter((track): track is number => track != null)
+  );
+  return {
+    cameraChannels: tracks.filter(
+      (track) => track.track_type === 'camera_channel'
+    ).length,
+    fileCount: tracks.length,
+    recorderTracks: recorderTracks.size,
+  };
+}
+
+function baseSourceDescription(
+  inventory: AudioInventory
+): [label: string, detail: string] {
+  if (inventory.recorderTracks) {
+    return [
+      'External recorder mix',
+      `${inventory.recorderTracks} logical recorder ${inventory.recorderTracks === 1 ? 'track is' : 'tracks are'} available across ${inventory.fileCount} extracted ${inventory.fileCount === 1 ? 'file' : 'files'}.`,
+    ];
+  }
+  if (inventory.cameraChannels) {
+    return [
+      'Camera-channel mix',
+      `${inventory.cameraChannels} preserved camera ${inventory.cameraChannels === 1 ? 'channel feeds' : 'channels feed'} the canonical mix.`,
+    ];
+  }
+  return [
+    'Audio source unavailable',
+    'No canonical source description is available yet.',
+  ];
+}
+
+function repairDescription(
+  selection: NonNullable<
+    QualitySnapshot['audio_quality']['repair_selection']
+  >
+): [label: string, detail: string] {
+  if (selection.status === 'stale') {
+    return [
+      'Grounded repair selected · stale',
+      `The selected repair is stale: ${selection.detail ?? 'its inputs changed'}.`,
+    ];
+  }
+  return [
+    'Grounded repair selected',
+    selection.release_safe === false
+      ? 'The repair is selected for future renders, while the current release still requires review.'
+      : 'Future renders use the revision-bound repair selection.',
+  ];
+}
+
+function inventorySummary(inventory: AudioInventory): string {
+  const parts: string[] = [];
+  if (inventory.recorderTracks) {
+    parts.push(
+      `${inventory.recorderTracks} logical recorder ${inventory.recorderTracks === 1 ? 'track' : 'tracks'}`
+    );
+  }
+  if (inventory.cameraChannels) {
+    parts.push(
+      `${inventory.cameraChannels} camera ${inventory.cameraChannels === 1 ? 'channel' : 'channels'}`
+    );
+  }
+  const sources = parts.length ? parts.join(' and ') : 'auxiliary audio';
+  return `${sources} across ${inventory.fileCount} extracted ${inventory.fileCount === 1 ? 'file' : 'files'}`;
+}
+
+function measurement(label: string, value: string): HTMLElement {
   return h(
     'div',
     null,
-    h('div', { class: 'text-heading-sm uppercase text-ink-tertiary mb-0.5' }, label),
-    h('div', { class: 'text-body text-ink-secondary font-mono tabular' }, value)
+    h(
+      'div',
+      { class: 'text-heading-sm uppercase text-ink-tertiary' },
+      label
+    ),
+    h(
+      'div',
+      { class: 'text-body text-ink-primary font-mono tabular mt-1' },
+      value
+    )
   );
 }
 
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function numberUnit(value: unknown, unit: string): string {
+  const number = finiteNumber(value);
+  return number == null ? '—' : `${number.toFixed(1)}${unit}`;
 }

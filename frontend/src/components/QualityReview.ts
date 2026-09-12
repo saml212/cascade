@@ -27,6 +27,11 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
   const revision = quality?.quality.current_revision ?? 'missing';
   const findings = quality?.audio_quality.findings ?? [];
   const blockers = quality?.release_gate.blockers ?? [];
+  const audioGate = quality?.audio_quality.release_gate;
+  const cameraSourceOnly =
+    audioGate?.status === 'not_applicable' &&
+    typeof audioGate.reason === 'string' &&
+    audioGate.reason.includes('camera-source audio');
   const runButton = Button({
     variant: state === 'blocked' ? 'secondary' : 'primary',
     size: 'md',
@@ -34,7 +39,7 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
     onClick: async () => {
       const button = runButton as HTMLButtonElement;
       button.disabled = true;
-      button.textContent = 'Analyzing source audio…';
+      button.textContent = 'Running quality checks…';
       try {
         await api.runQuality(episodeId);
         showToast('Quality report updated.', 'success');
@@ -92,8 +97,16 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
           metric('Candidates', quality.artifacts.candidate_count),
           metric('Shorts rendered', quality.artifacts.rendered_short_count),
           metric('Awaiting clip review', quality.artifacts.pending_clip_count),
-          metric('Audio findings', quality.audio_quality.finding_count)
+          metric(
+            cameraSourceOnly ? 'Camera-source findings' : 'Audio findings',
+            cameraSourceOnly
+              ? `${quality.audio_quality.finding_count} · reference only`
+              : quality.audio_quality.finding_count
+          )
         )
+      : null,
+    cameraSourceOnly && quality
+      ? cameraSourceScope(quality.audio_quality.finding_count)
       : null,
     !compact && quality?.audio_quality.repair_candidate
       ? repairCandidate(
@@ -105,7 +118,7 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
         )
       : null,
     !compact && findings.length
-      ? findingList(findings, revision, controls)
+      ? findingList(findings, revision, controls, cameraSourceOnly)
       : null
   );
 }
@@ -173,7 +186,7 @@ function repairCandidate(
       action
     ),
     previewPlayer(
-      'Full repair draft · source timeline',
+      'Repair draft · source clock',
       candidate.audio_url,
       `repair-candidate:${candidate.fingerprint ?? 'unknown'}`,
       controls
@@ -189,7 +202,8 @@ function repairCandidate(
 function findingList(
   findings: QualityFinding[],
   revision: string,
-  controls?: QualityReviewControls
+  controls?: QualityReviewControls,
+  cameraSourceOnly = false
 ): HTMLElement {
   const panel = h('div', {
     class: 'border-t border-border-subtle pt-4 flex flex-col gap-3',
@@ -206,7 +220,9 @@ function findingList(
       h(
         'div',
         { class: 'text-heading-sm uppercase text-ink-tertiary' },
-        'Continuity findings requiring review'
+        cameraSourceOnly
+          ? 'Camera-source findings · not used by selected mix'
+          : 'Continuity findings requiring review'
       ),
       ...visible.map((finding) => findingCard(finding, revision, controls)),
     ];
@@ -356,7 +372,21 @@ function previewPlayer(
   );
 }
 
-function metric(label: string, value: number): HTMLElement {
+function cameraSourceScope(findingCount: number): HTMLElement {
+  return h(
+    'div',
+    {
+      class:
+        'rounded-md bg-surface-2 border border-border-subtle px-4 py-3 text-body-sm text-ink-secondary',
+      role: 'note',
+    },
+    `The continuity detector checked camera channels that the selected mix does not use. ${findingCount} ${
+      findingCount === 1 ? 'finding remains' : 'findings remain'
+    } as source evidence; this check is explicitly skipped in the release decision. Current output and release checks still apply.`
+  );
+}
+
+function metric(label: string, value: number | string): HTMLElement {
   return h(
     'div',
     { class: 'rounded-md bg-surface-2 px-3 py-2' },
