@@ -137,6 +137,41 @@ def test_expected_speaker_dropout_is_blocking_and_maps_to_edited_clock():
     )
 
 
+def test_adjacent_speaker_words_do_not_create_frame_rounding_overlap():
+    stats = _stats()
+    _set_level(stats, 0, 1, 9, -20)
+    _set_level(stats, 1, 1, 9, -45)
+    _set_level(stats, 0, 5, 6.5, -240, digital_zero=True)
+    _set_level(stats, 1, 5, 6.5, -20)
+    transcript = _transcript(
+        ("guest", 1, 4, "before"),
+        ("guest", 5, 5.731, "ending"),
+        ("host", 5.731, 6.5, "starting"),
+        ("guest", 7, 9, "after"),
+    )
+
+    findings, _, mappings = analyze_windows(stats, transcript=transcript)
+
+    assert mappings["guest"]["channel"] == 0
+    assert mappings["host"]["channel"] == 1
+    finding = next(item for item in findings if item["channel"] == 0)
+    assert finding["evidence"]["expected_speech_ranges"] == [
+        {
+            "start_seconds": 5.0,
+            "end_seconds": 5.731,
+            "duration_seconds": 0.731,
+        }
+    ]
+    assert finding["evidence"]["surviving_speech_ranges"] == [
+        {
+            "start_seconds": 5.731,
+            "end_seconds": 6.5,
+            "duration_seconds": 0.769,
+        }
+    ]
+    assert finding["evidence"]["temporal_overlap_seconds"] == 0
+
+
 def test_consecutive_outages_remain_separate_across_short_signal_return():
     stats = _stats(duration=20)
     _set_level(stats, 0, 1, 19, -36)

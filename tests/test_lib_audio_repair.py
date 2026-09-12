@@ -12,10 +12,14 @@ import pytest
 from lib.audio_mix import (
     CAMERA_AUDIO_TIMELINE_FILTER,
     SELECTED_REPAIR_AUDIO_PATH,
+    document_fingerprint,
     generate_audio_mix,
 )
 from lib.audio_qa import file_fingerprint, media_fingerprint
 from lib.audio_repair import (
+    _combined_finding,
+    _prepare_repair_finding,
+    _validated_predecessor_entries,
     build_audio_repair_plan,
     render_audio_repair_candidate,
     select_audio_repair_candidate,
@@ -91,6 +95,151 @@ def test_grounded_selection_accepts_only_nonoverlapping_activity_evidence():
     assert select_grounded_repair_findings({"findings": [separated, overlapping]}) == [
         "aq_separated"
     ]
+
+
+def test_selected_predecessor_preserves_its_verified_operation():
+    entry = {
+        "id": "repair_old",
+        "finding_ids": ["aq_old"],
+        "repair_scope": "transcript_activity",
+        "repair_intervals": [
+            {"start_seconds": 2.02, "end_seconds": 2.77, "duration_seconds": 0.75}
+        ],
+        "verification": {"status": "pass"},
+    }
+    plan = {"schema": "cascade.audio-repair-plan/v1", "repairs": [entry]}
+    plan["fingerprint"] = document_fingerprint(plan)
+    provenance = {
+        "repair_selection": {
+            "repair_plan_fingerprint": plan["fingerprint"],
+            "repaired_findings": [{"id": "aq_old"}],
+        }
+    }
+
+    predecessors = _validated_predecessor_entries(plan, provenance)
+    prepared = _prepare_repair_finding(
+        _finding("aq_old"), predecessor_entry=predecessors["aq_old"]
+    )
+
+    assert prepared["_repair_intervals"] == entry["repair_intervals"]
+    assert prepared["_repair_scope"] == "transcript_activity"
+    assert prepared["_fade_mode"] == "cross_boundary"
+    assert prepared["_predecessor_entry_id"] == "repair_old"
+
+
+def test_grouped_predecessor_intervals_are_not_repeated_per_finding():
+    intervals = [
+        {"start_seconds": 2.02, "end_seconds": 2.77, "duration_seconds": 0.75},
+        {"start_seconds": 3.02, "end_seconds": 3.77, "duration_seconds": 0.75},
+    ]
+    entry = {
+        "id": "repair_group",
+        "finding_ids": ["aq_one", "aq_two"],
+        "repair_scope": "full_finding",
+        "repair_intervals": intervals,
+        "verification": {"status": "pass"},
+    }
+    plan = {"schema": "cascade.audio-repair-plan/v1", "repairs": [entry]}
+    plan["fingerprint"] = document_fingerprint(plan)
+    provenance = {
+        "repair_selection": {
+            "repair_plan_fingerprint": plan["fingerprint"],
+            "repaired_findings": [{"id": "aq_one"}, {"id": "aq_two"}],
+        }
+    }
+    predecessors = _validated_predecessor_entries(plan, provenance)
+    one = _prepare_repair_finding(
+        _finding("aq_one"), predecessor_entry=predecessors["aq_one"]
+    )
+    two_finding = _finding("aq_two")
+    two_finding["source_time"] = {
+        "start_seconds": 3,
+        "end_seconds": 4,
+        "duration_seconds": 1,
+    }
+    two = _prepare_repair_finding(two_finding, predecessor_entry=predecessors["aq_two"])
+
+    combined = _combined_finding([one, two])
+
+    assert combined["repair_intervals"] == intervals
+
+
+@pytest.mark.skipif(not HAS_FFMPEG_FULL, reason="ffmpeg-full is not installed")
+def test_activity_repair_envelope_does_not_change_adjacent_speaker(tmp_path):
+    decoder = FFMPEG_FULL if FFMPEG_FULL.is_file() else Path("ffmpeg-full")
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    (episode_dir / "episode.json").write_text("{}")
+    source = episode_dir / "source_merged.mp4"
+    subprocess.run(
+        [
+            str(decoder),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            (
+                "aevalsrc='if(between(t,2,3),0,0.08*sin(2*PI*220*t))|"
+                "0.02*sin(2*PI*330*t)':s=48000:d=6"
+            ),
+            "-c:a",
+            "pcm_f32le",
+            str(source),
+        ],
+        check=True,
+    )
+    finding = _finding("aq_activity", confidence=0.82)
+    finding["evidence"].update(
+        {
+            "expected_speech_seconds": 0.8,
+            "surviving_speech_seconds": 0.2,
+            "expected_speech_ranges": [
+                {
+                    "start_seconds": 2.0,
+                    "end_seconds": 2.8,
+                    "duration_seconds": 0.8,
+                }
+            ],
+            "surviving_speech_ranges": [
+                {
+                    "start_seconds": 2.8,
+                    "end_seconds": 3.0,
+                    "duration_seconds": 0.2,
+                }
+            ],
+            "temporal_overlap_seconds": 0,
+        }
+    )
+    report = {
+        "fingerprint": "sha256:report",
+        "source": {"path": str(source), "fingerprint": media_fingerprint(source)},
+        "scope": {"selected_mix_provenance": {"kind": "embedded_camera"}},
+        "findings": [finding],
+        "analysis": {"suppressed_candidates": []},
+    }
+
+    plan = build_audio_repair_plan(
+        report,
+        [finding["id"]],
+        episode_dir / "qa" / "audio-repair",
+        ffmpeg_bin=decoder,
+        held_out_count=0,
+    )
+
+    repair = plan["repairs"][0]
+    assert repair["repair_scope"] == "transcript_activity"
+    assert repair["fade_mode"] == "contained"
+    assert repair["preview"]["envelope"] == {
+        "mode": "contained",
+        "maximum_fade_seconds": 0.08,
+        "frame_guard_seconds": 0.03,
+    }
+    assert (
+        repair["verification"]["metrics"]["outside_repair_max_absolute_delta"] <= 2e-6
+    )
 
 
 @pytest.mark.skipif(not HAS_FFMPEG_FULL, reason="ffmpeg-full is not installed")
@@ -229,6 +378,7 @@ def test_full_candidate_preserves_master_and_records_actual_verification(tmp_pat
         manifest["selected_master_before"]["fingerprint"]["method"] == "sha256-full/v1"
     )
     assert manifest["candidate"]["fingerprint"] == file_fingerprint(candidate)
+    assert manifest["predecessor_selection"] is None
     assert current_master.read_bytes() == master_bytes
     assert (
         episode_dir / "qa" / "audio-repair" / "audio-repair-candidate.json"

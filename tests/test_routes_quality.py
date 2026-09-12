@@ -373,6 +373,42 @@ def test_repair_plan_and_preview_are_agent_accessible_without_path_input(
     assert audio.content == b"review audio"
 
 
+def test_repair_plan_replays_the_current_selected_plan(quality_client, monkeypatch):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    report = {
+        "fingerprint": "report-current",
+        "scope": {
+            "selected_mix_provenance": {
+                "repair_selection": {"repair_plan_fingerprint": "plan-selected"}
+            }
+        },
+    }
+    selected_plan = {"fingerprint": "plan-selected", "repairs": []}
+    _write_json(episode_dir / "qa" / "audio-quality.json", report)
+    _write_json(
+        episode_dir / "qa" / "audio-repair" / "audio-repair-plan.json",
+        selected_plan,
+    )
+    seen = {}
+
+    monkeypatch.setattr(
+        quality, "select_grounded_repair_findings", lambda _report: ["aq_one"]
+    )
+
+    def fake_build(_report, finding_ids, _output_dir, **kwargs):
+        seen.update(finding_ids=finding_ids, predecessor=kwargs["predecessor_plan"])
+        return {"status": "preview_ready"}
+
+    monkeypatch.setattr(quality, "build_audio_repair_plan", fake_build)
+
+    response = client.post("/api/episodes/ep_test/audio-qc/repair-plan")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "preview_ready"
+    assert seen == {"finding_ids": ["aq_one"], "predecessor": selected_plan}
+
+
 def test_repair_candidate_audio_is_bound_to_controlled_cache(
     quality_client, monkeypatch, tmp_path
 ):

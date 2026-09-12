@@ -190,12 +190,25 @@ async def create_audio_repair_plan(
             status_code=409,
             detail="No findings meet the grounded automatic-repair policy",
         )
+    predecessor_plan = None
+    plan_path = episode_dir / REPAIR_PLAN_PATH
+    selected_plan_fingerprint = (
+        report.get("scope", {})
+        .get("selected_mix_provenance", {})
+        .get("repair_selection", {})
+        .get("repair_plan_fingerprint")
+    )
+    if selected_plan_fingerprint and plan_path.is_file():
+        existing = _read_report(plan_path, "Audio repair plan")
+        if existing.get("fingerprint") == selected_plan_fingerprint:
+            predecessor_plan = existing
     return await _run_quality_job(
         f"{episode_id}:audio-repair-plan",
         build_audio_repair_plan,
         report,
         finding_ids,
         episode_dir / REPAIR_PLAN_PATH.parent,
+        predecessor_plan=predecessor_plan,
         selection_policy=AUTO_REPAIR_POLICY,
     )
 

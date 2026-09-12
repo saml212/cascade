@@ -31,8 +31,8 @@ from lib.audio_qa import (
     _checked_ffmpeg,
     _mix_provenance,
     _read_json,
-    _switch_weight,
     render_finding_preview,
+    repair_envelope_weight,
     resolve_ffmpeg,
     transcript_analysis_fingerprint,
 )
@@ -43,7 +43,7 @@ REPAIR_PLAN_SCHEMA = "cascade.audio-repair-plan/v1"
 REPAIR_PLAN_PATH = Path("qa/audio-repair/audio-repair-plan.json")
 REPAIR_CANDIDATE_SCHEMA = "cascade.audio-repair-candidate/v1"
 REPAIR_CANDIDATE_PATH = Path("qa/audio-repair/audio-repair-candidate.json")
-CANDIDATE_ALGORITHM_VERSION = "grounded-channel-envelope/v2"
+CANDIDATE_ALGORITHM_VERSION = "grounded-channel-envelope/v3"
 AUTO_REPAIR_POLICY = "grounded_probable_dropout/v1"
 MIN_FREE_BYTES_AFTER_CANDIDATE = 10 * 1024**3
 UNCHANGED_SURVIVOR_GAIN_DB = 20 * math.log10(0.5)
@@ -67,6 +67,7 @@ def build_audio_repair_plan(
     finding_ids: list[str],
     output_dir: str | Path,
     *,
+    predecessor_plan: dict | None = None,
     ffmpeg_bin: str | Path | None = None,
     held_out_count: int = 2,
     group_gap_seconds: float = 0.35,
@@ -87,6 +88,9 @@ def build_audio_repair_plan(
         and recorded_provenance.get("kind") != current_provenance["kind"]
     ):
         raise ValueError("Audio quality report is stale for the selected mix")
+    predecessor_entries = _validated_predecessor_entries(
+        predecessor_plan, current_provenance
+    )
 
     findings = {item.get("id"): item for item in report.get("findings", [])}
     missing = [finding_id for finding_id in finding_ids if finding_id not in findings]
@@ -95,7 +99,12 @@ def build_audio_repair_plan(
     selected = [findings[finding_id] for finding_id in dict.fromkeys(finding_ids)]
     for finding in selected:
         _validate_repair_finding(finding)
-    selected = [_prepare_repair_finding(finding) for finding in selected]
+    selected = [
+        _prepare_repair_finding(
+            finding, predecessor_entry=predecessor_entries.get(finding["id"])
+        )
+        for finding in selected
+    ]
 
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -114,6 +123,7 @@ def build_audio_repair_plan(
         if entry["verification"]["status"] != "pass" and any(
             item.get("_repair_scope") == "full_finding"
             and item.get("evidence", {}).get("expected_speech_ranges")
+            and not item.get("_predecessor_entry_id")
             for item in group
         ):
             activity_group = [
@@ -198,6 +208,9 @@ def build_audio_repair_plan(
             "classification": "probable_dropout",
             "maximum_group_gap_seconds": group_gap_seconds,
             "preview_algorithm_version": PREVIEW_ALGORITHM_VERSION,
+            "predecessor_plan_fingerprint": (
+                predecessor_plan.get("fingerprint") if predecessor_plan else None
+            ),
             "synthetic_audio": False,
         },
         "repairs": repairs,
@@ -297,10 +310,51 @@ def _automatic_repair_eligibility(finding: dict) -> tuple[bool, str]:
     return True, "meets_grounded_probable_dropout_policy"
 
 
+def _validated_predecessor_entries(
+    predecessor_plan: dict | None, current_provenance: dict
+) -> dict[str, dict]:
+    """Return previously selected, verified operations that may be replayed."""
+    if predecessor_plan is None:
+        return {}
+    if predecessor_plan.get("fingerprint") != document_fingerprint(predecessor_plan):
+        raise ValueError("Predecessor audio repair plan fingerprint is invalid")
+    selection = current_provenance.get("repair_selection") or {}
+    if selection.get("repair_plan_fingerprint") != predecessor_plan.get("fingerprint"):
+        raise ValueError("Predecessor audio repair plan is not the selected plan")
+    selected_ids = {item.get("id") for item in selection.get("repaired_findings", [])}
+    entries: dict[str, dict] = {}
+    for entry in predecessor_plan.get("repairs", []):
+        finding_ids = entry.get("finding_ids") or []
+        if (
+            entry.get("verification", {}).get("status") != "pass"
+            or not finding_ids
+            or any(finding_id not in selected_ids for finding_id in finding_ids)
+        ):
+            continue
+        for finding_id in finding_ids:
+            if finding_id in entries:
+                raise ValueError("Predecessor audio repair plan has duplicate findings")
+            entries[finding_id] = entry
+    return entries
+
+
 def _prepare_repair_finding(
-    finding: dict, *, force_activity_scope: bool = False
+    finding: dict,
+    *,
+    force_activity_scope: bool = False,
+    predecessor_entry: dict | None = None,
 ) -> dict:
     prepared = dict(finding)
+    if predecessor_entry is not None and not force_activity_scope:
+        prepared["_repair_scope"] = predecessor_entry.get(
+            "repair_scope", "full_finding"
+        )
+        prepared["_repair_intervals"] = json.loads(
+            json.dumps(predecessor_entry["repair_intervals"])
+        )
+        prepared["_fade_mode"] = predecessor_entry.get("fade_mode", "cross_boundary")
+        prepared["_predecessor_entry_id"] = predecessor_entry["id"]
+        return prepared
     _, reason = _automatic_repair_eligibility(finding)
     activity_ranges = finding.get("evidence", {}).get("expected_speech_ranges") or []
     use_activity = force_activity_scope or reason == (
@@ -312,6 +366,7 @@ def _prepare_repair_finding(
     prepared["_repair_intervals"] = (
         activity_ranges if use_activity else [finding["source_time"]]
     )
+    prepared["_fade_mode"] = "contained" if use_activity else "cross_boundary"
     return prepared
 
 
@@ -430,6 +485,7 @@ def render_audio_repair_candidate(
         "repair_plan_fingerprint": plan.get("fingerprint"),
         "render_algorithm": CANDIDATE_ALGORITHM_VERSION,
         "selected_mix_fingerprint": current_provenance["fingerprint"],
+        "predecessor_selection": current_provenance.get("repair_selection"),
         "processing_config_fingerprint": _config_fingerprint(config),
         "source": {
             "path": str(source.resolve()),
@@ -673,8 +729,15 @@ def _entry_weight(entry: dict) -> str:
     for interval in entry["repair_intervals"]:
         start = float(interval["start_seconds"])
         end = float(interval["end_seconds"])
-        fade = min(0.08, max(0.01, (end - start) / 4))
-        weights.append(f"({_switch_weight(start, end, fade, inverted=True)})")
+        weights.append(
+            "("
+            + repair_envelope_weight(
+                start,
+                end,
+                contained=entry.get("fade_mode") == "contained",
+            )
+            + ")"
+        )
     return f"min(1,{'+'.join(weights)})"
 
 
@@ -851,17 +914,31 @@ def _verify_full_candidate(
             _rms(repaired[mask]),
         )
         peak = float(np.max(np.abs(repaired[mask]))) if np.any(mask) else math.inf
-        passed = delta_rms > 1e-5 and output_rms > 10 ** (-60 / 20) and peak <= 1.0
-        repair_windows.append(
-            {
-                "entry_id": entry["id"],
-                "finding_ids": entry["finding_ids"],
-                "status": "pass" if passed else "failed",
-                "delta_rms": round(delta_rms, 9),
-                "rms_dbfs": _amplitude_dbfs(output_rms),
-                "peak": round(peak, 9),
-            }
-        )
+        predecessor = bool(entry.get("predecessor_entry_id"))
+        window = {
+            "entry_id": entry["id"],
+            "finding_ids": entry["finding_ids"],
+            "expectation": (
+                "preserve_selected_repair" if predecessor else "apply_new_repair"
+            ),
+            "delta_rms": round(delta_rms, 9),
+            "rms_dbfs": _amplitude_dbfs(output_rms),
+            "peak": round(peak, 9),
+        }
+        if predecessor:
+            correlation = _correlation(existing[mask], repaired[mask])
+            level_delta = _amplitude_dbfs(output_rms) - _amplitude_dbfs(
+                _rms(existing[mask])
+            )
+            passed = correlation >= 0.999 and abs(level_delta) <= 0.25
+            window.update(
+                correlation=round(correlation, 9),
+                level_delta_db=round(level_delta, 4),
+            )
+        else:
+            passed = delta_rms > 1e-5 and output_rms > 10 ** (-60 / 20) and peak <= 1.0
+        window["status"] = "pass" if passed else "failed"
+        repair_windows.append(window)
     control_windows = []
     for entry in controls:
         mask = _interval_mask(count, sample_rate, [entry["source_time"]], padding=0.5)
@@ -922,9 +999,16 @@ def _verify_full_candidate(
         _check("audio_format_is_delivery_safe_pcm", format_ok),
         _check("master_loudness_and_true_peak", loudness_ok),
         _check(
-            "every_proposed_repair_present",
+            "every_repair_operation_verified",
             bool(repair_windows) and all(x["status"] == "pass" for x in repair_windows),
             checked_count=len(repair_windows),
+            new_count=sum(
+                item["expectation"] == "apply_new_repair" for item in repair_windows
+            ),
+            preserved_count=sum(
+                item["expectation"] == "preserve_selected_repair"
+                for item in repair_windows
+            ),
         ),
         _check(
             "held_out_timing_and_level_preserved",
@@ -1039,6 +1123,17 @@ def _combined_finding(group: list[dict]) -> dict:
         float(item.get("evidence", {}).get("estimated_recovery_gain_db", 0))
         for item in group
     ]
+    intervals = []
+    seen_intervals = set()
+    for item in group:
+        for interval in item.get("_repair_intervals", [item["source_time"]]):
+            key = (
+                float(interval["start_seconds"]),
+                float(interval["end_seconds"]),
+            )
+            if key not in seen_intervals:
+                intervals.append(interval)
+                seen_intervals.add(key)
     return {
         "id": "repair_" + hashlib.sha256(signature.encode()).hexdigest()[:16],
         "channel": first["channel"],
@@ -1047,11 +1142,7 @@ def _combined_finding(group: list[dict]) -> dict:
             "end_seconds": end,
             "duration_seconds": round(end - start, 6),
         },
-        "repair_intervals": [
-            interval
-            for item in group
-            for interval in item.get("_repair_intervals", [item["source_time"]])
-        ],
+        "repair_intervals": intervals,
         "evidence": {"estimated_recovery_gain_db": float(np.median(gains))},
         "preview": {
             "padding_seconds": max(
@@ -1082,7 +1173,20 @@ def _render_plan_entry(
         ),
     )
     combined["evidence"]["estimated_recovery_gain_db"] = calibration["applied_gain_db"]
-    combined["recovery"] = {"maximum_gain_db": calibration["maximum_gain_db"]}
+    activity_scoped = any(
+        item.get("_repair_scope") == "transcript_activity" for item in group
+    )
+    fade_modes = {
+        item.get("_fade_mode", "contained" if activity_scoped else "cross_boundary")
+        for item in group
+    }
+    if len(fade_modes) != 1:
+        raise ValueError("Grouped repair findings use incompatible fade modes")
+    fade_mode = fade_modes.pop()
+    combined["recovery"] = {
+        "maximum_gain_db": calibration["maximum_gain_db"],
+        "fade_mode": fade_mode,
+    }
     preview = render_finding_preview(source, combined, output_dir, ffmpeg_bin=decoder)
     verification = _verify_preview_pair(
         combined,
@@ -1105,10 +1209,15 @@ def _render_plan_entry(
         "surviving_channel": 1 - combined["channel"],
         "gain_db": round(float(combined["evidence"]["estimated_recovery_gain_db"]), 2),
         "gain_calibration": calibration,
-        "repair_scope": (
-            "transcript_activity"
-            if any(item.get("_repair_scope") == "transcript_activity" for item in group)
-            else "full_finding"
+        "repair_scope": "transcript_activity" if activity_scoped else "full_finding",
+        "fade_mode": fade_mode,
+        "predecessor_entry_id": next(
+            (
+                item.get("_predecessor_entry_id")
+                for item in group
+                if item.get("_predecessor_entry_id")
+            ),
+            None,
         ),
         "suppression_reason": group[0].get("suppression_reason") if control else None,
         "preview": preview,
@@ -1243,6 +1352,14 @@ def _verify_preview_pair(
         ),
         "level_delta_db": round(level_delta, 3),
     }
+    contained = finding.get("recovery", {}).get("fade_mode") == "contained"
+    if contained:
+        metrics["outside_repair_max_absolute_delta"] = round(
+            float(np.max(np.abs(fallback[~issue] - original[~issue])))
+            if np.any(~issue)
+            else math.inf,
+            9,
+        )
     passed = (
         metrics["duration_error_seconds"] <= 0.02
         and metrics["sample_count_delta"] <= 1
@@ -1252,6 +1369,7 @@ def _verify_preview_pair(
         and metrics["limited_sample_fraction"] <= 0.005
         and metrics["healthy_gap_max_absolute_delta"] <= 2e-6
         and abs(level_delta) <= 1.5
+        and (not contained or metrics["outside_repair_max_absolute_delta"] <= 2e-6)
     )
     return {
         "status": "pass" if passed else "failed",

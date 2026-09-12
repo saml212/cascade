@@ -27,9 +27,11 @@ from lib.ffprobe import file_fingerprint, get_audio_stream, media_fingerprint
 from lib.ffprobe import probe as ffprobe
 
 REPORT_SCHEMA = "cascade.audio-quality/v1"
-DETECTOR_VERSION = "1.1"
-PREVIEW_ALGORITHM_VERSION = "4"
+DETECTOR_VERSION = "1.2"
+PREVIEW_ALGORITHM_VERSION = "5"
 TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD = "sha256-audio-word-timing-speaker/v1"
+REPAIR_FADE_SECONDS = 0.08
+REPAIR_FRAME_GUARD_SECONDS = 0.03
 
 
 @dataclass(frozen=True)
@@ -807,13 +809,9 @@ def render_finding_preview(
         [*common, "-af", original_filter, "-c:a", "pcm_s24le", str(original)]
     )
 
+    fade_mode = finding.get("recovery", {}).get("fade_mode", "cross_boundary")
     repair_weights = [
-        _switch_weight(
-            start,
-            end,
-            min(0.08, max(0.01, (end - start) / 4)),
-            inverted=True,
-        )
+        repair_envelope_weight(start, end, contained=fade_mode == "contained")
         for start, end in intervals
     ]
     fallback_weight = f"min(1,{'+'.join(f'({item})' for item in repair_weights)})"
@@ -846,6 +844,13 @@ def render_finding_preview(
         "fallback_source_channel": survivor,
         "fallback_gain_db": round(gain_db, 2),
         "synthetic_audio_used": False,
+        "envelope": {
+            "mode": fade_mode,
+            "maximum_fade_seconds": REPAIR_FADE_SECONDS,
+            "frame_guard_seconds": (
+                REPAIR_FRAME_GUARD_SECONDS if fade_mode == "contained" else 0.0
+            ),
+        },
     }
 
 
@@ -900,6 +905,8 @@ def _classify_candidate(
     speaker_channels: dict[str, dict],
     settings: AudioQAConfig,
 ) -> dict:
+    interval_start = start * stats.frame_seconds
+    interval_end = end * stats.frame_seconds
     duration = (end - start) * stats.frame_seconds
     context_frames = round(settings.context_seconds / stats.frame_seconds)
     before = stats.rms_dbfs[max(0, start - context_frames) : start, channel]
@@ -932,12 +939,24 @@ def _classify_candidate(
             surviving_speakers.append(speaker)
             surviving_frames |= mask[start:end]
 
-    expected_seconds = float(np.count_nonzero(expected_frames) * stats.frame_seconds)
-    surviving_seconds = float(np.count_nonzero(surviving_frames) * stats.frame_seconds)
-    expected_ranges = _activity_ranges(expected_frames, start, stats.frame_seconds)
-    surviving_ranges = _activity_ranges(surviving_frames, start, stats.frame_seconds)
-    temporal_overlap_seconds = float(
-        np.count_nonzero(expected_frames & surviving_frames) * stats.frame_seconds
+    expected_ranges = _refine_activity_ranges(
+        _activity_ranges(expected_frames, start, stats.frame_seconds),
+        words,
+        set(expected_speakers),
+        interval_start,
+        interval_end,
+    )
+    surviving_ranges = _refine_activity_ranges(
+        _activity_ranges(surviving_frames, start, stats.frame_seconds),
+        words,
+        set(surviving_speakers),
+        interval_start,
+        interval_end,
+    )
+    expected_seconds = _ranges_duration(expected_ranges)
+    surviving_seconds = _ranges_duration(surviving_ranges)
+    temporal_overlap_seconds = _ranges_overlap_seconds(
+        expected_ranges, surviving_ranges
     )
     expected_minimum = min(0.20, duration * 0.15)
     transcript_expected = expected_seconds >= expected_minimum
@@ -969,8 +988,6 @@ def _classify_candidate(
         confidence += 0.05
     confidence = round(min(0.99, confidence), 3)
     severity = "error" if transcript_expected and confidence >= 0.70 else "warning"
-    interval_start = start * stats.frame_seconds
-    interval_end = end * stats.frame_seconds
     overlap = [
         word
         for word in words
@@ -1281,6 +1298,56 @@ def _activity_ranges(
     ]
 
 
+def _refine_activity_ranges(
+    coarse_ranges: list[dict],
+    words: list[dict],
+    speakers: set[str],
+    interval_start: float,
+    interval_end: float,
+) -> list[dict]:
+    """Replace detector-frame edges with the transcript's exact word edges."""
+    refined = []
+    for coarse in coarse_ranges:
+        matching = [
+            word
+            for word in words
+            if word["speaker"] in speakers
+            and word["end"] > coarse["start_seconds"]
+            and word["start"] < coarse["end_seconds"]
+        ]
+        if not matching:
+            continue
+        start = max(interval_start, min(word["start"] for word in matching))
+        end = min(interval_end, max(word["end"] for word in matching))
+        if end > start:
+            refined.append(
+                {
+                    "start_seconds": round(start, 6),
+                    "end_seconds": round(end, 6),
+                    "duration_seconds": round(end - start, 6),
+                }
+            )
+    return refined
+
+
+def _ranges_duration(ranges: list[dict]) -> float:
+    return sum(
+        float(item["end_seconds"]) - float(item["start_seconds"]) for item in ranges
+    )
+
+
+def _ranges_overlap_seconds(left: list[dict], right: list[dict]) -> float:
+    return sum(
+        max(
+            0.0,
+            min(float(a["end_seconds"]), float(b["end_seconds"]))
+            - max(float(a["start_seconds"]), float(b["start_seconds"])),
+        )
+        for a in left
+        for b in right
+    )
+
+
 def _speaker_masks(
     words: list[dict], frame_count: int, frame_seconds: float
 ) -> dict[str, np.ndarray]:
@@ -1574,6 +1641,24 @@ def _switch_weight(start: float, end: float, fade: float, *, inverted: bool) -> 
         f"if(lt(t,{end + fade:.6f}),{up},1))))"
     )
     return f"1-({normal})" if inverted else normal
+
+
+def repair_envelope_weight(start: float, end: float, *, contained: bool) -> str:
+    """Build a recovery envelope, optionally contained inside trusted speech."""
+    duration = end - start
+    if duration <= 0:
+        raise ValueError("Audio repair interval must have positive duration")
+    if not contained:
+        fade = min(REPAIR_FADE_SECONDS, max(0.01, duration / 4))
+        return _switch_weight(start, end, fade, inverted=True)
+
+    remaining = duration - 2 * REPAIR_FRAME_GUARD_SECONDS
+    if remaining < 0.02:
+        raise ValueError("Transcript activity is too short for a contained repair")
+    fade = min(REPAIR_FADE_SECONDS, remaining / 4)
+    plateau_start = start + REPAIR_FRAME_GUARD_SECONDS + fade
+    plateau_end = end - REPAIR_FRAME_GUARD_SECONDS - fade
+    return _switch_weight(plateau_start, plateau_end, fade, inverted=True)
 
 
 def _checked_ffmpeg(
