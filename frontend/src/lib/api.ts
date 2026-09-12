@@ -148,6 +148,8 @@ export interface AudioFindingReviewContext extends UnknownRecord {
 
 export interface OutputContinuityFinding extends UnknownRecord {
   id: string;
+  fingerprint?: string;
+  revision?: string;
   role: string;
   clip_id?: string;
   kind?: string;
@@ -162,18 +164,53 @@ export interface OutputContinuityFinding extends UnknownRecord {
   inspection_request?: InspectionRequest;
 }
 
+export interface OutputFindingReviewEvent extends UnknownRecord {
+  id: string;
+  fingerprint: string;
+  binding: {
+    classification: string;
+    source_ranges: Array<{ start_seconds: number; end_seconds: number }>;
+    transcript_evidence: {
+      speech_overlap_seconds: number;
+      required_speech_overlap_seconds: number;
+      transcript_word_count: number;
+      transcript_excerpt: string;
+    } & UnknownRecord;
+  };
+  members: Array<{
+    id: string;
+    fingerprint: string;
+    revision: string;
+    role: string;
+    clip_id?: string;
+  }>;
+  resolution?: QualityFinding['resolution'];
+  review: {
+    allowed: boolean;
+    reason?: string | null;
+    report_fingerprint: string;
+    event_fingerprint: string;
+    output_revision?: string | null;
+    inspection_request?: InspectionRequest | null;
+    decision_endpoint: string;
+  };
+}
+
 export interface OutputContinuityReport extends UnknownRecord {
   current?: boolean;
   status?: string;
   safe?: boolean;
+  reviewable?: boolean;
   detail?: string;
   artifacts?: Array<{
     role?: string;
     clip_id?: string;
     status?: string;
     detail?: string;
+    mechanically_verified?: boolean;
   } & UnknownRecord>;
   findings?: OutputContinuityFinding[];
+  review_events?: OutputFindingReviewEvent[];
 }
 
 export interface MediaInspection extends UnknownRecord {
@@ -247,6 +284,8 @@ export interface QualitySnapshot extends UnknownRecord {
       fingerprint?: string;
       release_safe?: boolean;
       detail?: string;
+      repair_binding_status?: 'current' | 'partial' | 'stale' | null;
+      stale_repaired_finding_count?: number;
     } | null;
     selected_master_output_continuity?: OutputContinuityReport;
   };
@@ -475,6 +514,23 @@ export const api = {
     request<UnknownRecord>(
       'POST',
       `/api/episodes/${id}/audio-qc/findings/${findingId}/review`,
+      body
+    ),
+  reviewAudioOutputFinding: (
+    id: string,
+    eventId: string,
+    body: {
+      decision: 'accepted' | 'false_positive';
+      reviewer: string;
+      evidence_note: string;
+      expected_report_fingerprint: string;
+      expected_event_fingerprint: string;
+      expected_output_revision: string;
+    }
+  ) =>
+    request<UnknownRecord>(
+      'POST',
+      `/api/episodes/${id}/audio-qc/output-findings/${eventId}/review`,
       body
     ),
 

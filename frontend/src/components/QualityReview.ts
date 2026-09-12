@@ -2,9 +2,11 @@ import { Button } from './Button';
 import { h } from '../lib/dom';
 import {
   api,
+  type AudioRepairCandidate,
   type InspectionRequest,
   type OutputContinuityFinding,
   type OutputContinuityReport,
+  type OutputFindingReviewEvent,
   type QualityFinding,
   type QualitySnapshot,
 } from '../lib/api';
@@ -126,7 +128,8 @@ export function QualityReview(options: QualityReviewOptions): HTMLElement {
       ? outputContinuityReview(
           episodeId,
           quality.audio_quality.selected_master_output_continuity,
-          controls
+          controls,
+          onUpdated
         )
       : null,
     !compact && findings.length
@@ -200,7 +203,8 @@ function repairCandidate(
           'p',
           { class: 'text-body-sm text-ink-tertiary mt-1' },
           `${candidate.repaired_finding_count} findings repaired · ${candidate.unresolved_finding_count} unresolved · human listening ${candidate.perceptual_review?.status === 'not_performed' ? 'not performed' : 'not recorded'}`
-        )
+        ),
+        selectedRepairBindingWarning(candidate, selection)
       ),
       action
     ),
@@ -215,6 +219,23 @@ function repairCandidate(
       { class: 'text-body-sm text-ink-tertiary' },
       'Selecting this draft changes future render input. It does not approve publishing or mark unresolved findings safe.'
     )
+  );
+}
+
+function selectedRepairBindingWarning(
+  candidate: AudioRepairCandidate,
+  selection: QualitySnapshot['audio_quality']['repair_selection']
+): HTMLElement | null {
+  const bindingStatus = selection?.repair_binding_status;
+  if (!bindingStatus || bindingStatus === 'current') return null;
+  const staleCount = selection?.stale_repaired_finding_count;
+  const staleDetail = staleCount == null
+    ? 'One or more historical repair bindings no longer match current finding evidence.'
+    : `${staleCount} historical repair ${staleCount === 1 ? 'binding is' : 'bindings are'} stale and ${staleCount === 1 ? 'is' : 'are'} not counted.`;
+  return h(
+    'p',
+    { class: 'text-body-sm text-status-warning mt-2' },
+    `Current QA projects ${candidate.repaired_finding_count} repaired findings. ${staleDetail}`
   );
 }
 
@@ -373,24 +394,87 @@ function findingReviewAction(
 ): HTMLElement | null {
   const context = finding.review;
   if (!context) return null;
-  const resolution = finding.resolution;
-  const outputRevision = context.output_revision;
-  const existingDecision = new Set(['accepted', 'false_positive']).has(
-    resolution?.status ?? ''
-  );
-  if (!context.allowed || !outputRevision || !context.inspection_request) {
+  return boundReviewAction({
+    episodeId,
+    identity: `finding-review:${context.report_fingerprint}:${context.finding_fingerprint}:${context.output_revision}`,
+    allowed: context.allowed,
+    reason: context.reason,
+    outputRevision: context.output_revision,
+    inspectionRequest: context.inspection_request,
+    resolution: finding.resolution,
+    heading: 'Review current rendered output',
+    explanation:
+      'This decision applies to this source finding and the exact current full render. It does not approve publishing or waive selected-master or rendered-output continuity failures.',
+    acceptLabel: 'Accept issue for this render',
+    falsePositiveLabel: 'Mark false positive for this render',
+    successMessage: 'Finding review recorded for the current output.',
+    controls,
+    onUpdated,
+    submit: (decision, reviewer, evidenceNote) =>
+      api.reviewAudioFinding(episodeId, finding.id, {
+        decision,
+        reviewer,
+        evidence_note: evidenceNote,
+        expected_report_fingerprint: context.report_fingerprint,
+        expected_finding_fingerprint: context.finding_fingerprint,
+        expected_output_revision: context.output_revision!,
+      }),
+  });
+}
+
+interface BoundReviewOptions {
+  episodeId: string;
+  identity: string;
+  allowed: boolean;
+  reason?: string | null;
+  outputRevision?: string | null;
+  inspectionRequest?: InspectionRequest | null;
+  resolution?: QualityFinding['resolution'];
+  heading: string;
+  explanation: string;
+  acceptLabel: string;
+  falsePositiveLabel: string;
+  successMessage: string;
+  controls?: QualityReviewControls;
+  onUpdated?: () => void | Promise<void>;
+  submit: (
+    decision: 'accepted' | 'false_positive',
+    reviewer: string,
+    evidenceNote: string
+  ) => Promise<unknown>;
+}
+
+function boundReviewAction(options: BoundReviewOptions): HTMLElement {
+  const {
+    episodeId,
+    identity,
+    allowed,
+    reason,
+    outputRevision,
+    inspectionRequest,
+    resolution,
+    heading,
+    explanation,
+    acceptLabel,
+    falsePositiveLabel,
+    successMessage,
+    controls,
+    onUpdated,
+    submit: recordDecision,
+  } = options;
+  if (!allowed || !outputRevision || !inspectionRequest) {
     return h(
       'div',
       {
         class:
           'rounded-md border border-border-subtle bg-surface-1 px-3 py-2 text-body-sm text-ink-tertiary',
       },
-      context.reason ?? 'A current rendered-output review is unavailable.'
+      reason ?? 'A current rendered-output review is unavailable.'
     );
   }
-
-  const inspectionRequest = context.inspection_request;
-  const identity = `finding-review:${context.report_fingerprint}:${context.finding_fingerprint}:${outputRevision}`;
+  const existingDecision = new Set(['accepted', 'false_positive']).has(
+    resolution?.status ?? ''
+  );
   const previewMap = inspectionPreviewMap(controls);
   const draftMap = reviewDraftMap(controls);
   const draft = draftMap.get(identity) ?? { reviewer: '', evidenceNote: '' };
@@ -405,12 +489,12 @@ function findingReviewAction(
       h(
         'div',
         { class: 'text-heading-sm uppercase text-ink-tertiary' },
-        'Review current rendered output'
+        heading
       ),
       h(
         'p',
         { class: 'text-body-sm text-ink-secondary' },
-        'This decision applies to this source finding and the exact current full render. It does not approve publishing or waive selected-master or rendered-output continuity failures.'
+        explanation
       ),
     ];
     if (existingDecision) {
@@ -479,7 +563,7 @@ function findingReviewAction(
       },
     }) as HTMLTextAreaElement;
     const actions: HTMLButtonElement[] = [];
-    const submit = async (
+    const submitDecision = async (
       decision: 'accepted' | 'false_positive'
     ): Promise<void> => {
       if (!draft.reviewer.trim() || !draft.evidenceNote.trim()) {
@@ -490,15 +574,12 @@ function findingReviewAction(
         button.disabled = true;
       });
       try {
-        await api.reviewAudioFinding(episodeId, finding.id, {
+        await recordDecision(
           decision,
-          reviewer: draft.reviewer.trim(),
-          evidence_note: draft.evidenceNote.trim(),
-          expected_report_fingerprint: context.report_fingerprint,
-          expected_finding_fingerprint: context.finding_fingerprint,
-          expected_output_revision: outputRevision,
-        });
-        showToast('Finding review recorded for the current output.', 'success');
+          draft.reviewer.trim(),
+          draft.evidenceNote.trim()
+        );
+        showToast(successMessage, 'success');
         await onUpdated?.();
       } catch (error) {
         showToast((error as Error).message, 'error');
@@ -510,14 +591,14 @@ function findingReviewAction(
     const accept = Button({
       variant: 'secondary',
       size: 'sm',
-      label: 'Accept issue for this render',
-      onClick: () => submit('accepted'),
+      label: acceptLabel,
+      onClick: () => submitDecision('accepted'),
     });
     const falsePositive = Button({
       variant: 'secondary',
       size: 'sm',
-      label: 'Mark false positive for this render',
-      onClick: () => submit('false_positive'),
+      label: falsePositiveLabel,
+      onClick: () => submitDecision('false_positive'),
     });
     actions.push(accept, falsePositive);
     children.push(
@@ -541,9 +622,11 @@ function findingReviewAction(
 function outputContinuityReview(
   episodeId: string,
   report: OutputContinuityReport,
-  controls?: QualityReviewControls
+  controls?: QualityReviewControls,
+  onUpdated?: () => void | Promise<void>
 ): HTMLElement | null {
   const findings = report.findings ?? [];
+  const reviewEvents = report.review_events ?? [];
   const groups = new Map<
     string,
     {
@@ -577,9 +660,21 @@ function outputContinuityReview(
   const visibleGroups = [...groups.values()].filter(
     (group) => group.status !== 'pass' || group.findings.length
   );
-  if ((!report.status || report.status === 'pass') && !visibleGroups.length) {
+  if (
+    (!report.status || report.status === 'pass') &&
+    !visibleGroups.length &&
+    !reviewEvents.length
+  ) {
     return null;
   }
+  const unresolvedReviewCount = reviewEvents.filter(
+    (event) => !['accepted', 'false_positive'].includes(event.resolution?.status ?? '')
+  ).length;
+  const actionableReviewCount = reviewEvents.filter(
+    (event) =>
+      event.review.allowed &&
+      !['accepted', 'false_positive'].includes(event.resolution?.status ?? '')
+  ).length;
   return h(
     'div',
     { class: 'border-t border-border-subtle pt-4 flex flex-col gap-3' },
@@ -595,6 +690,30 @@ function outputContinuityReview(
         ? 'This output-continuity report is stale. Run QA before using its timestamps or previews.'
         : report.detail ?? 'Current output continuity evidence is incomplete.'
     ),
+    ...(reviewEvents.length
+      ? [
+          h(
+            'details',
+            { class: 'rounded-md border border-accent/30 bg-accent/5 px-3 py-2' },
+            h(
+              'summary',
+              { class: 'cursor-pointer text-body text-ink-primary font-medium' },
+              actionableReviewCount
+                ? `${actionableReviewCount} semantic output ${actionableReviewCount === 1 ? 'prediction requires' : 'predictions require'} explicit review`
+                : unresolvedReviewCount
+                  ? `${unresolvedReviewCount} semantic output ${unresolvedReviewCount === 1 ? 'prediction is' : 'predictions are'} unavailable for review`
+                : `${reviewEvents.length} semantic output ${reviewEvents.length === 1 ? 'prediction reviewed' : 'predictions reviewed'}`
+            ),
+            h(
+              'div',
+              { class: 'mt-3 grid gap-3' },
+              ...reviewEvents.map((event) =>
+                outputReviewEvent(episodeId, event, controls, onUpdated)
+              )
+            )
+          ),
+        ]
+      : []),
     ...visibleGroups.map((group) =>
       h(
         'details',
@@ -605,7 +724,7 @@ function outputContinuityReview(
         h(
           'summary',
           { class: 'cursor-pointer text-body text-ink-primary font-medium' },
-          `${outputRole(group.role, group.clipId)} · ${group.status ?? 'finding'} · ${group.findings.length} hard ${group.findings.length === 1 ? 'finding' : 'findings'}`
+          `${outputRole(group.role, group.clipId)} · ${group.status ?? 'finding'} · ${group.findings.length} artifact ${group.findings.length === 1 ? 'candidate' : 'candidates'}`
         ),
         h(
           'div',
@@ -622,11 +741,82 @@ function outputContinuityReview(
     h(
       'p',
       { class: 'text-body-sm text-ink-tertiary' },
-      'These are hard output checks. Source-finding review decisions cannot waive them.'
+      'Per-artifact findings remain available above with their exact clocks and previews. Missing, stale, decode, and duration failures are hard checks; semantic decisions do not waive them, resolve source findings, or approve publishing.'
     )
   );
 }
 
+function outputReviewEvent(
+  episodeId: string,
+  event: OutputFindingReviewEvent,
+  controls?: QualityReviewControls,
+  onUpdated?: () => void | Promise<void>
+): HTMLElement {
+  const sourceRanges = event.binding.source_ranges
+    .map((source) => timeRange(source.start_seconds, source.end_seconds))
+    .join(', ');
+  const context = event.review;
+  const roles = [
+    ...new Set(event.members.map((member) => outputRole(member.role, member.clip_id))),
+  ].join(', ');
+  const evidence = event.binding.transcript_evidence;
+  const resolution = event.resolution?.status;
+  const status = ['accepted', 'false_positive'].includes(resolution ?? '')
+    ? ` · ${resolution?.replace('_', ' ')}`
+    : '';
+  return h(
+    'details',
+    { class: 'rounded-md border border-border-subtle bg-surface-2 px-4 py-3' },
+    h(
+      'summary',
+      { class: 'cursor-pointer text-body text-ink-primary font-medium' },
+      `Source ${sourceRanges || '—'} · ${event.members.length} exact ${event.members.length === 1 ? 'artifact' : 'artifacts'}${status}`
+    ),
+    h(
+      'div',
+      { class: 'mt-3 grid gap-3' },
+      h('p', { class: 'text-body-sm text-ink-secondary' }, `Exact evidence match: ${roles}.`),
+      h(
+        'p',
+        { class: 'text-body-sm text-ink-tertiary' },
+        `Detector evidence: ${event.binding.classification.replaceAll('_', ' ')}; transcript timing overlaps ${evidence.speech_overlap_seconds.toFixed(3)}s across ${evidence.transcript_word_count} ${evidence.transcript_word_count === 1 ? 'word' : 'words'} (review threshold ${evidence.required_speech_overlap_seconds.toFixed(3)}s).`
+      ),
+      evidence.transcript_excerpt
+        ? h(
+            'blockquote',
+            { class: 'text-body-sm text-ink-secondary border-l-2 border-border pl-3' },
+            evidence.transcript_excerpt
+          )
+        : null,
+      boundReviewAction({
+        episodeId,
+        identity: `output-review:${context.report_fingerprint}:${context.event_fingerprint}:${context.output_revision}`,
+        allowed: context.allowed,
+        reason: context.reason,
+        outputRevision: context.output_revision,
+        inspectionRequest: context.inspection_request,
+        resolution: event.resolution,
+        heading: 'Review semantic output prediction',
+        explanation:
+          'This records a judgment for these exact artifact revisions after reviewing the current full output. It does not alter word timing, waive missing, stale, decode, or duration failures, resolve source findings, or approve publishing.',
+        acceptLabel: 'Accept as a real pause',
+        falsePositiveLabel: 'Mark prediction false positive',
+        successMessage: 'Output prediction review recorded for the current artifacts.',
+        controls,
+        onUpdated,
+        submit: (decision, reviewer, evidenceNote) =>
+          api.reviewAudioOutputFinding(episodeId, event.id, {
+            decision,
+            reviewer,
+            evidence_note: evidenceNote,
+            expected_report_fingerprint: context.report_fingerprint,
+            expected_event_fingerprint: context.event_fingerprint,
+            expected_output_revision: context.output_revision!,
+          }),
+      })
+    )
+  );
+}
 
 function outputContinuityFinding(
   episodeId: string,
