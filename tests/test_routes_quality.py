@@ -1,9 +1,12 @@
 """Quality-report API and release-state regression tests."""
 
+import asyncio
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -285,6 +288,48 @@ def test_quality_api_reports_current_release_ready(quality_client):
     assert body["release_gate"]["status"] == "ready"
     assert body["release_gate"]["safe"] is True
     assert body["artifacts"]["legacy_longform"]["release_candidate"] is False
+
+
+def test_quality_snapshot_does_not_block_other_requests(quality_client, monkeypatch):
+    client, episodes_dir = quality_client
+    _write_json(episodes_dir / "ep_test" / "episode.json", {"episode_id": "ep_test"})
+    started = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    def slow_snapshot(_episode_dir):
+        started.set()
+        observed["health_ran_before_snapshot_returned"] = release.wait(timeout=1.0)
+        return {"status": "ok"}
+
+    @client.app.get("/health-for-quality-test")
+    async def health():
+        release.set()
+        return {"status": "ok"}
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as async_client:
+            quality_request = asyncio.create_task(
+                async_client.get("/api/episodes/ep_test/quality")
+            )
+            assert await asyncio.wait_for(
+                asyncio.to_thread(started.wait, 1.0), timeout=2.0
+            )
+            health_response = await asyncio.wait_for(
+                async_client.get("/health-for-quality-test"), timeout=2.0
+            )
+            quality_response = await asyncio.wait_for(quality_request, timeout=2.0)
+            return health_response, quality_response
+
+    monkeypatch.setattr(quality, "quality_snapshot", slow_snapshot)
+    health_response, quality_response = asyncio.run(exercise())
+
+    assert health_response.status_code == 200
+    assert observed["health_ran_before_snapshot_returned"] is True
+    assert quality_response.status_code == 200
 
 
 def test_quality_api_marks_changed_inputs_stale(quality_client):

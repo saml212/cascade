@@ -365,7 +365,7 @@ def _bound_audio_response(
 @router.get("/{episode_id}/quality")
 async def get_quality(episode_id: str) -> dict:
     """Return the current revision, findings, artifacts, approvals, and blockers."""
-    return quality_snapshot(_episode_dir(episode_id))
+    return await asyncio.to_thread(quality_snapshot, _episode_dir(episode_id))
 
 
 @router.get("/{episode_id}/quality/report")
