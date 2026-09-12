@@ -37,7 +37,6 @@ from lib.audio_mix import (
 from lib.delivery_video import (
     build_keep_intervals,
     current_longform_render,
-    longform_render_fingerprint,
     read_render_manifest,
     render_config_for_episode,
     render_space_budget,
@@ -174,25 +173,6 @@ def migrate_unchanged_delivery_audio_fingerprint(
     return True
 
 
-def _video_fingerprint(
-    episode_dir: Path, episode: dict, config: dict, audio: Path
-) -> str | None:
-    segment_document = current_speaker_segments(episode_dir, episode, config)
-    if not segment_document:
-        return None
-    segments = segment_document.get("segments", [])
-    current = current_longform_render(episode_dir, episode, config, audio, segments)
-    if current:
-        return current["fingerprint"]
-    return longform_render_fingerprint(
-        episode_dir,
-        episode,
-        config,
-        audio,
-        segments,
-    )
-
-
 def _current_video_record(
     episode_dir: Path, episode: dict, config: dict
 ) -> dict | None:
@@ -207,13 +187,71 @@ def _current_video_record(
     return current_longform_render(episode_dir, episode, config, audio, segments)
 
 
-def _video_audio_status(episode_dir: Path, config: dict) -> dict:
+def _video_audio_status(
+    episode_dir: Path, config: dict, record: dict | None = None
+) -> dict:
     """Classify recorded final AAC evidence without decoding on status polls."""
-    record = read_render_manifest(episode_dir).get("longform", {})
+    record = record or read_render_manifest(episode_dir).get("longform", {})
     return loudness_status(
         record.get("output", {}).get("audio_loudness"),
         delivery_loudness_policy(config, "longform"),
     )
+
+
+def current_delivery_video_fields(
+    episode_dir: Path, episode: dict, config: dict
+) -> dict:
+    """Return read-only delivery fields only for the current proven video."""
+    try:
+        record = _current_video_record(episode_dir, episode, config)
+        if record is None:
+            return {"video_status": "not_prepared"}
+        video_path = episode_dir / "upload_video.mp4"
+        output_stat = _file_stat(video_path)
+        recorded_output = record.get("output", {})
+        if (
+            recorded_output.get("size_bytes") != output_stat["size"]
+            or recorded_output.get("mtime_ns") != output_stat["mtime_ns"]
+        ):
+            return {"video_status": "not_prepared"}
+        video_audio = _video_audio_status(episode_dir, config, record)
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        return {"video_status": "not_prepared"}
+
+    fields = {
+        "video_completed_at": record.get("completed_at"),
+        "video_download_url": _artifact_download_url(
+            episode_dir.name, "video", output_stat
+        ),
+        "video_source_fingerprint": record["fingerprint"],
+        "video_output_stat": output_stat,
+        "video": {
+            "filename": video_path.name,
+            "render_mode": record.get("render_mode"),
+            "render_fingerprint": record["fingerprint"],
+            **record.get("output", {}),
+        },
+        "video_audio": video_audio,
+        "video_stale": False,
+    }
+    if not video_audio["safe"]:
+        return {
+            **fields,
+            "video_status": "not_prepared",
+            "video_repair_required": True,
+            "video_error": (
+                "; ".join(video_audio.get("errors", []))
+                or video_audio.get("error")
+                or "Encoded video audio needs repair."
+            ),
+        }
+    return {
+        **fields,
+        "video_status": "ready",
+        "video_progress": 100.0,
+        "video_repair_required": False,
+        "video_error": None,
+    }
 
 
 def _recover_current_video_status(
@@ -222,35 +260,7 @@ def _recover_current_video_status(
     """Populate missing delivery state only from a fully current render record."""
     if status.get("video_status") is not None:
         return
-    status["video_status"] = "not_prepared"
-    try:
-        record = _current_video_record(episode_dir, episode, config)
-        if record is None:
-            return
-        video_path = episode_dir / "upload_video.mp4"
-        output_stat = _file_stat(video_path)
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
-        return
-
-    status.update(
-        video_status="ready",
-        video_progress=100.0,
-        video_completed_at=record.get("completed_at"),
-        video_download_url=_artifact_download_url(
-            episode_dir.name, "video", output_stat
-        ),
-        video_source_fingerprint=record["fingerprint"],
-        video_output_stat=output_stat,
-        video={
-            "filename": video_path.name,
-            "render_mode": record.get("render_mode"),
-            "render_fingerprint": record["fingerprint"],
-            **record.get("output", {}),
-        },
-        video_stale=False,
-        video_repair_required=False,
-        video_error=None,
-    )
+    status.update(current_delivery_video_fields(episode_dir, episode, config))
 
 
 def _video_status_fields(status: dict) -> dict:
@@ -381,53 +391,16 @@ def _refresh_status(episode_dir: Path) -> dict:
             )
             _write_status(episode_dir, status)
     elif status.get("video_status") == "ready":
-        video_path = episode_dir / "upload_video.mp4"
-        video_input_error = None
-        try:
-            video_output_stat = _file_stat(video_path)
-            status["video_download_url"] = _artifact_download_url(
-                episode_id, "video", video_output_stat
-            )
-            audio_path = selected_audio_source(episode_dir, episode, config) or (
-                episode_dir / "work" / "audio_mix.wav"
-            )
-            expected_fingerprint = _video_fingerprint(
-                episode_dir, episode, config, audio_path
-            )
-            video_stale = (
-                not video_path.exists()
-                or not expected_fingerprint
-                or status.get("video_output_stat") != video_output_stat
-                or status.get("video_source_fingerprint") != expected_fingerprint
-            )
-            video_audio = _video_audio_status(episode_dir, config)
-            status["video_audio"] = video_audio
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            video_stale = True
-            video_input_error = str(exc)
-        if video_stale:
-            status.update(
-                video_status="not_prepared",
-                video_stale=True,
-                video_repair_required=False,
-                video_error=video_input_error
-                or "Video inputs or output changed; prepare the video again.",
-            )
+        current_video = current_delivery_video_fields(episode_dir, episode, config)
+        status.update(current_video)
+        if current_video.get("video_status") != "ready":
+            if not current_video.get("video_repair_required"):
+                status.update(
+                    video_stale=True,
+                    video_repair_required=False,
+                    video_error="Video inputs or output changed; prepare the video again.",
+                )
             _write_status(episode_dir, status)
-        elif not video_audio["safe"]:
-            status.update(
-                video_status="not_prepared",
-                video_stale=False,
-                video_repair_required=True,
-                video_error=(
-                    "; ".join(video_audio.get("errors", []))
-                    or video_audio.get("error")
-                    or "Encoded video audio needs repair."
-                ),
-            )
-            _write_status(episode_dir, status)
-        else:
-            status["video_repair_required"] = False
     return status
 
 

@@ -156,7 +156,9 @@ class TestListEpisodes:
         assert resp.status_code == 200
         assert len(resp.json()) == 1
 
-    def test_list_includes_lightweight_verified_delivery_snapshot(self, test_client):
+    def test_list_recovers_verified_video_missing_from_cached_delivery(
+        self, test_client
+    ):
         client, episodes_dir = test_client
         ep_dir = _create_episode(episodes_dir, "ep_001")
         audio = ep_dir / "podcast_audio.mp3"
@@ -179,46 +181,60 @@ class TestListEpisodes:
 
         with patch("agents.podcast_feed.subprocess.run", side_effect=finish_audio):
             PodcastFeedAgent(ep_dir, config).prepare_local_audio()
-        (ep_dir / "delivery.json").write_text(
-            json.dumps(
-                {
-                    "status": "ready",
+        cached_status = {
+            "status": "ready",
+            "duration_seconds": 120.0,
+            "download_url": "/api/episodes/ep_001/delivery/audio",
+            "output_stat": {
+                "size": audio.stat().st_size,
+                "mtime_ns": audio.stat().st_mtime_ns,
+            },
+            "source_fingerprint": _source_fingerprint(ep_dir, episode, config),
+        }
+        (ep_dir / "delivery.json").write_text(json.dumps(cached_status))
+
+        def current_video_fields(_dir, _current, _config):
+            return {
+                "video_status": "ready",
+                "video_download_url": "/api/episodes/ep_001/delivery/video?v=current",
+                "video_output_stat": {
+                    "size": video.stat().st_size,
+                    "mtime_ns": video.stat().st_mtime_ns,
+                },
+                "video_source_fingerprint": "video-current",
+                "video": {
                     "duration_seconds": 120.0,
-                    "download_url": "/api/episodes/ep_001/delivery/audio",
-                    "output_stat": {
-                        "size": audio.stat().st_size,
-                        "mtime_ns": audio.stat().st_mtime_ns,
-                    },
-                    "source_fingerprint": _source_fingerprint(ep_dir, episode, config),
-                    "video_status": "ready",
-                    "video_download_url": "/api/episodes/ep_001/delivery/video",
-                    "video_output_stat": {
-                        "size": video.stat().st_size,
-                        "mtime_ns": video.stat().st_mtime_ns,
-                    },
-                    "video_source_fingerprint": "video-current",
-                    "video": {"duration_seconds": 120.0, "width": 1920, "height": 1080},
-                }
-            )
-        )
+                    "width": 1920,
+                    "height": 1080,
+                },
+            }
 
         with patch.object(
             episodes_mod,
-            "_video_fingerprint",
-            side_effect=lambda _dir, current, _config, _audio: (
-                "video-changed" if current.get("crop_config") else "video-current"
-            ),
+            "current_delivery_video_fields",
+            side_effect=current_video_fields,
         ):
             delivery = client.get("/api/episodes/").json()[0]["delivery"]
             assert delivery["status"] == "ready"
             assert delivery["video_status"] == "ready"
             assert delivery["video"]["duration_seconds"] == 120.0
 
-            episode["crop_config"] = {"speakers": [{"track": 1, "volume": 1.5}]}
-            (ep_dir / "episode.json").write_text(json.dumps(episode))
-            stale = client.get("/api/episodes/").json()[0]["delivery"]
-        assert stale["status"] == "not_prepared"
-        assert stale["video_status"] == "not_prepared"
+            detail = client.get("/api/episodes/ep_001").json()["delivery"]
+            assert detail["video_status"] == "ready"
+        assert json.loads((ep_dir / "delivery.json").read_text()) == cached_status
+
+    def test_list_does_not_recover_unproven_video(self, test_client):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        (ep_dir / "upload_video.mp4").write_bytes(b"unproven")
+        cached_status = {"status": "not_prepared", "episode_id": "ep_001"}
+        (ep_dir / "delivery.json").write_text(json.dumps(cached_status))
+
+        delivery = client.get("/api/episodes/").json()[0]["delivery"]
+
+        assert delivery["video_status"] == "not_prepared"
+        assert "video_download_url" not in delivery
+        assert json.loads((ep_dir / "delivery.json").read_text()) == cached_status
 
 
 class TestGetEpisode:

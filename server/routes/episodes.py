@@ -37,7 +37,7 @@ from lib.crop import speaker_crop_state, visual_crop_state
 from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
 from lib.ffprobe import get_dimensions
 from server.routes.delivery import (
-    _video_fingerprint,
+    current_delivery_video_fields,
     migrate_unchanged_delivery_audio_fingerprint,
 )
 
@@ -92,8 +92,6 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, processing_config = {}, {}
 
-    # File existence and stat comparisons are cheap and prevent other screens
-    # from presenting a deleted or replaced artifact as verified and ready.
     if snapshot.get("status") == "ready":
         try:
             current_audio = current_podcast_audio(
@@ -109,34 +107,15 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
             "mtime_ns": current_audio.stat().st_mtime_ns,
         }:
             snapshot["status"] = "not_prepared"
-    if snapshot.get("video_status") == "ready":
-        video = ep_dir / "upload_video.mp4"
-        stat = raw.get("video_output_stat")
-        if not video.exists() or not isinstance(stat, dict):
-            snapshot["video_status"] = "not_prepared"
-        else:
-            actual = video.stat()
-            if stat != {"size": actual.st_size, "mtime_ns": actual.st_mtime_ns}:
-                snapshot["video_status"] = "not_prepared"
-            else:
-                try:
-                    canonical_audio = selected_audio_source(
-                        ep_dir, episode, processing_config
-                    ) or (ep_dir / "work" / "audio_mix.wav")
-                except ValueError:
-                    canonical_audio = None
-                expected_fingerprint = (
-                    _video_fingerprint(
-                        ep_dir, episode, processing_config, canonical_audio
-                    )
-                    if canonical_audio is not None and canonical_audio.exists()
-                    else None
-                )
-                if (
-                    not expected_fingerprint
-                    or raw.get("video_source_fingerprint") != expected_fingerprint
-                ):
-                    snapshot["video_status"] = "not_prepared"
+    if snapshot.get("video_status") in {None, "ready"}:
+        snapshot = {
+            key: value
+            for key, value in snapshot.items()
+            if key != "video" and not key.startswith("video_")
+        }
+        snapshot.update(
+            current_delivery_video_fields(ep_dir, episode, processing_config)
+        )
     return snapshot
 
 

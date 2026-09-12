@@ -113,14 +113,13 @@ def test_status_recovers_missing_video_fields_from_current_manifest(delivery):
             "duration_seconds": 3590.0,
             "width": 3840,
             "height": 2160,
-            **mod._file_stat(video),
+            "size_bytes": video.stat().st_size,
+            "mtime_ns": video.stat().st_mtime_ns,
         },
     }
 
     with (
         patch.object(mod, "_current_video_record", return_value=record),
-        patch.object(mod, "selected_audio_source", return_value=None),
-        patch.object(mod, "_video_fingerprint", return_value="current-video"),
         patch.object(
             mod,
             "_video_audio_status",
@@ -153,6 +152,43 @@ def test_status_does_not_recover_unproven_video_file(delivery):
     assert "video_source_fingerprint" not in status
     assert "video_output_stat" not in status
     assert video.read_bytes() == b"unproven render"
+
+
+def test_status_does_not_mix_currentness_with_replaced_video(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    video = episode_dir / "upload_video.mp4"
+    video.write_bytes(b"manifest-backed render")
+    original = video.stat()
+    record = {
+        "path": video.name,
+        "render_mode": "speaker_cut",
+        "fingerprint": "current-video",
+        "output": {
+            "size_bytes": original.st_size,
+            "mtime_ns": original.st_mtime_ns,
+            "audio_loudness": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbfs": -1.2,
+            },
+        },
+    }
+
+    def replace_after_currentness(*_args):
+        video.write_bytes(b"replacement bytes from a later render")
+        return record
+
+    with (
+        patch.object(
+            mod, "_current_video_record", side_effect=replace_after_currentness
+        ),
+        patch.object(mod, "_video_audio_status") as audio_status,
+    ):
+        status = mod._refresh_status(episode_dir)
+
+    assert status["video_status"] == "not_prepared"
+    assert "video_source_fingerprint" not in status
+    audio_status.assert_not_called()
 
 
 def test_audio_source_fingerprint_ignores_picture_crop(delivery):
@@ -795,10 +831,23 @@ def test_status_validates_ready_video_against_selected_repair(delivery):
             "video_output_stat": mod._file_stat(video),
         },
     )
+    record = {
+        "render_mode": "speaker_cut",
+        "fingerprint": "current-video",
+        "output": {
+            "size_bytes": video.stat().st_size,
+            "mtime_ns": video.stat().st_mtime_ns,
+        },
+    }
 
     with (
         patch.object(mod, "selected_audio_source", return_value=selected),
-        patch.object(mod, "_video_fingerprint", return_value="current-video") as check,
+        patch.object(
+            mod,
+            "current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 1}]},
+        ),
+        patch.object(mod, "current_longform_render", return_value=record) as check,
         patch.object(
             mod,
             "_video_audio_status",
@@ -835,10 +884,17 @@ def test_status_blocks_unsafe_aac_without_hiding_repair_path(delivery):
         "safe": False,
         "errors": ["true peak 0.9 dBFS exceeds -1.0 dBFS"],
     }
+    record = {
+        "render_mode": "speaker_cut",
+        "fingerprint": "current-video",
+        "output": {
+            "size_bytes": video.stat().st_size,
+            "mtime_ns": video.stat().st_mtime_ns,
+        },
+    }
 
     with (
-        patch.object(mod, "selected_audio_source", return_value=None),
-        patch.object(mod, "_video_fingerprint", return_value="current-video"),
+        patch.object(mod, "_current_video_record", return_value=record),
         patch.object(mod, "_video_audio_status", return_value=unsafe),
     ):
         status = mod._refresh_status(episode_dir)
