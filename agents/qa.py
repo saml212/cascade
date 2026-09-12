@@ -138,6 +138,14 @@ def _podcast_rss_plan(
     podcast = config.get("podcast", {})
     r2 = podcast.get("r2", {})
     account = environment.get("CLOUDFLARE_ACCOUNT_ID", "")
+    required_channel_fields = (
+        "title",
+        "description",
+        "author",
+        "artwork_url",
+        "link",
+        "owner_email",
+    )
     plan.update(
         account_identity=(
             _private_identity("cloudflare-account", account) if account else None
@@ -149,10 +157,12 @@ def _podcast_rss_plan(
                 "public_url": str(r2.get("public_url", "")).rstrip("/"),
             },
         ),
+        destination_configured=bool(r2.get("bucket") and r2.get("public_url")),
         channel_identity=_private_identity(
             "podcast-channel",
             {field: podcast.get(field) for field in PODCAST_CHANNEL_FIELDS},
         ),
+        channel_configured=all(podcast.get(field) for field in required_channel_fields),
         episode_identity=_private_identity(
             "podcast-episode",
             {

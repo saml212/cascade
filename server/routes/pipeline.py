@@ -514,6 +514,28 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
                 status_code=409,
                 detail="No publication destinations are enabled",
             )
+        configuration_blockers = []
+        if plan["upload_post"].get("enabled") and not plan["upload_post"].get(
+            "account_identity"
+        ):
+            configuration_blockers.append("UPLOAD_POST_USER is not configured")
+        rss_plan = plan["podcast_rss"]
+        if rss_plan.get("enabled") and not rss_plan.get("account_identity"):
+            configuration_blockers.append(
+                "CLOUDFLARE_ACCOUNT_ID is not configured"
+            )
+        if rss_plan.get("enabled") and not rss_plan.get("destination_configured"):
+            configuration_blockers.append("Podcast R2 destination is not configured")
+        if rss_plan.get("enabled") and not rss_plan.get("channel_configured"):
+            configuration_blockers.append("Podcast channel metadata is incomplete")
+        if configuration_blockers:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Publication destinations are not ready",
+                    "blockers": configuration_blockers,
+                },
+            )
 
         episode.pop("publish_approved", None)
         episode.pop("publish_approved_at", None)

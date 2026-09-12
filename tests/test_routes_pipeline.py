@@ -15,8 +15,16 @@ def _release_snapshot(*, upload_post=True, podcast_rss=False):
             "revision": "sha256:approved-plan",
             "blockers": [],
             "publish_plan": {
-                "upload_post": {"enabled": upload_post},
-                "podcast_rss": {"enabled": podcast_rss},
+                "upload_post": {
+                    "enabled": upload_post,
+                    "account_identity": "sha256:upload-account",
+                },
+                "podcast_rss": {
+                    "enabled": podcast_rss,
+                    "account_identity": "sha256:r2-account",
+                    "destination_configured": True,
+                    "channel_configured": True,
+                },
             },
         }
     }
@@ -259,6 +267,45 @@ class TestPublishApproval:
         assert not thread_class.called
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert "publish_approval" not in episode
+
+    def test_refuses_enabled_upload_post_without_bound_account(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        release = _release_snapshot(upload_post=True)
+        release["release_gate"]["publish_plan"]["upload_post"][
+            "account_identity"
+        ] = None
+
+        with (
+            patch("server.routes.pipeline.quality_snapshot", return_value=release),
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+        ):
+            response = client.post("/api/episodes/ep_001/approve-publish")
+
+        assert response.status_code == 409
+        assert "UPLOAD_POST_USER" in str(response.json()["detail"])
+        assert not thread_class.called
+        assert "publish_approval" not in json.loads(
+            (episode_dir / "episode.json").read_text()
+        )
+
+    def test_refuses_enabled_rss_without_bound_account(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        release = _release_snapshot(upload_post=False, podcast_rss=True)
+        release["release_gate"]["publish_plan"]["podcast_rss"][
+            "account_identity"
+        ] = None
+
+        with (
+            patch("server.routes.pipeline.quality_snapshot", return_value=release),
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+        ):
+            response = client.post("/api/episodes/ep_001/approve-publish")
+
+        assert response.status_code == 409
+        assert "CLOUDFLARE_ACCOUNT_ID" in str(response.json()["detail"])
+        assert not thread_class.called
 
 
 class TestUploadPostReceipts:
