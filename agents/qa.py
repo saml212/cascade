@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from lib.timeline import Timeline
 from lib.transcript_search import clip_boundary_evidence
 
 QUALITY_SCHEMA = "cascade.release-quality/v1"
+PUBLISH_PLAN_SCHEMA = "cascade.publish-plan/v1"
 QUALITY_REPORT_PATH = Path("qa/qa.json")
 AUDIO_REPORT_PATH = Path("qa/audio-quality.json")
 PLATFORM_COPY_FIELDS = {
@@ -32,6 +35,17 @@ PLATFORM_COPY_FIELDS = {
     "instagram": ("caption",),
     "x": ("text",),
 }
+PODCAST_CHANNEL_FIELDS = (
+    "title",
+    "description",
+    "author",
+    "artwork_url",
+    "language",
+    "category",
+    "explicit",
+    "link",
+    "owner_email",
+)
 
 
 def _load_json(path: Path, default=None):
@@ -50,6 +64,121 @@ def _file_signature(path: Path) -> dict | None:
         "path": str(path.resolve()),
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _private_identity(scope: str, value: object) -> str:
+    """Fingerprint private destination data without exposing the source value."""
+    encoded = json.dumps(
+        {"scope": scope, "value": value},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _upload_post_plan(
+    config: dict, episode: dict, environment: Mapping[str, str]
+) -> dict:
+    platforms = config.get("platforms", {})
+    destinations = sorted(
+        platform
+        for platform in PLATFORM_COPY_FIELDS
+        if platforms.get(platform, {}).get("enabled") is True
+    )
+    plan = {"enabled": bool(destinations), "destinations": destinations}
+    if not destinations:
+        return plan
+
+    user = environment.get("UPLOAD_POST_USER", "")
+    youtube_url = episode.get("youtube_longform_url", "")
+    if episode.get("youtube_longform_url_source") == "upload_post_receipt" or (
+        not youtube_url and "youtube" in destinations
+    ):
+        youtube_funnel = {"source": "upload_post_receipt"}
+    else:
+        youtube_funnel = {
+            "source": "supplied",
+            "identity": (
+                _private_identity("youtube-longform-url", youtube_url)
+                if youtube_url
+                else None
+            ),
+        }
+    schedule = config.get("schedule", {})
+    plan.update(
+        account_identity=_private_identity("upload-post-user", user) if user else None,
+        schedule={
+            "timezone": schedule.get("timezone", "America/Los_Angeles"),
+            "shorts_per_day_weekday": schedule.get("shorts_per_day_weekday", 1),
+            "shorts_per_day_weekend": schedule.get("shorts_per_day_weekend", 2),
+        },
+        funnel_identity=_private_identity(
+            "upload-post-funnel",
+            {
+                "youtube": youtube_funnel,
+                "spotify": episode.get("spotify_longform_url", ""),
+                "channel_handle": config.get("podcast", {}).get("channel_handle", ""),
+            },
+        ),
+    )
+    return plan
+
+
+def _podcast_rss_plan(
+    config: dict, episode: dict, environment: Mapping[str, str]
+) -> dict:
+    platforms = config.get("platforms", {})
+    enabled = platforms.get("podcast_rss", {}).get("enabled") is True
+    plan = {"enabled": enabled}
+    if not enabled:
+        return plan
+
+    podcast = config.get("podcast", {})
+    r2 = podcast.get("r2", {})
+    account = environment.get("CLOUDFLARE_ACCOUNT_ID", "")
+    plan.update(
+        account_identity=(
+            _private_identity("cloudflare-account", account) if account else None
+        ),
+        destination_identity=_private_identity(
+            "podcast-r2-destination",
+            {
+                "bucket": r2.get("bucket", ""),
+                "public_url": str(r2.get("public_url", "")).rstrip("/"),
+            },
+        ),
+        channel_identity=_private_identity(
+            "podcast-channel",
+            {field: podcast.get(field) for field in PODCAST_CHANNEL_FIELDS},
+        ),
+        episode_identity=_private_identity(
+            "podcast-episode",
+            {
+                "episode_id": episode.get("episode_id", ""),
+                "title": episode.get("episode_name") or episode.get("title", ""),
+                "description": episode.get("episode_description")
+                or episode.get("description", ""),
+                "created_at": episode.get("created_at", ""),
+            },
+        ),
+    )
+    return plan
+
+
+def current_publish_plan(
+    config: dict,
+    episode: dict,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> dict:
+    """Return the normalized external destinations covered by publish approval."""
+    environment = os.environ if environment is None else environment
+    return {
+        "schema": PUBLISH_PLAN_SCHEMA,
+        "upload_post": _upload_post_plan(config, episode, environment),
+        "podcast_rss": _podcast_rss_plan(config, episode, environment),
     }
 
 
@@ -209,12 +338,22 @@ def quality_revision(episode_dir: str | Path, episode: dict | None = None) -> st
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def release_revision(episode_dir: str | Path, episode: dict | None = None) -> str:
+def release_revision(
+    episode_dir: str | Path,
+    episode: dict | None = None,
+    *,
+    config: dict | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> str:
     """Bind final publish approval to quality inputs and clip decisions."""
     episode_dir = Path(episode_dir)
     episode = (
         episode if episode is not None else _load_json(episode_dir / "episode.json")
     )
+    if config is None:
+        from agents.pipeline import load_config
+
+        config = load_config()
     clips_data = _load_json(episode_dir / "clips.json", {"clips": []})
     clips = clips_data.get("clips", []) if isinstance(clips_data, dict) else clips_data
     decisions = {
@@ -225,6 +364,7 @@ def release_revision(episode_dir: str | Path, episode: dict | None = None) -> st
     payload = {
         "quality_revision": quality_revision(episode_dir, episode),
         "clip_decisions": decisions,
+        "publish_plan": current_publish_plan(config, episode, environment=environment),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
@@ -302,12 +442,9 @@ def current_clip_boundary_evidence(
 
 
 def _render_status(
-    episode_dir: Path, episode: dict, clips: list[dict]
+    episode_dir: Path, episode: dict, clips: list[dict], config: dict
 ) -> tuple[dict | None, dict[str, dict]]:
     try:
-        from agents.pipeline import load_config
-
-        config = load_config()
         audio = selected_audio_source(episode_dir, episode, config) or (
             episode_dir / "work" / "audio_mix.wav"
         )
@@ -327,16 +464,34 @@ def _render_status(
         return None, {}
 
 
-def quality_snapshot(episode_dir: str | Path, *, include_findings: bool = True) -> dict:
+def quality_snapshot(
+    episode_dir: str | Path,
+    *,
+    include_findings: bool = True,
+    config: dict | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> dict:
     """Return the single machine-readable quality and release decision."""
     episode_dir = Path(episode_dir)
+    if config is None:
+        from agents.pipeline import load_config
+
+        config = load_config()
     episode = _load_json(episode_dir / "episode.json")
     clips_data = _load_json(episode_dir / "clips.json", {"clips": []})
     clips = clips_data.get("clips", []) if isinstance(clips_data, dict) else clips_data
-    current_longform, current_shorts = _render_status(episode_dir, episode, clips)
+    current_longform, current_shorts = _render_status(
+        episode_dir, episode, clips, config
+    )
     current_editorial_revision = editorial_revision(episode_dir, episode)
     current_quality_revision = quality_revision(episode_dir, episode)
-    current_release_revision = release_revision(episode_dir, episode)
+    publish_plan = current_publish_plan(config, episode, environment=environment)
+    current_release_revision = release_revision(
+        episode_dir,
+        episode,
+        config=config,
+        environment=environment,
+    )
     report = _load_json(episode_dir / QUALITY_REPORT_PATH)
     report_revision = report.get("quality_revision")
 
@@ -461,9 +616,7 @@ def quality_snapshot(episode_dir: str | Path, *, include_findings: bool = True) 
             }
         )
     try:
-        from agents.pipeline import load_config
-
-        metadata_issues = release_metadata_issues(metadata, approved, load_config())
+        metadata_issues = release_metadata_issues(metadata, approved, config)
     except (FileNotFoundError, OSError, TypeError, ValueError):
         metadata_issues = [
             {
@@ -590,6 +743,7 @@ def quality_snapshot(episode_dir: str | Path, *, include_findings: bool = True) 
             "safe": release_status == "ready",
             "can_approve_publish": not prerequisites,
             "revision": current_release_revision,
+            "publish_plan": publish_plan,
             "blockers": blockers,
         },
         "approvals": {
@@ -885,7 +1039,9 @@ class QAAgent(BaseAgent):
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "editorial_revision": editorial_revision(self.episode_dir, episode),
             "quality_revision": quality_revision(self.episode_dir, episode),
-            "release_revision": release_revision(self.episode_dir, episode),
+            "release_revision": release_revision(
+                self.episode_dir, episode, config=self.config
+            ),
             "overall": "pass" if hard_pass else "fail",
             "checks": checks,
             "skipped_checks": skipped_checks,
