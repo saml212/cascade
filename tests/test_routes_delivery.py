@@ -48,12 +48,83 @@ def make_episode(episodes_dir, episode_id="ep_test", *, with_source=True):
     return episode_dir
 
 
+def verified_video_status():
+    return {
+        "video_status": "ready",
+        "video_progress": 100.0,
+        "video_source_fingerprint": "current-video",
+        "video_output_stat": {"size": 12, "mtime_ns": 34},
+        "video_download_url": "/api/episodes/ep_test/delivery/video?v=c-22",
+        "video": {
+            "filename": "upload_video.mp4",
+            "render_mode": "speaker_cut",
+            "render_fingerprint": "current-video",
+        },
+    }
+
+
 def test_status_defaults_to_not_prepared(delivery):
     client, _, episodes_dir = delivery
     make_episode(episodes_dir)
     response = client.get("/api/episodes/ep_test/delivery")
     assert response.status_code == 200
     assert response.json()["status"] == "not_prepared"
+
+
+def test_status_recovers_missing_video_fields_from_current_manifest(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    video = episode_dir / "upload_video.mp4"
+    video.write_bytes(b"current render")
+    record = {
+        "path": video.name,
+        "render_mode": "speaker_cut",
+        "fingerprint": "current-video",
+        "completed_at": "2026-09-11T00:00:00+00:00",
+        "output": {
+            "duration_seconds": 3590.0,
+            "width": 3840,
+            "height": 2160,
+            **mod._file_stat(video),
+        },
+    }
+
+    with (
+        patch.object(mod, "_current_video_record", return_value=record),
+        patch.object(mod, "selected_audio_source", return_value=None),
+        patch.object(mod, "_video_fingerprint", return_value="current-video"),
+        patch.object(
+            mod,
+            "_video_audio_status",
+            return_value={"status": "passed", "safe": True},
+        ),
+        patch.object(mod, "_write_status") as write_status,
+    ):
+        status = mod._refresh_status(episode_dir)
+
+    assert status["video_status"] == "ready"
+    assert status["video_source_fingerprint"] == "current-video"
+    assert status["video_output_stat"] == mod._file_stat(video)
+    assert status["video"]["render_mode"] == "speaker_cut"
+    assert status["video"]["duration_seconds"] == 3590.0
+    assert "/delivery/video?v=" in status["video_download_url"]
+    write_status.assert_not_called()
+    assert not (episode_dir / "delivery.json").exists()
+
+
+def test_status_does_not_recover_unproven_video_file(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    video = episode_dir / "upload_video.mp4"
+    video.write_bytes(b"unproven render")
+
+    with patch.object(mod, "_current_video_record", return_value=None):
+        status = mod._refresh_status(episode_dir)
+
+    assert status["video_status"] == "not_prepared"
+    assert "video_source_fingerprint" not in status
+    assert "video_output_stat" not in status
+    assert video.read_bytes() == b"unproven render"
 
 
 def test_audio_source_fingerprint_ignores_picture_crop(delivery):
@@ -124,6 +195,25 @@ def test_prepare_rejects_double_click(delivery):
     mod._running.add("ep_test")
     response = client.post("/api/episodes/ep_test/delivery/prepare")
     assert response.status_code == 409
+    mod._running.clear()
+
+
+def test_prepare_keeps_verified_video_state_before_worker_starts(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    current = {"status": "not_prepared", **verified_video_status()}
+
+    with (
+        patch.object(mod, "_refresh_status", return_value=current),
+        patch.object(mod.threading.Thread, "start"),
+    ):
+        response = asyncio.run(mod.prepare_delivery("ep_test"))
+
+    assert response == current
+    persisted = json.loads((episode_dir / "delivery.json").read_text())
+    assert persisted["status"] == "preparing"
+    for key, value in verified_video_status().items():
+        assert persisted[key] == value
     mod._running.clear()
 
 
@@ -393,6 +483,11 @@ def test_worker_persists_verified_ready_status(delivery):
         patch.object(mod, "PodcastFeedAgent", return_value=fake_agent),
         patch.object(mod, "current_podcast_audio", return_value=mp3),
         patch.object(mod, "measure_loudness", return_value=metrics),
+        patch.object(
+            mod,
+            "_refresh_status",
+            return_value={"status": "not_prepared", **verified_video_status()},
+        ),
     ):
         mod._running.add("ep_test")
         mod._prepare_delivery("ep_test")
@@ -402,17 +497,28 @@ def test_worker_persists_verified_ready_status(delivery):
     assert status["duration_seconds"] == 3600.25
     assert status["integrated_lufs"] == -16.0
     assert "/delivery/audio?v=" in status["download_url"]
+    for key, value in verified_video_status().items():
+        assert status[key] == value
     assert "ep_test" not in mod._running
 
 
 def test_worker_persists_failure(delivery):
     _, mod, episodes_dir = delivery
     episode_dir = make_episode(episodes_dir)
-    with patch.object(mod, "generate_audio_mix", side_effect=RuntimeError("bad mix")):
+    with (
+        patch.object(mod, "generate_audio_mix", side_effect=RuntimeError("bad mix")),
+        patch.object(
+            mod,
+            "_refresh_status",
+            return_value={"status": "not_prepared", **verified_video_status()},
+        ),
+    ):
         mod._prepare_delivery("ep_test")
     status = json.loads((episode_dir / "delivery.json").read_text())
     assert status["status"] == "failed"
     assert status["error"] == "bad mix"
+    for key, value in verified_video_status().items():
+        assert status[key] == value
 
 
 def test_video_worker_delegates_to_canonical_speaker_cut_renderer(delivery):

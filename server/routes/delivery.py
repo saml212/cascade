@@ -215,6 +215,52 @@ def _video_audio_status(episode_dir: Path, config: dict) -> dict:
     )
 
 
+def _recover_current_video_status(
+    status: dict, episode_dir: Path, episode: dict, config: dict
+) -> None:
+    """Populate missing delivery state only from a fully current render record."""
+    if status.get("video_status") is not None:
+        return
+    status["video_status"] = "not_prepared"
+    try:
+        record = _current_video_record(episode_dir, episode, config)
+        if record is None:
+            return
+        video_path = episode_dir / "upload_video.mp4"
+        output_stat = _file_stat(video_path)
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        return
+
+    status.update(
+        video_status="ready",
+        video_progress=100.0,
+        video_completed_at=record.get("completed_at"),
+        video_download_url=_artifact_download_url(
+            episode_dir.name, "video", output_stat
+        ),
+        video_source_fingerprint=record["fingerprint"],
+        video_output_stat=output_stat,
+        video={
+            "filename": video_path.name,
+            "render_mode": record.get("render_mode"),
+            "render_fingerprint": record["fingerprint"],
+            **record.get("output", {}),
+        },
+        video_stale=False,
+        video_repair_required=False,
+        video_error=None,
+    )
+
+
+def _video_status_fields(status: dict) -> dict:
+    """Keep the independently verified video half of a delivery record."""
+    return {
+        key: value
+        for key, value in status.items()
+        if key == "video" or key.startswith("video_")
+    }
+
+
 def _video_preflight(
     episode_dir: Path,
     episode: dict,
@@ -276,6 +322,7 @@ def _refresh_status(episode_dir: Path) -> dict:
                 "safe": False,
                 "error": str(exc),
             }
+        _recover_current_video_status(status, episode_dir, episode, config)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, config = {}, {}
     if status.get("status") == "preparing":
@@ -410,9 +457,15 @@ def _prepare_delivery(episode_id: str) -> None:
     """Synchronous worker used by the background thread and unit tests."""
     episode_dir = EPISODES_DIR / episode_id
     started_at = _now()
+    video_status = _video_status_fields(_refresh_status(episode_dir))
     _write_status(
         episode_dir,
-        {"status": "preparing", "episode_id": episode_id, "started_at": started_at},
+        {
+            **video_status,
+            "status": "preparing",
+            "episode_id": episode_id,
+            "started_at": started_at,
+        },
     )
     try:
         episode = json.loads((episode_dir / "episode.json").read_text())
@@ -468,6 +521,7 @@ def _prepare_delivery(episode_id: str) -> None:
 
         output_stat = _file_stat(audio_path)
         result = {
+            **video_status,
             "status": "ready",
             "episode_id": episode_id,
             "started_at": started_at,
@@ -493,6 +547,7 @@ def _prepare_delivery(episode_id: str) -> None:
         _write_status(
             episode_dir,
             {
+                **video_status,
                 "status": "failed",
                 "episode_id": episode_id,
                 "started_at": started_at,
@@ -679,6 +734,7 @@ async def prepare_delivery(episode_id: str) -> dict:
     episode = json.loads((episode_dir / "episode.json").read_text())
     if not _has_audio_input(episode_dir, episode):
         raise HTTPException(status_code=422, detail="Episode has no usable audio input")
+    video_status = _video_status_fields(_refresh_status(episode_dir))
 
     with _running_lock:
         if episode_id in _running or episode_id in _video_running:
@@ -689,7 +745,12 @@ async def prepare_delivery(episode_id: str) -> dict:
 
     _write_status(
         episode_dir,
-        {"status": "preparing", "episode_id": episode_id, "started_at": _now()},
+        {
+            **video_status,
+            "status": "preparing",
+            "episode_id": episode_id,
+            "started_at": _now(),
+        },
     )
     threading.Thread(
         target=_prepare_delivery,
