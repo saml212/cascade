@@ -27,7 +27,9 @@ from lib.ffprobe import file_fingerprint, get_audio_stream, media_fingerprint
 from lib.ffprobe import probe as ffprobe
 
 REPORT_SCHEMA = "cascade.audio-quality/v1"
+OUTPUT_CONTINUITY_SCHEMA = "cascade.output-audio-continuity/v1"
 DETECTOR_VERSION = "1.2"
+OUTPUT_CONTINUITY_VERSION = "1"
 PREVIEW_ALGORITHM_VERSION = "5"
 TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD = "sha256-audio-word-timing-speaker/v1"
 REPAIR_FADE_SECONDS = 0.08
@@ -68,6 +70,22 @@ class WindowStats:
     @property
     def duration(self) -> float:
         return len(self.rms_dbfs) * self.frame_seconds
+
+
+@dataclass(frozen=True)
+class OutputContinuityConfig:
+    """Thresholds for whole-output silence over current transcript speech."""
+
+    sample_rate: int = 8000
+    frame_seconds: float = 0.02
+    min_issue_seconds: float = 0.30
+    bridge_seconds: float = 0.04
+    exact_zero_peak: float = 1e-8
+    near_zero_dbfs: float = -60.0
+    transcript_confidence: float = 0.55
+    maximum_required_speech_overlap_seconds: float = 0.20
+    minimum_required_speech_overlap_ratio: float = 0.50
+    duration_tolerance_seconds: float = 0.12
 
 
 def analyze_episode_audio(
@@ -404,6 +422,375 @@ def decode_audio_windows(
             np.concatenate(delta_blocks) if delta_blocks else np.empty(0)
         ),
     )
+
+
+def analyze_output_continuity(
+    targets: list[dict],
+    transcript: dict,
+    *,
+    episode_timeline: Any,
+    transcript_fingerprint: str,
+    ffmpeg_bin: str | Path | None = None,
+    config: OutputContinuityConfig | None = None,
+) -> dict:
+    """Check current selected and delivery artifacts for whole-output silence."""
+    settings = config or OutputContinuityConfig()
+    words = _transcript_words(transcript, settings.transcript_confidence)
+    if not words:
+        raise ValueError("Current transcript has no timed speech for output continuity")
+
+    decoder_config = AudioQAConfig(
+        sample_rate=settings.sample_rate,
+        frame_seconds=settings.frame_seconds,
+        min_issue_seconds=settings.min_issue_seconds,
+        bridge_seconds=settings.bridge_seconds,
+        exact_zero_peak=settings.exact_zero_peak,
+    )
+    artifacts = []
+    all_findings = []
+    for target in targets:
+        artifact = {
+            key: target[key]
+            for key in (
+                "role",
+                "clip_id",
+                "path",
+                "clock",
+                "required",
+                "revision",
+                "status",
+                "detail",
+            )
+            if key in target
+        }
+        artifact["currentness"] = target.get("status")
+        if target.get("status") != "current":
+            if target.get("status") not in {
+                "missing",
+                "stale",
+                "unavailable",
+                "not_required",
+            } or (
+                target.get("required", True) and target.get("status") == "not_required"
+            ):
+                artifact.update(
+                    status="error",
+                    detail="Artifact currentness status is invalid.",
+                )
+            artifact["findings"] = []
+            artifacts.append(artifact)
+            continue
+
+        timeline = target.get("timeline")
+        if timeline is None:
+            artifact.update(
+                status="error",
+                detail="Artifact timeline is unavailable.",
+                findings=[],
+            )
+            artifacts.append(artifact)
+            continue
+        path = Path(target["path"])
+        if target.get("scan_identity") != _scan_identity(path):
+            artifact.update(
+                status="stale",
+                detail="Artifact changed after its currentness proof was resolved.",
+                findings=[],
+            )
+            artifacts.append(artifact)
+            continue
+        try:
+            stats = decode_audio_windows(path, ffmpeg_bin, decoder_config)
+            expected_duration = (
+                timeline.source_duration
+                if target["clock"] == "source"
+                else timeline.duration
+            )
+            if stats.duration + settings.duration_tolerance_seconds < expected_duration:
+                raise ValueError(
+                    f"Decoded audio ends at {stats.duration:.3f}s; "
+                    f"expected at least {expected_duration:.3f}s."
+                )
+            findings = analyze_output_windows(
+                stats,
+                words=words,
+                timeline=timeline,
+                episode_timeline=episode_timeline,
+                artifact_clock=target["clock"],
+                role=target["role"],
+                revision=target.get("revision"),
+                config=settings,
+            )
+            if target.get("scan_identity") != _scan_identity(path):
+                raise ValueError("Artifact changed while output continuity was decoded")
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            artifact.update(status="error", detail=str(exc), findings=[])
+        else:
+            artifact.update(
+                status="failed" if findings else "pass",
+                detail=(
+                    f"{len(findings)} speech-overlapping silence span(s) detected."
+                    if findings
+                    else "No speech-overlapping whole-output silence detected."
+                ),
+                decoded_duration_seconds=round(stats.duration, 6),
+                expected_duration_seconds=round(
+                    expected_duration,
+                    6,
+                ),
+                findings=findings,
+            )
+            all_findings.extend(findings)
+        artifacts.append(artifact)
+
+    blocking = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("required", True) and artifact.get("status") != "pass"
+    ]
+    precedence = ("failed", "error", "stale", "missing", "unavailable")
+    status = (
+        next(
+            (
+                candidate
+                for candidate in precedence
+                if any(artifact.get("status") == candidate for artifact in blocking)
+            ),
+            "error",
+        )
+        if blocking
+        else "pass"
+    )
+    detail = (
+        "All current selected and delivery audio passed continuity analysis."
+        if status == "pass"
+        else "; ".join(
+            "{}{}: {} ({})".format(
+                artifact.get("role", "artifact"),
+                f"/{artifact['clip_id']}" if artifact.get("clip_id") else "",
+                artifact.get("status", "unknown"),
+                artifact.get("detail", "no detail"),
+            )
+            for artifact in blocking
+        )
+    )
+    report = {
+        "schema": OUTPUT_CONTINUITY_SCHEMA,
+        "detector_version": OUTPUT_CONTINUITY_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "safe": status == "pass",
+        "detail": detail,
+        "transcript_fingerprint": transcript_fingerprint,
+        "timeline": {
+            "keep_intervals": [list(item) for item in episode_timeline.keep_intervals],
+            "output_duration_seconds": episode_timeline.duration,
+        },
+        "settings": asdict(settings),
+        "artifacts": artifacts,
+        "findings": all_findings,
+    }
+    report["fingerprint"] = json_fingerprint(
+        {
+            key: report[key]
+            for key in (
+                "schema",
+                "detector_version",
+                "status",
+                "transcript_fingerprint",
+                "timeline",
+                "settings",
+                "artifacts",
+            )
+        }
+    )
+    return report
+
+
+def _scan_identity(path: Path) -> dict | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+
+
+def analyze_output_windows(
+    stats: WindowStats,
+    *,
+    words: list[dict],
+    timeline: Any,
+    episode_timeline: Any,
+    artifact_clock: str,
+    role: str,
+    revision: str | None = None,
+    config: OutputContinuityConfig | None = None,
+) -> list[dict]:
+    """Return transcript-grounded spans where every output channel is quiet."""
+    settings = config or OutputContinuityConfig(frame_seconds=stats.frame_seconds)
+    if artifact_clock not in {"source", "output"}:
+        raise ValueError(f"Unsupported artifact clock: {artifact_clock}")
+    if stats.rms_dbfs.ndim != 2 or stats.rms_dbfs.shape[1] != 2:
+        raise ValueError("Output continuity statistics must contain two channels")
+    if not (stats.rms_dbfs.shape == stats.peak.shape == stats.zero_fraction.shape):
+        raise ValueError("Output continuity statistics have inconsistent shapes")
+
+    projected = timeline.project(words, output_clock=artifact_clock == "output")
+    exact = np.max(stats.peak, axis=1) <= settings.exact_zero_peak
+    near = np.max(stats.rms_dbfs, axis=1) <= settings.near_zero_dbfs
+    findings = []
+    for start, end in _mask_spans(exact | near, stats.frame_seconds, settings):
+        start_seconds = start * stats.frame_seconds
+        end_seconds = end * stats.frame_seconds
+        overlap_words = [
+            word
+            for word in projected
+            if word["end"] > start_seconds and word["start"] < end_seconds
+        ]
+        speech_overlap = _interval_overlap_seconds(
+            start_seconds, end_seconds, overlap_words
+        )
+        required_overlap = min(
+            settings.maximum_required_speech_overlap_seconds,
+            (end_seconds - start_seconds)
+            * settings.minimum_required_speech_overlap_ratio,
+        )
+        if speech_overlap + 1e-9 < required_overlap:
+            continue
+
+        source_ranges = _artifact_source_ranges(
+            timeline, start_seconds, end_seconds, artifact_clock
+        )
+        episode_output_ranges = _episode_output_ranges(episode_timeline, source_ranges)
+        kind = "digital_zero" if bool(np.all(exact[start:end])) else "near_zero"
+        identity = [
+            OUTPUT_CONTINUITY_VERSION,
+            role,
+            revision,
+            kind,
+            round(start_seconds, 6),
+            round(end_seconds, 6),
+        ]
+        finding = {
+            "id": "oc_"
+            + hashlib.sha256(
+                json.dumps(identity, separators=(",", ":"), default=str).encode()
+            ).hexdigest()[:16],
+            "kind": kind,
+            "classification": "speech_overlapping_whole_output_silence",
+            "severity": "error",
+            "role": role,
+            "artifact_time": {
+                "clock": artifact_clock,
+                "start_seconds": round(start_seconds, 6),
+                "end_seconds": round(end_seconds, 6),
+                "duration_seconds": round(end_seconds - start_seconds, 6),
+            },
+            "source_ranges": source_ranges,
+            "episode_output_ranges": episode_output_ranges,
+            "evidence": {
+                "maximum_channel_median_dbfs": _round_finite(
+                    float(np.median(np.max(stats.rms_dbfs[start:end], axis=1)))
+                ),
+                "minimum_channel_zero_sample_fraction": round(
+                    float(np.mean(np.min(stats.zero_fraction[start:end], axis=1))),
+                    6,
+                ),
+                "speech_overlap_seconds": round(speech_overlap, 6),
+                "required_speech_overlap_seconds": round(required_overlap, 6),
+                "transcript_word_count": len(overlap_words),
+                "transcript_excerpt": " ".join(
+                    word["word"] for word in overlap_words[:12] if word["word"]
+                ),
+            },
+            "resolution": {"status": "unresolved"},
+        }
+        finding["fingerprint"] = json_fingerprint(
+            {
+                **finding,
+                "evidence": {
+                    key: value
+                    for key, value in finding["evidence"].items()
+                    if key != "transcript_excerpt"
+                },
+            }
+        )
+        findings.append(finding)
+    return findings
+
+
+def _interval_overlap_seconds(start: float, end: float, words: list[dict]) -> float:
+    intervals = sorted(
+        (max(start, word["start"]), min(end, word["end"]))
+        for word in words
+        if min(end, word["end"]) > max(start, word["start"])
+    )
+    if not intervals:
+        return 0.0
+    merged = [list(intervals[0])]
+    for interval_start, interval_end in intervals[1:]:
+        if interval_start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], interval_end)
+        else:
+            merged.append([interval_start, interval_end])
+    return sum(interval_end - interval_start for interval_start, interval_end in merged)
+
+
+def _artifact_source_ranges(
+    timeline: Any, start: float, end: float, clock: str
+) -> list[dict]:
+    if clock == "source":
+        clipped_start = max(0.0, start)
+        clipped_end = min(timeline.source_duration, end)
+        ranges = (
+            timeline.source_ranges(clipped_start, clipped_end)
+            if clipped_end > clipped_start
+            else []
+        )
+    else:
+        ranges = []
+        for span in timeline.spans:
+            output_start = max(start, span.output_start)
+            output_end = min(end, span.output_end)
+            if output_end <= output_start:
+                continue
+            ranges.append(
+                (
+                    span.source_start + output_start - span.output_start,
+                    span.source_start + output_end - span.output_start,
+                )
+            )
+    return [
+        {
+            "start_seconds": round(range_start, 6),
+            "end_seconds": round(range_end, 6),
+        }
+        for range_start, range_end in ranges
+    ]
+
+
+def _episode_output_ranges(
+    episode_timeline: Any, source_ranges: list[dict]
+) -> list[dict]:
+    projected = episode_timeline.project(
+        [
+            {"start": item["start_seconds"], "end": item["end_seconds"]}
+            for item in source_ranges
+        ],
+        output_clock=True,
+    )
+    return [
+        {
+            "start_seconds": round(item["start"], 6),
+            "end_seconds": round(item["end"], 6),
+        }
+        for item in projected
+    ]
 
 
 def analyze_windows(

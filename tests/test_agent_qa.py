@@ -3,7 +3,22 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from agents.qa import QAAgent
+
+
+@pytest.fixture(autouse=True)
+def current_output_continuity(monkeypatch):
+    monkeypatch.setattr(
+        "agents.qa.analyze_release_audio_continuity",
+        lambda *args, **kwargs: {
+            "status": "pass",
+            "safe": True,
+            "artifacts": [],
+            "findings": [],
+        },
+    )
 
 
 class TestQAAgent:
@@ -347,3 +362,53 @@ class TestQAAgent:
         )
         assert warning["evidence"]["findings"][0]["word"]["word"] == "partial"
         assert result["overall"] == "pass"
+
+    def test_release_output_continuity_failure_is_a_hard_check(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+        continuity = {
+            "status": "failed",
+            "safe": False,
+            "artifacts": [
+                {
+                    "role": "upload_video",
+                    "required": True,
+                    "status": "failed",
+                    "detail": "1 speech-overlapping silence span detected.",
+                }
+            ],
+            "findings": [{"id": "oc_dropout"}],
+        }
+
+        agent = QAAgent(tmp_episode_dir, sample_config)
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+            patch(
+                "agents.qa.analyze_release_audio_continuity",
+                return_value=continuity,
+            ),
+        ):
+            result = agent.execute()
+
+        check = next(
+            item
+            for item in result["checks"]
+            if item["name"] == "selected_master_output_continuity"
+        )
+        assert check["pass"] is False
+        assert check["status"] == "failed"
+        assert result["overall"] == "fail"
+        assert result["selected_master_output_continuity"] == continuity

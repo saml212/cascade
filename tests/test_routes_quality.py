@@ -163,7 +163,7 @@ def _seed_release(episodes_dir: Path, *, qa_overall: str = "pass") -> Path:
         episode_dir / "qa" / "qa.json",
         {
             "overall": qa_overall,
-            "quality_revision": quality_revision(episode_dir, episode),
+            "quality_revision": quality_revision(episode_dir, episode, config=config),
             "generated_at": "2026-01-01T00:00:00+00:00",
             "checks": [],
             "audio_quality": audio,

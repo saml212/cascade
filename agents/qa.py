@@ -11,8 +11,20 @@ from pathlib import Path
 
 from agents.base import BaseAgent
 from agents.transcribe import current_diarized_transcript
-from lib.audio_mix import current_audio_selection, selected_audio_source
-from lib.audio_qa import TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD, analyze_episode_audio
+from lib.audio_mix import (
+    AUDIO_SELECTION_PATH,
+    SELECTED_REPAIR_AUDIO_PATH,
+    current_audio_selection,
+    selected_audio_source,
+)
+from lib.audio_qa import (
+    OUTPUT_CONTINUITY_SCHEMA,
+    OUTPUT_CONTINUITY_VERSION,
+    TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD,
+    analyze_episode_audio,
+    analyze_output_continuity,
+    transcript_analysis_fingerprint,
+)
 from lib.audio_qa import release_gate as audio_release_gate
 from lib.clips import is_selected_clip
 from lib.delivery_video import (
@@ -311,7 +323,12 @@ def editorial_revision(episode_dir: str | Path, episode: dict | None = None) -> 
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def quality_revision(episode_dir: str | Path, episode: dict | None = None) -> str:
+def quality_revision(
+    episode_dir: str | Path,
+    episode: dict | None = None,
+    *,
+    config: dict | None = None,
+) -> str:
     """Fingerprint rendered media and copy, excluding human review decisions."""
     episode_dir = Path(episode_dir)
     episode = (
@@ -319,10 +336,12 @@ def quality_revision(episode_dir: str | Path, episode: dict | None = None) -> st
     )
     clips = _load_json(episode_dir / "clips.json", {"clips": []})
     clip_list = clips.get("clips", []) if isinstance(clips, dict) else clips
+    short_records = read_render_manifest(episode_dir).get("shorts", {})
     shorts = {
-        str(clip.get("id")): _file_signature(
-            episode_dir / "shorts" / f"{clip.get('id')}.mp4"
-        )
+        str(clip.get("id")): {
+            "file": _file_signature(episode_dir / "shorts" / f"{clip.get('id')}.mp4"),
+            "render": short_records.get(str(clip.get("id"))),
+        }
         for clip in clip_list
         if isinstance(clip, dict) and clip.get("id")
     }
@@ -338,10 +357,30 @@ def quality_revision(episode_dir: str | Path, episode: dict | None = None) -> st
         for clip in clip_list
         if isinstance(clip, dict)
     ]
+    continuity_inputs = {
+        name: _file_signature(episode_dir / path)
+        for name, path in {
+            "raw_transcript": "transcript.json",
+            "diarized_transcript": "diarized_transcript.json",
+            "transcript_provenance": "transcript_provenance.json",
+            "transcript_corrections": "transcript_corrections.json",
+        }.items()
+    }
+    if config and (
+        config.get("platforms", {}).get("podcast_rss", {}).get("enabled") is True
+    ):
+        continuity_inputs.update(
+            podcast_audio=_file_signature(episode_dir / "podcast_audio.mp3"),
+            podcast_audio_proof=_file_signature(
+                episode_dir / "podcast_audio.fingerprint"
+            ),
+        )
     payload = {
         "editorial_revision": editorial_revision(episode_dir, episode),
+        "output_continuity_detector": OUTPUT_CONTINUITY_VERSION,
         "clips": quality_clips,
         "shorts": shorts,
+        "output_continuity_inputs": continuity_inputs,
         "metadata": canonical_release_metadata(episode_dir, episode, clip_list),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -372,7 +411,7 @@ def release_revision(
         if isinstance(clip, dict) and clip.get("id")
     }
     payload = {
-        "quality_revision": quality_revision(episode_dir, episode),
+        "quality_revision": quality_revision(episode_dir, episode, config=config),
         "clip_decisions": decisions,
         "publish_plan": current_publish_plan(config, episode, environment=environment),
     }
@@ -413,6 +452,7 @@ def clip_review_revision(
     payload = {
         "clip": {key: value for key, value in clip.items() if key not in ignored},
         "render_fingerprint": render_record.get("fingerprint"),
+        "render_output": render_record.get("output"),
         "metadata": copy,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -474,6 +514,235 @@ def _render_status(
         return None, {}
 
 
+def _continuity_target(
+    path: Path,
+    *,
+    role: str,
+    clock: str,
+    timeline: Timeline,
+    current: bool,
+    proof: object,
+    stale_detail: str,
+    clip_id: str | None = None,
+) -> dict:
+    signature = _file_signature(path)
+    target = {
+        "role": role,
+        "path": str(path.resolve()),
+        "clock": clock,
+        "required": True,
+        "timeline": timeline,
+    }
+    if clip_id is not None:
+        target["clip_id"] = clip_id
+    if signature is None or signature["size_bytes"] <= 0:
+        target.update(status="missing", detail=f"{path.name} is missing.")
+        return target
+    try:
+        stat = path.stat()
+    except OSError:
+        target.update(
+            status="stale",
+            detail="Artifact changed while its currentness proof was resolved.",
+        )
+        return target
+    target["scan_identity"] = {
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+    recorded_output = proof.get("output") if isinstance(proof, dict) else None
+    if isinstance(proof, dict) and "selected_output" in proof:
+        recorded_output = (proof.get("selected_output") or {}).get("fingerprint")
+    if isinstance(recorded_output, dict) and (
+        recorded_output.get("size_bytes") != stat.st_size
+        or recorded_output.get("mtime_ns") != stat.st_mtime_ns
+    ):
+        current = False
+        stale_detail = "Artifact changed after its currentness proof was recorded."
+    target["revision"] = _private_identity(
+        "output-continuity-artifact", {"file": signature, "proof": proof}
+    )
+    target.update(
+        status="current" if current else "stale",
+        detail="Current artifact is ready for analysis." if current else stale_detail,
+    )
+    return target
+
+
+def _output_continuity_targets(
+    episode_dir: Path,
+    episode: dict,
+    clips: list[dict],
+    config: dict,
+    timeline: Timeline,
+) -> list[dict]:
+    selected_clips = [
+        clip
+        for clip in clips
+        if isinstance(clip, dict) and clip.get("id") and is_selected_clip(clip)
+    ]
+    selection_path = episode_dir / AUDIO_SELECTION_PATH
+    try:
+        selection = current_audio_selection(episode_dir, episode, config)
+        selection_error = None
+    except ValueError as exc:
+        selection = None
+        selection_error = str(exc)
+
+    if selection_error is not None:
+        master_path = episode_dir / SELECTED_REPAIR_AUDIO_PATH
+        master_current = False
+        master_proof = {"selection_error": selection_error}
+        master_detail = selection_error
+    elif selection is not None:
+        master_path = Path(selection["selected_output"]["path"])
+        master_current = True
+        master_proof = selection
+        master_detail = "Selected repair audio is stale."
+    else:
+        master_path = episode_dir / "work" / "audio_mix.wav"
+        try:
+            master_proof = master_path.with_suffix(".fingerprint").read_text().strip()
+        except OSError:
+            master_proof = None
+        master_current = bool(master_proof) and not selection_path.exists()
+        master_detail = "Base audio mix has no current generation proof."
+
+    master = _continuity_target(
+        master_path,
+        role="selected_audio_master",
+        clock="source",
+        timeline=timeline,
+        current=master_current,
+        proof=master_proof,
+        stale_detail=master_detail,
+    )
+    targets = [master]
+    master_ready = master["status"] == "current"
+    longform_record, short_records = (
+        _render_status(episode_dir, episode, selected_clips, config)
+        if master_ready
+        else (None, {})
+    )
+    targets.append(
+        _continuity_target(
+            episode_dir / "upload_video.mp4",
+            role="upload_video",
+            clock="output",
+            timeline=timeline,
+            current=longform_record is not None,
+            proof=longform_record,
+            stale_detail="Canonical upload video is stale for current release inputs.",
+        )
+    )
+
+    for clip in selected_clips:
+        clip_id = str(clip["id"])
+        try:
+            clip_timeline = timeline.slice(
+                float(clip.get("start_seconds", clip.get("start"))),
+                float(clip.get("end_seconds", clip.get("end"))),
+            )
+        except (TypeError, ValueError) as exc:
+            targets.append(
+                {
+                    "role": "short",
+                    "clip_id": clip_id,
+                    "path": str((episode_dir / "shorts" / f"{clip_id}.mp4").resolve()),
+                    "clock": "output",
+                    "required": True,
+                    "status": "unavailable",
+                    "detail": str(exc),
+                }
+            )
+            continue
+        short_record = short_records.get(clip_id)
+        targets.append(
+            _continuity_target(
+                episode_dir / "shorts" / f"{clip_id}.mp4",
+                role="short",
+                clip_id=clip_id,
+                clock="output",
+                timeline=clip_timeline,
+                current=short_record is not None,
+                proof=short_record,
+                stale_detail="Selected short is stale for current release inputs.",
+            )
+        )
+
+    podcast_path = episode_dir / "podcast_audio.mp3"
+    rss_enabled = (
+        config.get("platforms", {}).get("podcast_rss", {}).get("enabled") is True
+    )
+    if not rss_enabled:
+        targets.append(
+            {
+                "role": "podcast_audio",
+                "path": str(podcast_path.resolve()),
+                "clock": "output",
+                "required": False,
+                "status": "not_required",
+                "detail": "Podcast RSS delivery is disabled.",
+            }
+        )
+    else:
+        try:
+            from agents.podcast_feed import current_podcast_audio
+
+            podcast_current = current_podcast_audio(
+                episode_dir,
+                episode,
+                config,
+            )
+            podcast_error = None
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+            podcast_current = None
+            podcast_error = str(exc)
+        podcast_proof = _load_json(podcast_path.with_suffix(".fingerprint"), {})
+        targets.append(
+            _continuity_target(
+                podcast_path,
+                role="podcast_audio",
+                clock="output",
+                timeline=timeline,
+                current=podcast_current is not None,
+                proof=podcast_proof,
+                stale_detail=podcast_error
+                or "Podcast audio is stale for current release inputs.",
+            )
+        )
+    return targets
+
+
+def analyze_release_audio_continuity(
+    episode_dir: Path,
+    episode: dict,
+    clips: list[dict],
+    config: dict,
+    timeline: Timeline,
+    *,
+    ffmpeg_bin: str | Path | None = None,
+) -> dict:
+    """Analyze only provenance-current release audio against the current transcript."""
+    transcript = current_diarized_transcript(episode_dir, episode, config)
+    if transcript is None:
+        raise ValueError("Current source-clock transcript is unavailable")
+    transcript_fingerprint = transcript_analysis_fingerprint(
+        episode_dir / "diarized_transcript.json",
+        transcript,
+        minimum_confidence=0.55,
+    )["id"]
+    return analyze_output_continuity(
+        _output_continuity_targets(episode_dir, episode, clips, config, timeline),
+        transcript,
+        episode_timeline=timeline,
+        transcript_fingerprint=transcript_fingerprint,
+        ffmpeg_bin=ffmpeg_bin,
+    )
+
+
 def quality_snapshot(
     episode_dir: str | Path,
     *,
@@ -494,7 +763,7 @@ def quality_snapshot(
         episode_dir, episode, clips, config
     )
     current_editorial_revision = editorial_revision(episode_dir, episode)
-    current_quality_revision = quality_revision(episode_dir, episode)
+    current_quality_revision = quality_revision(episode_dir, episode, config=config)
     publish_plan = current_publish_plan(config, episode, environment=environment)
     current_release_revision = release_revision(
         episode_dir,
@@ -716,6 +985,7 @@ def quality_snapshot(
     )
     analysis = audio_quality.get("analysis", {})
     audio_gate = audio_quality.get("release_gate", {})
+    output_continuity = report.get("selected_master_output_continuity", {})
     if not include_findings:
         analysis = {
             key: analysis.get(key)
@@ -726,6 +996,14 @@ def quality_snapshot(
             key: audio_gate.get(key)
             for key in ("status", "safe", "reason")
             if key in audio_gate
+        }
+        output_continuity = {
+            **output_continuity,
+            "findings": [],
+            "artifacts": [
+                {**artifact, "findings": []}
+                for artifact in output_continuity.get("artifacts", [])
+            ],
         }
     editorial_approval = episode.get("editorial_approval") or {}
     publish_approval = episode.get("publish_approval") or {}
@@ -791,6 +1069,7 @@ def quality_snapshot(
             "analysis": analysis,
             "finding_count": len(findings),
             "findings": findings if include_findings else [],
+            "selected_master_output_continuity": output_continuity,
             "repair_candidate": (
                 {
                     "status": repair_candidate.get("status"),
@@ -1006,8 +1285,9 @@ class QAAgent(BaseAgent):
                 }
             )
 
-        self.report_progress(2, 3, "Analyzing source-channel continuity")
+        self.report_progress(2, 3, "Analyzing source and release audio continuity")
         audio_report = {}
+        timeline = None
         try:
             timeline = (
                 Timeline.from_edits(source_duration, episode.get("longform_edits", []))
@@ -1043,12 +1323,54 @@ class QAAgent(BaseAgent):
                 }
             )
 
+        output_continuity = {}
+        try:
+            if timeline is None:
+                raise ValueError("Current episode timeline is unavailable")
+            output_continuity = analyze_release_audio_continuity(
+                self.episode_dir,
+                episode,
+                clips,
+                self.config,
+                timeline,
+                ffmpeg_bin=self.get_config("tools", "ffmpeg", default=None),
+            )
+            checks.append(
+                {
+                    "name": "selected_master_output_continuity",
+                    "status": output_continuity.get("status", "unknown"),
+                    "pass": output_continuity.get("safe") is True,
+                    "detail": output_continuity.get(
+                        "detail", "Release audio continuity is unavailable."
+                    ),
+                }
+            )
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            output_continuity = {
+                "schema": OUTPUT_CONTINUITY_SCHEMA,
+                "status": "error",
+                "safe": False,
+                "detail": str(exc),
+                "artifacts": [],
+                "findings": [],
+            }
+            checks.append(
+                {
+                    "name": "selected_master_output_continuity",
+                    "status": "error",
+                    "pass": False,
+                    "detail": str(exc),
+                }
+            )
+
         hard_pass = all(check["pass"] for check in checks)
         result = {
             "schema": QUALITY_SCHEMA,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "editorial_revision": editorial_revision(self.episode_dir, episode),
-            "quality_revision": quality_revision(self.episode_dir, episode),
+            "quality_revision": quality_revision(
+                self.episode_dir, episode, config=self.config
+            ),
             "release_revision": release_revision(
                 self.episode_dir, episode, config=self.config
             ),
@@ -1062,6 +1384,7 @@ class QAAgent(BaseAgent):
             "warning_count": len(warnings),
             "clip_boundary_evidence": boundary_evidence,
             "audio_quality": audio_report,
+            "selected_master_output_continuity": output_continuity,
         }
         self.save_json(QUALITY_REPORT_PATH, result)
         self.report_progress(3, 3, f"QA {result['overall']}")
