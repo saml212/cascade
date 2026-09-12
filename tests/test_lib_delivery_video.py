@@ -22,8 +22,10 @@ from lib.delivery_video import (
     current_short_render,
     ffmpeg_executable,
     longform_render_fingerprint,
+    longform_trim_reuse_fingerprint,
     migrate_unchanged_short_crop_fingerprints,
     mux_timeline_audio,
+    prepare_longform_trim_reuse,
     record_longform_render,
     record_short_render,
     render_config_for_episode,
@@ -31,6 +33,7 @@ from lib.delivery_video import (
     render_space_budget,
     render_space_status,
     render_video_segment,
+    reusable_terminal_trim_render,
     short_render_fingerprint,
     source_fps,
 )
@@ -226,15 +229,11 @@ def test_short_fingerprint_marks_only_clips_with_overlapping_caption_events(tmp_
                 "utterances": [
                     {
                         "speaker": 0,
-                        "words": [
-                            {"word": "main", "start": 10.0, "end": 11.0}
-                        ],
+                        "words": [{"word": "main", "start": 10.0, "end": 11.0}],
                     },
                     {
                         "speaker": 1,
-                        "words": [
-                            {"word": "reply", "start": 10.7, "end": 11.1}
-                        ],
+                        "words": [{"word": "reply", "start": 10.7, "end": 11.1}],
                     },
                 ]
             }
@@ -422,6 +421,66 @@ def test_mux_uses_a_unique_atomic_temp_for_each_attempt(tmp_path):
     assert not any(destination.exists() for destination in destinations)
 
 
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_mux_can_atomically_shorten_its_video_input_in_place(tmp_path):
+    output = tmp_path / "upload_video.mp4"
+    audio = tmp_path / "audio.wav"
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "30",
+            "-bf",
+            "0",
+            "-use_editlist",
+            "0",
+            "-c:a",
+            "aac",
+            output,
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000:duration=3",
+            audio,
+        ],
+        check=True,
+    )
+    timeline = Timeline.from_edits(3, [{"type": "trim_end", "seconds": 2}]).quantize(
+        "30/1"
+    )
+
+    media = mux_timeline_audio(output, audio, output, timeline)
+
+    assert output.is_file()
+    assert media["duration_seconds"] == pytest.approx(2, abs=0.1)
+    assert media["audio_duration_seconds"] == pytest.approx(2, abs=0.1)
+    assert media["video_duration_seconds"] == pytest.approx(2, abs=0.1)
+
+
 def test_manifest_updates_survive_multiple_writer_processes(tmp_path):
     (tmp_path / "shorts").mkdir()
     clip_ids = [f"clip_{index:02d}" for index in range(8)]
@@ -463,6 +522,93 @@ def test_longform_manifest_rejects_changed_segments(tmp_path):
     assert current_longform_render(tmp_path, episode, config, audio, segments)
     changed = [{"start": 0, "end": 5, "speaker": "B"}]
     assert current_longform_render(tmp_path, episode, config, audio, changed) is None
+
+
+def test_terminal_trim_reuse_requires_explicit_current_proof_and_exact_inputs(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    transcript = tmp_path / "diarized_transcript.json"
+    audio = tmp_path / "audio_mix.wav"
+    output = tmp_path / "upload_video.mp4"
+    source.write_bytes(b"source")
+    transcript.write_text('{"utterances":[]}')
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"render")
+    episode = {
+        "crop_config": {"wide_zoom": 1},
+        "longform_edits": [
+            {"type": "trim_start", "seconds": 1},
+            {"type": "trim_end", "seconds": 9},
+        ],
+    }
+    config = {"processing": {"video_crf": 22}}
+    segments = [{"start": 0, "end": 10, "speaker": "A"}]
+    timeline = Timeline.from_edits(10, episode["longform_edits"])
+    fingerprint = longform_render_fingerprint(
+        tmp_path, episode, config, audio, segments
+    )
+    record_longform_render(
+        tmp_path,
+        fingerprint=fingerprint,
+        render_mode="speaker_cut",
+        timeline=timeline,
+        media={"duration_seconds": 8},
+    )
+
+    shortened = {
+        **episode,
+        "longform_edits": [
+            {"type": "trim_start", "seconds": 1},
+            {"type": "trim_end", "seconds": 8},
+        ],
+    }
+    shortened_timeline = Timeline.from_edits(10, shortened["longform_edits"])
+    assert (
+        reusable_terminal_trim_render(
+            tmp_path, shortened, config, audio, segments, shortened_timeline
+        )
+        is None
+    )
+
+    prepared = prepare_longform_trim_reuse(tmp_path, episode, config, audio, segments)
+    assert prepared is not None
+    proof = prepared["provenance"]["terminal_trim_reuse"]
+    assert proof["input_fingerprint"] == longform_trim_reuse_fingerprint(
+        tmp_path, episode, config, audio, segments
+    )
+    assert proof["source_intervals"] == [[1.0, 9.0]]
+    assert reusable_terminal_trim_render(
+        tmp_path, shortened, config, audio, segments, shortened_timeline
+    )
+
+    changed_crop = {
+        **shortened,
+        "crop_config": {"wide_zoom": 1.1},
+    }
+    assert (
+        reusable_terminal_trim_render(
+            tmp_path, changed_crop, config, audio, segments, shortened_timeline
+        )
+        is None
+    )
+    changed_middle = {
+        **episode,
+        "longform_edits": [
+            {"type": "trim_start", "seconds": 1},
+            {"type": "cut", "start_seconds": 4, "end_seconds": 5},
+            {"type": "trim_end", "seconds": 8},
+        ],
+    }
+    assert (
+        reusable_terminal_trim_render(
+            tmp_path,
+            changed_middle,
+            config,
+            audio,
+            segments,
+            Timeline.from_edits(10, changed_middle["longform_edits"]),
+        )
+        is None
+    )
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")

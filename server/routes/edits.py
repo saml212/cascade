@@ -9,22 +9,23 @@ Endpoints:
     POST   /api/episodes/{id}/edits/apply       trigger longform_render with current edits
 """
 
+import asyncio
+import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from lib.editor import (
     add_cut,
-    add_trim_start,
     add_trim_end,
+    add_trim_start,
     clear_edits,
+    find_and_propose_cut,
     list_edits,
     remove_edit,
     total_time_removed,
-    find_and_propose_cut,
 )
 from lib.paths import get_episodes_dir
 
@@ -37,11 +38,12 @@ EPISODES_DIR = get_episodes_dir()
 
 # ---------- Request/response models ----------
 
+
 class AddEditRequest(BaseModel):
     type: str  # "cut" | "trim_start" | "trim_end"
-    start_seconds: Optional[float] = None
-    end_seconds: Optional[float] = None
-    seconds: Optional[float] = None
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+    seconds: float | None = None
     reason: str = ""
 
 
@@ -52,6 +54,7 @@ class FindRequest(BaseModel):
 
 # ---------- Helpers ----------
 
+
 def _ep_dir(episode_id: str) -> Path:
     ep = EPISODES_DIR / episode_id
     if not ep.exists():
@@ -59,7 +62,36 @@ def _ep_dir(episode_id: str) -> Path:
     return ep
 
 
+def _prepare_terminal_trim_reuse(ep_dir: Path) -> bool:
+    """Bind the current verified longform before a trim edit changes its inputs."""
+    from agents.pipeline import load_config
+    from agents.speaker_cut import current_speaker_segments
+    from lib.audio_mix import selected_audio_source
+    from lib.delivery_video import prepare_longform_trim_reuse
+
+    try:
+        episode = json.loads((ep_dir / "episode.json").read_text())
+        config = load_config()
+        segment_document = current_speaker_segments(ep_dir, episode, config)
+        segments = segment_document.get("segments", []) if segment_document else []
+        audio = selected_audio_source(ep_dir, episode, config) or (
+            ep_dir / "work" / "audio_mix.wav"
+        )
+        if not segments or not audio.is_file():
+            return False
+        return (
+            prepare_longform_trim_reuse(ep_dir, episode, config, audio, segments)
+            is not None
+        )
+    except (OSError, TypeError, ValueError):
+        logger.exception(
+            "Could not prepare the current longform for terminal trim reuse"
+        )
+        return False
+
+
 # ---------- Endpoints ----------
+
 
 @router.get("")
 async def list_episode_edits(episode_id: str):
@@ -78,6 +110,9 @@ async def list_episode_edits(episode_id: str):
 async def add_edit(episode_id: str, req: AddEditRequest):
     """Append a new edit (cut, trim_start, or trim_end)."""
     ep_dir = _ep_dir(episode_id)
+    trim_reuse_prepared = (
+        _prepare_terminal_trim_reuse(ep_dir) if req.type == "trim_end" else False
+    )
     try:
         if req.type == "cut":
             if req.start_seconds is None or req.end_seconds is None:
@@ -96,7 +131,11 @@ async def add_edit(episode_id: str, req: AddEditRequest):
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    return {"edit": edit, "edits": list_edits(ep_dir)}
+    return {
+        "edit": edit,
+        "edits": list_edits(ep_dir),
+        "longform_trim_reuse_prepared": trim_reuse_prepared,
+    }
 
 
 @router.delete("/{index}")
@@ -155,7 +194,11 @@ async def apply_edits(episode_id: str):
     # the current edits, not stale segment files.
     work_dir = ep_dir / "work"
     if work_dir.exists():
-        for pattern in ("longform_seg_*.mp4", "longform_raw.mp4", "longform_concat.txt"):
+        for pattern in (
+            "longform_seg_*.mp4",
+            "longform_raw.mp4",
+            "longform_concat.txt",
+        ):
             for f in work_dir.glob(pattern):
                 try:
                     f.unlink()
@@ -163,10 +206,8 @@ async def apply_edits(episode_id: str):
                     pass
 
     # Read source/audio paths from episode.json so the pipeline can resume
-    import json
     ep_file = ep_dir / "episode.json"
-    with open(ep_file) as f:
-        ep_data = json.load(f)
+    ep_data = json.loads(await asyncio.to_thread(ep_file.read_text))
     source_path = ep_data.get("source_path", "")
     audio_path = ep_data.get("audio_path")
 

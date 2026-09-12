@@ -18,6 +18,8 @@ from lib.delivery_video import (
     concat_video_segments,
     current_longform_render,
     longform_render_fingerprint,
+    longform_trim_reuse_fingerprint,
+    longform_trim_reuse_proof,
     mux_timeline_audio,
     record_longform_render,
     render_config_for_episode,
@@ -26,6 +28,7 @@ from lib.delivery_video import (
     render_space_budget,
     render_video_segment,
     require_render_space,
+    reusable_terminal_trim_render,
     source_fps,
 )
 from lib.encoding import (
@@ -136,6 +139,29 @@ class LongformRenderAgent(BaseAgent):
 
         encoding = get_video_encoding_policy(self.config, "longform")
         encoder_args = get_video_encoder_args(self.config, "longform")
+        reuse_record = reusable_terminal_trim_render(
+            self.episode_dir,
+            episode,
+            self.config,
+            audio,
+            segments,
+            timeline,
+        )
+        if reuse_record is not None:
+            return self._reuse_terminal_prefix(
+                episode,
+                audio,
+                segments,
+                timeline,
+                fingerprint,
+                caption_path,
+                caption_record,
+                render_segments,
+                encoding,
+                encoder_args,
+                reuse_record,
+            )
+
         lut_filter = get_lut_filter(self.config)
         budget = render_space_budget(timeline.duration, encoding)
         require_render_space(self.episode_dir, budget)
@@ -201,10 +227,100 @@ class LongformRenderAgent(BaseAgent):
                     "lut" if episode.get("delivery_apply_lut", False) else "source"
                 ),
                 "encoding": {**encoding, "encoder": encoder_args[1]},
+                "terminal_trim_reuse": longform_trim_reuse_proof(
+                    fingerprint,
+                    longform_trim_reuse_fingerprint(
+                        self.episode_dir,
+                        episode,
+                        self.config,
+                        audio,
+                        segments,
+                    ),
+                    timeline,
+                ),
             },
         )
         self.report_progress(progress_total, progress_total, "Longform render complete")
         return self._result(record, caption_path, reused=False)
+
+    def _reuse_terminal_prefix(
+        self,
+        episode: dict,
+        audio: Path,
+        segments: list[dict],
+        timeline: Timeline,
+        fingerprint: str,
+        caption_path: Path,
+        caption_record: dict,
+        render_segments: list[dict],
+        encoding: dict,
+        encoder_args: list[str],
+        reuse_record: dict,
+    ) -> dict:
+        output = self.episode_dir / "upload_video.mp4"
+        output_bytes = int(reuse_record.get("output", {}).get("size_bytes", 0))
+        if output_bytes <= 0:
+            raise RuntimeError("Verified prefix render has no recorded output size")
+        require_render_space(
+            self.episode_dir,
+            {"output_bytes": output_bytes, "scratch_bytes": 0},
+        )
+        progress_total = 3
+        self.report_progress(
+            0,
+            progress_total,
+            "Reusing verified video pixels and muxing canonical audio",
+        )
+        media = mux_timeline_audio(
+            output,
+            audio,
+            output,
+            timeline,
+            audio_bitrate=encoding["audio_bitrate"],
+            runner=self._run_ffmpeg,
+        )
+        media.update(
+            encoder=encoder_args[1],
+            edit_count=len(episode.get("longform_edits", [])),
+            segment_count=len(render_segments),
+            expected_duration_seconds=round(timeline.duration, 3),
+        )
+        self.report_progress(1, progress_total, "Measuring output loudness")
+        loudness = measure_loudness(output)
+        if loudness:
+            media["audio_loudness"] = loudness
+        input_fingerprint = longform_trim_reuse_fingerprint(
+            self.episode_dir,
+            episode,
+            self.config,
+            audio,
+            segments,
+        )
+        self.report_progress(2, progress_total, "Recording verified render manifest")
+        record = record_longform_render(
+            self.episode_dir,
+            fingerprint=fingerprint,
+            render_mode="speaker_cut",
+            timeline=timeline,
+            media=media,
+            captions=caption_record,
+            provenance={
+                "color_grade": (
+                    "lut" if episode.get("delivery_apply_lut", False) else "source"
+                ),
+                "encoding": {**encoding, "encoder": encoder_args[1]},
+                "terminal_trim_reuse": longform_trim_reuse_proof(
+                    fingerprint, input_fingerprint, timeline
+                ),
+                "video_reuse": {
+                    "mode": "verified_terminal_prefix",
+                    "source_render_fingerprint": reuse_record["fingerprint"],
+                    "source_output_size_bytes": output_bytes,
+                },
+            },
+        )
+        self.report_progress(progress_total, progress_total, "Longform render complete")
+        return self._result(record, caption_path, reused=True)
 
     def _result(self, record: dict, caption_path: Path, *, reused: bool) -> dict:
         output = self.episode_dir / "upload_video.mp4"

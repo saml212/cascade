@@ -6,6 +6,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ RENDER_MANIFEST_NAME = "render_manifest.json"
 RENDER_PIPELINE_VERSION = "source-clock/v3"
 SHORTS_TWO_PERSON_STACK_VERSION = "two-person-stack/v1"
 ASPECT_CROP_FINGERPRINT_VERSION = "aspect-crop/v1"
+LONGFORM_TRIM_REUSE_VERSION = "verified-terminal-prefix/v1"
 OUTPUT_RESERVE_BYTES = 1_000_000_000
 SCRATCH_RESERVE_BYTES = 10_000_000_000
 _manifest_lock = threading.Lock()
@@ -532,6 +534,26 @@ def longform_render_fingerprint(
     )
 
 
+def longform_trim_reuse_fingerprint(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+) -> str:
+    """Fingerprint longform inputs other than its source-clock edit timeline."""
+    episode_without_edits = copy.deepcopy(episode)
+    episode_without_edits["longform_edits"] = []
+    return _longform_render_fingerprint(
+        episode_dir,
+        episode_without_edits,
+        config,
+        audio_path,
+        segments,
+        render_mode="speaker_cut",
+    )
+
+
 def _longform_render_fingerprint(
     episode_dir: Path,
     episode: dict,
@@ -628,9 +650,7 @@ def _short_render_fingerprint(
     if _uses_two_person_stack(episode, processing, segments, clip):
         state["shorts_overlap_layout"] = SHORTS_TWO_PERSON_STACK_VERSION
     try:
-        transcript = json.loads(
-            (episode_dir / "diarized_transcript.json").read_text()
-        )
+        transcript = json.loads((episode_dir / "diarized_transcript.json").read_text())
     except (OSError, json.JSONDecodeError):
         transcript = {}
     caption_start = clip.get("start_seconds", clip.get("start"))
@@ -896,6 +916,132 @@ def current_longform_render(
         if state["current"]:
             return record
     return None
+
+
+def longform_trim_reuse_proof(
+    render_fingerprint_value: str,
+    input_fingerprint: str,
+    timeline: Timeline,
+) -> dict:
+    return {
+        "version": LONGFORM_TRIM_REUSE_VERSION,
+        "render_fingerprint": render_fingerprint_value,
+        "input_fingerprint": input_fingerprint,
+        "source_intervals": [list(interval) for interval in timeline.keep_intervals],
+    }
+
+
+def prepare_longform_trim_reuse(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+) -> dict | None:
+    """Explicitly attest that a current longform may supply prefix pixels later."""
+    current = current_longform_render(
+        episode_dir, episode, config, audio_path, segments
+    )
+    if current is None:
+        return None
+    proof = {
+        "version": LONGFORM_TRIM_REUSE_VERSION,
+        "render_fingerprint": current["fingerprint"],
+        "input_fingerprint": longform_trim_reuse_fingerprint(
+            episode_dir, episode, config, audio_path, segments
+        ),
+        "source_intervals": copy.deepcopy(current.get("keep_intervals", [])),
+    }
+    with _file_lock(episode_dir / ".render_manifest.lock", _manifest_lock):
+        manifest = read_render_manifest(episode_dir)
+        record = manifest.get("longform", {})
+        if record.get("fingerprint") != current.get("fingerprint"):
+            return None
+        state = render_artifact_state(
+            episode_dir,
+            episode_dir / "upload_video.mp4",
+            record,
+            expected_fingerprint=current["fingerprint"],
+            expected_mode="speaker_cut",
+        )
+        if not state["current"]:
+            return None
+        updated = copy.deepcopy(record)
+        provenance = updated.setdefault("provenance", {})
+        if provenance.get("terminal_trim_reuse") == proof:
+            return updated
+        provenance["terminal_trim_reuse"] = proof
+        manifest["longform"] = updated
+        atomic_write_json(episode_dir / RENDER_MANIFEST_NAME, manifest)
+        return updated
+
+
+def reusable_terminal_trim_render(
+    episode_dir: Path,
+    episode: dict,
+    config: dict,
+    audio_path: Path,
+    segments: list[dict],
+    timeline: Timeline,
+) -> dict | None:
+    """Return a verified render only when the new timeline removes a suffix."""
+    record = read_render_manifest(episode_dir).get("longform", {})
+    if record.get("pipeline_version") != RENDER_PIPELINE_VERSION:
+        return None
+    proof = record.get("provenance", {}).get("terminal_trim_reuse", {})
+    if (
+        proof.get("version") != LONGFORM_TRIM_REUSE_VERSION
+        or proof.get("render_fingerprint") != record.get("fingerprint")
+        or proof.get("source_intervals") != record.get("keep_intervals")
+        or proof.get("input_fingerprint")
+        != longform_trim_reuse_fingerprint(
+            episode_dir, episode, config, audio_path, segments
+        )
+        or not _is_strict_terminal_prefix(
+            timeline.keep_intervals, record.get("keep_intervals", [])
+        )
+    ):
+        return None
+    state = render_artifact_state(
+        episode_dir,
+        episode_dir / "upload_video.mp4",
+        record,
+        expected_fingerprint=record.get("fingerprint"),
+        expected_mode="speaker_cut",
+    )
+    return record if state["current"] else None
+
+
+def _is_strict_terminal_prefix(
+    new_intervals: tuple[tuple[float, float], ...], old_intervals: list
+) -> bool:
+    """Accept only a shorter source timeline that is an exact retained prefix."""
+    try:
+        old = [(float(start), float(end)) for start, end in old_intervals]
+        new = [(float(start), float(end)) for start, end in new_intervals]
+    except (TypeError, ValueError):
+        return False
+    if not new or not old or len(new) > len(old):
+        return False
+    tolerance = 1e-6
+    for index, (new_start, new_end) in enumerate(new):
+        old_start, old_end = old[index]
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (new_start, new_end, old_start, old_end)
+            )
+            or new_end <= new_start
+            or old_end <= old_start
+            or abs(new_start - old_start) > tolerance
+            or new_end > old_end + tolerance
+        ):
+            return False
+        if index < len(new) - 1 and abs(new_end - old_end) > tolerance:
+            return False
+    new_duration = sum(end - start for start, end in new)
+    old_duration = sum(end - start for start, end in old)
+    return new_duration < old_duration - tolerance
 
 
 def current_episode_longform_render(

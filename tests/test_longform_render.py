@@ -413,3 +413,121 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     budget = render_space_budget(2, get_video_encoding_policy(config, "longform"))
     render_space.assert_called_once_with(tmp_episode_dir, budget)
     assert scratch_space.call_args.args[1] == budget["scratch_bytes"]
+
+
+def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segments(
+    tmp_episode_dir, sample_config
+):
+    episode = {
+        "crop_config": {"speakers": [{"center_x": 80, "center_y": 45, "zoom": 1}]},
+        "longform_edits": [{"type": "trim_end", "seconds": 2}],
+        "delivery_apply_lut": False,
+    }
+    (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+    (tmp_episode_dir / "diarized_transcript.json").write_text(
+        json.dumps(
+            {
+                "utterances": [
+                    {
+                        "speaker": 0,
+                        "words": [{"word": "hello", "start": 0.2, "end": 0.6}],
+                    }
+                ]
+            }
+        )
+    )
+    source = tmp_episode_dir / "source_merged.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    output = tmp_episode_dir / "upload_video.mp4"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"verified prior render")
+    segments = [{"start": 0, "end": 3, "speaker": "speaker_0"}]
+    progress = []
+    agent = LongformRenderAgent(
+        tmp_episode_dir,
+        sample_config,
+        progress=lambda percent, detail: progress.append((percent, detail)),
+    )
+    source_probe = {
+        "format": {"duration": "3"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 160,
+                "height": 90,
+                "r_frame_rate": "30/1",
+            }
+        ],
+    }
+    prior = {
+        "fingerprint": "verified-prior-fingerprint",
+        "output": {"size_bytes": output.stat().st_size},
+    }
+
+    def fake_mux(video, _audio, destination, timeline, **_kwargs):
+        assert video == destination == output
+        assert timeline.keep_intervals == ((0.0, 2.0),)
+        destination.write_bytes(b"shortened mux")
+        return {
+            "duration_seconds": 2,
+            "audio_duration_seconds": 2,
+            "video_duration_seconds": 2,
+            "width": 160,
+            "height": 90,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+        }
+
+    with (
+        patch(
+            "agents.longform_render.current_speaker_segments",
+            return_value={"segments": segments},
+        ),
+        patch(
+            "agents.longform_render.current_diarized_transcript",
+            return_value={
+                "utterances": [
+                    {
+                        "speaker": 0,
+                        "words": [{"word": "hello", "start": 0.2, "end": 0.6}],
+                    }
+                ]
+            },
+        ),
+        patch("agents.longform_render.generate_audio_mix", return_value=audio),
+        patch("agents.longform_render.ffprobe", return_value=source_probe),
+        patch("agents.longform_render.current_longform_render", return_value=None),
+        patch(
+            "agents.longform_render.reusable_terminal_trim_render",
+            return_value=prior,
+        ),
+        patch(
+            "agents.longform_render.get_video_encoder_args",
+            return_value=["-c:v", "libx264"],
+        ),
+        patch("agents.longform_render.require_render_space") as render_space,
+        patch.object(agent, "_render_segments") as render_segments,
+        patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
+        patch("agents.longform_render.measure_loudness", return_value=None),
+    ):
+        result = agent.execute()
+
+    render_segments.assert_not_called()
+    render_space.assert_called_once_with(
+        tmp_episode_dir,
+        {"output_bytes": len(b"verified prior render"), "scratch_bytes": 0},
+    )
+    assert result["reused"] is True
+    assert result["manifest"]["provenance"]["video_reuse"] == {
+        "mode": "verified_terminal_prefix",
+        "source_render_fingerprint": "verified-prior-fingerprint",
+        "source_output_size_bytes": len(b"verified prior render"),
+    }
+    assert [detail for _, detail in progress] == [
+        "Reusing verified video pixels and muxing canonical audio",
+        "Measuring output loudness",
+        "Recording verified render manifest",
+        "Longform render complete",
+    ]
+    assert all(percent < 100 for percent, _ in progress[:-1])
