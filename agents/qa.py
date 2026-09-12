@@ -32,8 +32,7 @@ from lib.delivery_video import (
     current_short_render,
     read_render_manifest,
 )
-from lib.ffprobe import probe as ffprobe
-from lib.media_inspection import file_revision
+from lib.ffprobe import file_fingerprint, probe as ffprobe
 from lib.timeline import Timeline
 from lib.transcript_search import clip_boundary_evidence
 
@@ -472,7 +471,9 @@ def current_clip_boundary_evidence(
         transcript = current_diarized_transcript(episode_dir, episode, config)
         if transcript is None:
             raise ValueError("Current source-clock transcript is unavailable")
-        transcript_revision = file_revision(episode_dir / "diarized_transcript.json")
+        transcript_revision = file_fingerprint(
+            episode_dir / "diarized_transcript.json"
+        )["id"]
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
         unavailable.update(
             current=False,

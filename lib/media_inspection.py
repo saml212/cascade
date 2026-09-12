@@ -23,7 +23,7 @@ from lib.delivery_video import (
     ffmpeg_executable,
     source_fps,
 )
-from lib.ffprobe import probe
+from lib.ffprobe import file_fingerprint, probe
 from lib.timeline import Timeline
 
 INSPECTION_VERSION = "source-clock/v1"
@@ -47,11 +47,7 @@ class InspectionAsset:
 
 
 def file_revision(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return f"sha256:{digest.hexdigest()}"
+    return file_fingerprint(path)["id"]
 
 
 def media_revision(path: Path) -> str:

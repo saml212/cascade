@@ -3,6 +3,8 @@
 import math
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,6 +20,18 @@ from lib.media_inspection import (
     source_ranges,
 )
 from lib.timeline import Timeline
+
+
+def test_media_inspection_can_be_imported_before_agents_package():
+    result = subprocess.run(
+        [sys.executable, "-c", "from lib.media_inspection import file_revision"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_output_window_maps_across_source_cut():
