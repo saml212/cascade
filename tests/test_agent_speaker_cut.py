@@ -590,6 +590,86 @@ def test_reviewed_overlap_does_not_assert_competing_speaker_ownership():
     ]
 
 
+def test_explicit_speaker_bindings_add_third_crop_and_wide_unresolved_turn(
+    tmp_episode_dir,
+):
+    _write(
+        tmp_episode_dir / "segments.json",
+        {
+            "clock": "source",
+            "fingerprint": "camera-analysis",
+            "track_mapping": [
+                {"speaker": "speaker_0", "person": "Laura"},
+                {"speaker": "speaker_1", "person": "Todd"},
+                {"speaker": "speaker_2", "person": "Sam"},
+            ],
+            "segments": [{"speaker": "speaker_0", "start": 0.0, "end": 20.0}],
+        },
+    )
+
+    def utterance(speaker, start):
+        return {
+            "speaker": speaker,
+            "words": [
+                {
+                    "word": f"word{index}",
+                    "start": start + index,
+                    "end": start + index + 0.8,
+                    "speaker": speaker,
+                    "suspect": False,
+                }
+                for index in range(3)
+            ],
+        }
+
+    _write(
+        tmp_episode_dir / "diarized_transcript.json",
+        {
+            "clock": "source",
+            "speaker_map": [
+                {
+                    "index": 0,
+                    "target_speaker": "speaker_1",
+                    "mapping_method": "manual_review",
+                },
+                {
+                    "index": 2,
+                    "target_speaker": "speaker_2",
+                    "mapping_method": "manual_review",
+                },
+                {
+                    "index": 3,
+                    "target_speaker": "BOTH",
+                    "mapping_method": "manual_review",
+                },
+            ],
+            "utterances": [
+                utterance(0, 2.0),
+                utterance(2, 6.0),
+                utterance(3, 10.0),
+            ],
+        },
+    )
+    _write(tmp_episode_dir / "transcript_provenance.json", {"clock": "source"})
+
+    result = align_speaker_segments_to_transcript(tmp_episode_dir)
+
+    ownership = [
+        (segment["speaker"], segment["start"], segment["end"])
+        for segment in result["segments"]
+        if segment["speaker"] != "speaker_0"
+    ]
+    assert ownership == [
+        ("speaker_1", 2.0, 4.8),
+        ("speaker_2", 6.0, 8.8),
+        ("BOTH", 10.0, 12.8),
+    ]
+    assert {
+        adjustment["to_speaker"]
+        for adjustment in result["transcript_alignment"]["adjustments"]
+    } == {"speaker_1", "speaker_2", "BOTH"}
+
+
 @pytest.mark.parametrize("alignment_version", ["source-clock-v1", "source-clock-v2"])
 def test_current_segments_rejects_changed_transcript(
     tmp_episode_dir, sample_config, alignment_version

@@ -87,11 +87,21 @@ class TranscriptClockEvidence(BaseModel):
     artifact_references: list[str] = Field(default_factory=list, max_length=20)
 
 
+class TranscriptSpeakerBinding(BaseModel):
+    asr_speaker: int = Field(ge=0)
+    crop_speaker_index: int | None = Field(default=None, ge=0)
+    label: str | None = Field(default=None, max_length=200)
+    evidence: str = Field(min_length=1, max_length=1000)
+
+
 class TranscriptClockRepairRequest(BaseModel):
     expected_binding_revision: str = Field(min_length=1)
     source_seconds_per_asr_second: float = Field(ge=0.99, le=1.01)
     source_offset_seconds: float
     evidence: TranscriptClockEvidence
+    speaker_bindings: list[TranscriptSpeakerBinding] | None = Field(
+        default=None, min_length=1, max_length=100
+    )
 
 
 class _TranscriptRevisionConflict(RuntimeError):
@@ -203,6 +213,26 @@ def _transcript_media_state(episode_dir: Path) -> dict:
     }
 
 
+def _transcript_binding_revision(episode_dir: Path, state: dict) -> str:
+    transcript_path = episode_dir / "diarized_transcript.json"
+    segments_path = episode_dir / "segments.json"
+    transcript_revision = (
+        file_revision(transcript_path) if transcript_path.is_file() else None
+    )
+    speaker_plan_revision = (
+        file_revision(segments_path) if segments_path.is_file() else None
+    )
+    episode_revision = file_revision(episode_dir / "episode.json")
+    return json_fingerprint(
+        {
+            **state,
+            "episode_revision": episode_revision,
+            "speaker_plan_revision": speaker_plan_revision,
+            "transcript_revision": transcript_revision,
+        }
+    )
+
+
 def _transcript_repair_document(episode_dir: Path, config: dict) -> dict:
     state = _transcript_media_state(episode_dir)
     provenance = _read_json(episode_dir / "transcript_provenance.json", {})
@@ -226,9 +256,16 @@ def _transcript_repair_document(episode_dir: Path, config: dict) -> dict:
         "schema": "cascade.transcript-clock-repair/v1",
         "clock": "source",
         **state,
-        "binding_revision": json_fingerprint(state),
+        "binding_revision": _transcript_binding_revision(episode_dir, state),
         "mapping_current": mapping_current,
         "mapping": mapping,
+        "speaker_bindings": provenance.get("speaker_map_override"),
+        "episode_revision": file_revision(episode_dir / "episode.json"),
+        "speaker_plan_revision": (
+            file_revision(episode_dir / "segments.json")
+            if (episode_dir / "segments.json").is_file()
+            else None
+        ),
         "transcript_current": current,
         "transcript_revision": (
             file_revision(transcript_path) if transcript_path.is_file() else None
@@ -241,7 +278,9 @@ def _apply_transcript_clock_repair(
 ) -> dict:
     with _transcript_corrections_lock:
         before = _transcript_media_state(episode_dir)
-        if request.expected_binding_revision != json_fingerprint(before):
+        if request.expected_binding_revision != _transcript_binding_revision(
+            episode_dir, before
+        ):
             raise _TranscriptRevisionConflict(
                 "Transcript repair inputs changed; inspect the repair state again"
             )
@@ -261,6 +300,11 @@ def _apply_transcript_clock_repair(
                 episode_dir,
                 config,
                 clock_mapping_document=mapping,
+                speaker_bindings=(
+                    [binding.model_dump() for binding in request.speaker_bindings]
+                    if request.speaker_bindings is not None
+                    else None
+                ),
             )
             after = _transcript_media_state(episode_dir)
             if json_fingerprint(after) != json_fingerprint(before):
@@ -272,6 +316,32 @@ def _apply_transcript_clock_repair(
                 raise RuntimeError(
                     "Repaired transcript did not pass currentness checks"
                 )
+            if request.speaker_bindings is not None:
+                current_segments = current_speaker_segments(
+                    episode_dir, episode, config
+                )
+                if result.get("speaker_alignment") is None or current_segments is None:
+                    raise RuntimeError(
+                        "Speaker bindings require a current aligned speaker plan; "
+                        "configure crops and rerun speaker_cut before retrying"
+                    )
+                available_targets = {
+                    row.get("speaker")
+                    for row in current_segments.get("track_mapping", [])
+                }
+                missing_targets = sorted(
+                    {
+                        row["target_speaker"]
+                        for row in result.get("speaker_map", [])
+                        if row.get("target_speaker") != "BOTH"
+                    }
+                    - available_targets
+                )
+                if missing_targets:
+                    raise RuntimeError(
+                        "Current speaker plan is missing reviewed crop targets: "
+                        + ", ".join(missing_targets)
+                    )
         except BaseException:
             try:
                 inputs_unchanged = json_fingerprint(
@@ -295,6 +365,7 @@ def _apply_transcript_clock_repair(
                 episode_dir / "diarized_transcript.json"
             ),
             "speaker_alignment": result.get("speaker_alignment"),
+            "speaker_map": result.get("speaker_map", []),
             "raw_transcript_unchanged": True,
             "source_media_unchanged": True,
         }

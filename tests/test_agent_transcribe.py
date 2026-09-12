@@ -16,6 +16,7 @@ from agents.transcribe import (
     analyze_transcript_coverage,
     build_transcript_clock_mapping,
     current_diarized_transcript,
+    explicit_diarized_speaker_map,
     export_logical_track_window,
     remap_transcript_timestamps,
     repair_existing_transcript,
@@ -490,6 +491,48 @@ def _multichannel_episode(ep_dir):
 
 
 class TestCanonicalRepair:
+    def test_explicit_map_binds_reviewed_crops_and_unresolved_speakers(self):
+        episode = {
+            "crop_config": {
+                "speakers": [
+                    {"label": "Laura"},
+                    {"label": "Todd"},
+                    {"label": "Sam"},
+                ]
+            }
+        }
+        raw = {
+            "results": {
+                "utterances": [
+                    {"speaker": speaker, "words": []} for speaker in range(4)
+                ]
+            }
+        }
+        bindings = [
+            {"asr_speaker": 0, "crop_speaker_index": 1, "evidence": "self intro"},
+            {"asr_speaker": 1, "crop_speaker_index": 2, "evidence": "host intro"},
+            {"asr_speaker": 2, "crop_speaker_index": 0, "evidence": "self intro"},
+            {
+                "asr_speaker": 3,
+                "crop_speaker_index": None,
+                "label": "Off-camera statistics narrator",
+                "evidence": "27 reviewed readout turns",
+            },
+        ]
+
+        speaker_map = explicit_diarized_speaker_map(raw, episode, bindings)
+
+        assert [row["target_speaker"] for row in speaker_map] == [
+            "speaker_1",
+            "speaker_2",
+            "speaker_0",
+            "BOTH",
+        ]
+        assert speaker_map[3]["unresolved"] is True
+        assert speaker_map[3]["person"] is None
+        with pytest.raises(ValueError, match="cover every raw ASR speaker"):
+            explicit_diarized_speaker_map(raw, episode, bindings[:-1])
+
     def test_maps_mono_diarization_ids_to_source_speakers(
         self, tmp_episode_dir, sample_config
     ):

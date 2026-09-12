@@ -483,6 +483,75 @@ def _raw_is_multichannel(raw: dict) -> bool:
     return len(utterance_channels) > 1
 
 
+def explicit_diarized_speaker_map(
+    raw: dict, episode: dict, bindings: list[dict]
+) -> list[dict]:
+    """Bind every mono ASR speaker to one reviewed crop or the wide shot."""
+    if _raw_is_multichannel(raw):
+        raise ValueError("Explicit diarization bindings are only valid for mono ASR")
+    raw_speakers = {
+        speaker
+        for utterance in raw.get("results", {}).get("utterances", [])
+        for speaker in [utterance.get("speaker")]
+        if isinstance(speaker, int) and not isinstance(speaker, bool)
+    }
+    if not raw_speakers:
+        raise ValueError("Raw transcript has no diarized speaker ids")
+    by_speaker = {}
+    for binding in bindings:
+        speaker = binding.get("asr_speaker", binding.get("index"))
+        if not isinstance(speaker, int) or isinstance(speaker, bool):
+            raise TypeError("Every speaker binding needs an integer ASR speaker id")
+        if speaker in by_speaker:
+            raise ValueError(f"Duplicate ASR speaker binding: {speaker}")
+        by_speaker[speaker] = binding
+    if set(by_speaker) != raw_speakers:
+        raise ValueError(
+            "Speaker bindings must cover every raw ASR speaker exactly once"
+        )
+
+    crops = episode.get("crop_config", {}).get("speakers", [])
+    result = []
+    for speaker in sorted(raw_speakers):
+        binding = by_speaker[speaker]
+        evidence = str(binding.get("evidence", "")).strip()
+        if not evidence:
+            raise ValueError(f"ASR speaker {speaker} needs review evidence")
+        crop_index = binding.get("crop_speaker_index")
+        if crop_index is None:
+            label = str(binding.get("label") or f"Unresolved ASR speaker {speaker}")
+            person = None
+            target = "BOTH"
+        else:
+            if (
+                not isinstance(crop_index, int)
+                or isinstance(crop_index, bool)
+                or not 0 <= crop_index < len(crops)
+            ):
+                raise ValueError(f"ASR speaker {speaker} targets an unavailable crop")
+            person = str(crops[crop_index].get("label", "")).strip()
+            if not person:
+                raise ValueError(f"Crop speaker {crop_index} needs a person label")
+            label = person
+            target = f"speaker_{crop_index}"
+        result.append(
+            {
+                "index": speaker,
+                "label": label,
+                "person": person,
+                "crop_speaker_index": crop_index,
+                "target_speaker": target,
+                "clock": "source",
+                "mapping_method": "manual_review",
+                "mapping_confidence": 1.0,
+                "mapping_collision": False,
+                "unresolved": crop_index is None,
+                "evidence": evidence,
+            }
+        )
+    return result
+
+
 def _load_corrections(episode_dir: Path) -> dict | None:
     try:
         corrections = json.loads(
@@ -833,6 +902,9 @@ def _speaker_map_identity(speaker_map: list[dict] | None) -> list[dict]:
                 "person",
                 "logical_track",
                 "camera_channel",
+                "crop_speaker_index",
+                "target_speaker",
+                "unresolved",
             )
         }
         for mapping in (speaker_map or [])
@@ -1028,6 +1100,7 @@ def repair_existing_transcript(
     config: dict,
     *,
     clock_mapping_document: dict | None = None,
+    speaker_bindings: list[dict] | None = None,
 ) -> dict:
     """Canonicalize a stored ASR response without uploading audio again.
 
@@ -1067,6 +1140,14 @@ def repair_existing_transcript(
             "Stored ASR clock lineage is unknown; submit a guarded transcript "
             "clock mapping before repair"
         )
+    stored_bindings = provenance.get("speaker_map_override")
+    speaker_map_override = None
+    if speaker_bindings is not None or stored_bindings is not None:
+        speaker_map_override = explicit_diarized_speaker_map(
+            raw,
+            episode,
+            speaker_bindings if speaker_bindings is not None else stored_bindings,
+        )
     canonical_raw = _apply_transcript_clock_mapping(raw, mapping) if mapping else raw
     return agent._save_canonical_outputs(
         canonical_raw,
@@ -1076,6 +1157,7 @@ def repair_existing_transcript(
         config_fingerprint,
         reused_raw=True,
         clock_mapping=mapping,
+        speaker_map_override=speaker_map_override,
     )
 
 
@@ -1122,8 +1204,19 @@ def current_diarized_transcript(
             ValueError,
         ):
             return None
+    speaker_map_override = None
+    stored_bindings = provenance.get("speaker_map_override")
+    if stored_bindings is not None:
+        try:
+            speaker_map_override = explicit_diarized_speaker_map(
+                raw, episode, stored_bindings
+            )
+        except (TypeError, ValueError):
+            return None
     speaker_map = (
-        channel_map if multichannel else agent._infer_diarized_speaker_map(raw)
+        channel_map
+        if multichannel
+        else speaker_map_override or agent._infer_diarized_speaker_map(raw)
     )
     if (
         diarized.get("clock") != "source"
@@ -1138,6 +1231,7 @@ def current_diarized_transcript(
         != _speaker_map_identity(speaker_map)
         or provenance.get("corrections_fingerprint") != corrections_fingerprint
         or provenance.get("clock_mapping") != mapping
+        or provenance.get("speaker_map_override") != speaker_map_override
     ):
         return None
     expected_activity = activity.fingerprint if activity else None
@@ -1224,6 +1318,7 @@ class TranscribeAgent(BaseAgent):
 
         audio_size_mb = 0.0
         clock_mapping = None
+        speaker_map_override = None
         if reuse_raw:
             raw = self.load_json("transcript.json")
             if provenance.get("clock_mapping") is not None:
@@ -1231,6 +1326,10 @@ class TranscribeAgent(BaseAgent):
                     self.episode_dir, provenance["clock_mapping"]
                 )
                 raw = _apply_transcript_clock_mapping(raw, clock_mapping)
+            if provenance.get("speaker_map_override") is not None:
+                speaker_map_override = explicit_diarized_speaker_map(
+                    raw, episode, provenance["speaker_map_override"]
+                )
             self.logger.info("Reusing source-current Deepgram response")
         else:
             if multichannel:
@@ -1262,6 +1361,7 @@ class TranscribeAgent(BaseAgent):
             config_fingerprint,
             reused_raw=reuse_raw,
             clock_mapping=clock_mapping,
+            speaker_map_override=speaker_map_override,
         )
         result["audio_size_mb"] = round(audio_size_mb, 1)
         result["mode"] = "multichannel" if multichannel else "diarized"
@@ -2209,10 +2309,13 @@ class TranscribeAgent(BaseAgent):
         *,
         reused_raw: bool,
         clock_mapping: dict | None = None,
+        speaker_map_override: list[dict] | None = None,
     ) -> dict:
         activity = self._load_source_activity(channel_map)
         speaker_map = (
-            channel_map if multichannel else self._infer_diarized_speaker_map(raw)
+            channel_map
+            if multichannel
+            else speaker_map_override or self._infer_diarized_speaker_map(raw)
         )
         diarized = self._build_diarized_transcript(
             raw,
@@ -2247,6 +2350,9 @@ class TranscribeAgent(BaseAgent):
             "speaker_map": speaker_map or [],
             "raw_reused_without_api": reused_raw,
             "clock_mapping": deepcopy(clock_mapping) if clock_mapping else None,
+            "speaker_map_override": (
+                deepcopy(speaker_map_override) if speaker_map_override else None
+            ),
         }
         diarized["provenance"] = provenance
         self.save_json("diarized_transcript.json", diarized)
@@ -2271,4 +2377,5 @@ class TranscribeAgent(BaseAgent):
                 if aligned_segments is not None
                 else None
             ),
+            "speaker_map": speaker_map,
         }

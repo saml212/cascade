@@ -143,10 +143,15 @@ def _speaker_identity(mapping: dict) -> list[tuple[str, object]]:
 
 def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dict]:
     target_by_identity = {}
+    valid_targets = set()
+    camera_only = True
     for mapping in segments.get("track_mapping", []):
         target = mapping.get("speaker")
         if not str(target).startswith("speaker_"):
             continue
+        valid_targets.add(target)
+        if isinstance(mapping.get("logical_track"), int):
+            camera_only = False
         for identity in _speaker_identity(mapping):
             target_by_identity.setdefault(identity, target)
 
@@ -155,20 +160,29 @@ def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dic
         source = mapping.get("index")
         if not isinstance(source, int) or isinstance(source, bool):
             continue
+        reviewed_target = mapping.get("target_speaker")
+        if (
+            camera_only
+            and mapping.get("mapping_method") == "manual_review"
+            and (reviewed_target == "BOTH" or reviewed_target in valid_targets)
+        ):
+            source_to_target[source] = (reviewed_target, f"asr_speaker_{source}")
+            continue
         if float(mapping.get("mapping_confidence", 1.0) or 0) < 0.6:
             continue
         for identity in _speaker_identity(mapping):
             target = target_by_identity.get(identity)
             if target:
-                source_to_target[source] = target
+                source_to_target[source] = (target, None)
                 break
 
     turns = []
     for utterance in transcript.get("utterances", []):
         utterance_words = utterance.get("words", [])
-        target = source_to_target.get(utterance.get("speaker"))
-        if target is None:
+        target_binding = source_to_target.get(utterance.get("speaker"))
+        if target_binding is None:
             continue
+        target, speaker_binding = target_binding
         reliable_words = [
             word
             for word in utterance_words
@@ -196,19 +210,26 @@ def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dic
                         if isinstance(word.get("correction_id"), str)
                     }
                 ),
+                "speaker_binding": speaker_binding,
             }
         )
     return turns
 
 
 def _corrected_ownership_intervals(turns: list[dict]) -> list[dict]:
-    """Return unambiguous spans backed entirely by reviewed correction words."""
+    """Return spans backed by reviewed words or explicit speaker bindings."""
     corrected = [
         turn
         for turn in turns
-        if turn["fully_corrected"]
-        and turn["correction_ids"]
-        and turn["end"] - turn["start"] >= _CORRECTED_MIN_TURN_SECONDS
+        if (
+            turn.get("speaker_binding")
+            and turn["end"] - turn["start"] >= _ALIGNMENT_MIN_TURN_SECONDS
+        )
+        or (
+            turn["fully_corrected"]
+            and turn["correction_ids"]
+            and turn["end"] - turn["start"] >= _CORRECTED_MIN_TURN_SECONDS
+        )
     ]
     boundaries = sorted(
         {point for turn in corrected for point in (turn["start"], turn["end"])}
@@ -221,9 +242,15 @@ def _corrected_ownership_intervals(turns: list[dict]) -> list[dict]:
             turn for turn in corrected if turn["start"] < end and turn["end"] > start
         ]
         speakers = {turn["speaker"] for turn in active}
-        if len(speakers) != 1:
+        bound_turns = [turn for turn in active if turn.get("speaker_binding")]
+        if any(turn["speaker"] == "BOTH" for turn in bound_turns) or (
+            len(speakers) > 1 and len(bound_turns) == len(active)
+        ):
+            speaker = "BOTH"
+        elif len(speakers) == 1:
+            speaker = speakers.pop()
+        else:
             continue
-        speaker = speakers.pop()
         correction_ids = sorted(
             {
                 correction_id
@@ -231,22 +258,27 @@ def _corrected_ownership_intervals(turns: list[dict]) -> list[dict]:
                 for correction_id in turn["correction_ids"]
             }
         )
+        speaker_bindings = sorted(
+            {turn["speaker_binding"] for turn in active if turn.get("speaker_binding")}
+        )
         if (
             intervals
             and intervals[-1]["speaker"] == speaker
             and abs(intervals[-1]["end"] - start) < 1e-6
             and intervals[-1]["correction_ids"] == correction_ids
+            and intervals[-1].get("speaker_bindings", []) == speaker_bindings
         ):
             intervals[-1]["end"] = end
             continue
-        intervals.append(
-            {
-                "speaker": speaker,
-                "start": start,
-                "end": end,
-                "correction_ids": correction_ids,
-            }
-        )
+        interval = {
+            "speaker": speaker,
+            "start": start,
+            "end": end,
+            "correction_ids": correction_ids,
+        }
+        if speaker_bindings:
+            interval["speaker_bindings"] = speaker_bindings
+        intervals.append(interval)
     return intervals
 
 
@@ -319,12 +351,21 @@ def _apply_corrected_ownership(
                 )
             adjustments.append(
                 {
-                    "kind": "corrected_turn_ownership",
+                    "kind": (
+                        "speaker_binding_ownership"
+                        if ownership.get("speaker_bindings")
+                        else "corrected_turn_ownership"
+                    ),
                     "from_speaker": current_speaker,
                     "to_speaker": ownership["speaker"],
                     "start": round(overlap_start, 6),
                     "end": round(overlap_end, 6),
                     "correction_ids": ownership["correction_ids"],
+                    **(
+                        {"speaker_bindings": ownership["speaker_bindings"]}
+                        if ownership.get("speaker_bindings")
+                        else {}
+                    ),
                 }
             )
         decisions = _merge_adjacent_segments(updated)
@@ -827,17 +868,19 @@ class SpeakerCutAgent(BaseAgent):
                 for assignment in assignments
             ]
         speakers = episode.get("crop_config", {}).get("speakers", [])
-        return [
-            {
+        result = []
+        for index in range(max(2, len(speakers))):
+            mapping = {
                 "speaker": f"speaker_{index}",
                 "person": (
                     speakers[index].get("label") if index < len(speakers) else None
                 ),
-                "camera_channel": channel,
                 "source_clock": True,
             }
-            for index, channel in enumerate(("left", "right"))
-        ]
+            if index < 2:
+                mapping["camera_channel"] = ("left", "right")[index]
+            result.append(mapping)
+        return result
 
     def _load_tracks(
         self,
