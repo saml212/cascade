@@ -550,7 +550,8 @@ def test_legacy_trim_endpoint_preserves_source_bytes_and_replaces_edit_bounds(
     )
 
     assert response.status_code == 200
-    assert response.json()["new_duration"] == 80
+    assert response.json()["new_duration"] == 75
+    assert response.json()["terminal_range_duration_seconds"] == 80
     assert response.json()["source_unchanged"] is True
     stored = json.loads(episode_path.read_text())
     assert stored["duration_seconds"] == 3600.25
@@ -573,6 +574,34 @@ def test_legacy_trim_endpoint_preserves_source_bytes_and_replaces_edit_bounds(
     assert repeated.json()["status"] == "noop"
     assert episode_path.read_bytes() == stored_before
     assert (source.read_bytes(), source.stat().st_mtime_ns) == source_before
+
+
+def test_legacy_trim_rejects_negative_end_without_mutation(delivery, monkeypatch):
+    client, delivery_mod, episodes_dir = delivery
+    from server.routes import trim as trim_mod
+
+    episode_dir = make_episode(episodes_dir)
+    source = episode_dir / "source_merged.mp4"
+    source.write_bytes(b"immutable source media")
+    episode_path = episode_dir / "episode.json"
+    episode_before = episode_path.read_bytes()
+    source_before = source.read_bytes(), source.stat().st_mtime_ns
+    probes = []
+    monkeypatch.setattr(trim_mod, "get_duration", lambda _path: probes.append(True))
+    monkeypatch.setattr(delivery_mod, "get_duration", lambda _path: 100.0)
+
+    response = client.post(
+        "/api/episodes/ep_test/trim",
+        json={"trim_start_seconds": 10, "trim_end_seconds": -1},
+    )
+
+    assert response.status_code == 400
+    assert "non-negative" in response.json()["detail"]
+    assert probes == []
+    assert episode_path.read_bytes() == episode_before
+    assert (source.read_bytes(), source.stat().st_mtime_ns) == source_before
+    assert not (episode_dir / "source_merged_original.mp4").exists()
+    assert not (episode_dir / "source_merged_trimmed.mp4").exists()
 
 
 def test_worker_persists_verified_ready_status(delivery):

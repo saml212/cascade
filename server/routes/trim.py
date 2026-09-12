@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
+from lib.timeline import Timeline
 from server.routes.delivery import DeliveryTrimRequest, save_delivery_trim
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,8 @@ async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
         req.trim_end_seconds
     ):
         raise HTTPException(status_code=400, detail="Trim values must be finite")
+    if req.trim_start_seconds < 0 or req.trim_end_seconds < 0:
+        raise HTTPException(status_code=400, detail="Trim values must be non-negative")
     try:
         duration = get_duration(source)
     except (subprocess.CalledProcessError, KeyError, ValueError) as exc:
@@ -70,8 +73,6 @@ async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
 
     start = req.trim_start_seconds
     end = req.trim_end_seconds if req.trim_end_seconds > 0 else duration
-    if start < 0 or end < 0:
-        raise HTTPException(status_code=400, detail="Trim values must be non-negative")
     end = min(end, duration)
     if start >= end:
         raise HTTPException(
@@ -93,11 +94,16 @@ async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
         episode_id,
         DeliveryTrimRequest(start_seconds=start, end_seconds=end),
     )
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    retained_duration = Timeline.from_edits(
+        duration, episode.get("longform_edits", [])
+    ).duration
     original = episode_dir / "source_merged_original.mp4"
     return {
         "status": "saved",
-        "new_duration": end - start,
-        "duration_seconds": end - start,
+        "new_duration": retained_duration,
+        "duration_seconds": retained_duration,
+        "terminal_range_duration_seconds": end - start,
         "backup_path": str(original) if original.is_file() else None,
         "source_unchanged": True,
         "delivery": status,
