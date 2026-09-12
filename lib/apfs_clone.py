@@ -399,25 +399,35 @@ def replace_with_clone(source: dict, target: dict) -> dict:
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=dst_dir,
             )
-            cloned_mode = stat.S_IMODE(os.fstat(temp_fd).st_mode)
-            if not cloned_mode & stat.S_IWUSR:
-                os.fchmod(temp_fd, cloned_mode | stat.S_IWUSR)
-            _remove_unwanted_xattrs(temp_fd, dst_actual)
-            _checked_call(
-                _fcopyfile,
-                "fcopyfile metadata",
-                dst_fd,
-                temp_fd,
-                None,
-                _COPYFILE_METADATA,
-            )
+            if _metadata(src_actual) != _metadata(dst_actual):
+                cloned_mode = stat.S_IMODE(os.fstat(temp_fd).st_mode)
+                if not cloned_mode & stat.S_IWUSR:
+                    os.fchmod(temp_fd, cloned_mode | stat.S_IWUSR)
+                _remove_unwanted_xattrs(temp_fd, dst_actual)
+                _checked_call(
+                    _fcopyfile,
+                    "fcopyfile metadata",
+                    dst_fd,
+                    temp_fd,
+                    None,
+                    _COPYFILE_METADATA,
+                )
             os.fsync(temp_fd)
 
             cloned = snapshot_fd(temp_fd, dst)
             if cloned["sha256"] != src_actual["sha256"]:
                 raise CloneSafetyError("cloned content hash does not match source")
-            if _metadata(cloned) != _metadata(dst_actual):
-                raise CloneSafetyError("clone does not preserve target metadata")
+            cloned_metadata = _metadata(cloned)
+            target_metadata = _metadata(dst_actual)
+            if cloned_metadata != target_metadata:
+                differences = [
+                    key
+                    for key in target_metadata
+                    if cloned_metadata[key] != target_metadata[key]
+                ]
+                raise CloneSafetyError(
+                    "clone does not preserve target metadata: " + ", ".join(differences)
+                )
             if cloned["inode"] in {src_actual["inode"], dst_actual["inode"]}:
                 raise CloneSafetyError("clone did not create an independent inode")
             _assert_directory_anchor(src_dir, src)

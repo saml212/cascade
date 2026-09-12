@@ -248,6 +248,31 @@ def test_clone_unavailable_has_no_byte_copy_fallback(
     assert not _temporary_clone_files(tmp_path)
 
 
+def test_equal_metadata_does_not_rewrite_clone_metadata(tmp_path, monkeypatch):
+    source, target = _duplicate_pair(tmp_path)
+    source_stat = source.stat()
+    os.utime(target, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+    for path in (source, target):
+        subprocess.run(
+            ["xattr", "-wx", "com.apple.provenance", "0102007C05C2C960A50211", path],
+            check=True,
+        )
+    source_snapshot = snapshot_path(source)
+    target_snapshot = snapshot_path(target)
+
+    def unexpected_metadata_copy(*_args):
+        raise AssertionError("identical metadata must not be rewritten")
+
+    monkeypatch.setattr(apfs_clone, "_fcopyfile", unexpected_metadata_copy)
+    replace_with_clone(source_snapshot, target_snapshot)
+
+    assert snapshot_path(target)["sha256"] == source_snapshot["sha256"]
+    assert target.stat().st_ino not in {
+        source_snapshot["inode"],
+        target_snapshot["inode"],
+    }
+
+
 def test_full_preflight_finds_late_stale_target_before_any_replacement(tmp_path):
     source, first_target = _duplicate_pair(tmp_path)
     second_target = tmp_path / "second-target.bin"
