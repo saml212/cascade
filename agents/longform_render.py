@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -27,6 +26,7 @@ from lib.delivery_video import (
     render_output_lock,
     render_scratch_dir,
     render_space_budget,
+    staged_render_output,
     render_video_segment,
     require_render_space,
     reusable_terminal_trim_render,
@@ -168,54 +168,61 @@ class LongformRenderAgent(BaseAgent):
         require_render_space(self.episode_dir, budget)
         output = self.episode_dir / "upload_video.mp4"
 
-        with render_scratch_dir(
-            f"longform-{self.episode_dir.name}", budget["scratch_bytes"]
-        ) as scratch:
-            segment_paths = self._render_segments(
-                source,
-                scratch,
-                render_segments,
-                captions if burn_captions else None,
-                style if burn_captions else None,
-                src_w,
-                src_h,
-                crop_config,
-                encoder_args,
-                lut_filter,
-                fps,
-                out_w,
-                out_h,
-            )
-            video_only = scratch / "longform_video.mp4"
-            progress_total = len(render_segments) + _POST_RENDER_PHASES
-            self.report_progress(
-                len(render_segments), progress_total, "Joining rendered segments"
-            )
-            concat_video_segments(segment_paths, video_only, runner=self._run_ffmpeg)
-            self.report_progress(
-                len(render_segments) + 1, progress_total, "Muxing canonical audio"
-            )
-            media = mux_timeline_audio(
-                video_only,
-                audio,
-                output,
-                timeline,
-                audio_bitrate=encoding["audio_bitrate"],
-                runner=self._run_ffmpeg,
-            )
+        with staged_render_output(output) as staged:
+            with render_scratch_dir(
+                f"longform-{self.episode_dir.name}", budget["scratch_bytes"]
+            ) as scratch:
+                segment_paths = self._render_segments(
+                    source,
+                    scratch,
+                    render_segments,
+                    captions if burn_captions else None,
+                    style if burn_captions else None,
+                    src_w,
+                    src_h,
+                    crop_config,
+                    encoder_args,
+                    lut_filter,
+                    fps,
+                    out_w,
+                    out_h,
+                )
+                video_only = scratch / "longform_video.mp4"
+                progress_total = len(render_segments) + _POST_RENDER_PHASES
+                self.report_progress(
+                    len(render_segments), progress_total, "Joining rendered segments"
+                )
+                concat_video_segments(
+                    segment_paths, video_only, runner=self._run_ffmpeg
+                )
+                self.report_progress(
+                    len(render_segments) + 1,
+                    progress_total,
+                    "Muxing canonical audio",
+                )
+                media = mux_timeline_audio(
+                    video_only,
+                    audio,
+                    staged,
+                    timeline,
+                    audio_bitrate=encoding["audio_bitrate"],
+                    runner=self._run_ffmpeg,
+                )
 
-        media.update(
-            encoder=encoder_args[1],
-            edit_count=len(episode.get("longform_edits", [])),
-            segment_count=len(render_segments),
-            expected_duration_seconds=round(timeline.duration, 3),
-        )
-        self.report_progress(
-            len(render_segments) + 2, progress_total, "Measuring output loudness"
-        )
-        loudness = measure_loudness(output)
-        if loudness:
-            media["audio_loudness"] = loudness
+            media.update(
+                encoder=encoder_args[1],
+                edit_count=len(episode.get("longform_edits", [])),
+                segment_count=len(render_segments),
+                expected_duration_seconds=round(timeline.duration, 3),
+            )
+            self.report_progress(
+                len(render_segments) + 2,
+                progress_total,
+                "Measuring output loudness",
+            )
+            loudness = measure_loudness(staged)
+            if loudness:
+                media["audio_loudness"] = loudness
         record = record_longform_render(
             self.episode_dir,
             fingerprint=fingerprint,
@@ -272,15 +279,7 @@ class LongformRenderAgent(BaseAgent):
             progress_total,
             "Reusing verified video pixels and muxing canonical audio",
         )
-        descriptor, staged_name = tempfile.mkstemp(
-            prefix=".upload_video-trim-reuse-",
-            suffix=".mp4",
-            dir=self.episode_dir,
-        )
-        os.close(descriptor)
-        staged = Path(staged_name)
-        staged.unlink()
-        try:
+        with staged_render_output(output) as staged:
             media = mux_timeline_audio(
                 output,
                 audio,
@@ -299,9 +298,6 @@ class LongformRenderAgent(BaseAgent):
             loudness = measure_loudness(staged)
             if loudness:
                 media["audio_loudness"] = loudness
-            os.replace(staged, output)
-        finally:
-            staged.unlink(missing_ok=True)
         input_fingerprint = longform_trim_reuse_fingerprint(
             self.episode_dir,
             episode,

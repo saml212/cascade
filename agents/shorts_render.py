@@ -35,7 +35,7 @@ from lib.encoding import (
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
-from lib.srt import escape_srt_path, generate_srt_from_diarized
+from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
 
@@ -480,16 +480,6 @@ class ShortsRenderAgent(BaseAgent):
         )
         polish = get_video_polish_filters(self.config)
         return f"{chain},{polish}" if polish else chain
-
-    def _get_short_crop_filter(self, speaker, src_w, src_h, caption_path, crop_config):
-        chain = self._get_short_crop_filter_no_subs(speaker, src_w, src_h, crop_config)
-        if caption_path and Path(caption_path).exists():
-            chain += f",subtitles='{escape_srt_path(Path(caption_path))}'"
-        return chain
-
-    def _generate_clip_srt(self, diarized, start, end, srt_path):
-        """Compatibility helper for chat clients that still request SRT."""
-        generate_srt_from_diarized(diarized, start, end, Path(srt_path))
 
     def _run_ffmpeg(self, cmd, **kwargs):
         return timed_ffmpeg(cmd, agent_logger=self.logger, **kwargs)

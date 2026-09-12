@@ -36,6 +36,7 @@ from lib.delivery_video import (
     reusable_terminal_trim_render,
     short_render_fingerprint,
     source_fps,
+    staged_render_output,
 )
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
@@ -419,6 +420,21 @@ def test_mux_uses_a_unique_atomic_temp_for_each_attempt(tmp_path):
     assert destinations[0] != destinations[1]
     assert all(destination.parent == tmp_path for destination in destinations)
     assert not any(destination.exists() for destination in destinations)
+
+
+def test_staged_render_output_preserves_reviewed_file_when_verification_fails(
+    tmp_path,
+):
+    output = tmp_path / "upload_video.mp4"
+    output.write_bytes(b"reviewed")
+
+    with pytest.raises(RuntimeError, match="verification failed"):
+        with staged_render_output(output) as staged:
+            staged.write_bytes(b"unverified")
+            raise RuntimeError("verification failed")
+
+    assert output.read_bytes() == b"reviewed"
+    assert not list(tmp_path.glob(".upload_video-*.mp4"))
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")

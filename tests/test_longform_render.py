@@ -322,8 +322,10 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     )
     source = tmp_episode_dir / "source_merged.mp4"
     audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    output = tmp_episode_dir / "upload_video.mp4"
     source.write_bytes(b"source")
     audio.write_bytes(b"audio")
+    output.write_bytes(b"reviewed")
     scratch = tmp_episode_dir / "scratch"
     scratch.mkdir()
     config = json.loads(json.dumps(sample_config))
@@ -395,7 +397,9 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
         ) as render_segments,
         patch("agents.longform_render.concat_video_segments", side_effect=fake_concat),
         patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
-        patch("agents.longform_render.measure_loudness", return_value=None),
+        patch(
+            "agents.longform_render.measure_loudness", return_value=None
+        ) as measure_loudness,
     ):
         result = agent.execute()
 
@@ -403,6 +407,8 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     assert (render_segments.call_args.args[3] is not None) is burn_captions
     assert result["captions_burned_in"] is burn_captions
     assert result["filename"] == "upload_video.mp4"
+    assert measure_loudness.call_args.args[0] != output
+    assert output.read_bytes() == b"muxed"
     assert [detail for _, detail in progress] == [
         "Joining rendered segments",
         "Muxing canonical audio",

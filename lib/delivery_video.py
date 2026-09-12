@@ -340,6 +340,27 @@ def concat_video_segments(
         raise RuntimeError(f"Video concat produced an empty file: {output}")
 
 
+@contextmanager
+def staged_render_output(output: Path):
+    """Install a completed render only after every caller-side check succeeds."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{output.stem}-",
+        suffix=output.suffix,
+        dir=output.parent,
+    )
+    os.close(descriptor)
+    staged = Path(temp_name)
+    staged.unlink()
+    try:
+        yield staged
+        if output.name == "upload_video.mp4":
+            _preserve_previous_wide_render(output)
+        os.replace(staged, output)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def mux_timeline_audio(
     video_path: Path,
     audio_path: Path,
@@ -358,16 +379,7 @@ def mux_timeline_audio(
             f"requires audio through {required_end:.3f}s"
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix=f".{output_path.stem}-",
-        suffix=output_path.suffix,
-        dir=output_path.parent,
-    )
-    os.close(descriptor)
-    temp = Path(temp_name)
-    temp.unlink()
-    try:
+    with staged_render_output(output_path) as temp:
         runner(
             [
                 ffmpeg_executable(),
@@ -405,12 +417,7 @@ def mux_timeline_audio(
             check=True,
         )
         media = validate_av_output(temp, timeline.duration)
-        if output_path.name == "upload_video.mp4":
-            _preserve_previous_wide_render(output_path)
-        os.replace(temp, output_path)
         return media
-    finally:
-        temp.unlink(missing_ok=True)
 
 
 def validate_av_output(path: Path, expected_duration: float) -> dict:
