@@ -2,9 +2,8 @@
 
 These tests pin the safety-critical behaviors:
 
-1. The agent refuses to run unless ``publish_approved`` is True. This is the
-   destructive-action gate — bypassing it sends real videos to live social
-   platforms.
+1. The agent refuses to run unless the exact current release revision has
+   explicit approval.
 2. The agent surfaces per-clip API errors instead of marking everything
    submitted. Background: at one point the X (Twitter) integration silently
    failed because Upload-Post returned HTTP 200 with an error body and the
@@ -25,7 +24,6 @@ from unittest.mock import patch
 import pytest
 
 from agents.publish import PublishAgent
-from agents.pipeline import load_config
 from agents.qa import (
     clip_review_revision,
     editorial_revision,
@@ -65,11 +63,28 @@ def _write_json(path, data):
     path.write_text(json.dumps(data))
 
 
-def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=True):
+def _publish_config() -> dict:
+    return {
+        "platforms": {
+            "youtube": {"enabled": True},
+            "tiktok": {"enabled": True},
+            "instagram": {"enabled": True},
+            "x": {"enabled": True},
+            "podcast_rss": {"enabled": False},
+        },
+        "schedule": {
+            "timezone": "America/Los_Angeles",
+            "shorts_per_day_weekday": 1,
+            "shorts_per_day_weekend": 2,
+        },
+    }
+
+
+def _seed_episode(episode_dir, *, clips=None, longform=True, config=None):
     """Write the minimum files publish agent needs to run successfully."""
+    config = config or _publish_config()
     episode = {
         "episode_id": "ep_test",
-        "publish_approved": publish_approved,
         "status": "ready_for_review",
         "crop_config": {"speakers": [{"label": "Host"}]},
         "longform_edits": [],
@@ -116,7 +131,6 @@ def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=Tr
     )
     segments = [{"start": 0, "end": duration, "speaker": "BOTH"}]
     _write_json(episode_dir / "segments.json", {"segments": segments})
-    config = load_config()
     audio = episode_dir / "work" / "audio_mix.wav"
     if longform:
         video = episode_dir / "upload_video.mp4"
@@ -166,7 +180,7 @@ def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=Tr
     }
     _write_json(episode_dir / "episode.json", episode)
     episode["publish_approval"] = {
-        "revision": release_revision(episode_dir, episode),
+        "revision": release_revision(episode_dir, episode, config=config),
         "approved_at": "2026-01-01T00:01:00+00:00",
     }
     _write_json(episode_dir / "episode.json", episode)
@@ -180,24 +194,9 @@ def _seed_episode(episode_dir, *, publish_approved=True, clips=None, longform=Tr
     )
 
 
-def _make_agent(episode_dir, **platform_overrides):
+def _make_agent(episode_dir, config=None):
     """Construct an agent with a minimal config."""
-    cfg = {
-        "platforms": {
-            "youtube": {"enabled": True},
-            "tiktok": {"enabled": True},
-            "instagram": {"enabled": True},
-            "x": {"enabled": True},
-        },
-        "schedule": {
-            "timezone": "America/Los_Angeles",
-            "shorts_per_day_weekday": 1,
-            "shorts_per_day_weekend": 2,
-        },
-    }
-    for k, v in platform_overrides.items():
-        cfg["platforms"][k] = v
-    return PublishAgent(episode_dir, cfg)
+    return PublishAgent(episode_dir, config or _publish_config())
 
 
 def _mock_proc(stdout="", stderr="", returncode=0):
@@ -208,23 +207,30 @@ def _mock_proc(stdout="", stderr="", returncode=0):
 
 
 class TestSafetyGate:
-    """The agent must refuse to run unless publish_approved=True. This is the
-    only thing standing between a misclick and live social posts."""
+    """Only an approval for the exact current release may publish."""
 
-    def test_refuses_without_publish_approved(self, env, episode_dir):
-        _seed_episode(episode_dir, publish_approved=False)
+    def test_legacy_boolean_does_not_replace_publish_approval(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode.pop("publish_approval")
+        episode["publish_approved"] = True
+        _write_json(episode_path, episode)
         agent = _make_agent(episode_dir)
-        with pytest.raises(RuntimeError, match="not publish_approved"):
-            agent.execute()
+        with patch("agents.publish.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="release gate blocked"):
+                agent.execute()
+        run.assert_not_called()
 
     def test_refuses_when_episode_json_missing(self, env, episode_dir):
-        # No episode.json at all → load_json_safe returns {} → flag falsy.
         agent = _make_agent(episode_dir)
-        with pytest.raises(RuntimeError, match="not publish_approved"):
-            agent.execute()
+        with patch("agents.publish.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="release gate blocked"):
+                agent.execute()
+        run.assert_not_called()
 
-    def test_runs_when_publish_approved(self, env, episode_dir):
-        _seed_episode(episode_dir, publish_approved=True)
+    def test_runs_with_current_publish_approval(self, env, episode_dir):
+        _seed_episode(episode_dir)
         agent = _make_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(
@@ -233,6 +239,27 @@ class TestSafetyGate:
             result = agent.execute()
         assert result["shorts_submitted"] == 1
         assert result["shorts_failed"] == 0
+
+    def test_destination_change_after_approval_is_blocked(self, env, episode_dir):
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        config["platforms"]["tiktok"]["enabled"] = False
+
+        with patch("agents.publish.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="release gate blocked"):
+                _make_agent(episode_dir, config).execute()
+        run.assert_not_called()
+
+    def test_account_change_after_approval_is_blocked(
+        self, env, monkeypatch, episode_dir
+    ):
+        _seed_episode(episode_dir)
+        monkeypatch.setenv("UPLOAD_POST_USER", "different-account")
+
+        with patch("agents.publish.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="release gate blocked"):
+                _make_agent(episode_dir).execute()
+        run.assert_not_called()
 
     @pytest.mark.parametrize("report_state", ["missing", "failed", "stale"])
     def test_refuses_missing_failed_or_stale_qa(self, env, episode_dir, report_state):
@@ -278,14 +305,15 @@ class TestSafetyGate:
         run.assert_not_called()
 
     def test_episode_editor_copy_is_the_publisher_payload(self, env, episode_dir):
-        _seed_episode(episode_dir)
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
         episode_path = episode_dir / "episode.json"
         episode = json.loads(episode_path.read_text())
         episode["title"] = "Title saved in the episode editor"
         episode["description"] = "Description saved in the episode editor"
         episode["tags"] = ["editor-copy"]
         episode["publish_approval"] = {
-            "revision": release_revision(episode_dir, episode),
+            "revision": release_revision(episode_dir, episode, config=config),
             "approved_at": "2026-01-01T00:02:00+00:00",
         }
         _write_json(episode_path, episode)
@@ -300,7 +328,7 @@ class TestSafetyGate:
                 captured.append(cmd)
                 or _mock_proc(stdout=json.dumps({"request_id": "request"}))
             )
-            _make_agent(episode_dir).execute()
+            _make_agent(episode_dir, config).execute()
 
         longform = next(cmd for cmd in captured if "upload_video.mp4" in " ".join(cmd))
         fields = [
@@ -463,17 +491,23 @@ class TestYouTubeLongformFunnel:
     def _seed_with_longform_url(
         self, episode_dir, *, youtube_url=None, spotify_url=None, channel_handle=None
     ):
-        _seed_episode(episode_dir, publish_approved=True)
-        # Inject the longform URLs into episode.json
+        config = _publish_config()
+        if channel_handle:
+            config["podcast"] = {"channel_handle": channel_handle}
+        _seed_episode(episode_dir, config=config)
         ep_path = episode_dir / "episode.json"
         ep = json.loads(ep_path.read_text())
-        ep["publish_approved"] = True
         if youtube_url is not None:
             ep["youtube_longform_url"] = youtube_url
+            ep["youtube_longform_url_source"] = "supplied"
         if spotify_url is not None:
             ep["spotify_longform_url"] = spotify_url
-        ep_path.write_text(json.dumps(ep))
-        return channel_handle
+        ep["publish_approval"] = {
+            "revision": release_revision(episode_dir, ep, config=config),
+            "approved_at": "2026-01-01T00:02:00+00:00",
+        }
+        _write_json(ep_path, ep)
+        return config
 
     def _capture_upload_cmds(self, env, episode_dir, agent):
         captured = []
@@ -488,11 +522,11 @@ class TestYouTubeLongformFunnel:
         return captured
 
     def test_first_comment_sent_when_youtube_url_set(self, env, episode_dir):
-        self._seed_with_longform_url(
+        config = self._seed_with_longform_url(
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc123",
         )
-        agent = _make_agent(episode_dir)
+        agent = _make_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         # First call is the short upload
         short_cmd = captured[0]
@@ -510,12 +544,12 @@ class TestYouTubeLongformFunnel:
         assert "Full episode" in first_comment_flags[0]
 
     def test_first_comment_includes_spotify_when_set(self, env, episode_dir):
-        self._seed_with_longform_url(
+        config = self._seed_with_longform_url(
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc",
             spotify_url="https://open.spotify.com/episode/xyz",
         )
-        agent = _make_agent(episode_dir)
+        agent = _make_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
         flags = [
@@ -526,12 +560,12 @@ class TestYouTubeLongformFunnel:
         assert "Listen on Spotify" in first_comment
 
     def test_first_comment_includes_channel_handle(self, env, episode_dir):
-        self._seed_with_longform_url(
+        config = self._seed_with_longform_url(
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc",
+            channel_handle="@local-pod",
         )
-        agent = _make_agent(episode_dir)
-        agent.config["podcast"] = {"channel_handle": "@local-pod"}
+        agent = _make_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
         flags = [
@@ -543,7 +577,7 @@ class TestYouTubeLongformFunnel:
     def test_first_comment_skipped_when_no_youtube_url(self, env, episode_dir):
         # If user hasn't filled in the URL yet, we must NOT send an empty
         # first comment — that would post a useless empty pinned comment.
-        _seed_episode(episode_dir, publish_approved=True)
+        _seed_episode(episode_dir)
         agent = _make_agent(episode_dir)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
@@ -560,13 +594,26 @@ class TestYouTubeLongformFunnel:
         # longform re-upload. This is the two-phase flow: longform uploads on
         # the first publish run (URL not yet set), then on the SECOND run
         # (after URL is saved) only shorts upload.
-        self._seed_with_longform_url(
+        config = self._seed_with_longform_url(
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc",
         )
-        agent = _make_agent(episode_dir)
+        agent = _make_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         # Only 1 call: short upload. Longform upload is skipped by idempotency.
+        assert len(captured) == 1
+        assert "upload_video.mp4" not in " ".join(captured[0])
+
+    def test_receipt_url_keeps_the_approved_batch_current(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode["youtube_longform_url"] = "https://youtube.com/watch?v=receipt"
+        episode["youtube_longform_url_source"] = "upload_post_receipt"
+        _write_json(episode_path, episode)
+
+        captured = self._capture_upload_cmds(env, episode_dir, _make_agent(episode_dir))
+
         assert len(captured) == 1
         assert "upload_video.mp4" not in " ".join(captured[0])
 

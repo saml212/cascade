@@ -358,6 +358,8 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         ep["episode_description"] = req.episode_description
     if req.youtube_longform_url is not None:
         ep["youtube_longform_url"] = req.youtube_longform_url
+        ep["youtube_longform_url_source"] = "supplied"
+        ep.pop("youtube_longform_url_captured_at", None)
     if req.spotify_longform_url is not None:
         ep["spotify_longform_url"] = req.spotify_longform_url
     if req.link_tree_url is not None:

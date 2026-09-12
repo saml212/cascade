@@ -336,6 +336,28 @@ class TestUpdateEpisode:
             "tags": ["final"],
         }
 
+    def test_supplied_youtube_url_replaces_receipt_provenance(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "youtube_longform_url": "https://youtu.be/receipt",
+                "youtube_longform_url_source": "upload_post_receipt",
+                "youtube_longform_url_captured_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+
+        response = client.patch(
+            "/api/episodes/ep_001",
+            json={"youtube_longform_url": "https://youtu.be/supplied"},
+        )
+
+        assert response.status_code == 200
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert episode["youtube_longform_url_source"] == "supplied"
+        assert "youtube_longform_url_captured_at" not in episode
+
     def test_update_not_found(self, test_client):
         client, _ = test_client
         resp = client.patch("/api/episodes/nonexistent", json={"title": "X"})

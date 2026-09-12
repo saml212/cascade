@@ -1,11 +1,25 @@
 """Tests for pipeline API routes."""
 
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.test_routes_episodes import _create_episode
 
 pytest_plugins = ["tests.test_routes_episodes"]
+
+
+def _release_snapshot(*, upload_post=True, podcast_rss=False):
+    return {
+        "release_gate": {
+            "can_approve_publish": True,
+            "revision": "sha256:approved-plan",
+            "blockers": [],
+            "publish_plan": {
+                "upload_post": {"enabled": upload_post},
+                "podcast_rss": {"enabled": podcast_rss},
+            },
+        }
+    }
 
 
 class TestPipelineStatus:
@@ -164,6 +178,118 @@ class TestResumeAfterComplete:
         resp = client.post("/api/episodes/ep_001/resume-pipeline")
         assert resp.status_code == 200
         assert resp.json()["status"] == "already_complete"
+
+    def test_implicit_resume_excludes_publication_agents(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+
+        with patch("server.routes.pipeline.threading.Thread") as thread_class:
+            response = client.post("/api/episodes/ep_001/resume-pipeline", json={})
+
+        assert response.status_code == 200
+        remaining = response.json()["remaining_agents"]
+        assert "publish" not in remaining
+        assert "podcast_feed" not in remaining
+        assert thread_class.called
+
+
+class TestPublishApproval:
+    def test_dispatches_only_enabled_publication_agents(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"publish_approved": True, "publish_approved_at": "legacy"},
+        )
+
+        with (
+            patch("server.routes.pipeline.quality_snapshot") as snapshot,
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+            patch("agents.pipeline.run_pipeline") as run_pipeline,
+        ):
+            snapshot.return_value = _release_snapshot(
+                upload_post=True, podcast_rss=True
+            )
+            response = client.post("/api/episodes/ep_001/approve-publish")
+            thread_class.call_args.kwargs["target"]()
+
+        assert response.status_code == 200
+        assert run_pipeline.call_args.kwargs["agents"] == ["publish", "podcast_feed"]
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert episode["publish_approval"]["revision"] == "sha256:approved-plan"
+        assert (
+            episode["publish_approval"]["plan"]
+            == snapshot.return_value["release_gate"]["publish_plan"]
+        )
+        assert "publish_approved" not in episode
+        assert "publish_approved_at" not in episode
+
+    def test_rss_only_plan_dispatches_only_podcast_feed(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+
+        with (
+            patch("server.routes.pipeline.quality_snapshot") as snapshot,
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+            patch("agents.pipeline.run_pipeline") as run_pipeline,
+        ):
+            snapshot.return_value = _release_snapshot(
+                upload_post=False, podcast_rss=True
+            )
+            response = client.post("/api/episodes/ep_001/approve-publish")
+            thread_class.call_args.kwargs["target"]()
+
+        assert response.status_code == 200
+        assert run_pipeline.call_args.kwargs["agents"] == ["podcast_feed"]
+
+    def test_refuses_plan_without_destinations(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+
+        with (
+            patch("server.routes.pipeline.quality_snapshot") as snapshot,
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+        ):
+            snapshot.return_value = _release_snapshot(
+                upload_post=False, podcast_rss=False
+            )
+            response = client.post("/api/episodes/ep_001/approve-publish")
+
+        assert response.status_code == 409
+        assert not thread_class.called
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert "publish_approval" not in episode
+
+
+class TestUploadPostReceipts:
+    def test_captured_youtube_url_records_receipt_provenance(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "longform": {"status": "submitted", "request_id": "request-1"},
+                    "shorts": [],
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"youtube_url": "https://youtu.be/receipt"}
+        http_client = AsyncMock()
+        http_client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert episode["youtube_longform_url"] == "https://youtu.be/receipt"
+        assert episode["youtube_longform_url_source"] == "upload_post_receipt"
 
 
 class TestRunSingleAgent:

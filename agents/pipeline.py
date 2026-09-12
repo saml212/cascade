@@ -33,6 +33,7 @@ AGENT_DEPS = {
 }
 
 NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup", "thumbnail_gen"}
+EXPLICIT_PUBLICATION_AGENTS = frozenset({"podcast_feed", "publish"})
 
 
 def _cleanup_stitched_sources(episode_dir: Path) -> None:
@@ -79,7 +80,8 @@ def run_pipeline(
         speaker_count: Optional number of speakers — stored as metadata in episode.json
             for the frontend crop setup UI. Not used by pipeline agents directly.
         episode_id: Optional episode ID. If None, one is generated.
-        agents: Optional list of agent names to run. If None, runs all.
+        agents: Optional list of agent names to run. If None, runs the local
+            production pipeline and leaves publication for explicit approval.
 
     Returns:
         The final episode.json dict.
@@ -123,7 +125,13 @@ def run_pipeline(
         }
 
     # Determine which agents to run
-    agent_names = agents if agents else PIPELINE_ORDER
+    agent_names = (
+        list(agents)
+        if agents is not None
+        else [
+            name for name in PIPELINE_ORDER if name not in EXPLICIT_PUBLICATION_AGENTS
+        ]
+    )
 
     # Store which agents were requested and reset their completion status
     episode["pipeline"]["agents_requested"] = agent_names
@@ -134,7 +142,7 @@ def run_pipeline(
         for name, message in existing_errors.items()
         if name not in agent_names
     }
-    if agents:
+    if agents is not None:
         # Partial re-run: remove requested agents from completed list so they re-run cleanly
         prev_completed = episode["pipeline"].get("agents_completed", [])
         episode["pipeline"]["agents_completed"] = [

@@ -303,9 +303,9 @@ async def resume_pipeline(
     not already completed). This is what /produce relies on to gate
     paid-API stages: it dispatches subagents to produce clips.json /
     metadata.json, then resumes with an explicit list so the cost-locked
-    agents never run automatically. If `agents` is omitted we fall back to
-    'every remaining agent in order' for compatibility with the older UI
-    Save & Continue path.
+    agents never run automatically. If `agents` is omitted we run every
+    remaining local-production agent. Publication agents require an explicit
+    request and a current release approval.
     """
     logger.info("POST /api/episodes/%s/resume-pipeline", episode_id)
     async with _pipeline_lock:
@@ -327,9 +327,10 @@ async def resume_pipeline(
         source_path = episode.get("source_path", "")
 
         from agents import PIPELINE_ORDER
+        from agents.pipeline import EXPLICIT_PUBLICATION_AGENTS
 
-        requested = req.agents if req and req.agents else None
-        if requested:
+        requested = req.agents if req is not None else None
+        if requested is not None:
             unknown = [a for a in requested if a not in PIPELINE_ORDER]
             if unknown:
                 raise HTTPException(
@@ -341,7 +342,11 @@ async def resume_pipeline(
                 a for a in PIPELINE_ORDER if a in requested and a not in completed
             ]
         else:
-            remaining = [a for a in PIPELINE_ORDER if a not in completed]
+            remaining = [
+                agent
+                for agent in PIPELINE_ORDER
+                if agent not in completed and agent not in EXPLICIT_PUBLICATION_AGENTS
+            ]
 
         if not remaining:
             return {"status": "already_complete", "episode_id": episode_id}
@@ -498,11 +503,24 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
                 },
             )
         now = datetime.now(timezone.utc).isoformat()
-        episode["publish_approved"] = True
-        episode["publish_approved_at"] = now
+        plan = gate["publish_plan"]
+        publication_agents = []
+        if plan["upload_post"]["enabled"]:
+            publication_agents.append("publish")
+        if plan["podcast_rss"]["enabled"]:
+            publication_agents.append("podcast_feed")
+        if not publication_agents:
+            raise HTTPException(
+                status_code=409,
+                detail="No publication destinations are enabled",
+            )
+
+        episode.pop("publish_approved", None)
+        episode.pop("publish_approved_at", None)
         episode["publish_approval"] = {
             "revision": gate["revision"],
             "approved_at": now,
+            "plan": plan,
         }
         episode["status"] = "processing"
 
@@ -510,9 +528,13 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
 
         source_path = episode.get("source_path", "")
 
-        _start_pipeline_thread(episode_id, source_path, ["publish"])
+        _start_pipeline_thread(episode_id, source_path, publication_agents)
 
-    logger.info("Shorts publish approved and started for %s", episode_id)
+    logger.info(
+        "Publication approved and started for %s: %s",
+        episode_id,
+        publication_agents,
+    )
     return {"status": "shorts_publishing", "episode_id": episode_id}
 
 
@@ -611,6 +633,7 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
             url = _extract_youtube_url(data)
             if url:
                 episode["youtube_longform_url"] = url
+                episode["youtube_longform_url_source"] = "upload_post_receipt"
                 episode["youtube_longform_url_captured_at"] = datetime.now(
                     timezone.utc
                 ).isoformat()

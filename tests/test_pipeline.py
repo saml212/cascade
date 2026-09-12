@@ -9,11 +9,13 @@ import pytest
 from agents import AGENT_REGISTRY, PIPELINE_ORDER
 from agents.pipeline import (
     AGENT_DEPS,
+    EXPLICIT_PUBLICATION_AGENTS,
     NON_CRITICAL_AGENTS,
     _cleanup_stitched_sources,
     _has_name_slug,
     _save_episode,
     _slugify,
+    run_pipeline,
 )
 
 
@@ -120,6 +122,24 @@ class TestNonCriticalAgents:
         assert "clip_miner" not in NON_CRITICAL_AGENTS
         assert "longform_render" not in NON_CRITICAL_AGENTS
         assert "qa" not in NON_CRITICAL_AGENTS
+
+
+class TestExplicitPublicationAgents:
+    def test_default_pipeline_omits_external_publication(self, tmp_path, monkeypatch):
+        episodes_dir = tmp_path / "episodes"
+        monkeypatch.setenv("CASCADE_OUTPUT_DIR", str(episodes_dir))
+
+        with (
+            patch("agents.pipeline.PIPELINE_ORDER", ["podcast_feed", "publish"]),
+            patch(
+                "agents.pipeline.load_config",
+                return_value={"paths": {"output_dir": str(episodes_dir)}},
+            ),
+        ):
+            result = run_pipeline("/tmp/source", episode_id="ep_test")
+
+        assert result["pipeline"]["agents_requested"] == []
+        assert EXPLICIT_PUBLICATION_AGENTS == {"podcast_feed", "publish"}
 
 
 class TestSlugify:
