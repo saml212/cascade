@@ -241,11 +241,11 @@ function videoDetails(
         h('div', { class: 'text-body-sm text-ink-tertiary mt-1' },
           busy
             ? `${delivery.video_detail || 'Encoding'} · ${(delivery.video_progress ?? 0).toFixed(0)}%`
-            : video?.render_mode === 'speaker_cut'
+            : videoState === 'ready' && video?.render_mode === 'speaker_cut'
               ? 'Speaker-cut 1080p render with saved edits and mastered audio.'
-              : delivery.delivery_apply_lut
-                ? 'Existing wide render with saved edits, camera LUT, and mastered audio.'
-                : 'Existing wide render with saved edits, source color, and mastered audio.'
+              : videoState === 'ready'
+                ? 'An earlier render is available. Prepare again to build the current speaker-cut 1080p video.'
+                : 'Prepare a speaker-cut 1080p video with the saved edits and mastered audio.'
         )
       ),
       Button({
@@ -384,7 +384,11 @@ function statusLabel(status?: DeliveryStatus['status']): string {
 
 function statusDetail(status: DeliveryStatus | null): string {
   if (!status) return 'Reading the current local artifacts and checks.';
-  if (status.status === 'not_prepared') return 'No local podcast master has been prepared yet.';
+  if (status.status === 'not_prepared') {
+    return status.stale && status.download_url
+      ? 'A previous local podcast master is available, but its inputs changed. Prepare again to make it current.'
+      : 'No local podcast master has been prepared yet.';
+  }
   if (status.status === 'preparing') return 'Mixing, mastering, encoding, and checking the finished MP3.';
   if (status.status === 'failed') return 'Fix the issue below, then prepare the episode again.';
   return status.completed_at
