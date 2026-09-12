@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -271,24 +272,36 @@ class LongformRenderAgent(BaseAgent):
             progress_total,
             "Reusing verified video pixels and muxing canonical audio",
         )
-        media = mux_timeline_audio(
-            output,
-            audio,
-            output,
-            timeline,
-            audio_bitrate=encoding["audio_bitrate"],
-            runner=self._run_ffmpeg,
+        descriptor, staged_name = tempfile.mkstemp(
+            prefix=".upload_video-trim-reuse-",
+            suffix=".mp4",
+            dir=self.episode_dir,
         )
-        media.update(
-            encoder=encoder_args[1],
-            edit_count=len(episode.get("longform_edits", [])),
-            segment_count=len(render_segments),
-            expected_duration_seconds=round(timeline.duration, 3),
-        )
-        self.report_progress(1, progress_total, "Measuring output loudness")
-        loudness = measure_loudness(output)
-        if loudness:
-            media["audio_loudness"] = loudness
+        os.close(descriptor)
+        staged = Path(staged_name)
+        staged.unlink()
+        try:
+            media = mux_timeline_audio(
+                output,
+                audio,
+                staged,
+                timeline,
+                audio_bitrate=encoding["audio_bitrate"],
+                runner=self._run_ffmpeg,
+            )
+            media.update(
+                encoder=encoder_args[1],
+                edit_count=len(episode.get("longform_edits", [])),
+                segment_count=len(render_segments),
+                expected_duration_seconds=round(timeline.duration, 3),
+            )
+            self.report_progress(1, progress_total, "Measuring output loudness")
+            loudness = measure_loudness(staged)
+            if loudness:
+                media["audio_loudness"] = loudness
+            os.replace(staged, output)
+        finally:
+            staged.unlink(missing_ok=True)
         input_fingerprint = longform_trim_reuse_fingerprint(
             self.episode_dir,
             episode,

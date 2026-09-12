@@ -9,6 +9,7 @@ import pytest
 from agents.longform_render import LongformRenderAgent
 from lib.delivery_video import render_space_budget
 from lib.encoding import get_video_encoding_policy
+from lib.timeline import Timeline
 
 
 @pytest.fixture
@@ -466,7 +467,8 @@ def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segment
     }
 
     def fake_mux(video, _audio, destination, timeline, **_kwargs):
-        assert video == destination == output
+        assert video == output
+        assert destination != output
         assert timeline.keep_intervals == ((0.0, 2.0),)
         destination.write_bytes(b"shortened mux")
         return {
@@ -519,6 +521,7 @@ def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segment
         {"output_bytes": len(b"verified prior render"), "scratch_bytes": 0},
     )
     assert result["reused"] is True
+    assert output.read_bytes() == b"shortened mux"
     assert result["manifest"]["provenance"]["video_reuse"] == {
         "mode": "verified_terminal_prefix",
         "source_render_fingerprint": "verified-prior-fingerprint",
@@ -531,3 +534,55 @@ def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segment
         "Longform render complete",
     ]
     assert all(percent < 100 for percent, _ in progress[:-1])
+
+
+def test_terminal_prefix_verification_failure_preserves_reviewed_output(
+    agent, tmp_episode_dir
+):
+    output = tmp_episode_dir / "upload_video.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    caption = tmp_episode_dir / "subtitles" / "longform.ass"
+    output.write_bytes(b"reviewed master")
+    audio.write_bytes(b"audio")
+    caption.write_text("captions")
+
+    def fake_mux(_video, _audio, destination, _timeline, **_kwargs):
+        destination.write_bytes(b"unverified replacement")
+        return {
+            "duration_seconds": 2,
+            "audio_duration_seconds": 2,
+            "video_duration_seconds": 2,
+            "width": 160,
+            "height": 90,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+        }
+
+    with (
+        patch("agents.longform_render.require_render_space"),
+        patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
+        patch(
+            "agents.longform_render.measure_loudness",
+            side_effect=RuntimeError("verification failed"),
+        ),
+        pytest.raises(RuntimeError, match="verification failed"),
+    ):
+        agent._reuse_terminal_prefix(
+            {"longform_edits": [{"type": "trim_end", "seconds": 2}]},
+            audio,
+            [{"start": 0, "end": 3, "speaker": "speaker_0"}],
+            Timeline.from_edits(3, [{"type": "trim_end", "seconds": 2}]),
+            "new-fingerprint",
+            caption,
+            {"path": "subtitles/longform.ass", "burned_in": False},
+            [{"start": 0, "end": 2, "speaker": "speaker_0"}],
+            {"audio_bitrate": "192k"},
+            ["-c:v", "libx264"],
+            {
+                "fingerprint": "old-fingerprint",
+                "output": {"size_bytes": len(b"reviewed master")},
+            },
+        )
+
+    assert output.read_bytes() == b"reviewed master"
+    assert not list(tmp_episode_dir.glob(".upload_video-trim-reuse-*.mp4"))
