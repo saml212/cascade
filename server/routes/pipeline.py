@@ -29,6 +29,30 @@ _cancel_requested = set()  # type: set
 _pipeline_lock = asyncio.Lock()
 
 
+def _start_pipeline_thread(
+    episode_id: str,
+    source_path: str,
+    agents: list[str] | None,
+    *,
+    audio_path: str | None = None,
+) -> None:
+    """Start and register one background pipeline with a single launch contract."""
+
+    def _run() -> None:
+        from agents.pipeline import run_pipeline
+
+        run_pipeline(
+            source_path=source_path,
+            audio_path=audio_path,
+            episode_id=episode_id,
+            agents=agents,
+        )
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    _running[episode_id] = thread
+
+
 def _current_longform_for_approval(episode_dir: Path, episode: dict) -> dict | None:
     """Resolve the canonical current render required by editorial approval."""
     from agents.pipeline import load_config
@@ -143,19 +167,12 @@ async def run_pipeline_endpoint(
                 detail="source_path required (not found in request or episode.json)",
             )
 
-        def _run():
-            from agents.pipeline import run_pipeline
-
-            run_pipeline(
-                source_path=source_path,
-                audio_path=audio_path,
-                episode_id=episode_id,
-                agents=req.agents,
-            )
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        _running[episode_id] = thread
+        _start_pipeline_thread(
+            episode_id,
+            source_path,
+            req.agents,
+            audio_path=audio_path,
+        )
 
     logger.info("Pipeline started for %s", episode_id)
     return {"status": "started", "episode_id": episode_id}
@@ -329,18 +346,7 @@ async def resume_pipeline(
         if not remaining:
             return {"status": "already_complete", "episode_id": episode_id}
 
-        def _run():
-            from agents.pipeline import run_pipeline
-
-            run_pipeline(
-                source_path=source_path,
-                episode_id=episode_id,
-                agents=remaining,
-            )
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        _running[episode_id] = thread
+        _start_pipeline_thread(episode_id, source_path, remaining)
 
     logger.info("Pipeline resumed for %s with agents: %s", episode_id, remaining)
     return {
@@ -401,18 +407,7 @@ async def approve_backup(episode_id: str) -> PipelineActionResponse:
         # Resume pipeline with just backup
         source_path = episode.get("source_path", "")
 
-        def _run():
-            from agents.pipeline import run_pipeline
-
-            run_pipeline(
-                source_path=source_path,
-                episode_id=episode_id,
-                agents=["backup"],
-            )
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        _running[episode_id] = thread
+        _start_pipeline_thread(episode_id, source_path, ["backup"])
 
     logger.info("Backup approved and started for %s", episode_id)
     return {"status": "backup_started", "episode_id": episode_id}
@@ -456,24 +451,17 @@ async def approve_longform(episode_id: str) -> PipelineActionResponse:
 
         source_path = episode.get("source_path", "")
 
-        def _run():
-            from agents.pipeline import run_pipeline
-
-            run_pipeline(
-                source_path=source_path,
-                episode_id=episode_id,
-                agents=[
-                    "clip_miner",
-                    "shorts_render",
-                    "metadata_gen",
-                    "thumbnail_gen",
-                    "qa",
-                ],
-            )
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        _running[episode_id] = thread
+        _start_pipeline_thread(
+            episode_id,
+            source_path,
+            [
+                "clip_miner",
+                "shorts_render",
+                "metadata_gen",
+                "thumbnail_gen",
+                "qa",
+            ],
+        )
 
     logger.info("Longform approved; local clip production started for %s", episode_id)
     return {"status": "approved", "episode_id": episode_id}
@@ -522,18 +510,7 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
 
         source_path = episode.get("source_path", "")
 
-        def _run():
-            from agents.pipeline import run_pipeline
-
-            run_pipeline(
-                source_path=source_path,
-                episode_id=episode_id,
-                agents=["publish"],
-            )
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        _running[episode_id] = thread
+        _start_pipeline_thread(episode_id, source_path, ["publish"])
 
     logger.info("Shorts publish approved and started for %s", episode_id)
     return {"status": "shorts_publishing", "episode_id": episode_id}

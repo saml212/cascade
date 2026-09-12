@@ -48,15 +48,29 @@ class TestRunPipeline:
         # Mock the pipeline run to avoid actual execution
         from unittest.mock import patch
 
-        with patch("server.routes.pipeline.threading.Thread") as mock_thread:
+        with (
+            patch("server.routes.pipeline.threading.Thread") as mock_thread,
+            patch("agents.pipeline.run_pipeline") as run_pipeline,
+        ):
             mock_instance = mock_thread.return_value
             mock_instance.is_alive.return_value = False
             resp = client.post(
                 "/api/episodes/ep_001/run-pipeline",
-                json={"source_path": "/tmp/test_source"},
+                json={
+                    "source_path": "/tmp/test_source",
+                    "audio_path": "/tmp/test_audio",
+                    "agents": ["ingest"],
+                },
             )
+            mock_thread.call_args.kwargs["target"]()
         assert resp.status_code == 200
         assert resp.json()["status"] == "started"
+        assert run_pipeline.call_args.kwargs == {
+            "source_path": "/tmp/test_source",
+            "audio_path": "/tmp/test_audio",
+            "episode_id": "ep_001",
+            "agents": ["ingest"],
+        }
 
 
 class TestCancelPipeline:
