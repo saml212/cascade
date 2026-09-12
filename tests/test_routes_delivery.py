@@ -401,7 +401,7 @@ def test_worker_persists_verified_ready_status(delivery):
     assert status["status"] == "ready"
     assert status["duration_seconds"] == 3600.25
     assert status["integrated_lufs"] == -16.0
-    assert status["download_url"].endswith("/delivery/audio")
+    assert "/delivery/audio?v=" in status["download_url"]
     assert "ep_test" not in mod._running
 
 
@@ -446,6 +446,7 @@ def test_video_worker_delegates_to_canonical_speaker_cut_renderer(delivery):
     assert render.call_args.kwargs["progress"]
     status = json.loads((episode_dir / "delivery.json").read_text())
     assert status["video_source_fingerprint"] == "canonical-fingerprint"
+    assert "/delivery/video?v=" in status["video_download_url"]
 
 
 def test_video_audio_repair_worker_uses_public_packet_copy_adapter(delivery):
@@ -577,6 +578,7 @@ def test_status_marks_changed_output_stale(delivery):
     response = client.get("/api/episodes/ep_test/delivery")
     assert response.json()["status"] == "not_prepared"
     assert response.json()["stale"] is True
+    assert "/delivery/audio?v=" in response.json()["download_url"]
 
 
 def test_status_marks_legacy_source_only_audio_proof_stale(delivery):
@@ -673,6 +675,7 @@ def test_status_validates_ready_video_against_selected_repair(delivery):
 
     assert response.status_code == 200
     assert response.json()["video_status"] == "ready"
+    assert "/delivery/video?v=" in response.json()["video_download_url"]
     assert check.call_args.args[3] == selected
 
 

@@ -101,6 +101,11 @@ def _file_stat(path: Path) -> dict:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def _artifact_download_url(episode_id: str, artifact: str, output_stat: dict) -> str:
+    revision = f"{int(output_stat['size']):x}-{int(output_stat['mtime_ns']):x}"
+    return f"/api/episodes/{episode_id}/delivery/{artifact}?v={revision}"
+
+
 def _legacy_source_fingerprint(
     episode_dir: Path, episode: dict, config: dict | None = None
 ) -> str:
@@ -289,6 +294,10 @@ def _refresh_status(episode_dir: Path) -> dict:
     elif status.get("status") == "ready":
         audio_input_error = None
         try:
+            output_stat = _file_stat(episode_dir / "podcast_audio.mp3")
+            status["download_url"] = _artifact_download_url(
+                episode_id, "audio", output_stat
+            )
             stored_fingerprint = status.get("source_fingerprint")
             current_fingerprint = _source_fingerprint(episode_dir, episode, config)
             audio_path = current_podcast_audio(
@@ -296,7 +305,7 @@ def _refresh_status(episode_dir: Path) -> dict:
             )
             stale = (
                 audio_path is None
-                or status.get("output_stat") != _file_stat(audio_path)
+                or status.get("output_stat") != output_stat
                 or stored_fingerprint != current_fingerprint
             )
         except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -327,6 +336,10 @@ def _refresh_status(episode_dir: Path) -> dict:
         video_path = episode_dir / "upload_video.mp4"
         video_input_error = None
         try:
+            video_output_stat = _file_stat(video_path)
+            status["video_download_url"] = _artifact_download_url(
+                episode_id, "video", video_output_stat
+            )
             audio_path = selected_audio_source(episode_dir, episode, config) or (
                 episode_dir / "work" / "audio_mix.wav"
             )
@@ -336,7 +349,7 @@ def _refresh_status(episode_dir: Path) -> dict:
             video_stale = (
                 not video_path.exists()
                 or not expected_fingerprint
-                or status.get("video_output_stat") != _file_stat(video_path)
+                or status.get("video_output_stat") != video_output_stat
                 or status.get("video_source_fingerprint") != expected_fingerprint
             )
             video_audio = _video_audio_status(episode_dir, config)
@@ -453,13 +466,16 @@ def _prepare_delivery(episode_id: str) -> None:
                 f"Podcast true peak is {true_peak:.1f} dBFS; expected at most -0.5 dBFS"
             )
 
+        output_stat = _file_stat(audio_path)
         result = {
             "status": "ready",
             "episode_id": episode_id,
             "started_at": started_at,
             "completed_at": _now(),
             "filename": audio_path.name,
-            "download_url": f"/api/episodes/{episode_id}/delivery/audio",
+            "download_url": _artifact_download_url(
+                episode_id, "audio", output_stat
+            ),
             "size_bytes": audio_path.stat().st_size,
             "duration_seconds": round(duration, 3),
             "expected_duration_seconds": round(float(expected_duration), 3),
@@ -467,7 +483,7 @@ def _prepare_delivery(episode_id: str) -> None:
             **loudness,
             "target_lufs": target_lufs,
             "source_fingerprint": source_fingerprint,
-            "output_stat": _file_stat(audio_path),
+            "output_stat": output_stat,
             "notes": [
                 "Local file only; nothing has been uploaded or published.",
                 "Duration, integrated loudness, loudness range, and true peak passed automated checks.",
@@ -511,13 +527,16 @@ def _prepare_video(episode_id: str, *, repair_audio: bool = False) -> None:
         operation = repair_longform_audio if repair_audio else render_longform
         video = operation(episode_dir, config, progress=progress)
         status = _read_status(episode_dir)
+        video_output_stat = _file_stat(episode_dir / "upload_video.mp4")
         status.update(
             video_status="ready",
             video_progress=100.0,
             video_completed_at=_now(),
-            video_download_url=f"/api/episodes/{episode_id}/delivery/video",
+            video_download_url=_artifact_download_url(
+                episode_id, "video", video_output_stat
+            ),
             video_source_fingerprint=video["render_fingerprint"],
-            video_output_stat=_file_stat(episode_dir / "upload_video.mp4"),
+            video_output_stat=video_output_stat,
             video=video,
             video_operation="repair_audio" if repair_audio else "render",
             video_repair_required=False,
