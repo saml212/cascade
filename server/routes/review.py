@@ -37,9 +37,11 @@ from lib.atomic_write import atomic_write_json
 from lib.audio_mix import json_fingerprint, selected_audio_source
 from lib.clips import clip_selection_status
 from lib.delivery_video import (
+    capture_transcript_render_reuse_proof,
     current_longform_render,
     current_short_render,
     longform_render_fingerprint,
+    migrate_unchanged_transcript_render_fingerprints,
     read_render_manifest,
     render_artifact_state,
     short_render_fingerprint,
@@ -71,6 +73,7 @@ _DERIVED_TRANSCRIPT_ARTIFACTS = (
     "transcript_provenance.json",
     "subtitles/transcript.srt",
     "segments.json",
+    "render_manifest.json",
 )
 
 
@@ -192,6 +195,43 @@ def _snapshot_transcript_artifacts(episode_dir: Path) -> dict[Path, bytes | None
     return {path: path.read_bytes() if path.exists() else None for path in paths}
 
 
+def _transcript_render_inputs(
+    episode_dir: Path, episode: dict, config: dict
+) -> tuple[Path, list[dict], list[dict]] | None:
+    try:
+        audio = selected_audio_source(episode_dir, episode, config) or (
+            episode_dir / "work" / "audio_mix.wav"
+        )
+        plan = current_speaker_segments(episode_dir, episode, config)
+        segments = plan.get("segments", []) if plan else []
+        clips = _stored_clips(episode_dir)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return None
+    if not audio.is_file() or not segments:
+        return None
+    return audio, segments, clips
+
+
+def _capture_transcript_render_reuse(
+    episode_dir: Path, episode: dict, config: dict
+) -> dict | None:
+    inputs = _transcript_render_inputs(episode_dir, episode, config)
+    if inputs is None:
+        return None
+    return capture_transcript_render_reuse_proof(episode_dir, episode, config, *inputs)
+
+
+def _migrate_transcript_render_reuse(
+    episode_dir: Path, episode: dict, config: dict, proof: dict | None
+) -> dict | None:
+    inputs = _transcript_render_inputs(episode_dir, episode, config)
+    if proof is None or inputs is None:
+        return None
+    return migrate_unchanged_transcript_render_fingerprints(
+        episode_dir, episode, config, *inputs, proof
+    )
+
+
 def _transcript_media_state(episode_dir: Path) -> dict:
     before = transcript_repair_revisions(episode_dir)
     source = episode_dir / "source_merged.mp4"
@@ -285,6 +325,18 @@ def _apply_transcript_clock_repair(
                 "Transcript repair inputs changed; inspect the repair state again"
             )
 
+        episode = _read_json(episode_dir / "episode.json", {})
+        render_reuse_proof = _capture_transcript_render_reuse(
+            episode_dir, episode, config
+        )
+        if request.expected_binding_revision != _transcript_binding_revision(
+            episode_dir, before
+        ):
+            raise _TranscriptRevisionConflict(
+                "Transcript repair inputs changed during render inspection; "
+                "inspect the repair state again"
+            )
+
         mapping = build_transcript_clock_mapping(
             episode_dir,
             source_seconds_per_asr_second=request.source_seconds_per_asr_second,
@@ -311,7 +363,6 @@ def _apply_transcript_clock_repair(
                 raise RuntimeError(
                     "Transcript or source media changed during local repair"
                 )
-            episode = _read_json(episode_dir / "episode.json", {})
             if current_diarized_transcript(episode_dir, episode, config) is None:
                 raise RuntimeError(
                     "Repaired transcript did not pass currentness checks"
@@ -342,6 +393,9 @@ def _apply_transcript_clock_repair(
                         "Current speaker plan is missing reviewed crop targets: "
                         + ", ".join(missing_targets)
                     )
+            render_reuse = _migrate_transcript_render_reuse(
+                episode_dir, episode, config, render_reuse_proof
+            )
         except BaseException:
             try:
                 inputs_unchanged = json_fingerprint(
@@ -366,6 +420,7 @@ def _apply_transcript_clock_repair(
             ),
             "speaker_alignment": result.get("speaker_alignment"),
             "speaker_map": result.get("speaker_map", []),
+            "render_reuse": render_reuse,
             "raw_transcript_unchanged": True,
             "source_media_unchanged": True,
         }
@@ -445,9 +500,17 @@ def _apply_transcript_corrections(
                 "updated_ids": [],
                 "unchanged_ids": unchanged_ids,
                 "speaker_alignment": None,
+                "render_reuse": None,
             }
 
         corrections = {**corrections, "operations": operations}
+        render_reuse_proof = _capture_transcript_render_reuse(
+            episode_dir, episode, config
+        )
+        if file_revision(transcript_path) != current_revision:
+            raise _TranscriptRevisionConflict(
+                "Transcript changed during render inspection; inspect it again"
+            )
         snapshot = _snapshot_transcript_artifacts(episode_dir)
         try:
             atomic_write_json(episode_dir / "transcript_corrections.json", corrections)
@@ -469,6 +532,9 @@ def _apply_transcript_corrections(
                 raise RuntimeError(
                     "Rebuilt speaker alignment did not pass currentness checks"
                 )
+            render_reuse = _migrate_transcript_render_reuse(
+                episode_dir, episode, config, render_reuse_proof
+            )
         except BaseException:
             try:
                 raw_changed = (
@@ -495,6 +561,7 @@ def _apply_transcript_corrections(
             "updated_ids": updated_ids,
             "unchanged_ids": unchanged_ids,
             "speaker_alignment": result.get("speaker_alignment"),
+            "render_reuse": render_reuse,
         }
 
 

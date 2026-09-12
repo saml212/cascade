@@ -726,6 +726,39 @@ def test_transcript_clock_repair_rejects_stale_raw_source_and_episode_guards(
     assert not (episode_dir / "transcript_provenance.json").exists()
 
 
+def test_transcript_clock_repair_rechecks_revision_after_render_inspection(
+    test_client, monkeypatch
+):
+    client, episode_dir, _, _, _, guards, review = _transcript_clock_repair_fixture(
+        test_client, monkeypatch
+    )
+    repaired = []
+
+    def change_episode_during_capture(*_args):
+        path = episode_dir / "episode.json"
+        episode = json.loads(path.read_text())
+        episode["title"] = "Concurrent change"
+        path.write_text(json.dumps(episode))
+
+    monkeypatch.setattr(
+        review, "_capture_transcript_render_reuse", change_episode_during_capture
+    )
+    monkeypatch.setattr(
+        review,
+        "repair_existing_transcript",
+        lambda *_args, **_kwargs: repaired.append(True),
+    )
+
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/repair",
+        json=_clock_repair_request(guards),
+    )
+
+    assert response.status_code == 409
+    assert "during render inspection" in response.json()["detail"]
+    assert repaired == []
+
+
 def test_transcript_clock_repair_restores_derived_artifacts_on_failure(
     test_client, monkeypatch
 ):
@@ -737,6 +770,7 @@ def test_transcript_clock_repair_restores_derived_artifacts_on_failure(
         "transcript_provenance.json",
         "subtitles/transcript.srt",
         "segments.json",
+        "render_manifest.json",
     )
     for name in artifact_names:
         path = episode_dir / name
@@ -798,8 +832,33 @@ def test_transcript_correction_api_upserts_without_losing_existing_operations(
             (directory / "diarized_transcript.json").read_text()
         ),
     )
+    canonical_audio = episode_dir / "work" / "audio_mix.wav"
+    canonical_audio.parent.mkdir(exist_ok=True)
+    canonical_audio.write_bytes(b"canonical audio")
+    current_plan = {"segments": [{"speaker": "speaker_0", "start": 0, "end": 5}]}
+    monkeypatch.setattr(review, "current_speaker_segments", lambda *_args: current_plan)
+    events = []
+
+    def capture(*args):
+        events.append(("capture", args[0]))
+        return {"version": "verified-transcript-rebind/v1", "renders": [{}]}
+
+    def migrate(*args):
+        events.append(("migrate", args[0]))
+        return {
+            "version": "verified-transcript-rebind/v1",
+            "manifest_updated": True,
+            "longform_migrated": True,
+            "shorts_migrated": [],
+        }
+
+    monkeypatch.setattr(review, "capture_transcript_render_reuse_proof", capture)
+    monkeypatch.setattr(
+        review, "migrate_unchanged_transcript_render_fingerprints", migrate
+    )
 
     def rebuild(directory, _config):
+        events.append(("rebuild", directory))
         corrections = json.loads(
             (directory / "transcript_corrections.json").read_text()
         )
@@ -845,6 +904,8 @@ def test_transcript_correction_api_upserts_without_losing_existing_operations(
     assert response.json()["updated_ids"] == ["existing"]
     assert response.json()["correction_count"] == 2
     assert response.json()["revision"] != expected_revision
+    assert response.json()["render_reuse"]["longform_migrated"] is True
+    assert [event[0] for event in events] == ["capture", "rebuild", "migrate"]
     stored = json.loads((episode_dir / "transcript_corrections.json").read_text())
     assert stored["review_note"] == "preserve me"
     assert [operation["id"] for operation in stored["operations"]] == [
@@ -904,6 +965,7 @@ def test_transcript_correction_api_preserves_a_concurrent_transcript_generation(
         "transcript_provenance.json",
         "subtitles/transcript.srt",
         "segments.json",
+        "render_manifest.json",
     )
     for name in artifact_names:
         path = episode_dir / name
@@ -950,6 +1012,7 @@ def test_transcript_correction_api_restores_derived_artifacts_on_local_failure(
         "transcript_provenance.json",
         "subtitles/transcript.srt",
         "segments.json",
+        "render_manifest.json",
     )
     for name in artifact_names:
         path = episode_dir / name
@@ -977,6 +1040,60 @@ def test_transcript_correction_api_restores_derived_artifacts_on_local_failure(
     )
 
     assert response.status_code == 422
+    assert not (episode_dir / "transcript_corrections.json").exists()
+    for name in artifact_names:
+        assert (episode_dir / name).read_text() == f"original {name}"
+
+
+def test_transcript_correction_api_rolls_back_render_reuse_failure(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    (episode_dir / "transcript.json").write_text("unchanged raw")
+    artifact_names = (
+        "diarized_transcript.json",
+        "transcript_provenance.json",
+        "subtitles/transcript.srt",
+        "segments.json",
+        "render_manifest.json",
+    )
+    for name in artifact_names:
+        path = episode_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original {name}")
+
+    from lib.media_inspection import file_revision
+    from server.routes import review
+
+    monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})
+
+    def rebuild(directory, _config):
+        for name in artifact_names[:-1]:
+            (directory / name).write_text(f"changed {name}")
+        return {"speaker_alignment": None}
+
+    def fail_migration(directory, *_args):
+        (directory / "render_manifest.json").write_text("changed manifest")
+        raise OSError("manifest update failed")
+
+    monkeypatch.setattr(review, "repair_existing_transcript", rebuild)
+    monkeypatch.setattr(
+        review, "_capture_transcript_render_reuse", lambda *_args: {"renders": [{}]}
+    )
+    monkeypatch.setattr(review, "_migrate_transcript_render_reuse", fail_migration)
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/corrections",
+        json={
+            "expected_revision": file_revision(
+                episode_dir / "diarized_transcript.json"
+            ),
+            "operations": [{"id": "new", "op": "replace_word"}],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "manifest update failed"
     assert not (episode_dir / "transcript_corrections.json").exists()
     for name in artifact_names:
         assert (episode_dir / name).read_text() == f"original {name}"
