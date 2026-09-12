@@ -30,6 +30,7 @@ _COPYFILE_STAT = 1 << 1
 _COPYFILE_XATTR = 1 << 2
 _COPYFILE_METADATA = _COPYFILE_ACL | _COPYFILE_STAT | _COPYFILE_XATTR
 _RENAME_SWAP = 0x00000002
+_RENAME_EXCL = 0x00000004
 _RENAME_NOFOLLOW_ANY = 0x00000010
 
 _libc = ctypes.CDLL(None, use_errno=True)
@@ -299,6 +300,197 @@ def assert_snapshot(path: str | Path, expected: dict) -> dict:
     actual = snapshot_path(path)
     _assert_snapshot(actual, expected)
     return actual
+
+
+def clone_to_new_path(source: dict, destination: str | Path) -> dict:
+    """Create and verify an independent APFS clone at an unused path."""
+    _require_macos()
+    src = _absolute_path(source["path"])
+    dst = _absolute_path(destination)
+    if src == dst:
+        raise CloneSafetyError("source and destination paths must differ")
+
+    with (
+        _open_regular(src) as (src_dir, src_name, src_fd),
+        _open_directory(dst.parent) as dst_dir,
+    ):
+        src_actual = snapshot_fd(src_fd, src)
+        _assert_snapshot(src_actual, source)
+        src_signature = _stat_signature(os.fstat(src_fd))
+        if src_actual["device"] != os.fstat(dst_dir).st_dev:
+            raise CloneSafetyError(
+                "source and destination are on different filesystems"
+            )
+
+        dst_name = os.fsencode(dst.name)
+        clone_fd = None
+        clone_inode = None
+        try:
+            try:
+                _checked_call(
+                    _fclonefileat,
+                    "fclonefileat",
+                    src_fd,
+                    dst_dir,
+                    dst_name,
+                    _CLONE_ACL | _CLONE_NOFOLLOW_ANY,
+                )
+            except OSError as error:
+                if error.errno in {
+                    errno.ENOSPC,
+                    errno.ENOTSUP,
+                    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                    errno.EXDEV,
+                }:
+                    raise CloneSafetyError(
+                        f"clone unavailable; no byte-copy fallback used: {error}"
+                    ) from error
+                raise
+            clone_inode = os.stat(
+                dst_name, dir_fd=dst_dir, follow_symlinks=False
+            ).st_ino
+
+            clone_fd = os.open(
+                dst_name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=dst_dir,
+            )
+            os.fsync(clone_fd)
+            cloned = snapshot_fd(clone_fd, dst)
+            if cloned["inode"] != clone_inode:
+                raise StaleFileError(f"destination changed during clone: {dst}")
+            if cloned["sha256"] != src_actual["sha256"]:
+                raise CloneSafetyError("cloned content hash does not match source")
+            differences, system_xattr_changes = _metadata_differences(
+                cloned, src_actual
+            )
+            if differences:
+                raise CloneSafetyError(
+                    "clone does not preserve source metadata: " + ", ".join(differences)
+                )
+            if cloned["inode"] == src_actual["inode"]:
+                raise CloneSafetyError("clone did not create an independent inode")
+            _assert_directory_anchor(src_dir, src)
+            _assert_directory_anchor(dst_dir, dst)
+            _assert_open_file(
+                src_fd,
+                src_dir,
+                src_name,
+                src,
+                "during clone",
+                src_signature,
+            )
+            _assert_open_file(clone_fd, dst_dir, dst_name, dst, "during clone")
+            os.fsync(dst_dir)
+            cloned["system_xattr_changes"] = system_xattr_changes
+            return cloned
+        except BaseException:
+            if clone_inode is not None:
+                try:
+                    current = os.stat(dst_name, dir_fd=dst_dir, follow_symlinks=False)
+                    if current.st_ino == clone_inode:
+                        os.unlink(dst_name, dir_fd=dst_dir)
+                        os.fsync(dst_dir)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            if clone_fd is not None:
+                os.close(clone_fd)
+
+
+def move_to_new_path(source: dict, destination: str | Path) -> dict:
+    """Atomically move the snapshotted file to an unused path."""
+    _require_macos()
+    src = _absolute_path(source["path"])
+    dst = _absolute_path(destination)
+    if src == dst:
+        raise CloneSafetyError("source and destination paths must differ")
+
+    with (
+        _open_regular(src) as (src_dir, src_name, src_fd),
+        _open_directory(dst.parent) as dst_dir,
+    ):
+        before = os.fstat(src_fd)
+        _validate_stat(before, src)
+        checked = {
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "mode": stat.S_IMODE(before.st_mode),
+            "uid": before.st_uid,
+            "gid": before.st_gid,
+            "size_bytes": before.st_size,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+            "flags": getattr(before, "st_flags", 0),
+            "xattrs": _xattr_snapshot(src_fd),
+        }
+        changed = [key for key, value in checked.items() if source.get(key) != value]
+        if changed:
+            raise StaleFileError(
+                f"file no longer matches snapshot: {src} ({', '.join(changed)})"
+            )
+        if before.st_dev != os.fstat(dst_dir).st_dev:
+            raise CloneSafetyError(
+                "source and destination are on different filesystems"
+            )
+        signature = _stat_signature(before)
+        dst_name = os.fsencode(dst.name)
+        moved = False
+        try:
+            _assert_directory_anchor(src_dir, src)
+            _assert_directory_anchor(dst_dir, dst)
+            _assert_open_file(src_fd, src_dir, src_name, src, "before move", signature)
+            _checked_call(
+                _renameatx_np,
+                "renameatx_np exclusive move",
+                src_dir,
+                src_name,
+                dst_dir,
+                dst_name,
+                _RENAME_EXCL | _RENAME_NOFOLLOW_ANY,
+            )
+            moved = True
+            _assert_directory_anchor(src_dir, src)
+            _assert_directory_anchor(dst_dir, dst)
+            _assert_open_file(src_fd, dst_dir, dst_name, dst, "during move")
+            try:
+                os.stat(src_name, dir_fd=src_dir, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise StaleFileError(f"source path still exists after move: {src}")
+            os.fsync(src_dir)
+            if os.fstat(src_dir).st_ino != os.fstat(dst_dir).st_ino:
+                os.fsync(dst_dir)
+            after = os.fstat(src_fd)
+            return {
+                **source,
+                "path": str(dst),
+                "ctime_ns": after.st_ctime_ns,
+                "allocated_bytes": after.st_blocks * 512,
+            }
+        except BaseException:
+            if moved:
+                try:
+                    _checked_call(
+                        _renameatx_np,
+                        "renameatx_np move rollback",
+                        dst_dir,
+                        dst_name,
+                        src_dir,
+                        src_name,
+                        _RENAME_EXCL | _RENAME_NOFOLLOW_ANY,
+                    )
+                    os.fsync(src_dir)
+                    if os.fstat(src_dir).st_ino != os.fstat(dst_dir).st_ino:
+                        os.fsync(dst_dir)
+                    moved = False
+                except OSError as rollback_error:
+                    raise CloneSafetyError(
+                        f"move failed and atomic rollback failed: {rollback_error}"
+                    ) from rollback_error
+            raise
 
 
 def _metadata(snapshot: dict) -> dict:

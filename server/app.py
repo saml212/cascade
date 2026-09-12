@@ -23,6 +23,7 @@ from server.routes import (
     quality,
     review,
     schedule,
+    source_recovery,
     trim,
 )
 
@@ -59,6 +60,7 @@ app.include_router(edits.router)
 app.include_router(delivery.router)
 app.include_router(quality.router)
 app.include_router(review.router)
+app.include_router(source_recovery.router)
 
 # Mount output directory for video file serving
 if OUTPUT_DIR.exists():
