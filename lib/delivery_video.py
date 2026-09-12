@@ -1583,9 +1583,18 @@ def render_scratch_dir(label: str, estimated_bytes: int):
 
 
 def render_scratch_root() -> Path:
-    """Return the internal cache root used for temporary render intermediates."""
-    root = Path.home() / "Library" / "Caches" / "cascade" / "renders"
+    """Return the configured root used for temporary render intermediates."""
+    configured = os.getenv("CASCADE_RENDER_SCRATCH_ROOT")
+    root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / "Library" / "Caches" / "cascade" / "renders"
+    )
+    if not root.is_absolute():
+        raise ValueError("CASCADE_RENDER_SCRATCH_ROOT must be an absolute path")
     root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir() or not os.access(root, os.W_OK | os.X_OK):
+        raise OSError(f"Render scratch root is not a writable directory: {root}")
     return root
 
 

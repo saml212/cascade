@@ -1,6 +1,7 @@
 """Tests for shared source-clock render infrastructure."""
 
 import json
+import os
 import shutil
 import subprocess
 import wave
@@ -36,6 +37,7 @@ from lib.delivery_video import (
     record_short_render,
     render_config_for_episode,
     render_fingerprint,
+    render_scratch_root,
     render_space_budget,
     render_space_status,
     render_video_segment,
@@ -244,6 +246,23 @@ def test_space_status_combines_output_and_scratch_on_one_filesystem(tmp_path):
     assert status["combined_required_bytes"] == 18
     assert status["safe"] is False
     assert status["failures"] == ["combined_peak_exceeds_free_space"]
+
+
+def test_render_scratch_root_uses_absolute_environment_override(tmp_path):
+    scratch = tmp_path / "external" / "renders"
+
+    with patch.dict(os.environ, {"CASCADE_RENDER_SCRATCH_ROOT": str(scratch)}):
+        assert render_scratch_root() == scratch
+
+    assert scratch.is_dir()
+
+
+def test_render_scratch_root_rejects_relative_environment_override():
+    with (
+        patch.dict(os.environ, {"CASCADE_RENDER_SCRATCH_ROOT": "relative/renders"}),
+        pytest.raises(ValueError, match="must be an absolute path"),
+    ):
+        render_scratch_root()
 
 
 def test_episode_render_config_preserves_source_color_without_explicit_opt_in(
