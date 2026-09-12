@@ -543,15 +543,41 @@ function outputContinuityReview(
   report: OutputContinuityReport,
   controls?: QualityReviewControls
 ): HTMLElement | null {
-  const artifacts = (report.artifacts ?? []).filter(
-    (artifact) => artifact.status !== 'pass'
-  );
   const findings = report.findings ?? [];
-  if (
-    (!report.status || report.status === 'pass') &&
-    !artifacts.length &&
-    !findings.length
-  ) {
+  const groups = new Map<
+    string,
+    {
+      role?: string;
+      clipId?: string;
+      status?: string;
+      detail?: string;
+      findings: OutputContinuityFinding[];
+    }
+  >();
+  for (const artifact of report.artifacts ?? []) {
+    const key = `${artifact.role ?? ''}\u0000${artifact.clip_id ?? ''}`;
+    groups.set(key, {
+      role: artifact.role,
+      clipId: artifact.clip_id,
+      status: artifact.status,
+      detail: artifact.detail,
+      findings: [],
+    });
+  }
+  for (const finding of findings) {
+    const key = `${finding.role ?? ''}\u0000${finding.clip_id ?? ''}`;
+    const group = groups.get(key) ?? {
+      role: finding.role,
+      clipId: finding.clip_id,
+      findings: [],
+    };
+    group.findings.push(finding);
+    groups.set(key, group);
+  }
+  const visibleGroups = [...groups.values()].filter(
+    (group) => group.status !== 'pass' || group.findings.length
+  );
+  if ((!report.status || report.status === 'pass') && !visibleGroups.length) {
     return null;
   }
   return h(
@@ -569,18 +595,29 @@ function outputContinuityReview(
         ? 'This output-continuity report is stale. Run QA before using its timestamps or previews.'
         : report.detail ?? 'Current output continuity evidence is incomplete.'
     ),
-    ...artifacts.map((artifact) =>
+    ...visibleGroups.map((group) =>
       h(
-        'div',
+        'details',
         {
           class:
             'rounded-md border border-status-danger/30 bg-status-danger/5 px-3 py-2 text-body-sm text-ink-secondary',
         },
-        `${outputRole(artifact.role, artifact.clip_id)} · ${artifact.status ?? 'unknown'} · ${artifact.detail ?? 'No diagnostic detail.'}`
+        h(
+          'summary',
+          { class: 'cursor-pointer text-body text-ink-primary font-medium' },
+          `${outputRole(group.role, group.clipId)} · ${group.status ?? 'finding'} · ${group.findings.length} hard ${group.findings.length === 1 ? 'finding' : 'findings'}`
+        ),
+        h(
+          'div',
+          { class: 'mt-3 grid gap-3' },
+          group.detail
+            ? h('p', { class: 'text-body-sm text-ink-secondary' }, group.detail)
+            : null,
+          ...group.findings.map((finding) =>
+            outputContinuityFinding(episodeId, finding, controls)
+          )
+        )
       )
-    ),
-    ...findings.map((finding) =>
-      outputContinuityFinding(episodeId, finding, controls)
     ),
     h(
       'p',
