@@ -51,8 +51,15 @@ export interface EpisodeSummary {
   status: string;
   duration_seconds: number | null;
   created_at: string;
-  /** Backend returns the full clips array in the list response, not a count. */
+  /** Canonical clips from clips.json, retained for status resolution. */
   clips?: UnknownRecord[];
+  /** All mined clip candidates, including rejected candidates. */
+  clip_count?: number;
+  /** Clips selected for local rendering and review. */
+  selected_clip_count?: number;
+  /** Candidates that have not been rejected. */
+  nonrejected_clip_count?: number;
+  rejected_clip_count?: number;
   guest_name?: string | null;
   guest_title?: string | null;
   episode_name?: string | null;

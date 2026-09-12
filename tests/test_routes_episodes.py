@@ -110,6 +110,41 @@ class TestListEpisodes:
         assert data[0]["guest_name"] == "John Doe"
         assert data[0]["episode_name"] == "Test Episode"
 
+    def test_list_uses_canonical_clips_and_explicit_counts(self, test_client):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"clips": [{"id": "stale", "status": "approved"}]},
+        )
+        canonical = [
+            {"id": "selected", "selection_status": "selected"},
+            {"id": "approved", "status": "approved"},
+            {"id": "candidate", "status": "pending"},
+            {
+                "id": "rejected",
+                "selection_status": "selected",
+                "status": "rejected",
+            },
+        ]
+        (ep_dir / "clips.json").write_text(json.dumps({"clips": canonical}))
+
+        summary = client.get("/api/episodes/").json()[0]
+
+        assert [clip["id"] for clip in summary["clips"]] == [
+            "selected",
+            "approved",
+            "candidate",
+            "rejected",
+        ]
+        assert summary["clip_count"] == 4
+        assert summary["selected_clip_count"] == 2
+        assert summary["nonrejected_clip_count"] == 3
+        assert summary["rejected_clip_count"] == 1
+        assert json.loads((ep_dir / "episode.json").read_text())["clips"] == [
+            {"id": "stale", "status": "approved"}
+        ]
+
     def test_list_skips_invalid_json(self, test_client):
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")

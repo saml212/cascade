@@ -27,6 +27,11 @@ from lib.audio_mix import (
     audio_selection_settings,
     selected_audio_source,
 )
+from lib.clips import (
+    clip_selection_status,
+    is_selected_clip,
+    load_clips,
+)
 from lib.clips import normalize_clip as _normalize_clip
 from lib.crop import speaker_crop_state, visual_crop_state
 from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
@@ -158,6 +163,20 @@ def write_episode(episode_id: str, data: dict):
     atomic_write_json(ep_dir / "episode.json", data)
 
 
+def _canonical_episode_clips(ep_dir: Path, inline_clips: object) -> list[dict]:
+    """Load clips.json when available, with episode.json as a safe fallback."""
+    if (ep_dir / "clips.json").exists():
+        try:
+            return load_clips(ep_dir)
+        except (json.JSONDecodeError, OSError, TypeError):
+            pass
+    if not isinstance(inline_clips, list):
+        return []
+    return [
+        _normalize_clip(dict(clip)) for clip in inline_clips if isinstance(clip, dict)
+    ]
+
+
 @router.get("/")
 async def list_episodes() -> list[dict]:
     """List all episodes with summary info."""
@@ -176,6 +195,8 @@ async def list_episodes() -> list[dict]:
         try:
             with open(ep_file) as f:
                 ep = json.load(f)
+            clips = _canonical_episode_clips(ep_dir, ep.get("clips"))
+            clip_states = [clip_selection_status(clip) for clip in clips]
             episodes.append(
                 {
                     "episode_id": ep.get("episode_id", ep_dir.name),
@@ -183,7 +204,15 @@ async def list_episodes() -> list[dict]:
                     "status": ep.get("status", "processing"),
                     "duration_seconds": ep.get("duration_seconds"),
                     "created_at": ep.get("created_at"),
-                    "clips": ep.get("clips", []),
+                    "clips": clips,
+                    "clip_count": len(clips),
+                    "selected_clip_count": sum(
+                        is_selected_clip(clip) for clip in clips
+                    ),
+                    "nonrejected_clip_count": sum(
+                        state != "rejected" for state in clip_states
+                    ),
+                    "rejected_clip_count": clip_states.count("rejected"),
                     "guest_name": ep.get("guest_name", ""),
                     "guest_title": ep.get("guest_title", ""),
                     "episode_name": ep.get("episode_name", ""),
@@ -303,27 +332,8 @@ async def get_episode(episode_id: str) -> dict:
             longform_path.stat().st_mtime, tz=timezone.utc
         ).isoformat()
 
-    # clips.json is the source of truth — it's what the clip action handlers
-    # (approve, reject, update_metadata) write to. episode.json often carries
-    # a stale snapshot from initial clip-mining. Always prefer clips.json if
-    # it exists.
-    clips_file = ep_dir / "clips.json"
-    if clips_file.exists():
-        try:
-            with open(clips_file) as f:
-                clips_data = json.load(f)
-            clips = (
-                clips_data.get("clips", clips_data)
-                if isinstance(clips_data, dict)
-                else clips_data
-            )
-            ep["clips"] = [_normalize_clip(c) for c in clips]
-        except (json.JSONDecodeError, OSError):
-            # Fall back to whatever episode.json has if clips.json is malformed
-            if ep.get("clips"):
-                ep["clips"] = [_normalize_clip(c) for c in ep["clips"]]
-    elif ep.get("clips"):
-        ep["clips"] = [_normalize_clip(c) for c in ep["clips"]]
+    # Clip actions write clips.json; episode.json may retain an ingest-time snapshot.
+    ep["clips"] = _canonical_episode_clips(ep_dir, ep.get("clips"))
 
     return ep
 

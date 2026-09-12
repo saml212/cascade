@@ -67,7 +67,16 @@ function subtitleOf(ep: EpisodeSummary): string {
 }
 
 function clipCountOf(ep: EpisodeSummary): number {
-  return Array.isArray(ep.clips) ? ep.clips.length : 0;
+  if (typeof ep.selected_clip_count === 'number') {
+    return ep.selected_clip_count;
+  }
+  if (!Array.isArray(ep.clips)) return 0;
+  return ep.clips.filter((clip) => {
+    const selection = clip.selection_status;
+    const status = clip.status;
+    if (selection === 'rejected' || status === 'rejected') return false;
+    return selection === 'selected' || status === 'approved';
+  }).length;
 }
 
 export function Dashboard(target: HTMLElement): void {
