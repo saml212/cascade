@@ -489,8 +489,10 @@ def test_detector_output_report_is_reviewable_after_persistence(
     client, episodes_dir = quality_client
     episode_dir = _seed_release(episodes_dir)
     timeline = Timeline(60, [(0, 60)])
+    short_timeline = Timeline(60, [(0, 30)])
     master = episode_dir / "work" / "audio_mix.wav"
     video = episode_dir / "upload_video.mp4"
+    short = episode_dir / "shorts" / "clip_1.mp4"
 
     def scan_identity(path: Path) -> dict:
         stat = path.stat()
@@ -505,26 +507,30 @@ def test_detector_output_report_is_reviewable_after_persistence(
 
     master_identity = scan_identity(master)
     video_identity = scan_identity(video)
+    short_identity = scan_identity(short)
     timing = aac_content_timing_proof()
-    video_mapping = {
-        "schema": OUTPUT_SOURCE_MAPPING_SCHEMA,
-        "pipeline_version": RENDER_PIPELINE_VERSION,
-        "source_intervals": [[0, 60]],
-        "audio_codec": "aac",
-        "audio_sample_rate_hz": timing["sample_rate_hz"],
-        "audio_timing": timing,
-        "timing_provenance": {
-            "method": "render-manifest/v1",
-            "media_identity": video_identity,
-            "stream": {
-                "codec_name": "aac",
-                "sample_rate_hz": timing["sample_rate_hz"],
-                "start_pts": 0,
-                "time_base": "1/48000",
-                "initial_padding": 0,
+
+    def source_mapping(target_timeline: Timeline, identity: dict) -> dict:
+        return {
+            "schema": OUTPUT_SOURCE_MAPPING_SCHEMA,
+            "pipeline_version": RENDER_PIPELINE_VERSION,
+            "source_intervals": [list(item) for item in target_timeline.keep_intervals],
+            "audio_codec": "aac",
+            "audio_sample_rate_hz": timing["sample_rate_hz"],
+            "audio_timing": timing,
+            "timing_provenance": {
+                "method": "render-manifest/v1",
+                "media_identity": identity,
+                "stream": {
+                    "codec_name": "aac",
+                    "sample_rate_hz": timing["sample_rate_hz"],
+                    "start_pts": 0,
+                    "time_base": "1/48000",
+                    "initial_padding": 0,
+                },
             },
-        },
-    }
+        }
+
     rms = np.full((600, 2), -20.0)
     peak = np.full((600, 2), 0.1)
     zero = np.zeros((600, 2))
@@ -556,8 +562,21 @@ def test_detector_output_report_is_reviewable_after_persistence(
                 "status": "current",
                 "detail": "current",
                 "timeline": timeline,
-                "source_mapping": video_mapping,
+                "source_mapping": source_mapping(timeline, video_identity),
                 "scan_identity": video_identity,
+            },
+            {
+                "role": "short",
+                "clip_id": "clip_1",
+                "path": str(short),
+                "clock": "output",
+                "required": True,
+                "revision": "sha256:short",
+                "status": "current",
+                "detail": "current",
+                "timeline": short_timeline,
+                "source_mapping": source_mapping(short_timeline, short_identity),
+                "scan_identity": short_identity,
             },
         ],
         {
@@ -597,10 +616,16 @@ def test_detector_output_report_is_reviewable_after_persistence(
     assert continuity["status"] == "failed"
     assert {finding.get("revision") for finding in continuity["findings"]} == {
         "sha256:master",
+        "sha256:short",
         "sha256:video",
     }
     assert continuity["review_events"]
     assert all(event["review"]["allowed"] for event in continuity["review_events"])
+    assert any(
+        member.get("clip_id") == "clip_1" and member["revision"] == "sha256:short"
+        for event in continuity["review_events"]
+        for member in event["members"]
+    )
 
 
 def test_quality_snapshot_does_not_block_other_requests(quality_client, monkeypatch):

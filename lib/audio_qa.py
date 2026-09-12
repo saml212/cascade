@@ -580,6 +580,7 @@ def analyze_output_continuity(
                 episode_timeline=episode_timeline,
                 artifact_clock=target["clock"],
                 role=target["role"],
+                clip_id=target.get("clip_id"),
                 revision=target.get("revision"),
                 content_offset_seconds=content_offset_seconds,
                 config=settings,
@@ -703,6 +704,7 @@ def analyze_output_windows(
     episode_timeline: Any,
     artifact_clock: str,
     role: str,
+    clip_id: str | None = None,
     revision: str | None = None,
     content_offset_seconds: float = 0.0,
     config: OutputContinuityConfig | None = None,
@@ -766,6 +768,7 @@ def analyze_output_windows(
         identity = [
             OUTPUT_CONTINUITY_VERSION,
             role,
+            clip_id,
             revision,
             kind,
             round(start_seconds, 6),
@@ -781,6 +784,7 @@ def analyze_output_windows(
             "classification": "speech_overlapping_whole_output_silence",
             "severity": "error",
             "role": role,
+            **({"clip_id": clip_id} if clip_id is not None else {}),
             "revision": revision,
             "artifact_time": {
                 "clock": artifact_clock,
