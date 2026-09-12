@@ -326,6 +326,47 @@ def test_crop_validation_rejects_nearly_identical_longform_rectangles():
     assert validate_speaker_crops(episode)["status"] == "pass"
 
 
+def test_crop_validation_uses_dimensions_saved_with_crop_config():
+    episode = {
+        "crop_config": {
+            "source_width": 1920,
+            "source_height": 1080,
+            "speakers": [
+                {
+                    "label": "Left",
+                    "center_x": 710,
+                    "center_y": 630,
+                    "longform_center_x": 680,
+                    "longform_center_y": 560,
+                    "longform_zoom": 1.5,
+                },
+                {
+                    "label": "Center",
+                    "center_x": 960,
+                    "center_y": 630,
+                    "longform_center_x": 1020,
+                    "longform_center_y": 560,
+                    "longform_zoom": 1.5,
+                },
+                {
+                    "label": "Right",
+                    "center_x": 1370,
+                    "center_y": 635,
+                    "longform_center_x": 1370,
+                    "longform_center_y": 545,
+                    "longform_zoom": 1.25,
+                },
+            ],
+        }
+    }
+
+    result = validate_speaker_crops(episode)
+
+    assert result["status"] == "pass"
+    assert result["distinct"] is True
+    assert len(result["rectangles"]) == 3
+
+
 def test_current_segments_invalidates_when_crop_changes(tmp_episode_dir, sample_config):
     episode = {
         "source_properties": {"width": 1920, "height": 1080},

@@ -586,9 +586,9 @@ def rebind_visual_crop_segments(
 def validate_speaker_crops(episode: dict) -> dict:
     """Measure whether configured longform speaker crops are visually distinct."""
     properties = episode.get("source_properties", {})
-    width = int(properties.get("width") or 0)
-    height = int(properties.get("height") or 0)
     crop = episode.get("crop_config", {})
+    width = int(properties.get("width") or crop.get("source_width") or 0)
+    height = int(properties.get("height") or crop.get("source_height") or 0)
     speakers = crop.get("speakers", [])
     if width <= 0 or height <= 0 or len(speakers) < 2:
         return {
