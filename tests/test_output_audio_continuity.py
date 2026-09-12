@@ -186,15 +186,24 @@ def test_output_review_groups_require_exact_source_and_transcript_evidence(tmp_p
     shifted = _semantic_finding(
         "shifted", "podcast_audio", "podcast-rev", start=4.000001
     )
+    tied = _semantic_finding("tied", "short", "short-rev")
+    tied["clip_id"] = "clip_tie"
+    tied["evidence"]["transcript_excerpt"] = "different timed words"
 
     groups = output_finding_review_groups(
-        _continuity_report(tmp_path, master, video, shifted)
+        _continuity_report(tmp_path, master, video, shifted, tied)
     )
 
-    assert sorted(len(group["members"]) for group in groups) == [1, 2]
+    assert sorted(len(group["members"]) for group in groups) == [1, 1, 2]
+    order = [
+        (group["binding"]["source_ranges"][0]["start_seconds"], group["id"])
+        for group in groups
+    ]
+    assert order == sorted(order)
     grouped_ids = [{member["id"] for member in group["members"]} for group in groups]
     assert {"master", "video"} in grouped_ids
     assert {"shifted"} in grouped_ids
+    assert {"tied"} in grouped_ids
 
 
 def test_output_reviews_preserve_findings_and_cannot_waive_mechanical_errors(tmp_path):

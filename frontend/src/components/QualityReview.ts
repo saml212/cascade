@@ -699,7 +699,7 @@ function outputContinuityReview(
               'summary',
               { class: 'cursor-pointer text-body text-ink-primary font-medium' },
               actionableReviewCount
-                ? `${actionableReviewCount} semantic output ${actionableReviewCount === 1 ? 'prediction requires' : 'predictions require'} explicit review`
+                ? `${actionableReviewCount} output audio ${actionableReviewCount === 1 ? 'event needs' : 'events need'} review`
                 : unresolvedReviewCount
                   ? `${unresolvedReviewCount} semantic output ${unresolvedReviewCount === 1 ? 'prediction is' : 'predictions are'} unavailable for review`
                 : `${reviewEvents.length} semantic output ${reviewEvents.length === 1 ? 'prediction reviewed' : 'predictions reviewed'}`

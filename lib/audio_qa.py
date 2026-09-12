@@ -1453,7 +1453,13 @@ def output_finding_review_groups(report: dict) -> list[dict]:
             {"binding": group["binding"], "members": group["members"]}
         )
         groups.append(group)
-    return sorted(groups, key=lambda group: group["id"])
+    return sorted(
+        groups,
+        key=lambda group: (
+            group["binding"]["source_ranges"][0]["start_seconds"],
+            group["id"],
+        ),
+    )
 
 
 def apply_output_finding_reviews(
