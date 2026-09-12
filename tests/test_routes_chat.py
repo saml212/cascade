@@ -93,6 +93,13 @@ class TestChatContext:
             "_delivery_snapshot",
             lambda _episode_dir: {"status": "ready"},
         )
+        monkeypatch.setattr(
+            chat_mod,
+            "episode_review_state",
+            lambda _episode_dir: {
+                "clips": [{"id": "clip_01", "review": {"render": {"current": True}}}]
+            },
+        )
 
         context = chat_mod._load_episode_context(episode_dir)
 
@@ -105,8 +112,13 @@ class TestChatContext:
         assert context["legacy_metadata_evidence"]["status"] == (
             "historical_unverified"
         )
+        assert (
+            context["review_state"]["clips"][0]["review"]["render"]["current"] is True
+        )
         prompt = chat_mod._build_system_prompt(context)
         assert "never describe a legacy value as a current measurement" in prompt
+        assert "do not let an older report" in prompt
+        assert "<review_state>" in prompt
         assert "<quality_snapshot>" in prompt
         assert "<verified_delivery>" in prompt
 
@@ -397,6 +409,133 @@ class TestCanonicalActionEffects:
         }
         assert missing["status"] == "error"
         assert "clip_id" in missing["detail"]
+
+
+class TestCompleteMetadata:
+    @staticmethod
+    def _config(**enabled):
+        return {
+            "platforms": {
+                platform: {"enabled": value} for platform, value in enabled.items()
+            }
+        }
+
+    def test_complete_selected_copy_is_zero_action(self, test_client, monkeypatch):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "description": "Episode description",
+                "tags": ["local"],
+                "guest_name": "Guest",
+                "episode_name": "Episode",
+            },
+        )
+        (episode_dir / "clips.json").write_text(
+            json.dumps(
+                {
+                    "clips": [
+                        {
+                            "id": "selected",
+                            "selection_status": "selected",
+                            "metadata": {
+                                "youtube": {
+                                    "title": "YouTube title",
+                                    "description": "YouTube description",
+                                },
+                                "tiktok": {"caption": "TikTok caption"},
+                                "instagram": {"caption": "Instagram caption"},
+                                "x": {"text": "X copy"},
+                            },
+                        },
+                        {"id": "unselected", "selection_status": "unselected"},
+                    ]
+                }
+            )
+        )
+
+        import server.routes.chat as chat_mod
+
+        monkeypatch.setattr(
+            chat_mod,
+            "load_config",
+            lambda: self._config(
+                youtube=True,
+                tiktok=True,
+                instagram=True,
+                x=True,
+                linkedin=True,
+            ),
+        )
+
+        async def unexpected_assistant(*_args, **_kwargs):
+            raise AssertionError("complete metadata must not invoke generation")
+
+        monkeypatch.setattr(chat_mod, "_assistant_turn", unexpected_assistant)
+
+        response = client.post("/api/episodes/ep_001/complete-metadata")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "complete": True,
+            "iterations": 0,
+            "actions_taken": [],
+            "summary": "All metadata is already complete.",
+        }
+
+    def test_generation_cannot_overwrite_complete_copy(self, test_client, monkeypatch):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "description": "Episode description",
+                "tags": ["local"],
+                "guest_name": "Guest",
+                "episode_name": "Episode",
+            },
+        )
+        (episode_dir / "clips.json").write_text(
+            json.dumps(
+                {
+                    "clips": [
+                        {
+                            "id": "clip_01",
+                            "selection_status": "selected",
+                            "metadata": {"youtube": {"title": "Keep this title"}},
+                        }
+                    ]
+                }
+            )
+        )
+
+        import server.routes.chat as chat_mod
+
+        monkeypatch.setattr(chat_mod, "load_config", lambda: self._config(youtube=True))
+        monkeypatch.setattr(chat_mod, "_load_episode_context", lambda _path: {})
+
+        async def assistant(*_args, **_kwargs):
+            return """```action
+{"action":"update_platform_metadata","clip_id":"clip_01","platform":"youtube","title":"Overwrite","description":"Filled description"}
+```
+```action
+{"action":"reject_clip","clip_id":"clip_01"}
+```"""
+
+        monkeypatch.setattr(chat_mod, "_assistant_turn", assistant)
+
+        response = client.post("/api/episodes/ep_001/complete-metadata")
+
+        assert response.status_code == 200
+        assert response.json()["complete"] is True
+        assert len(response.json()["actions_taken"]) == 1
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert stored["selection_status"] == "selected"
+        assert stored["metadata"]["youtube"] == {
+            "title": "Keep this title",
+            "description": "Filled description",
+        }
 
 
 class TestParseActions:

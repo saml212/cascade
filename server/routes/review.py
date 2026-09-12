@@ -213,10 +213,10 @@ def _boundary_evidence_with_inspection(
     return evidence
 
 
-@router.get("/{episode_id}/review")
-async def review_state(episode_id: str) -> dict:
-    """Return reviewable files, their freshness, copy, and approval state."""
-    episode_dir = _episode_dir(episode_id)
+def episode_review_state(episode_dir: Path) -> dict:
+    """Build the canonical current review state for routes and local agents."""
+    episode_dir = Path(episode_dir)
+    episode_id = episode_dir.name
     episode = _read_json(episode_dir / "episode.json", {})
     clips_data = _read_json(episode_dir / "clips.json", {"clips": []})
     clips = clips_data.get("clips", []) if isinstance(clips_data, dict) else clips_data
@@ -321,6 +321,12 @@ async def review_state(episode_id: str) -> dict:
         },
         "clips": reviewed_clips,
     }
+
+
+@router.get("/{episode_id}/review")
+async def review_state(episode_id: str) -> dict:
+    """Return reviewable files, their freshness, copy, and approval state."""
+    return episode_review_state(_episode_dir(episode_id))
 
 
 def _stored_clips(episode_dir: Path) -> list[dict]:

@@ -20,7 +20,11 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from agents.base import BaseAgent
-from agents.qa import canonical_release_metadata, quality_snapshot
+from agents.qa import (
+    canonical_release_metadata,
+    quality_snapshot,
+    release_metadata_issues,
+)
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 STATUS_URL = "https://api.upload-post.com/api/uploadposts/status"
@@ -92,6 +96,17 @@ class PublishAgent(BaseAgent):
 
         if not platforms:
             raise RuntimeError("No platforms enabled in config")
+
+        approved = [clip for clip in clips if clip.get("status") == "approved"]
+        metadata_issues = release_metadata_issues(metadata, approved, self.config)
+        if metadata_issues:
+            issue = metadata_issues[0]
+            fields = ", ".join(issue["fields"])
+            if issue["scope"] == "clip":
+                subject = f"{issue['clip_id']} {issue['platform']} copy"
+            else:
+                subject = f"longform {issue['platform']} copy"
+            raise RuntimeError(f"{subject} is missing: {fields}")
 
         tz_name = self.get_config("schedule", "timezone", default="America/Los_Angeles")
         shorts_weekday = self.get_config(
