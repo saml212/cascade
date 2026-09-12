@@ -1,6 +1,5 @@
 /**
- * Schedule — seven-day publish calendar. Pulls /api/schedule and lays
- * clips into per-day columns with a platform-colored pill per entry.
+ * Schedule — current approved release proposals and recorded publication evidence.
  */
 
 import { h, mount } from '../lib/dom';
@@ -10,14 +9,14 @@ import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
 
 interface ScheduleItem {
-  type: 'longform' | 'clip' | string;
+  type: 'longform' | 'short' | string;
   episode_id: string;
   name?: string;
   title?: string;
   scheduled_date: string;
-  platform?: string;
+  destination?: string;
+  destinations?: string[];
   clip_id?: string;
-  virality_score?: number;
   scheduled_time?: string;
 }
 
@@ -27,9 +26,20 @@ interface ScheduleDay {
   items: ScheduleItem[];
 }
 
+interface PublicationEvidence {
+  episode_id: string;
+  name?: string;
+  content_type: 'podcast_audio' | 'longform' | 'short' | string;
+  destination?: string;
+  destinations?: string[];
+  status: string;
+  clip_id?: string;
+  url?: string;
+}
+
 const TYPE_COLOR: Record<string, string> = {
   longform: '#6fcf8e',
-  clip: '#f5a524',
+  short: '#f5a524',
 };
 
 export function Schedule(target: HTMLElement): void {
@@ -84,6 +94,8 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
   const unscheduledShorts = (d.unscheduled_shorts as number) ?? 0;
   const unscheduledLongforms = (d.unscheduled_longforms as number) ?? 0;
   const unscheduled = unscheduledShorts + unscheduledLongforms;
+  const publicationEvidence =
+    (d.publication_evidence as PublicationEvidence[]) ?? [];
 
   return h(
     'div',
@@ -132,7 +144,7 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           h(
             'p',
             { class: 'text-body text-ink-tertiary max-w-md mx-auto' },
-            'Approved episodes and clips appear here as a draft release plan.'
+            'Current, approved episodes and clips appear here as a draft release plan.'
           )
         )
       : h(
@@ -144,7 +156,10 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
             },
           },
           ...days.map(renderDayColumn)
-        )
+        ),
+    publicationEvidence.length > 0
+      ? renderPublicationEvidence(publicationEvidence)
+      : null
   );
 }
 
@@ -169,9 +184,7 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
       { class: 'pb-2 mb-2 border-b border-border-subtle' },
       h(
         'div',
-        {
-          class: 'flex items-baseline justify-between',
-        },
+        { class: 'flex items-baseline justify-between' },
         h(
           'span',
           {
@@ -184,9 +197,7 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
         ),
         h(
           'span',
-          {
-            class: 'text-display-md font-display text-ink-primary',
-          },
+          { class: 'text-display-md font-display text-ink-primary' },
           dayOfMonth
         )
       )
@@ -198,13 +209,9 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
             class:
               'flex-1 flex items-center justify-center text-body-sm text-ink-tertiary/70 italic',
           },
-            isToday ? 'Open day' : 'No suggested posts'
+          isToday ? 'Open day' : 'No suggested posts'
         )
-      : h(
-          'div',
-          { class: 'flex flex-col gap-2' },
-          ...day.items.map(renderItem)
-        )
+      : h('div', { class: 'flex flex-col gap-2' }, ...day.items.map(renderItem))
   );
 }
 
@@ -213,9 +220,11 @@ function renderItem(item: ScheduleItem): HTMLElement {
   const typeLabel =
     item.type === 'longform'
       ? 'Longform'
-      : item.type === 'clip'
+      : item.type === 'short'
       ? 'Short'
       : item.type;
+  const destinations =
+    item.destinations ?? (item.destination ? [item.destination] : []);
   return h(
     'a',
     {
@@ -247,14 +256,117 @@ function renderItem(item: ScheduleItem): HTMLElement {
             },
             item.scheduled_time
           )
+        : destinations.length > 0
+        ? h(
+            'span',
+            {
+              class:
+                'text-code-sm text-ink-tertiary font-mono tabular ml-auto uppercase',
+            },
+            destinations.join(', ')
+          )
         : null
     ),
     h(
       'div',
-      {
-        class: 'text-body-sm text-ink-primary leading-snug line-clamp-3',
-      },
+      { class: 'text-body-sm text-ink-primary leading-snug line-clamp-3' },
       item.title || item.name || 'Untitled'
     )
   );
+}
+
+function renderPublicationEvidence(records: PublicationEvidence[]): HTMLElement {
+  const byEpisode = new Map<string, PublicationEvidence[]>();
+  for (const record of records) {
+    const existing = byEpisode.get(record.episode_id) ?? [];
+    existing.push(record);
+    byEpisode.set(record.episode_id, existing);
+  }
+  return h(
+    'section',
+    { class: 'mt-10' },
+    h(
+      'div',
+      { class: 'mb-4' },
+      h(
+        'h2',
+        { class: 'font-display text-display-md text-ink-primary' },
+        'Recorded publication activity'
+      ),
+      h(
+        'p',
+        { class: 'text-body-sm text-ink-tertiary mt-1' },
+        'These records are excluded from generic suggestions. A submission record does not confirm a live post.'
+      )
+    ),
+    h(
+      'div',
+      { class: 'grid gap-3 md:grid-cols-2' },
+      ...Array.from(byEpisode.entries()).map(([episodeId, episodeRecords]) =>
+        h(
+          'div',
+          { class: 'panel p-4' },
+          h(
+            'a',
+            {
+              ...link(`/episodes/${episodeId}`),
+              class: 'text-heading-sm text-ink-primary hover:text-accent',
+            },
+            episodeRecords[0]?.name || episodeId
+          ),
+          h(
+            'div',
+            { class: 'mt-3 flex flex-col gap-2' },
+            ...episodeRecords.map(renderPublicationRecord)
+          )
+        )
+      )
+    )
+  );
+}
+
+function renderPublicationRecord(record: PublicationEvidence): HTMLElement {
+  const content =
+    record.content_type === 'podcast_audio'
+      ? 'Podcast RSS audio'
+      : record.content_type === 'longform'
+      ? 'Longform'
+      : record.clip_id
+      ? `Short ${record.clip_id}`
+      : 'Short';
+  const destinations =
+    record.destinations ??
+    (record.destination ? [record.destination] : ['unknown destination']);
+  const destinationLabel = destinations
+    .map((value) => value.replaceAll('_', ' '))
+    .join(', ');
+  const status =
+    record.status === 'published'
+      ? 'Published URL recorded'
+      : record.status === 'submitted'
+      ? 'Submission recorded'
+      : record.status === 'already_submitted'
+      ? 'Prior submission recorded'
+      : 'Publication record';
+  const safeUrl =
+    record.url?.startsWith('https://') || record.url?.startsWith('http://')
+      ? record.url
+      : null;
+  const label = h(
+    'span',
+    { class: 'text-body-sm text-ink-secondary' },
+    `${content} · ${destinationLabel} · ${status}`
+  );
+  return safeUrl
+    ? h(
+        'a',
+        {
+          href: safeUrl,
+          target: '_blank',
+          rel: 'noreferrer',
+          class: 'hover:text-accent',
+        },
+        label
+      )
+    : label;
 }

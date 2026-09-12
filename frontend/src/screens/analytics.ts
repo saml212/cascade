@@ -36,12 +36,12 @@ export function Analytics(target: HTMLElement): void {
         h(
           'h1',
           { class: 'font-display text-display-xl text-ink-primary mb-4' },
-          'Too early to tell.'
+          'Analytics integration is not connected yet.'
         ),
         h(
           'p',
           { class: 'text-body-lg text-ink-secondary leading-relaxed' },
-          'Performance data lands a week after each episode publishes. Until then, here’s what cascade will report when the numbers arrive.'
+          'Connect the platform analytics APIs and store their metric snapshots before Cascade can report performance here.'
         )
       ),
       h(
@@ -95,7 +95,7 @@ export function Analytics(target: HTMLElement): void {
         h(
           'span',
           null,
-          'This page unlocks once the first published episode has a week of data.'
+          'No performance data is being collected or imported by Cascade today.'
         )
       )
     )
