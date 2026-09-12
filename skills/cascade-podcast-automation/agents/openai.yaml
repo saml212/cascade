@@ -1,4 +1,4 @@
 interface:
-  display_name: "Cascade Podcast Automation"
-  short_description: "Automate Cascade ingest and workflow verification."
-  default_prompt: "Use $cascade-podcast-automation to run and troubleshoot a full Cascade ingest workflow for a source path."
+  display_name: "Cascade Ingest"
+  short_description: "Start Cascade and ingest local source media."
+  default_prompt: "Use $cascade-podcast-automation to start Cascade and create an episode from a local source path, then continue with the canonical API-first producer workflow."
