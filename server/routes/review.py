@@ -72,7 +72,11 @@ def _with_media_url(state: dict, episode_id: str) -> dict:
     state = dict(state)
     if state["playable"]:
         path = "/".join(quote(part, safe="") for part in state["path"].split("/"))
-        state["url"] = f"/media/episodes/{quote(episode_id, safe='')}/{path}"
+        revision = f"{int(state['size_bytes']):x}-{int(state['mtime_ns']):x}"
+        state["media_revision"] = revision
+        state["url"] = (
+            f"/media/episodes/{quote(episode_id, safe='')}/{path}?v={revision}"
+        )
         state["download_url"] = state["url"]
     else:
         state["url"] = None

@@ -58,6 +58,8 @@ Prepare and inspect the complete local package before any public action:
 4. Run QA against current audio, longform, shorts, thumbnails, and metadata. Missing, stale, failed, or review-required evidence remains visible as a blocker.
 5. Record longform editorial approval with `POST /api/episodes/{id}/approve-longform` only after the current rendered revision has been reviewed. This is separate from permission to publish.
 
+If delivery reports that a current longform's encoded audio needs repair, use `POST /api/episodes/{id}/delivery/video/repair-audio`. For a current short, use `POST /api/episodes/{id}/clips/{clip_id}/repair-audio`. Both operations retain the reviewed video stream, produce a new audio-bearing file for review, and invalidate the affected approval until that exact result is reviewed again.
+
 Local short rendering must not depend on a public YouTube URL. Do not publish a longform merely to unlock short production.
 
 ## External actions

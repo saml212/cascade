@@ -102,7 +102,7 @@ def test_review_keeps_stale_short_playable(test_client, monkeypatch):
     assert render["reason_code"] == "render_inputs_changed"
     assert render["playable"] is True
     assert render["current"] is False
-    assert render["url"].endswith("/shorts/clip_01.mp4")
+    assert "/shorts/clip_01.mp4?v=" in render["url"]
     assert payload["clips"][0]["review"]["approval"]["current"] is False
     assert [item["key"] for item in payload["enabled_destinations"]] == [
         "youtube",
@@ -132,9 +132,37 @@ def test_review_exposes_untracked_longform_despite_episode_status(test_client):
     assert longform["render"]["status"] == "untracked"
     assert longform["render"]["playable"] is True
     assert longform["render"]["current"] is False
-    assert longform["render"]["url"].endswith("/upload_video.mp4")
+    assert "/upload_video.mp4?v=" in longform["render"]["url"]
     assert longform["approval"]["current"] is False
     assert longform["source_preview_url"].endswith("/video-preview")
+
+
+def test_review_media_urls_change_when_atomic_outputs_are_replaced(test_client):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 30}
+    _write_clips(episode_dir, [clip])
+    longform = episode_dir / "upload_video.mp4"
+    short = episode_dir / "shorts" / "clip_01.mp4"
+    longform.write_bytes(b"old full")
+    short.write_bytes(b"old short")
+
+    first = client.get("/api/episodes/ep_001/review").json()
+    first_longform = first["longform"]["render"]
+    first_short = first["clips"][0]["review"]["render"]
+
+    longform.write_bytes(b"new full replacement")
+    short.write_bytes(b"new short replacement")
+    second = client.get("/api/episodes/ep_001/review").json()
+    second_longform = second["longform"]["render"]
+    second_short = second["clips"][0]["review"]["render"]
+
+    assert second_longform["url"] != first_longform["url"]
+    assert second_short["url"] != first_short["url"]
+    assert second_longform["media_revision"] != first_longform["media_revision"]
+    assert second_short["media_revision"] != first_short["media_revision"]
+    assert second_longform["download_url"] == second_longform["url"]
+    assert second_short["download_url"] == second_short["url"]
 
 
 def test_review_distinguishes_missing_short_from_stale(test_client):
