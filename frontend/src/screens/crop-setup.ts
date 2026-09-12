@@ -351,10 +351,9 @@ function renderHeader(
       },
       metaTag('Duration', formatDuration(duration)),
       metaTag('Speakers', String(speakerCount)),
-      // NOT "what you're hearing right now" — that's camera audio during
-      // scrub and H6E tracks in the mixer below. This tag describes what
-      // the FINAL longform mix will use as its source.
-      metaTag('Final mix source', mixSource),
+      // This tag describes the crop editor's base audio routing. A selected
+      // repair or recorder master may supply the final rendered audio.
+      metaTag('Base mix source', mixSource),
       h('div', { class: 'hidden 2xl:block' }, metaTag('ID', episodeId))
     )
   );
