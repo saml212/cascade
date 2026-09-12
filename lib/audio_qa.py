@@ -44,7 +44,7 @@ OUTPUT_SEMANTIC_EVIDENCE_FIELDS = (
 AUDIO_FINDING_REVIEWS_PATH = Path("qa/audio-finding-reviews.json")
 AUDIO_FINDING_REVIEWS_SCHEMA = "cascade.audio-finding-reviews/v1"
 DETECTOR_VERSION = "1.2"
-OUTPUT_CONTINUITY_VERSION = "3"
+OUTPUT_CONTINUITY_VERSION = "4"
 PREVIEW_ALGORITHM_VERSION = "5"
 TRANSCRIPT_ANALYSIS_FINGERPRINT_METHOD = "sha256-audio-word-timing-speaker/v1"
 REPAIR_FADE_SECONDS = 0.08
@@ -781,6 +781,7 @@ def analyze_output_windows(
             "classification": "speech_overlapping_whole_output_silence",
             "severity": "error",
             "role": role,
+            "revision": revision,
             "artifact_time": {
                 "clock": artifact_clock,
                 "start_seconds": round(start_seconds, 6),

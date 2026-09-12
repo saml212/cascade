@@ -273,6 +273,7 @@ def test_output_reviews_preserve_findings_and_cannot_waive_mechanical_errors(tmp
     [
         lambda report: report["artifacts"][1].update(detector_status="pass"),
         lambda report: report["artifacts"][1].update(required=False),
+        lambda report: report.update(detector_version="3"),
         lambda report: report["findings"][0]["evidence"].update(
             speech_overlap_seconds="0.4"
         ),
@@ -280,6 +281,7 @@ def test_output_reviews_preserve_findings_and_cannot_waive_mechanical_errors(tmp
     ids=(
         "injected-detector-status",
         "optional-required-video",
+        "stale-detector-version",
         "malformed-semantic-evidence",
     ),
 )

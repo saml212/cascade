@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -31,10 +32,16 @@ from lib.audio_qa import (
     AUDIO_FINDING_REVIEWS_PATH,
     OUTPUT_CONTINUITY_SCHEMA,
     OUTPUT_CONTINUITY_VERSION,
+    OUTPUT_SOURCE_MAPPING_SCHEMA,
+    OutputContinuityConfig,
+    WindowStats,
+    analyze_output_continuity,
     output_continuity_report_fingerprint,
 )
 from lib.audio_qa import release_gate as audio_release_gate
 from lib.delivery_video import (
+    RENDER_PIPELINE_VERSION,
+    aac_content_timing_proof,
     longform_render_fingerprint,
     read_render_manifest,
     record_longform_render,
@@ -474,6 +481,126 @@ def test_quality_api_reports_current_release_ready(quality_client):
     assert body["release_gate"]["status"] == "ready"
     assert body["release_gate"]["safe"] is True
     assert body["artifacts"]["legacy_longform"]["release_candidate"] is False
+
+
+def test_detector_output_report_is_reviewable_after_persistence(
+    quality_client, monkeypatch
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    timeline = Timeline(60, [(0, 60)])
+    master = episode_dir / "work" / "audio_mix.wav"
+    video = episode_dir / "upload_video.mp4"
+
+    def scan_identity(path: Path) -> dict:
+        stat = path.stat()
+        return {
+            "resolved_path": str(path.resolve()),
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+        }
+
+    master_identity = scan_identity(master)
+    video_identity = scan_identity(video)
+    timing = aac_content_timing_proof()
+    video_mapping = {
+        "schema": OUTPUT_SOURCE_MAPPING_SCHEMA,
+        "pipeline_version": RENDER_PIPELINE_VERSION,
+        "source_intervals": [[0, 60]],
+        "audio_codec": "aac",
+        "audio_sample_rate_hz": timing["sample_rate_hz"],
+        "audio_timing": timing,
+        "timing_provenance": {
+            "method": "render-manifest/v1",
+            "media_identity": video_identity,
+            "stream": {
+                "codec_name": "aac",
+                "sample_rate_hz": timing["sample_rate_hz"],
+                "start_pts": 0,
+                "time_base": "1/48000",
+                "initial_padding": 0,
+            },
+        },
+    }
+    rms = np.full((600, 2), -20.0)
+    peak = np.full((600, 2), 0.1)
+    zero = np.zeros((600, 2))
+    rms[100:105] = -240.0
+    peak[100:105] = 0.0
+    zero[100:105] = 1.0
+    stats = WindowStats(0.1, rms, peak, zero)
+    monkeypatch.setattr("lib.audio_qa.decode_audio_windows", lambda *_args: stats)
+
+    report = analyze_output_continuity(
+        [
+            {
+                "role": "selected_audio_master",
+                "path": str(master),
+                "clock": "source",
+                "required": True,
+                "revision": "sha256:master",
+                "status": "current",
+                "detail": "current",
+                "timeline": timeline,
+                "scan_identity": master_identity,
+            },
+            {
+                "role": "upload_video",
+                "path": str(video),
+                "clock": "output",
+                "required": True,
+                "revision": "sha256:video",
+                "status": "current",
+                "detail": "current",
+                "timeline": timeline,
+                "source_mapping": video_mapping,
+                "scan_identity": video_identity,
+            },
+        ],
+        {
+            "utterances": [
+                {
+                    "speaker": "host",
+                    "words": [{"start": 10.05, "end": 10.45, "word": "speech"}],
+                }
+            ]
+        },
+        episode_timeline=timeline,
+        transcript_fingerprint="sha256:transcript",
+        config=OutputContinuityConfig(
+            frame_seconds=0.1,
+            min_issue_seconds=0.3,
+            bridge_seconds=0,
+        ),
+    )
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report.update(
+        overall="fail",
+        selected_master_output_continuity=report,
+    )
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+    response = client.get("/api/episodes/ep_test/quality")
+
+    assert response.status_code == 200
+    snapshot = response.json()
+    assert snapshot["quality"]["status"] == "blocked"
+    assert (
+        snapshot["quality"]["report_revision"]
+        == snapshot["quality"]["current_revision"]
+    )
+    continuity = snapshot["audio_quality"]["selected_master_output_continuity"]
+    assert continuity["reviewable"] is True
+    assert continuity["status"] == "failed"
+    assert {finding.get("revision") for finding in continuity["findings"]} == {
+        "sha256:master",
+        "sha256:video",
+    }
+    assert continuity["review_events"]
+    assert all(event["review"]["allowed"] for event in continuity["review_events"])
 
 
 def test_quality_snapshot_does_not_block_other_requests(quality_client, monkeypatch):
