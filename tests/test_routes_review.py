@@ -468,3 +468,213 @@ def test_inspection_exposes_only_current_transcript_and_shot_plan(
 
     monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: None)
     assert client.get("/api/episodes/ep_001/inspection/transcript").status_code == 409
+
+
+def test_transcript_correction_api_upserts_without_losing_existing_operations(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    raw = b'{"immutable":"raw ASR"}'
+    (episode_dir / "transcript.json").write_bytes(raw)
+    (episode_dir / "diarized_transcript.json").write_text(
+        json.dumps({"clock": "source", "generation": 1})
+    )
+    existing = {
+        "version": 1,
+        "clock": "source",
+        "raw_transcript_sha256": __import__("hashlib").sha256(raw).hexdigest(),
+        "review_note": "preserve me",
+        "operations": [
+            {
+                "id": "existing",
+                "op": "replace_word",
+                "word_id": "word_1",
+                "speaker": 0,
+            }
+        ],
+    }
+    (episode_dir / "transcript_corrections.json").write_text(json.dumps(existing))
+
+    from lib.media_inspection import file_revision
+    from server.routes import review
+
+    expected_revision = file_revision(episode_dir / "diarized_transcript.json")
+    monkeypatch.setattr(
+        review,
+        "current_diarized_transcript",
+        lambda directory, *_args: json.loads(
+            (directory / "diarized_transcript.json").read_text()
+        ),
+    )
+
+    def rebuild(directory, _config):
+        corrections = json.loads(
+            (directory / "transcript_corrections.json").read_text()
+        )
+        (directory / "diarized_transcript.json").write_text(
+            json.dumps(
+                {
+                    "clock": "source",
+                    "applied": [
+                        operation["id"] for operation in corrections["operations"]
+                    ],
+                }
+            )
+        )
+        (directory / "transcript_provenance.json").write_text("{}")
+        (directory / "subtitles" / "transcript.srt").write_text("corrected")
+        (directory / "segments.json").write_text("{}")
+        return {"speaker_alignment": {"status": "aligned"}}
+
+    monkeypatch.setattr(review, "repair_existing_transcript", rebuild)
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/corrections",
+        json={
+            "expected_revision": expected_revision,
+            "operations": [
+                {
+                    "id": "existing",
+                    "op": "replace_word",
+                    "word_id": "word_1",
+                    "speaker": 1,
+                },
+                {
+                    "id": "new",
+                    "op": "replace_word",
+                    "word_id": "word_2",
+                    "speaker": 0,
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["added_ids"] == ["new"]
+    assert response.json()["updated_ids"] == ["existing"]
+    assert response.json()["correction_count"] == 2
+    assert response.json()["revision"] != expected_revision
+    stored = json.loads((episode_dir / "transcript_corrections.json").read_text())
+    assert stored["review_note"] == "preserve me"
+    assert [operation["id"] for operation in stored["operations"]] == [
+        "existing",
+        "new",
+    ]
+    assert stored["operations"][0]["speaker"] == 1
+    assert (episode_dir / "transcript.json").read_bytes() == raw
+
+    inspected = client.get("/api/episodes/ep_001/inspection/transcript/corrections")
+    assert inspected.status_code == 200
+    assert inspected.json()["transcript_revision"] == response.json()["revision"]
+    assert inspected.json()["correction_count"] == 2
+
+
+def test_transcript_correction_api_rejects_stale_revision_before_writing(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    (episode_dir / "transcript.json").write_text("{}")
+    (episode_dir / "diarized_transcript.json").write_text(
+        json.dumps({"clock": "source"})
+    )
+
+    from server.routes import review
+
+    monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})
+    rebuilt = []
+    monkeypatch.setattr(
+        review, "repair_existing_transcript", lambda *_args: rebuilt.append(True)
+    )
+
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/corrections",
+        json={
+            "expected_revision": "sha256:stale",
+            "operations": [{"id": "new", "op": "replace_word"}],
+        },
+    )
+
+    assert response.status_code == 409
+    assert "revision changed" in response.json()["detail"].lower()
+    assert rebuilt == []
+    assert not (episode_dir / "transcript_corrections.json").exists()
+
+
+def test_transcript_correction_api_restores_every_artifact_when_rebuild_fails(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    raw_path = episode_dir / "transcript.json"
+    raw_path.write_text("original raw generation")
+    artifact_names = (
+        "diarized_transcript.json",
+        "transcript_provenance.json",
+        "subtitles/transcript.srt",
+        "segments.json",
+    )
+    original = {}
+    for name in artifact_names:
+        path = episode_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original[name] = f"original {name}".encode()
+        path.write_bytes(original[name])
+
+    from lib.media_inspection import file_revision
+    from server.routes import review
+
+    expected_revision = file_revision(episode_dir / "diarized_transcript.json")
+    monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})
+
+    def fail_after_partial_writes(directory, _config):
+        (directory / "transcript.json").write_text("concurrent new raw generation")
+        for name in artifact_names:
+            (directory / name).write_text(f"changed {name}")
+        raise ValueError("invalid correction")
+
+    monkeypatch.setattr(review, "repair_existing_transcript", fail_after_partial_writes)
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/corrections",
+        json={
+            "expected_revision": expected_revision,
+            "operations": [{"id": "new", "op": "replace_word"}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid correction"
+    assert not (episode_dir / "transcript_corrections.json").exists()
+    assert raw_path.read_text() == "concurrent new raw generation"
+    for name, content in original.items():
+        assert (episode_dir / name).read_bytes() == content
+
+
+def test_transcript_correction_api_requires_unique_operation_ids(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    (episode_dir / "transcript.json").write_text("{}")
+    (episode_dir / "diarized_transcript.json").write_text("{}")
+
+    from lib.media_inspection import file_revision
+    from server.routes import review
+
+    monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})
+    response = client.post(
+        "/api/episodes/ep_001/inspection/transcript/corrections",
+        json={
+            "expected_revision": file_revision(
+                episode_dir / "diarized_transcript.json"
+            ),
+            "operations": [
+                {"id": "same", "op": "replace_word"},
+                {"id": "same", "op": "replace_range"},
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "duplicate requested" in response.json()["detail"].lower()
+    assert not (episode_dir / "transcript_corrections.json").exists()

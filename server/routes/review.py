@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from agents.pipeline import load_config
 from agents.qa import (
@@ -21,7 +25,8 @@ from agents.qa import (
     editorial_revision,
 )
 from agents.speaker_cut import current_speaker_segments
-from agents.transcribe import current_diarized_transcript
+from agents.transcribe import current_diarized_transcript, repair_existing_transcript
+from lib.atomic_write import atomic_write_json
 from lib.audio_mix import selected_audio_source
 from lib.clips import clip_selection_status
 from lib.delivery_video import (
@@ -51,6 +56,23 @@ PLATFORM_LABELS = {
     "x": "X",
 }
 _CLIP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_transcript_corrections_lock = threading.Lock()
+_DERIVED_TRANSCRIPT_ARTIFACTS = (
+    "transcript_corrections.json",
+    "diarized_transcript.json",
+    "transcript_provenance.json",
+    "subtitles/transcript.srt",
+    "segments.json",
+)
+
+
+class TranscriptCorrectionsRequest(BaseModel):
+    expected_revision: str
+    operations: list[dict] = Field(min_length=1, max_length=100)
+
+
+class _TranscriptRevisionConflict(RuntimeError):
+    pass
 
 
 def _read_json(path: Path, default):
@@ -66,6 +88,185 @@ def _episode_dir(episode_id: str) -> Path:
     if episode_dir.parent != root or not (episode_dir / "episode.json").is_file():
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
     return episode_dir
+
+
+def _transcript_corrections_document(episode_dir: Path) -> dict:
+    raw_revision = file_revision(episode_dir / "transcript.json").removeprefix(
+        "sha256:"
+    )
+    path = episode_dir / "transcript_corrections.json"
+    if path.exists():
+        document = json.loads(path.read_text())
+        if not isinstance(document, dict):
+            raise ValueError("Transcript corrections must be a JSON object")
+    else:
+        document = {}
+    if document.get("version", 1) != 1 or document.get("clock", "source") != "source":
+        raise ValueError("Transcript corrections must use version 1 and source clock")
+    operations = document.get("operations", [])
+    if not isinstance(operations, list) or not all(
+        isinstance(operation, dict) for operation in operations
+    ):
+        raise ValueError("Transcript correction operations must be objects")
+    expected_raw = document.get("raw_transcript_sha256")
+    if expected_raw and expected_raw != raw_revision:
+        raise _TranscriptRevisionConflict(
+            "Transcript corrections target a different raw transcript"
+        )
+    result = dict(document)
+    result.update(
+        version=1,
+        clock="source",
+        raw_transcript_sha256=raw_revision,
+        operations=operations,
+    )
+    return result
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(content)
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
+
+
+def _restore_transcript_artifacts(snapshot: dict[Path, bytes | None]) -> None:
+    errors = []
+    for path, content in snapshot.items():
+        try:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(path, content)
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+    if errors:
+        raise RuntimeError(
+            "Could not restore transcript artifacts: " + "; ".join(errors)
+        )
+
+
+def _apply_transcript_corrections(
+    episode_dir: Path,
+    config: dict,
+    expected_revision: str,
+    requested_operations: list[dict],
+) -> dict:
+    if not expected_revision:
+        raise ValueError("expected_revision is required")
+    if not requested_operations:
+        raise ValueError("At least one transcript correction operation is required")
+
+    with _transcript_corrections_lock:
+        episode = _read_json(episode_dir / "episode.json", {})
+        transcript_path = episode_dir / "diarized_transcript.json"
+        if current_diarized_transcript(episode_dir, episode, config) is None:
+            raise _TranscriptRevisionConflict(
+                "Current canonical transcript is unavailable; repair it before applying corrections"
+            )
+        current_revision = file_revision(transcript_path)
+        if current_revision != expected_revision:
+            raise _TranscriptRevisionConflict(
+                f"Transcript revision changed; expected {expected_revision}, current {current_revision}"
+            )
+        require_current_alignment = (
+            current_speaker_segments(episode_dir, episode, config) is not None
+        )
+
+        corrections = _transcript_corrections_document(episode_dir)
+        operations = [dict(operation) for operation in corrections["operations"]]
+        positions = {}
+        for index, operation in enumerate(operations):
+            operation_id = operation.get("id")
+            if not isinstance(operation_id, str) or not operation_id.strip():
+                raise ValueError("Every stored transcript correction must have an id")
+            if operation_id in positions:
+                raise ValueError(
+                    f"Duplicate stored transcript correction id: {operation_id}"
+                )
+            positions[operation_id] = index
+
+        request_ids = []
+        added_ids = []
+        updated_ids = []
+        unchanged_ids = []
+        for requested in requested_operations:
+            operation = dict(requested)
+            operation_id = operation.get("id")
+            if not isinstance(operation_id, str) or not operation_id.strip():
+                raise ValueError(
+                    "Every transcript correction operation must have an id"
+                )
+            if operation_id in request_ids:
+                raise ValueError(
+                    f"Duplicate requested transcript correction id: {operation_id}"
+                )
+            request_ids.append(operation_id)
+            if operation_id not in positions:
+                positions[operation_id] = len(operations)
+                operations.append(operation)
+                added_ids.append(operation_id)
+            elif operations[positions[operation_id]] == operation:
+                unchanged_ids.append(operation_id)
+            else:
+                operations[positions[operation_id]] = operation
+                updated_ids.append(operation_id)
+
+        if not added_ids and not updated_ids:
+            return {
+                "revision": current_revision,
+                "correction_count": len(operations),
+                "added_ids": [],
+                "updated_ids": [],
+                "unchanged_ids": unchanged_ids,
+                "speaker_alignment": None,
+            }
+
+        corrections = {**corrections, "operations": operations}
+        paths = [episode_dir / relative for relative in _DERIVED_TRANSCRIPT_ARTIFACTS]
+        snapshot = {
+            path: path.read_bytes() if path.exists() else None for path in paths
+        }
+        try:
+            atomic_write_json(episode_dir / "transcript_corrections.json", corrections)
+            result = repair_existing_transcript(episode_dir, config)
+            if (
+                file_revision(episode_dir / "transcript.json").removeprefix("sha256:")
+                != corrections["raw_transcript_sha256"]
+            ):
+                raise RuntimeError(
+                    "Raw transcript changed during local recanonicalization"
+                )
+            if current_diarized_transcript(episode_dir, episode, config) is None:
+                raise RuntimeError(
+                    "Recanonicalized transcript did not pass currentness checks"
+                )
+            if require_current_alignment and (
+                current_speaker_segments(episode_dir, episode, config) is None
+            ):
+                raise RuntimeError(
+                    "Rebuilt speaker alignment did not pass currentness checks"
+                )
+        except BaseException:
+            _restore_transcript_artifacts(snapshot)
+            raise
+
+        return {
+            "revision": file_revision(transcript_path),
+            "correction_count": len(operations),
+            "added_ids": added_ids,
+            "updated_ids": updated_ids,
+            "unchanged_ids": unchanged_ids,
+            "speaker_alignment": result.get("speaker_alignment"),
+        }
 
 
 def _with_media_url(state: dict, episode_id: str) -> dict:
@@ -498,6 +699,68 @@ async def inspection_transcript(episode_id: str) -> dict:
         "transcript",
         current_diarized_transcript,
     )
+
+
+@router.get("/{episode_id}/inspection/transcript/corrections")
+async def inspection_transcript_corrections(episode_id: str) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    episode = _read_json(episode_dir / "episode.json", {})
+    config = load_config()
+    try:
+        transcript = await asyncio.to_thread(
+            current_diarized_transcript, episode_dir, episode, config
+        )
+        if transcript is None:
+            raise _TranscriptRevisionConflict(
+                "Current canonical transcript is unavailable"
+            )
+        corrections = await asyncio.to_thread(
+            _transcript_corrections_document, episode_dir
+        )
+        revision = await asyncio.to_thread(
+            file_revision, episode_dir / "diarized_transcript.json"
+        )
+    except _TranscriptRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "schema": "cascade.transcript-corrections/v1",
+        "episode_id": episode_id,
+        "clock": "source",
+        "current": True,
+        "transcript_revision": revision,
+        "correction_count": len(corrections["operations"]),
+        "corrections": corrections,
+    }
+
+
+@router.post("/{episode_id}/inspection/transcript/corrections")
+async def apply_inspection_transcript_corrections(
+    episode_id: str, request: TranscriptCorrectionsRequest
+) -> dict:
+    episode_dir = _episode_dir(episode_id)
+    try:
+        result = await asyncio.to_thread(
+            _apply_transcript_corrections,
+            episode_dir,
+            load_config(),
+            request.expected_revision,
+            request.operations,
+        )
+    except _TranscriptRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (FileNotFoundError, OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "schema": "cascade.transcript-corrections/v1",
+        "episode_id": episode_id,
+        "clock": "source",
+        "current": True,
+        **result,
+    }
 
 
 @router.get("/{episode_id}/inspection/shot-plan")
