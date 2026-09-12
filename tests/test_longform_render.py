@@ -585,8 +585,9 @@ def test_terminal_prefix_verification_failure_preserves_reviewed_output(
     assert not list(tmp_episode_dir.glob(".upload_video-trim-reuse-*.mp4"))
 
 
-def test_audio_repair_copies_current_video_and_records_verified_remaster(
-    tmp_episode_dir, sample_config
+@pytest.mark.parametrize("record_failure", [False, True])
+def test_audio_repair_is_atomic_with_manifest_record(
+    tmp_episode_dir, sample_config, record_failure
 ):
     episode = {
         "crop_config": {"speakers": [{"center_x": 80, "center_y": 45, "zoom": 1}]},
@@ -603,6 +604,19 @@ def test_audio_repair_copies_current_video_and_records_verified_remaster(
     source.write_bytes(b"source")
     audio.write_bytes(b"audio")
     output.write_bytes(b"unsafe audio, verified video")
+    manifest_path = tmp_episode_dir / "render_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "clock": "source",
+                "shorts": {},
+                "longform": {"fingerprint": "prior-record"},
+            }
+        )
+    )
+    original_output = output.read_bytes()
+    original_manifest = manifest_path.read_bytes()
     current = {
         "fingerprint": "current-fingerprint",
         "render_mode": "speaker_cut",
@@ -634,6 +648,7 @@ def test_audio_repair_copies_current_video_and_records_verified_remaster(
         assert destination != output
         assert timeline.keep_intervals == ((0.0, 2.0),)
         assert kwargs["loudness_policy"]["target_lufs"] == -16
+        assert kwargs["verify_video_copy"] is True
         destination.write_bytes(b"same video packets, repaired audio")
         return {
             "duration_seconds": 2,
@@ -647,8 +662,21 @@ def test_audio_repair_copies_current_video_and_records_verified_remaster(
                 "integrated_lufs": -16.0,
                 "true_peak_dbfs": -1.4,
             },
+            "video_copy_verification": {
+                "status": "pass",
+                "input": {"sha256": "same", "packet_count": 60},
+                "output": {"sha256": "same", "packet_count": 60},
+            },
         }
 
+    record = (
+        patch(
+            "agents.longform_render.record_longform_render",
+            side_effect=RuntimeError("manifest write failed"),
+        )
+        if record_failure
+        else nullcontext()
+    )
     with (
         patch(
             "agents.longform_render.current_speaker_segments",
@@ -667,8 +695,18 @@ def test_audio_repair_copies_current_video_and_records_verified_remaster(
         patch("agents.longform_render.current_longform_render", return_value=current),
         patch("agents.longform_render.require_render_space"),
         patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
+        record,
     ):
-        result = repair_longform_audio(tmp_episode_dir, sample_config)
+        if record_failure:
+            with pytest.raises(RuntimeError, match="manifest write failed"):
+                repair_longform_audio(tmp_episode_dir, sample_config)
+        else:
+            result = repair_longform_audio(tmp_episode_dir, sample_config)
+
+    if record_failure:
+        assert output.read_bytes() == original_output
+        assert manifest_path.read_bytes() == original_manifest
+        return
 
     assert output.read_bytes() == b"same video packets, repaired audio"
     assert result["audio_repaired"] is True
@@ -676,6 +714,12 @@ def test_audio_repair_copies_current_video_and_records_verified_remaster(
     assert result["render_fingerprint"] == "current-fingerprint"
     assert (
         result["manifest"]["provenance"]["audio_remaster"]["video_reencoded"] is False
+    )
+    assert (
+        result["manifest"]["provenance"]["audio_remaster"]["video_copy_verification"][
+            "status"
+        ]
+        == "pass"
     )
 
 

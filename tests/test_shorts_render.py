@@ -374,8 +374,9 @@ def test_public_single_clip_adapter_rejects_unknown_clip(
         render_single_clip(tmp_episode_dir, sample_config, "missing")
 
 
-def test_repair_single_clip_audio_copies_video_and_preserves_fingerprint(
-    tmp_episode_dir, sample_config
+@pytest.mark.parametrize("record_failure", [False, True])
+def test_repair_single_clip_audio_is_atomic_with_manifest_record(
+    tmp_episode_dir, sample_config, record_failure
 ):
     clip = {"id": "clip_02", "start_seconds": 1, "end_seconds": 3}
     episode = {"crop_config": {"speakers": [{}]}, "longform_edits": []}
@@ -390,6 +391,18 @@ def test_repair_single_clip_audio_copies_video_and_preserves_fingerprint(
     audio.write_bytes(b"audio")
     output.parent.mkdir(exist_ok=True)
     output.write_bytes(b"old audio, reviewed video")
+    manifest_path = tmp_episode_dir / "render_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "clock": "source",
+                "shorts": {"clip_02": {"fingerprint": "prior-record"}},
+            }
+        )
+    )
+    original_output = output.read_bytes()
+    original_manifest = manifest_path.read_bytes()
     caption.parent.mkdir(exist_ok=True)
     caption.write_text("captions")
     current = {
@@ -420,7 +433,10 @@ def test_repair_single_clip_audio_copies_video_and_preserves_fingerprint(
         assert video == output
         assert timeline.keep_intervals == ((1.0, 3.0),)
         assert kwargs["loudness_policy"]["profile"] == "shorts"
-        destination.write_bytes(b"same video, normalized audio")
+        assert kwargs["verify_video_copy"] is True
+        replacement = destination.with_name(f".{destination.name}.replacement")
+        replacement.write_bytes(b"same video, normalized audio")
+        replacement.replace(destination)
         return {
             "duration_seconds": 2,
             "audio_duration_seconds": 2,
@@ -433,8 +449,21 @@ def test_repair_single_clip_audio_copies_video_and_preserves_fingerprint(
                 "integrated_lufs": -16.0,
                 "true_peak_dbfs": -1.4,
             },
+            "video_copy_verification": {
+                "status": "pass",
+                "input": {"sha256": "same", "packet_count": 60},
+                "output": {"sha256": "same", "packet_count": 60},
+            },
         }
 
+    record = (
+        patch(
+            "agents.shorts_render.record_short_render",
+            side_effect=RuntimeError("manifest write failed"),
+        )
+        if record_failure
+        else nullcontext()
+    )
     with (
         patch(
             "agents.shorts_render.current_speaker_segments",
@@ -445,11 +474,27 @@ def test_repair_single_clip_audio_copies_video_and_preserves_fingerprint(
         patch("agents.shorts_render.current_short_render", return_value=current),
         patch("agents.shorts_render.require_render_space"),
         patch("agents.shorts_render.mux_timeline_audio", side_effect=fake_mux),
+        record,
     ):
-        result = repair_single_clip_audio(tmp_episode_dir, sample_config, "clip_02")
+        if record_failure:
+            with pytest.raises(RuntimeError, match="manifest write failed"):
+                repair_single_clip_audio(tmp_episode_dir, sample_config, "clip_02")
+        else:
+            result = repair_single_clip_audio(tmp_episode_dir, sample_config, "clip_02")
+
+    if record_failure:
+        assert output.read_bytes() == original_output
+        assert manifest_path.read_bytes() == original_manifest
+        return
 
     assert output.read_bytes() == b"same video, normalized audio"
     assert result["audio_repaired"] is True
     assert result["video_reencoded"] is False
     assert result["render"]["fingerprint"] == "current-short"
     assert result["render"]["provenance"]["audio_remaster"]["video_reencoded"] is False
+    assert (
+        result["render"]["provenance"]["audio_remaster"]["video_copy_verification"][
+            "status"
+        ]
+        == "pass"
+    )

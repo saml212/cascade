@@ -37,6 +37,7 @@ from lib.delivery_video import (
     short_render_fingerprint,
     source_fps,
     staged_render_output,
+    video_packet_signature,
 )
 from lib.loudness import delivery_loudness_policy
 from lib.srt import escape_srt_path
@@ -534,6 +535,66 @@ def test_staged_render_output_preserves_reviewed_file_when_verification_fails(
     assert not list(tmp_path.glob(".upload_video-*.mp4"))
 
 
+def test_video_packet_signature_ignores_remux_timestamp_offsets():
+    first = """#extradata 0, 39, aaa
+0, 0, 0, 512, 10, one
+0, 512, 512, 512, 20, two
+"""
+    shifted = """#extradata 0, 39, aaa
+0, 840, 840, 512, 10, one
+0, 1352, 1352, 512, 20, two
+"""
+
+    def signature(output):
+        return video_packet_signature(
+            Path("video.mp4"),
+            runner=lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+        )
+
+    assert signature(first) == signature(shifted)
+    assert signature(first)["packet_count"] == 2
+
+
+def test_mux_rejects_video_packet_change_before_replacing_output(tmp_path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "result.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"reviewed")
+    signatures = iter(
+        [
+            "0, 0, 0, 512, 10, original\n",
+            "0, 0, 0, 512, 10, changed\n",
+        ]
+    )
+
+    def runner(command, **_kwargs):
+        if "framehash" in command:
+            return SimpleNamespace(stdout=next(signatures))
+        Path(command[-1]).write_bytes(b"remuxed")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    with (
+        patch("lib.delivery_video.probe", return_value={"format": {"duration": "1"}}),
+        patch(
+            "lib.delivery_video.validate_av_output",
+            return_value={"duration_seconds": 1},
+        ),
+        pytest.raises(RuntimeError, match="changed or truncated"),
+    ):
+        mux_timeline_audio(
+            video,
+            audio,
+            output,
+            Timeline.from_edits(1),
+            verify_video_copy=True,
+            runner=runner,
+        )
+
+    assert output.read_bytes() == b"reviewed"
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
 def test_mux_can_atomically_shorten_its_video_input_in_place(tmp_path):
     output = tmp_path / "upload_video.mp4"
@@ -668,9 +729,15 @@ def test_mux_normalizes_aac_and_copies_video_packets(tmp_path):
         output,
         Timeline.from_edits(3),
         loudness_policy=delivery_loudness_policy({}, "shorts"),
+        verify_video_copy=True,
     )
 
     assert video_hash(output) == before
+    assert media["video_copy_verification"]["status"] == "pass"
+    assert (
+        media["video_copy_verification"]["input"]
+        == media["video_copy_verification"]["output"]
+    )
     assert media["audio_loudness"]["integrated_lufs"] == pytest.approx(-16, abs=0.5)
     assert media["audio_loudness"]["true_peak_dbfs"] <= -1
 

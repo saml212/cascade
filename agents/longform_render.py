@@ -22,6 +22,7 @@ from lib.delivery_video import (
     longform_trim_reuse_fingerprint,
     longform_trim_reuse_proof,
     mux_timeline_audio,
+    preserve_reviewed_output,
     record_longform_render,
     render_config_for_episode,
     render_output_lock,
@@ -303,41 +304,48 @@ class LongformRenderAgent(BaseAgent):
         )
         policy = delivery_loudness_policy(self.config, "longform")
         self.report_progress(0, 2, "Remastering canonical audio; preserving video")
-        with staged_render_output(output) as staged:
-            media = mux_timeline_audio(
-                output,
-                audio,
-                staged,
-                timeline,
-                audio_bitrate=encoding["audio_bitrate"],
-                loudness_policy=policy,
-                runner=self._run_ffmpeg,
+        with preserve_reviewed_output(output):
+            with staged_render_output(output) as staged:
+                media = mux_timeline_audio(
+                    output,
+                    audio,
+                    staged,
+                    timeline,
+                    audio_bitrate=encoding["audio_bitrate"],
+                    loudness_policy=policy,
+                    verify_video_copy=True,
+                    runner=self._run_ffmpeg,
+                )
+                if "audio_loudness" not in media:
+                    raise RuntimeError(
+                        "Repaired longform has no verified audio loudness"
+                    )
+                media.update(
+                    encoder=current.get("output", {}).get("encoder", encoder_args[1]),
+                    edit_count=len(episode.get("longform_edits", [])),
+                    segment_count=len(render_segments),
+                    expected_duration_seconds=round(timeline.duration, 3),
+                )
+            provenance = copy.deepcopy(current.get("provenance", {}))
+            provenance["audio_remaster"] = {
+                "method": "copy-video-remux-canonical-audio/v1",
+                "source_render_fingerprint": current["fingerprint"],
+                "video_reencoded": False,
+                "video_copy_verification": copy.deepcopy(
+                    media["video_copy_verification"]
+                ),
+                "policy": policy,
+            }
+            self.report_progress(1, 2, "Recording verified audio repair")
+            record = record_longform_render(
+                self.episode_dir,
+                fingerprint=fingerprint,
+                render_mode="speaker_cut",
+                timeline=timeline,
+                media=media,
+                captions=caption_record,
+                provenance=provenance,
             )
-            if "audio_loudness" not in media:
-                raise RuntimeError("Repaired longform has no verified audio loudness")
-            media.update(
-                encoder=current.get("output", {}).get("encoder", encoder_args[1]),
-                edit_count=len(episode.get("longform_edits", [])),
-                segment_count=len(render_segments),
-                expected_duration_seconds=round(timeline.duration, 3),
-            )
-        provenance = copy.deepcopy(current.get("provenance", {}))
-        provenance["audio_remaster"] = {
-            "method": "copy-video-remux-canonical-audio/v1",
-            "source_render_fingerprint": current["fingerprint"],
-            "video_reencoded": False,
-            "policy": policy,
-        }
-        self.report_progress(1, 2, "Recording verified audio repair")
-        record = record_longform_render(
-            self.episode_dir,
-            fingerprint=fingerprint,
-            render_mode="speaker_cut",
-            timeline=timeline,
-            media=media,
-            captions=caption_record,
-            provenance=provenance,
-        )
         self.report_progress(2, 2, "Longform audio repair complete")
         result = self._result(record, caption_path, reused=True)
         result["audio_repaired"] = True

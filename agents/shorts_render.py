@@ -18,6 +18,7 @@ from lib.delivery_video import (
     concat_video_segments,
     current_short_render,
     mux_timeline_audio,
+    preserve_reviewed_output,
     record_short_render,
     render_config_for_episode,
     render_output_lock,
@@ -138,33 +139,38 @@ class ShortsRenderAgent(BaseAgent):
             output.parent, {"output_bytes": output_bytes, "scratch_bytes": 0}
         )
         encoding = get_video_encoding_policy(self.config, "shorts")
-        media = mux_timeline_audio(
-            output,
-            audio,
-            output,
-            timeline,
-            audio_bitrate=encoding["audio_bitrate"],
-            loudness_policy=policy,
-            runner=self._run_ffmpeg,
-        )
-        if "audio_loudness" not in media:
-            raise RuntimeError("Repaired short has no verified audio loudness")
-        provenance = copy.deepcopy(current.get("provenance", {}))
-        provenance["audio_remaster"] = {
-            "method": "copy-video-remux-canonical-audio/v1",
-            "source_render_fingerprint": current["fingerprint"],
-            "video_reencoded": False,
-            "policy": policy,
-        }
-        record = record_short_render(
-            self.episode_dir,
-            clip_id,
-            fingerprint=current["fingerprint"],
-            timeline=timeline,
-            media=media,
-            captions=copy.deepcopy(current.get("captions")),
-            provenance=provenance,
-        )
+        with preserve_reviewed_output(output):
+            media = mux_timeline_audio(
+                output,
+                audio,
+                output,
+                timeline,
+                audio_bitrate=encoding["audio_bitrate"],
+                loudness_policy=policy,
+                verify_video_copy=True,
+                runner=self._run_ffmpeg,
+            )
+            if "audio_loudness" not in media:
+                raise RuntimeError("Repaired short has no verified audio loudness")
+            provenance = copy.deepcopy(current.get("provenance", {}))
+            provenance["audio_remaster"] = {
+                "method": "copy-video-remux-canonical-audio/v1",
+                "source_render_fingerprint": current["fingerprint"],
+                "video_reencoded": False,
+                "video_copy_verification": copy.deepcopy(
+                    media["video_copy_verification"]
+                ),
+                "policy": policy,
+            }
+            record = record_short_render(
+                self.episode_dir,
+                clip_id,
+                fingerprint=current["fingerprint"],
+                timeline=timeline,
+                media=media,
+                captions=copy.deepcopy(current.get("captions")),
+                provenance=provenance,
+            )
         return self._clip_repair_result(clip_id, output, record, repaired=True)
 
     def _clip_repair_result(

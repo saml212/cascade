@@ -770,6 +770,24 @@ def test_video_audio_repair_route_starts_serialized_background_job(delivery):
     mod._video_running.clear()
 
 
+@pytest.mark.parametrize("failure", ["status", "thread"])
+def test_video_job_start_failure_releases_serialization(delivery, failure):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    status = {"status": "ready", "episode_id": "ep_test"}
+    status_error = RuntimeError("status write failed") if failure == "status" else None
+    thread_error = RuntimeError("thread start failed") if failure == "thread" else None
+
+    with (
+        patch.object(mod, "_write_status", side_effect=status_error),
+        patch.object(mod.threading.Thread, "start", side_effect=thread_error),
+        pytest.raises(RuntimeError, match=f"{failure} .* failed"),
+    ):
+        mod._start_video_job("ep_test", episode_dir, status, repair_audio=True)
+
+    assert "ep_test" not in mod._video_running
+
+
 def test_video_audio_repair_route_rejects_stale_pixels(delivery):
     _, mod, episodes_dir = delivery
     make_episode(episodes_dir)

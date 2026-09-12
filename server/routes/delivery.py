@@ -473,9 +473,7 @@ def _prepare_delivery(episode_id: str) -> None:
             "started_at": started_at,
             "completed_at": _now(),
             "filename": audio_path.name,
-            "download_url": _artifact_download_url(
-                episode_id, "audio", output_stat
-            ),
+            "download_url": _artifact_download_url(episode_id, "audio", output_stat),
             "size_bytes": audio_path.stat().st_size,
             "duration_seconds": round(duration, 3),
             "expected_duration_seconds": round(float(expected_duration), 3),
@@ -607,14 +605,20 @@ def _start_video_job(
         video_started_at=_now(),
         video_operation=operation,
     )
-    _write_status(episode_dir, status)
-    threading.Thread(
+    worker = threading.Thread(
         target=_prepare_video,
         args=(episode_id,),
         kwargs={"repair_audio": repair_audio},
         name=f"delivery-video-{operation}-{episode_id}",
         daemon=True,
-    ).start()
+    )
+    try:
+        _write_status(episode_dir, status)
+        worker.start()
+    except BaseException:
+        with _running_lock:
+            _video_running.discard(episode_id)
+        raise
     return status
 
 

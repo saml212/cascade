@@ -367,6 +367,75 @@ def staged_render_output(output: Path):
         staged.unlink(missing_ok=True)
 
 
+@contextmanager
+def preserve_reviewed_output(output: Path):
+    """Restore an existing reviewed artifact when its manifest update fails."""
+    if not output.is_file():
+        raise FileNotFoundError(f"Reviewed render is missing: {output}")
+    descriptor, backup_name = tempfile.mkstemp(
+        prefix=".render-rollback-",
+        suffix=f"-{output.name}",
+        dir=output.parent,
+    )
+    os.close(descriptor)
+    backup = Path(backup_name)
+    backup.unlink()
+    os.link(output, backup)
+    try:
+        yield
+    except BaseException:
+        os.replace(backup, output)
+        raise
+    finally:
+        backup.unlink(missing_ok=True)
+
+
+def video_packet_signature(path: Path, *, runner: Callable = subprocess.run) -> dict:
+    """Hash the ordered H.264 packet payloads without decoding or re-encoding."""
+    result = runner(
+        [
+            ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-f",
+            "framehash",
+            "-hash",
+            "sha256",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    records = []
+    packet_count = 0
+    for line in result.stdout.splitlines():
+        if line.startswith("#extradata"):
+            fields = [field.strip() for field in line.split(",")]
+            records.append("extradata:" + ":".join(fields[-2:]))
+        elif line and not line.startswith("#"):
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) < 6:
+                raise RuntimeError("ffmpeg returned an invalid video packet signature")
+            records.append("packet:" + ":".join(fields[-2:]))
+            packet_count += 1
+    if packet_count == 0:
+        raise RuntimeError("Rendered media contains no video packets")
+    canonical = "\n".join(records).encode()
+    return {
+        "method": "ffmpeg-framehash-packet-payload-sha256/v1",
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "packet_count": packet_count,
+    }
+
+
 def mux_timeline_audio(
     video_path: Path,
     audio_path: Path,
@@ -375,6 +444,7 @@ def mux_timeline_audio(
     *,
     audio_bitrate: str = "192k",
     loudness_policy: dict | None = None,
+    verify_video_copy: bool = False,
     runner: Callable = subprocess.run,
 ) -> dict:
     """Master and mux canonical audio using the video's exact source intervals."""
@@ -429,6 +499,9 @@ def mux_timeline_audio(
             "input_measurement": measurements,
         }
 
+    input_video = (
+        video_packet_signature(video_path, runner=runner) if verify_video_copy else None
+    )
     with staged_render_output(output_path) as temp:
         runner(
             [
@@ -472,6 +545,17 @@ def mux_timeline_audio(
                 measure_loudness(temp, ffmpeg_bin=ffmpeg_executable()), loudness_policy
             )
             media["audio_mastering"] = mastering
+        if input_video is not None:
+            output_video = video_packet_signature(temp, runner=runner)
+            if output_video != input_video:
+                raise RuntimeError(
+                    "Audio repair changed or truncated the encoded video packets"
+                )
+            media["video_copy_verification"] = {
+                "status": "pass",
+                "input": input_video,
+                "output": output_video,
+            }
         return media
 
 
