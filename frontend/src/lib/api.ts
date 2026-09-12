@@ -399,6 +399,15 @@ export interface CropConfigRequest {
   source_height?: number;
 }
 
+export interface TranscriptSpeakerMapEntry extends UnknownRecord {
+  index: number;
+  label?: string;
+  person?: string | null;
+  crop_speaker_index?: number | null;
+  target_speaker?: string;
+  mapping_method?: string;
+}
+
 export interface DeliveryStatus extends UnknownRecord {
   status: 'not_prepared' | 'preparing' | 'ready' | 'failed';
   episode_id: string;
@@ -615,19 +624,8 @@ export const api = {
   /* Transcript */
   getTranscript: (id: string): Promise<{
     utterances: Array<{ speaker: number; start: number; end: number; text: string }>;
-    speaker_map?:
-      | Array<{ index: number; label: string; track?: number }>
-      | Record<string, string>;
-  }> =>
-    fetch(`/media/episodes/${id}/diarized_transcript.json`).then((r) => {
-      if (!r.ok) throw new Error(`Transcript not available (status ${r.status})`);
-      return r.json() as Promise<{
-        utterances: Array<{ speaker: number; start: number; end: number; text: string }>;
-        speaker_map?:
-          | Array<{ index: number; label: string; track?: number }>
-          | Record<string, string>;
-      }>;
-    }),
+    speaker_map?: TranscriptSpeakerMapEntry[] | Record<string, string>;
+  }> => request('GET', `/media/episodes/${id}/diarized_transcript.json`),
 
   /* Schedule */
   schedule: () => request<UnknownRecord>('GET', '/api/schedule'),

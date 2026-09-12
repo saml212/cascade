@@ -37,18 +37,16 @@ import { Icon } from '../components/icons';
 import { SyncVerifier } from '../components/audio/SyncVerifier';
 import { TrackMixer } from '../components/audio/TrackMixer';
 import { navigate } from '../lib/router';
-
-interface SpeakerState {
-  label: string;
-  x: number;
-  y: number;
-  zoom: number;
-  longform_x: number | null;
-  longform_y: number | null;
-  longform_zoom: number;
-  track: number | null;
-  volume: number;
-}
+import {
+  MAX_CROP_SPEAKERS,
+  appendCropSpeaker,
+  cropBindingState,
+  removalBlockedReason,
+  type CropBindingState,
+  type CropSpeakerBinding,
+  type CropSpeakerState as SpeakerState,
+  type SpeakerMapLoadStatus,
+} from '../lib/crop-speakers';
 
 interface CropState {
   image: HTMLImageElement | null;
@@ -56,6 +54,8 @@ interface CropState {
   sourceHeight: number;
   scaleFactor: number;
   speakers: SpeakerState[];
+  speakerMap: unknown;
+  speakerMapStatus: SpeakerMapLoadStatus;
   ambientTracks: AmbientTrackConfig[];
   wide: { x: number; y: number; zoom: number };
   activeIdx: number; // -1 = wide, 0..n = speaker
@@ -118,6 +118,8 @@ export function CropSetup(target: HTMLElement, episodeId: string): void {
     sourceHeight: 0,
     scaleFactor: 1,
     speakers: [],
+    speakerMap: [],
+    speakerMapStatus: 'loading',
     ambientTracks: [],
     wide: { x: 0, y: 0, zoom: 1.0 },
     activeIdx: 0,
@@ -140,10 +142,34 @@ export function CropSetup(target: HTMLElement, episodeId: string): void {
     initialised = true;
     seedFromEpisode(state, ep);
     loadCropFrame(episodeId, state);
+    void loadSpeakerMap(episodeId, state);
   });
 
   const page = buildPage(episodeId, state);
   mount(target, page);
+}
+
+async function loadSpeakerMap(
+  episodeId: string,
+  state: Signal<CropState>
+): Promise<void> {
+  state.set((prev) => ({ ...prev, speakerMapStatus: 'loading' }));
+  try {
+    const transcript = await api.getTranscript(episodeId);
+    state.set((prev) => ({
+      ...prev,
+      speakerMap: transcript.speaker_map ?? [],
+      speakerMapStatus: 'ready',
+    }));
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    state.set((prev) => ({
+      ...prev,
+      speakerMap: [],
+      // A missing diarized transcript has no identity bindings to protect.
+      speakerMapStatus: status === 404 ? 'ready' : 'unavailable',
+    }));
+  }
 }
 
 function seedFromEpisode(
@@ -276,7 +302,7 @@ function buildPage(episodeId: string, state: Signal<CropState>): HTMLElement {
 
   effect(() => {
     const ep = episodeDetail();
-    headerHost.replaceChildren(renderHeader(episodeId, ep));
+    headerHost.replaceChildren(renderHeader(episodeId, ep, state().speakers.length));
   });
 
   effect(() => {
@@ -302,13 +328,11 @@ function buildPage(episodeId: string, state: Signal<CropState>): HTMLElement {
 
 function renderHeader(
   episodeId: string,
-  ep: Record<string, unknown> | null
+  ep: Record<string, unknown> | null,
+  speakerCount: number
 ): HTMLElement {
   const title = ep ? episodeTitle(ep, episodeId) : episodeId;
   const duration = ep ? (ep.duration_seconds as number) : null;
-  const cfg = (ep?.crop_config as Record<string, unknown>) ?? {};
-  const speakers = (cfg.speakers as unknown[] | undefined) ?? [];
-  const speakerCount = Math.max(speakers.length || 2, (ep?.speaker_count as number) ?? 2);
   const isH6E = !!ep?.audio_sync;
   const audioTracks = (ep?.audio_tracks as Array<Record<string, unknown>> | undefined) ?? [];
   const hasCameraChannels = audioTracks.some((t) => t.track_type === 'camera_channel');
@@ -937,10 +961,11 @@ function renderScrubBar(
         else v.pause();
       },
       class:
-        'w-9 h-9 rounded-md border border-border bg-surface-2 text-ink-primary flex items-center justify-center hover:bg-surface-3',
-      title: s.videoPlaying ? 'Pause' : 'Play',
+        'h-9 px-3 rounded-md border border-border bg-surface-2 text-ink-primary flex items-center justify-center gap-2 hover:bg-surface-3',
+      'aria-label': s.videoPlaying ? 'Pause source video' : 'Play source video',
     },
-    s.videoPlaying ? Icon.pause({ size: 16 }) : Icon.play({ size: 16 })
+    s.videoPlaying ? Icon.pause({ size: 16 }) : Icon.play({ size: 16 }),
+    s.videoPlaying ? 'Pause source' : 'Play source'
   );
 
   const seek = h('input', {
@@ -1084,12 +1109,22 @@ function renderSidebar(
   effect(() => {
     const s = state();
     const ep = episodeDetail();
+    const bindingState = cropBindingState(s.speakerMap, s.speakers.length);
     // Show track dropdown for ANY episode that has audio tracks, not just H6E.
     const hasAudioTracks = !!(ep &&
       (ep.audio_tracks as Array<unknown> | undefined)?.length);
     host.replaceChildren(
+      renderSpeakerRoster(episodeId, state, s, bindingState),
       ...s.speakers.map((spk, i) =>
-        renderSpeakerCard(state, s, i, spk, hasAudioTracks, ep)
+        renderSpeakerCard(
+          state,
+          s,
+          i,
+          spk,
+          bindingState.byIndex[i] ?? [],
+          hasAudioTracks,
+          ep
+        )
       ),
       renderWideCard(state, s),
       renderSaveCard(episodeId, state, s)
@@ -1099,16 +1134,137 @@ function renderSidebar(
   return host;
 }
 
+function renderSpeakerRoster(
+  episodeId: string,
+  state: Signal<CropState>,
+  s: CropState,
+  bindings: CropBindingState
+): HTMLElement {
+  const removeReason = removalBlockedReason(
+    s.speakers.length - 1,
+    s.speakers.length,
+    bindings.byIndex,
+    s.speakerMapStatus
+  );
+  const addDisabled =
+    s.speakers.length >= MAX_CROP_SPEAKERS ||
+    s.sourceWidth <= 0 ||
+    s.sourceHeight <= 0;
+
+  return h(
+    'div',
+    { class: 'panel p-4 flex flex-col gap-3' },
+    h(
+      'div',
+      { class: 'flex items-center justify-between gap-3' },
+      h('div', { class: 'text-body text-ink-primary font-medium' },
+        `Speakers · ${s.speakers.length} of ${MAX_CROP_SPEAKERS}`
+      ),
+      h(
+        'div',
+        { class: 'flex items-center gap-2' },
+        Button({
+          variant: 'destructive',
+          size: 'sm',
+          label: 'Remove last',
+          disabled: removeReason != null,
+          title: removeReason ?? 'Remove the final speaker',
+          onClick: () => removeLastSpeaker(state),
+        }),
+        Button({
+          size: 'sm',
+          label: 'Add speaker',
+          icon: Icon.plus({ size: 14 }),
+          disabled: addDisabled,
+          title:
+            !addDisabled
+              ? 'Add a speaker'
+              : s.speakers.length >= MAX_CROP_SPEAKERS
+                ? `Crop setup supports up to ${MAX_CROP_SPEAKERS} speakers.`
+                : 'Wait for the crop frame to load.',
+          onClick: () => addSpeaker(state),
+        })
+      )
+    ),
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-tertiary leading-relaxed' },
+      'New speakers are appended so existing crop IDs stay fixed. A reviewed transcript binding locks its speaker label and prevents removal.'
+    ),
+    ...bindings.unassigned.map((binding) =>
+      h(
+        'p',
+        {
+          class: binding.reviewed
+            ? 'text-body-sm text-accent'
+            : 'text-body-sm text-ink-tertiary',
+        },
+        `ASR ${binding.asrSpeaker} · ${binding.label} → wide / unresolved`,
+        binding.reviewed ? ' · reviewed' : ''
+      )
+    ),
+    s.speakerMapStatus === 'loading'
+      ? h(
+          'p',
+          { class: 'text-body-sm text-ink-tertiary' },
+          'Checking transcript identity…'
+        )
+      : null,
+    s.speakerMapStatus === 'unavailable'
+      ? h(
+          'div',
+          { class: 'flex items-center justify-between gap-3' },
+          h(
+            'p',
+            { class: 'text-body-sm text-status-warning' },
+            'Transcript identity is unavailable. Removal is disabled.'
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              onclick: () => void loadSpeakerMap(episodeId, state),
+              class: 'text-body-sm text-accent hover:underline',
+            },
+            'Retry'
+          )
+        )
+      : null
+  );
+}
+
+function addSpeaker(state: Signal<CropState>): void {
+  const current = state.peek();
+  const speakers = appendCropSpeaker(
+    current.speakers,
+    current.sourceWidth,
+    current.sourceHeight
+  );
+  state.set({ ...current, speakers, activeIdx: speakers.length - 1 });
+}
+
+function removeLastSpeaker(state: Signal<CropState>): void {
+  const current = state.peek();
+  const nextCount = current.speakers.length - 1;
+  state.set({
+    ...current,
+    speakers: current.speakers.slice(0, -1),
+    activeIdx: current.activeIdx >= nextCount ? nextCount - 1 : current.activeIdx,
+  });
+}
+
 function renderSpeakerCard(
   state: Signal<CropState>,
   s: CropState,
   idx: number,
   spk: SpeakerState,
+  bindings: CropSpeakerBinding[],
   hasAudioTracks: boolean,
   ep: Record<string, unknown> | null
 ): HTMLElement {
   const color = SPEAKER_CSS_VARS[idx % SPEAKER_CSS_VARS.length];
   const active = idx === s.activeIdx;
+  const reviewedBinding = bindings.some((binding) => binding.reviewed);
 
   return h(
     'div',
@@ -1130,13 +1286,38 @@ function renderSpeakerCard(
         class: 'w-2.5 h-2.5 rounded-full',
         style: { background: color },
       }),
-      labelInput(state, idx, spk.label),
+      labelInput(state, idx, spk.label, reviewedBinding),
       h(
         'span',
         { class: 'text-code-sm text-ink-tertiary font-mono tabular ml-auto' },
         `(${spk.x}, ${spk.y})`
       )
     ),
+    bindings.length
+      ? h(
+          'div',
+          { class: 'flex flex-col gap-1' },
+          ...bindings.map((binding) =>
+            h(
+              'div',
+              {
+                class: [
+                  'text-body-sm',
+                  binding.reviewed ? 'text-accent' : 'text-ink-tertiary',
+                ].join(' '),
+              },
+              `ASR ${binding.asrSpeaker} → ${binding.label}`,
+              binding.reviewed ? ' · reviewed' : ' · inferred'
+            )
+          )
+        )
+      : h(
+          'div',
+          { class: 'text-body-sm text-ink-tertiary' },
+          s.speakerMapStatus === 'ready'
+            ? 'No explicit transcript speaker is bound to this crop.'
+            : 'Transcript binding is not available.'
+        ),
     sliderRow({
       label: 'Shorts zoom',
       value: spk.zoom,
@@ -1205,13 +1386,20 @@ function renderSpeakerCard(
 function labelInput(
   state: Signal<CropState>,
   idx: number,
-  value: string
+  value: string,
+  locked: boolean
 ): HTMLElement {
   return h('input', {
     type: 'text',
     value,
-    class:
+    disabled: locked,
+    title: locked
+      ? 'This label is part of a reviewed transcript speaker binding.'
+      : 'Speaker label',
+    class: [
       'bg-transparent text-body text-ink-primary font-medium focus:outline-none w-40',
+      locked ? 'cursor-not-allowed opacity-70' : '',
+    ].join(' '),
     oninput: (e: Event) =>
       updateSpeaker(state, idx, {
         label: (e.target as HTMLInputElement).value,
@@ -1425,14 +1613,23 @@ async function doSave(
   }
 
   try {
-    await api.saveCropConfig(episodeId, payload);
-    try {
-      if (resume) {
-        await api.resumePipeline(episodeId);
-        showToast('Crops saved — pipeline resuming.', 'success');
-      } else {
-        showToast('Crop and audio settings saved.', 'success');
+    const saved = await api.saveCropConfig(episodeId, payload);
+    if (!resume) {
+      const cropConfig = saved.crop_config;
+      if (cropConfig && typeof cropConfig === 'object') {
+        seedFromEpisode(state, {
+          crop_config: cropConfig,
+          speaker_count: s.speakers.length,
+        });
       }
+      await loadSpeakerMap(episodeId, state);
+      state.set({ ...state.peek(), saving: false });
+      showToast('Crop and audio settings saved.', 'success');
+      return;
+    }
+    try {
+      await api.resumePipeline(episodeId);
+      showToast('Crops saved — pipeline resuming.', 'success');
     } catch (resumeError) {
       const status = (resumeError as { status?: number }).status;
       showToast(
