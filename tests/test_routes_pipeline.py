@@ -272,9 +272,9 @@ class TestPublishApproval:
         client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
         release = _release_snapshot(upload_post=True)
-        release["release_gate"]["publish_plan"]["upload_post"][
-            "account_identity"
-        ] = None
+        release["release_gate"]["publish_plan"]["upload_post"]["account_identity"] = (
+            None
+        )
 
         with (
             patch("server.routes.pipeline.quality_snapshot", return_value=release),
@@ -293,9 +293,9 @@ class TestPublishApproval:
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")
         release = _release_snapshot(upload_post=False, podcast_rss=True)
-        release["release_gate"]["publish_plan"]["podcast_rss"][
-            "account_identity"
-        ] = None
+        release["release_gate"]["publish_plan"]["podcast_rss"]["account_identity"] = (
+            None
+        )
 
         with (
             patch("server.routes.pipeline.quality_snapshot", return_value=release),
