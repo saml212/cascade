@@ -14,7 +14,6 @@ import { Icon } from '../../components/icons';
 import {
   episodeDetail,
   episodeDetailError,
-  watchEpisode,
 } from '../../state/episodes';
 import { renderOverview } from './overview';
 import { renderLongform } from './longform';
@@ -42,8 +41,6 @@ function sectionFromPath(path: string, id: string): SectionKey {
 }
 
 export function Episode(target: HTMLElement, episodeId: string): void {
-  watchEpisode(episodeId);
-
   const content = h('div');
   let mountedSection: SectionKey | null = null;
   let disposeContent: (() => void) | null = null;

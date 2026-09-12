@@ -22,7 +22,15 @@
 import { h, mount } from '../lib/dom';
 import { signal, effect, type Signal } from '../lib/signals';
 import { api, type EpisodeReviewState, type UnknownRecord } from '../lib/api';
-import { describeStatus, episodeTitle, formatDuration, formatTimecode } from '../lib/format';
+import {
+  describeEpisodeStatus,
+  describeStatus,
+  episodeTitle,
+  formatDuration,
+  formatEditableTimecode,
+  formatTimecode,
+} from '../lib/format';
+import { editSourceRange } from '../lib/edit-range';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
 import { EpisodeBackButton } from '../components/EpisodeBackButton';
@@ -48,34 +56,18 @@ interface Utterance {
   text: string;
 }
 
-function removedRange(edit: Edit, sourceDuration: number): [number, number] | null {
-  if (sourceDuration <= 0) return null;
-  const start =
-    edit.type === 'trim_start'
-      ? 0
-      : edit.type === 'trim_end'
-        ? edit.seconds ?? sourceDuration
-        : edit.start_seconds ?? 0;
-  const end =
-    edit.type === 'trim_start'
-      ? edit.seconds ?? 0
-      : edit.type === 'trim_end'
-        ? sourceDuration
-        : edit.end_seconds ?? 0;
-  const boundedStart = Math.max(0, Math.min(start, sourceDuration));
-  const boundedEnd = Math.max(0, Math.min(end, sourceDuration));
-  return boundedEnd > boundedStart ? [boundedStart, boundedEnd] : null;
-}
-
 function utteranceIsRemoved(
   utterance: Utterance,
   editList: Edit[],
   sourceDuration: number
 ): boolean {
   return editList.some((edit) => {
-    const range = removedRange(edit, sourceDuration);
+    const range = editSourceRange(edit, sourceDuration);
     return Boolean(
-      range && utterance.start >= range[0] && utterance.end <= range[1]
+      range &&
+        range[1] > range[0] &&
+        utterance.start >= range[0] &&
+        utterance.end <= range[1]
     );
   });
 }
@@ -661,18 +653,22 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
 
     effect(() => {
       const editList = edits();
-      const status = describeStatus(ep.status as string);
+      const workflowStatus = describeStatus(ep.status as string);
+      const currentStatus = describeEpisodeStatus(ep, {
+        cropConfig: ep.crop_config,
+        clips: ep.clips as unknown[] | undefined,
+      });
       const renderCurrent = reviewState.longform.render.current;
       const needsRender = !renderCurrent;
       const canApprove =
         renderCurrent &&
         !reviewState.longform.approval.current &&
-        status.key === 'awaiting_longform_review';
+        workflowStatus.key === 'awaiting_longform_review';
       const alreadyPast =
-        status.key === 'awaiting_clip_review' ||
-        status.key === 'awaiting_publish' ||
-        status.key === 'awaiting_backup' ||
-        status.key === 'live';
+        workflowStatus.key === 'awaiting_clip_review' ||
+        workflowStatus.key === 'awaiting_publish' ||
+        workflowStatus.key === 'awaiting_backup' ||
+        workflowStatus.key === 'live';
 
       const headline = needsRender
         ? `${editList.length} cut${editList.length === 1 ? '' : 's'} saved · current render required`
@@ -680,7 +676,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         ? 'Happy with this cut?'
         : alreadyPast
         ? 'Longform is already approved'
-        : status.label;
+        : currentStatus.label;
 
       const sub = needsRender
         ? reviewState.longform.render.playable
@@ -690,7 +686,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         ? 'Approving uploads to YouTube, updates the RSS feed, and fires clip mining.'
         : alreadyPast
         ? 'Downstream work has started. Request edits here to re-open.'
-        : status.hint;
+        : currentStatus.hint;
 
       footerEl.replaceChildren(
         h(
@@ -757,7 +753,10 @@ function loadingState(): HTMLElement {
 /* ─── Header ────────────────────────────────────────────────────────────── */
 
 function renderHeader(episodeId: string, ep: UnknownRecord): HTMLElement {
-  const status = describeStatus(ep.status as string);
+  const status = describeEpisodeStatus(ep, {
+    cropConfig: ep.crop_config,
+    clips: ep.clips as unknown[] | undefined,
+  });
   const title = episodeTitle(ep, episodeId);
 
   return h(
@@ -804,9 +803,9 @@ function renderTimeline(
   };
 
   const lanes = editList.map((e, i) => {
-    const [start, end] = removedRange(e, dur) ?? [0, 0];
-    const leftPct = (start / dur) * 100;
+    const [start, end] = editSourceRange(e, dur) ?? [0, 0];
     const widthPct = Math.max(0.6, ((end - start) / dur) * 100);
+    const leftPct = Math.min((start / dur) * 100, 100 - widthPct);
     return h('button', {
       class:
         'absolute top-0 bottom-0 rounded hover:brightness-125 transition-[filter] duration-[120ms]',
@@ -816,7 +815,7 @@ function renderTimeline(
         backgroundColor:
           e.type === 'cut' ? 'rgba(226, 109, 90, 0.82)' : 'rgba(245, 165, 36, 0.78)',
       },
-      title: `${e.type} · ${formatTimecode(start)}–${formatTimecode(end)}${
+      title: `${e.type} · ${formatEditableTimecode(start)}–${formatEditableTimecode(end)}${
         e.reason ? ` · ${e.reason}` : ''
       }\nClick to seek`,
       dataset: { idx: String(i) },

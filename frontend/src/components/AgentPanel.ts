@@ -1,7 +1,8 @@
 import { h } from '../lib/dom';
-import { effect } from '../lib/signals';
+import { effect, effectScope, onCleanup } from '../lib/signals';
 import { agentPanelCollapsed, compactShell, toggleAgentPanel } from '../state/ui';
-import { episodeDetailId } from '../state/episodes';
+import { describeEpisodeStatus } from '../lib/format';
+import { episodeDetail, episodeDetailId } from '../state/episodes';
 import { Icon } from './icons';
 import { EventFeed } from './EventFeed';
 
@@ -10,6 +11,7 @@ export function AgentPanel(): HTMLElement {
     class:
       'shrink-0 bg-surface-canvas border-l border-border-subtle transition-[width] duration-[220ms] ease-expressive overflow-hidden relative z-10',
   });
+  let viewDispose: (() => void) | null = null;
 
   effect(() => {
     const collapsed = agentPanelCollapsed();
@@ -20,7 +22,17 @@ export function AgentPanel(): HTMLElement {
     host.classList.toggle('h-full', compact);
     host.classList.toggle('shadow-2xl', compact && !collapsed);
     host.style.width = collapsed ? '48px' : compact ? 'min(380px, calc(100vw - 64px))' : '380px';
-    host.replaceChildren(collapsed ? collapsedView() : expandedView());
+    viewDispose?.();
+    viewDispose = null;
+    if (collapsed) {
+      host.replaceChildren(collapsedView());
+    } else {
+      let view!: HTMLElement;
+      viewDispose = effectScope(() => {
+        view = expandedView();
+      });
+      host.replaceChildren(view);
+    }
   });
 
   function collapsedView(): HTMLElement {
@@ -90,8 +102,43 @@ export function AgentPanel(): HTMLElement {
   }
 
   function feedSection(): HTMLElement {
+    const currentState = h('div');
     const inner = h('div', null);
     let currentDispose: (() => void) | null = null;
+    onCleanup(() => currentDispose?.());
+
+    effect(() => {
+      const id = episodeDetailId();
+      const episode = episodeDetail();
+      if (!id || !episode) {
+        currentState.replaceChildren();
+        return;
+      }
+      const status = describeEpisodeStatus(episode, {
+        cropConfig: episode.crop_config,
+        clips: episode.clips as unknown[] | undefined,
+      });
+      currentState.replaceChildren(
+        h(
+          'div',
+          {
+            class:
+              'rounded-md bg-surface-2 border border-border-subtle px-3 py-2.5',
+            role: 'status',
+          },
+          h(
+            'div',
+            { class: 'text-body text-ink-primary font-medium' },
+            status.label
+          ),
+          h(
+            'div',
+            { class: 'text-body-sm text-ink-tertiary mt-0.5' },
+            status.hint
+          )
+        )
+      );
+    });
 
     effect(() => {
       const id = episodeDetailId();
@@ -116,7 +163,7 @@ export function AgentPanel(): HTMLElement {
         inner.replaceChildren(el);
       }
     });
-    return inner;
+    return h('div', { class: 'flex flex-col gap-4' }, currentState, inner);
   }
 
   return host;

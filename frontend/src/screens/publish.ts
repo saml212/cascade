@@ -1,68 +1,67 @@
-/**
- * Publish — sign off on where each clip lands, see the weekly lane-up, kick
- * the uploads. Pulls the episode's clips + per-platform metadata and shows
- * per-platform readiness. Click "Publish" to POST approve-publish; cascade
- * handles the actual uploads behind the scenes.
- */
+/** Publish review for the current, revision-bound release state. */
 
-import { h, mount } from '../lib/dom';
-import { signal, effect, type Signal } from '../lib/signals';
-import { api, type UnknownRecord } from '../lib/api';
-import { describeStatus, episodeTitle, formatDuration, pluralize } from '../lib/format';
-import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
-import { Icon } from '../components/icons';
-import { link, navigate } from '../lib/router';
+import { EpisodeBackButton } from '../components/EpisodeBackButton';
+import { StatusPill } from '../components/StatusPill';
+import {
+  api,
+  type EpisodeReviewState,
+  type QualitySnapshot,
+  type ReviewDestination,
+  type UnknownRecord,
+} from '../lib/api';
+import { h, mount } from '../lib/dom';
+import {
+  describeEpisodeStatus,
+  episodeDisplayDuration,
+  episodeTitle,
+  formatDuration,
+  pluralize,
+  type StatusDescriptor,
+} from '../lib/format';
+import { navigate } from '../lib/router';
+import { effect, signal, type Signal } from '../lib/signals';
+import {
+  episodeDetail,
+  episodeDetailError,
+} from '../state/episodes';
 import { showToast } from '../state/ui';
 
-const PLATFORMS = [
-  { key: 'youtube', label: 'YouTube', color: '#ff3344' },
-  { key: 'tiktok', label: 'TikTok', color: '#69c9d0' },
-  { key: 'instagram', label: 'Instagram', color: '#e1306c' },
-  { key: 'x', label: 'X', color: '#e8e8e8' },
-  { key: 'linkedin', label: 'LinkedIn', color: '#0a66c2' },
-  { key: 'facebook', label: 'Facebook', color: '#1877f2' },
-  { key: 'threads', label: 'Threads', color: '#a0a0a0' },
-  { key: 'pinterest', label: 'Pinterest', color: '#e60023' },
-  { key: 'bluesky', label: 'Bluesky', color: '#1185fe' },
-];
+type ReviewedClip = EpisodeReviewState['clips'][number];
+
+const DESTINATION_COLORS: Record<string, string> = {
+  youtube: '#ff3344',
+  tiktok: '#69c9d0',
+  instagram: '#e1306c',
+  x: '#e8e8e8',
+};
 
 export function Publish(target: HTMLElement, episodeId: string): void {
-  const episode = signal<UnknownRecord | null>(null);
-  const clips = signal<UnknownRecord[] | null>(null);
-  const err = signal<string | null>(null);
-  const publishing = signal<boolean>(false);
+  const review = signal<EpisodeReviewState | null>(null);
+  const loadError = signal<string | null>(null);
+  const publishing = signal(false);
 
-  async function load(): Promise<void> {
-    try {
-      const [ep, cs] = await Promise.all([
-        api.getEpisode(episodeId),
-        api.listClips(episodeId),
-      ]);
-      episode.set(ep);
-      clips.set(cs);
-      err.set(null);
-    } catch (e) {
-      err.set((e as Error).message);
-    }
-  }
-
-  void load();
+  void api
+    .review(episodeId)
+    .then((state) => {
+      review.set(state);
+      loadError.set(null);
+    })
+    .catch((error: Error) => loadError.set(error.message));
 
   const page = h('div', { class: 'min-h-full flex flex-col' });
-
   effect(() => {
-    const ep = episode();
-    const cs = clips();
-    const e = err();
+    const episode = episodeDetail();
+    const state = review();
+    const error = loadError() ?? episodeDetailError();
 
-    if (e && !ep) {
+    if (error && (!episode || !state)) {
       page.replaceChildren(
-        h('div', { class: 'px-10 py-10 text-status-danger' }, e)
+        h('div', { class: 'px-10 py-10 text-status-danger' }, error)
       );
       return;
     }
-    if (!ep || !cs) {
+    if (!episode || !state) {
       page.replaceChildren(
         h(
           'div',
@@ -73,23 +72,42 @@ export function Publish(target: HTMLElement, episodeId: string): void {
       return;
     }
 
-    const approved = cs.filter((c) => c.status === 'approved' || c.status === 'published');
-    const pending = cs.filter((c) => c.status !== 'rejected' && c.status !== 'approved' && c.status !== 'published');
-    const rejected = cs.filter((c) => c.status === 'rejected');
+    const status = describeEpisodeStatus(episode, {
+      cropConfig: episode.crop_config,
+      clips: state.clips,
+    });
+    const selected = state.clips.filter(
+      (clip) => clip.review.selection.status === 'selected'
+    );
+    const approved = selected.filter((clip) => clip.review.approval.current);
+    const pending = selected.filter((clip) => !clip.review.approval.current);
+    const unselected = state.clips.filter(
+      (clip) => clip.review.selection.status === 'unselected'
+    );
+    const rejected = state.clips.filter(
+      (clip) => clip.review.selection.status === 'rejected'
+    );
 
     page.replaceChildren(
-      renderHeader(episodeId, ep),
+      renderHeader(episodeId, episode, status),
       h(
         'div',
         {
           class:
             'max-w-[1200px] mx-auto w-full px-8 py-6 flex flex-col gap-6 pb-32',
         },
-        renderOverview(approved.length, pending.length, rejected.length, ep),
-        renderPlatforms(cs),
-        renderClipList(approved, rejected, pending)
+        renderOverview(approved.length, pending.length, rejected.length, episode),
+        renderPlatforms(state.enabled_destinations, selected),
+        renderClipList(approved, pending, unselected, rejected)
       ),
-      renderPublishBar(episodeId, ep, approved.length, publishing)
+      renderPublishBar(
+        episodeId,
+        status,
+        episode.quality as QualitySnapshot | null | undefined,
+        approved.length,
+        publishing(),
+        publishing
+      )
     );
   });
 
@@ -98,26 +116,16 @@ export function Publish(target: HTMLElement, episodeId: string): void {
 
 function renderHeader(
   episodeId: string,
-  ep: UnknownRecord
+  episode: UnknownRecord,
+  status: StatusDescriptor
 ): HTMLElement {
-  const status = describeStatus(ep.status as string);
-  const title = episodeTitle(ep, episodeId);
-
   return h(
     'header',
     {
       class:
         'sticky top-0 z-10 bg-canvas border-b border-border-subtle px-8 py-4 flex items-center gap-5',
     },
-    h(
-      'a',
-      {
-        ...link(`/episodes/${episodeId}`),
-        class:
-          'w-8 h-8 flex items-center justify-center rounded-md text-ink-tertiary hover:text-ink-primary hover:bg-surface-2',
-      },
-      Icon.chevronLeft()
-    ),
+    EpisodeBackButton(episodeId),
     h(
       'div',
       { class: 'flex-1 min-w-0' },
@@ -134,7 +142,7 @@ function renderHeader(
       h(
         'div',
         { class: 'text-body-lg text-ink-primary font-medium mt-1 truncate' },
-        title
+        episodeTitle(episode, episodeId)
       )
     )
   );
@@ -144,15 +152,15 @@ function renderOverview(
   approved: number,
   pending: number,
   rejected: number,
-  ep: UnknownRecord
+  episode: UnknownRecord
 ): HTMLElement {
-  const longformUrl = (ep.youtube_longform_url as string) ?? '';
+  const longformUrl = String(episode.youtube_longform_url ?? '');
   return h(
     'div',
     { class: 'panel p-6 flex items-center gap-10 flex-wrap' },
-    statTile('Ready to post', String(approved), 'status-success'),
-    statTile('Pending review', String(pending), 'ink-primary'),
-    statTile('Rejected', String(rejected), 'ink-secondary'),
+    statTile('Final approved', String(approved), 'status-success'),
+    statTile('Selected · pending', String(pending), 'ink-primary'),
+    statTile('Rejected · deferred', String(rejected), 'ink-secondary'),
     statTile(
       'Longform',
       longformUrl ? 'YouTube uploaded' : 'Not uploaded',
@@ -160,7 +168,7 @@ function renderOverview(
     ),
     statTile(
       'Duration',
-      formatDuration(ep.duration_seconds as number),
+      formatDuration(episodeDisplayDuration(episode)),
       'ink-primary'
     )
   );
@@ -185,31 +193,28 @@ function statTile(label: string, value: string, tone: string): HTMLElement {
   );
 }
 
-function renderPlatforms(clips: UnknownRecord[]): HTMLElement {
+function renderPlatforms(
+  destinations: ReviewDestination[],
+  selected: ReviewedClip[]
+): HTMLElement {
   return h(
     'div',
     { class: 'panel p-5' },
     h(
       'div',
       { class: 'text-heading-sm uppercase text-ink-tertiary mb-4' },
-      'Per-platform readiness'
+      'Enabled destination copy'
     ),
     h(
       'div',
-      {
-        class:
-          'grid grid-cols-3 gap-3',
-      },
-      ...PLATFORMS.map((p) => {
-        const filled = clips.filter((c) => {
-          const m = (c.metadata as Record<string, UnknownRecord> | undefined)?.[p.key];
-          return (
-            m &&
-            Object.values(m).some((v) => typeof v === 'string' && v.length > 0)
-          );
-        }).length;
-        const total = clips.length;
-        const complete = filled === total && total > 0;
+      { class: 'grid grid-cols-2 lg:grid-cols-4 gap-3' },
+      ...destinations.map((destination) => {
+        const completeCount = selected.filter((clip) =>
+          clip.review.metadata.destinations.some(
+            (item) => item.key === destination.key && item.complete
+          )
+        ).length;
+        const complete = selected.length > 0 && completeCount === selected.length;
         return h(
           'div',
           {
@@ -218,12 +223,15 @@ function renderPlatforms(clips: UnknownRecord[]): HTMLElement {
           },
           h('span', {
             class: 'w-2 h-2 rounded-full',
-            style: { background: p.color },
+            style: {
+              background:
+                DESTINATION_COLORS[destination.key] ?? 'var(--ink-tertiary)',
+            },
           }),
           h(
             'span',
             { class: 'flex-1 text-body text-ink-primary font-medium' },
-            p.label
+            destination.label
           ),
           h(
             'span',
@@ -233,7 +241,7 @@ function renderPlatforms(clips: UnknownRecord[]): HTMLElement {
                 complete ? 'text-status-success' : 'text-ink-tertiary',
               ].join(' '),
             },
-            `${filled}/${total}`
+            `${completeCount}/${selected.length}`
           )
         );
       })
@@ -242,55 +250,67 @@ function renderPlatforms(clips: UnknownRecord[]): HTMLElement {
 }
 
 function renderClipList(
-  approved: UnknownRecord[],
-  rejected: UnknownRecord[],
-  pending: UnknownRecord[]
+  approved: ReviewedClip[],
+  pending: ReviewedClip[],
+  unselected: ReviewedClip[],
+  rejected: ReviewedClip[]
 ): HTMLElement {
+  const rows = [
+    ...approved.map((clip) => ({ clip, state: 'Final approved', tone: 'success' })),
+    ...pending.map((clip) => ({ clip, state: 'Needs final review', tone: 'warning' })),
+    ...unselected.map((clip) => ({ clip, state: 'Not selected', tone: 'neutral' })),
+    ...rejected.map((clip) => ({ clip, state: 'Rejected · deferred', tone: 'danger' })),
+  ];
   return h(
     'div',
     { class: 'panel p-5 flex flex-col gap-3' },
     h(
       'div',
       { class: 'text-heading-sm uppercase text-ink-tertiary' },
-      `Clips · ${pluralize(approved.length + pending.length + rejected.length, 'total')}`
+      `Clips · ${pluralize(rows.length, 'candidate')}`
     ),
     pending.length > 0
       ? h(
           'p',
           { class: 'text-body text-status-warning' },
-          `${pluralize(pending.length, 'clip')} still pending review — head back to clip review before publishing.`
+          `${pluralize(pending.length, 'selected clip')} still ${
+            pending.length === 1 ? 'needs' : 'need'
+          } current final approval.`
         )
       : null,
     h(
       'ul',
       { class: 'flex flex-col divide-y divide-border-subtle' },
-      ...[...approved, ...pending, ...rejected].map((c) =>
+      ...rows.map(({ clip, state, tone }) =>
         h(
           'li',
-          {
-            class: 'flex items-center gap-3 py-2.5',
-          },
+          { class: 'flex items-center gap-3 py-2.5' },
           h('span', {
             class: [
               'w-2 h-2 rounded-full',
-              c.status === 'approved' || c.status === 'published'
+              tone === 'success'
                 ? 'bg-status-success'
-                : c.status === 'rejected'
-                ? 'bg-status-danger'
-                : 'bg-status-warning',
+                : tone === 'warning'
+                  ? 'bg-status-warning'
+                  : tone === 'danger'
+                    ? 'bg-status-danger'
+                    : 'bg-ink-tertiary',
             ].join(' '),
           }),
           h(
             'span',
             { class: 'text-body text-ink-primary flex-1 truncate' },
-            (c.title as string) || 'Untitled clip'
+            String(clip.title || 'Untitled clip')
           ),
           h(
             'span',
-            {
-              class: 'text-code-sm text-ink-tertiary font-mono tabular',
-            },
-            formatDuration(c.duration as number)
+            { class: 'text-body-sm text-ink-tertiary' },
+            state
+          ),
+          h(
+            'span',
+            { class: 'text-code-sm text-ink-tertiary font-mono tabular' },
+            formatDuration(clipDuration(clip))
           )
         )
       )
@@ -298,71 +318,72 @@ function renderClipList(
   );
 }
 
+function clipDuration(clip: ReviewedClip): number {
+  if (typeof clip.duration === 'number') return clip.duration;
+  return Number(clip.end_seconds ?? 0) - Number(clip.start_seconds ?? 0);
+}
+
 function renderPublishBar(
   episodeId: string,
-  ep: UnknownRecord,
+  status: StatusDescriptor,
+  quality: QualitySnapshot | null | undefined,
   approvedCount: number,
-  publishing: Signal<boolean>
+  publishing: boolean,
+  publishingSignal: Signal<boolean>
 ): HTMLElement {
-  const status = describeStatus(ep.status as string);
   const canPublish =
-    status.key === 'awaiting_publish' ||
-    status.key === 'awaiting_clip_review';
+    quality?.release_gate.status === 'awaiting_publish_approval' &&
+    quality.release_gate.can_approve_publish &&
+    approvedCount > 0;
 
-  const host = h('footer', {
-    class:
-      'sticky bottom-0 z-20 border-t border-border-subtle bg-canvas/95 backdrop-blur-md px-8 py-4',
-  });
-
-  effect(() => {
-    const p = publishing();
-    host.replaceChildren(
+  return h(
+    'footer',
+    {
+      class:
+        'sticky bottom-0 z-20 border-t border-border-subtle bg-canvas/95 backdrop-blur-md px-8 py-4',
+    },
+    h(
+      'div',
+      { class: 'max-w-[1200px] mx-auto flex items-center gap-4' },
       h(
         'div',
-        {
-          class: 'max-w-[1200px] mx-auto flex items-center gap-4',
-        },
+        { class: 'flex-1' },
         h(
           'div',
-          { class: 'flex-1' },
-          h(
-            'div',
-            { class: 'text-body text-ink-primary font-medium' },
-            canPublish
-              ? `${approvedCount} approved clip${approvedCount === 1 ? '' : 's'} ready`
-              : status.label
-          ),
-          h(
-            'div',
-            { class: 'text-body-sm text-ink-secondary' },
-            canPublish
-              ? 'Publishing schedules the uploads across all platforms.'
-              : status.hint
-          )
+          { class: 'text-body text-ink-primary font-medium' },
+          canPublish
+            ? `${pluralize(approvedCount, 'approved clip')} ready`
+            : status.label
         ),
-        canPublish && approvedCount > 0
-          ? Button({
-              variant: 'primary',
-              size: 'lg',
-              label: p ? 'Kicking publish…' : 'Publish everywhere',
-              loading: p,
-              onClick: async () => {
-                publishing.set(true);
-                try {
-                  await api.approvePublish(episodeId);
-                  showToast('Publish kicked off.', 'success');
-                  navigate(`/episodes/${episodeId}`);
-                } catch (e) {
-                  showToast((e as Error).message, 'error');
-                } finally {
-                  publishing.set(false);
-                }
-              },
-            })
-          : null
-      )
-    );
-  });
-
-  return host;
+        h(
+          'div',
+          { class: 'text-body-sm text-ink-secondary' },
+          canPublish
+            ? 'Explicit approval starts uploads to the enabled destinations.'
+            : status.hint
+        )
+      ),
+      canPublish
+        ? Button({
+            variant: 'primary',
+            size: 'lg',
+            label: publishing ? 'Starting publish…' : 'Publish everywhere',
+            loading: publishing,
+            disabled: publishing,
+            onClick: async () => {
+              publishingSignal.set(true);
+              try {
+                await api.approvePublish(episodeId);
+                showToast('Publishing started.', 'success');
+                navigate(`/episodes/${episodeId}`);
+              } catch (error) {
+                showToast((error as Error).message, 'error');
+              } finally {
+                publishingSignal.set(false);
+              }
+            },
+          })
+        : null
+    )
+  );
 }

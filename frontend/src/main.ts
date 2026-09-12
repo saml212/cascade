@@ -22,6 +22,16 @@ if (!root) throw new Error('#app mount point missing');
 const { root: shell, main } = Shell();
 root.replaceChildren(shell);
 
+function episodeRoute(
+  pattern: string,
+  handler: (id: string, params: Record<string, string>) => void
+): void {
+  route(pattern, (params) => {
+    watchEpisode(params.id);
+    handler(params.id, params);
+  });
+}
+
 route('/', () => {
   watchEpisode(null);
   Dashboard(main);
@@ -39,22 +49,25 @@ route('/analytics', () => {
   Analytics(main);
 });
 
-route('/episodes/:id', ({ id }) => Episode(main, id));
-route('/episodes/:id/longform', ({ id }) => Episode(main, id));
-route('/episodes/:id/clips', ({ id }) => Episode(main, id));
-route('/episodes/:id/audio', ({ id }) => Episode(main, id));
-route('/episodes/:id/metadata', ({ id }) => Episode(main, id));
+episodeRoute('/episodes/:id', (id) => Episode(main, id));
+episodeRoute('/episodes/:id/longform', (id) => Episode(main, id));
+episodeRoute('/episodes/:id/clips', (id) => Episode(main, id));
+episodeRoute('/episodes/:id/audio', (id) => Episode(main, id));
+episodeRoute('/episodes/:id/metadata', (id) => Episode(main, id));
 
-route('/episodes/:id/crop-setup', ({ id }) => CropSetup(main, id));
-route('/episodes/:id/clips/review/:clipId', ({ id, clipId }) =>
+episodeRoute('/episodes/:id/crop-setup', (id) => CropSetup(main, id));
+episodeRoute('/episodes/:id/clips/review/:clipId', (id, { clipId }) =>
   ClipReview(main, id, clipId)
 );
-route('/episodes/:id/clips/review', ({ id }) => ClipReview(main, id));
-route('/episodes/:id/longform/review', ({ id }) => LongformReview(main, id));
-route('/episodes/:id/publish', ({ id }) => Publish(main, id));
-route('/episodes/:id/backup', ({ id }) => Backup(main, id));
-route('/episodes/:id/delivery', ({ id }) => Delivery(main, id));
+episodeRoute('/episodes/:id/clips/review', (id) => ClipReview(main, id));
+episodeRoute('/episodes/:id/longform/review', (id) => LongformReview(main, id));
+episodeRoute('/episodes/:id/publish', (id) => Publish(main, id));
+episodeRoute('/episodes/:id/backup', (id) => Backup(main, id));
+episodeRoute('/episodes/:id/delivery', (id) => Delivery(main, id));
 
-setFallback(() => NotFound(main));
+setFallback(() => {
+  watchEpisode(null);
+  NotFound(main);
+});
 
 startRouter();

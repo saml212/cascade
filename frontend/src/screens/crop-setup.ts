@@ -28,7 +28,7 @@ import {
   formatDuration,
   formatTimecode,
 } from '../lib/format';
-import { episodeDetail, watchEpisode } from '../state/episodes';
+import { episodeDetail } from '../state/episodes';
 import { agentPanelCollapsed, showToast } from '../state/ui';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
@@ -110,7 +110,6 @@ function buildTrackOptions(
 }
 
 export function CropSetup(target: HTMLElement, episodeId: string): void {
-  watchEpisode(episodeId);
   agentPanelCollapsed.set(true);
 
   const state = signal<CropState>({

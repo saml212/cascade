@@ -7,7 +7,7 @@
  */
 
 import { api } from './api';
-import { describeAgent, describeStatus } from './format';
+import { describeAgent } from './format';
 
 export interface PipelineEvent {
   at: number;
@@ -28,7 +28,6 @@ interface Subscription {
   listeners: Set<(e: PipelineEvent) => void>;
   timer: number | null;
   lastAgent: string | null;
-  lastStatus: string | null;
   lastCompletedCount: number;
   lastRunning: boolean | null;
   emittedErrors: Map<string, string>;
@@ -47,7 +46,6 @@ export function subscribe(
       listeners: new Set(),
       timer: null,
       lastAgent: null,
-      lastStatus: null,
       lastCompletedCount: -1,
       lastRunning: null,
       emittedErrors: new Map(),
@@ -82,16 +80,6 @@ async function tick(sub: Subscription): Promise<void> {
   const completed = (s.agents_completed as string[]) ?? [];
   const errors = (s.errors as Record<string, string>) ?? {};
   const isRunning = !!s.is_running;
-
-  if (status && status !== sub.lastStatus) {
-    emit(sub, {
-      at: Date.now(),
-      kind: 'status',
-      label: `Status: ${describeStatus(status).label}`,
-      status,
-    });
-    sub.lastStatus = status;
-  }
 
   if (currentAgent !== sub.lastAgent) {
     if (sub.lastAgent && completed.includes(sub.lastAgent)) {
