@@ -326,7 +326,7 @@ def episode_review_state(episode_dir: Path) -> dict:
 @router.get("/{episode_id}/review")
 async def review_state(episode_id: str) -> dict:
     """Return reviewable files, their freshness, copy, and approval state."""
-    return episode_review_state(_episode_dir(episode_id))
+    return await asyncio.to_thread(episode_review_state, _episode_dir(episode_id))
 
 
 def _stored_clips(episode_dir: Path) -> list[dict]:

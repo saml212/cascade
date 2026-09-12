@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 from tests.test_routes_episodes import _create_episode, test_client  # noqa: F401
@@ -160,12 +161,20 @@ class TestChatEndpoint:
 
         import server.routes.chat as chat_mod
 
+        threads = {}
+
+        def load_context(_episode_dir):
+            threads["snapshot"] = threading.get_ident()
+            return {}
+
         async def assistant(*_args, **_kwargs):
+            threads["route"] = threading.get_ident()
             return """Updated the guest.
 ```action
 {"action":"update_episode_info","guest_name":"Ada","guest_title":"Engineer"}
 ```"""
 
+        monkeypatch.setattr(chat_mod, "_load_episode_context", load_context)
         monkeypatch.setattr(chat_mod, "_assistant_turn", assistant)
         resp = client.post(
             "/api/episodes/ep_001/chat", json={"message": "Set the guest"}
@@ -174,6 +183,7 @@ class TestChatEndpoint:
         assert resp.status_code == 200
         assert resp.json()["response"] == "Updated the guest."
         assert resp.json()["actions_taken"][0]["status"] == "ok"
+        assert threads["snapshot"] != threads["route"]
         stored = json.loads((ep_dir / "episode.json").read_text())
         assert (stored["guest_name"], stored["guest_title"]) == ("Ada", "Engineer")
 

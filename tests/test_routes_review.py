@@ -3,6 +3,7 @@
 # ruff: noqa: F811 - imported pytest fixture is intentionally shadowed
 
 import json
+import threading
 
 from tests.test_routes_episodes import _create_episode, test_client  # noqa: F401
 
@@ -20,6 +21,33 @@ def _record(path, fingerprint, mode):
         "output": {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns},
         "completed_at": "2026-09-11T12:00:00+00:00",
     }
+
+
+def test_review_builds_snapshot_off_the_event_loop(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    _create_episode(episodes_dir, "ep_001")
+
+    from server.routes import review
+
+    threads = {}
+    resolve_episode = review._episode_dir
+
+    def resolve(episode_id):
+        threads["route"] = threading.get_ident()
+        return resolve_episode(episode_id)
+
+    def snapshot(episode_dir):
+        threads["snapshot"] = threading.get_ident()
+        return {"schema": "cascade.review/v1", "episode_id": episode_dir.name}
+
+    monkeypatch.setattr(review, "_episode_dir", resolve)
+    monkeypatch.setattr(review, "episode_review_state", snapshot)
+
+    response = client.get("/api/episodes/ep_001/review")
+
+    assert response.status_code == 200
+    assert response.json()["episode_id"] == "ep_001"
+    assert threads["snapshot"] != threads["route"]
 
 
 def test_review_keeps_stale_short_playable(test_client, monkeypatch):

@@ -648,7 +648,7 @@ async def get_chat_history(episode_id: str) -> dict:
 @router.post("/chat", response_model=ChatResponse)
 async def chat_with_episode(episode_id: str, req: ChatRequest) -> dict:
     episode_dir = _episode_dir(episode_id)
-    context = _load_episode_context(episode_dir)
+    context = await asyncio.to_thread(_load_episode_context, episode_dir)
     history = _load_chat_history(episode_dir)
     messages = history + [{"role": "user", "content": req.message}]
     try:
@@ -756,8 +756,9 @@ async def complete_metadata(episode_id: str) -> dict:
             "summary": "All metadata is already complete.",
         }
     try:
+        context = await asyncio.to_thread(_load_episode_context, episode_dir)
         response = await _assistant_turn(
-            _build_system_prompt(_load_episode_context(episode_dir)),
+            _build_system_prompt(context),
             [{"role": "user", "content": _metadata_completion_prompt(status)}],
             timeout=240,
         )
