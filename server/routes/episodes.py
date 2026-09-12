@@ -1007,6 +1007,73 @@ class CropConfigRequest(BaseModel):
     zoom: float = 1.0
 
 
+def _reviewed_crop_labels(ep_dir: Path) -> dict[int, str]:
+    """Return crop-index identities protected by explicit transcript review."""
+    provenance_path = ep_dir / "transcript_provenance.json"
+    if not provenance_path.exists():
+        return {}
+    try:
+        provenance = json.loads(provenance_path.read_text())
+        bindings = provenance.get("speaker_map_override")
+        if bindings is None:
+            return {}
+        if not isinstance(bindings, list):
+            raise TypeError
+        labels: dict[int, str] = {}
+        for binding in bindings:
+            crop_index = binding.get("crop_speaker_index")
+            if crop_index is None:
+                continue
+            raw_label = binding.get("person") or binding.get("label")
+            label = raw_label.strip() if isinstance(raw_label, str) else ""
+            if (
+                not isinstance(crop_index, int)
+                or isinstance(crop_index, bool)
+                or crop_index < 0
+                or not label
+                or (crop_index in labels and labels[crop_index] != label)
+            ):
+                raise ValueError
+            labels[crop_index] = label
+        return labels
+    except (
+        AttributeError,
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Reviewed speaker bindings are invalid; repair them before changing crop speakers.",
+        ) from exc
+
+
+def _guard_reviewed_crop_roster(ep_dir: Path, speakers: list[dict]) -> None:
+    """Prevent crop list edits from transferring reviewed speaker identities."""
+    for crop_index, reviewed_label in _reviewed_crop_labels(ep_dir).items():
+        if crop_index >= len(speakers):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f'Cannot remove crop speaker {crop_index + 1} ("{reviewed_label}"): '
+                    "it has an explicitly reviewed transcript binding. Only unbound "
+                    "speakers at the end may be removed."
+                ),
+            )
+        raw_label = speakers[crop_index].get("label")
+        requested_label = raw_label.strip() if isinstance(raw_label, str) else ""
+        if requested_label != reviewed_label:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot rename or reorder crop speaker {crop_index + 1}: its "
+                    f'explicitly reviewed identity is "{reviewed_label}". Keep that '
+                    "label at its existing speaker index."
+                ),
+            )
+
+
 @router.post("/{episode_id}/crop-config")
 async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
     """Save crop settings without rendering or deleting finished deliverables."""
@@ -1084,6 +1151,8 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
 
     if crop_config == ep.get("crop_config"):
         return {"status": "saved", "changed": False, "crop_config": crop_config}
+
+    _guard_reviewed_crop_roster(ep_dir, crop_config["speakers"])
 
     config = load_config()
     old_crop = old_episode["crop_config"]

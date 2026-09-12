@@ -80,6 +80,49 @@ def _create_episode(episodes_dir, episode_id, extra_data=None):
     return ep_dir
 
 
+def _crop_speaker(label, center_x):
+    return {
+        "label": label,
+        "center_x": center_x,
+        "center_y": 540,
+        "zoom": 1.0,
+        "longform_zoom": 0.75,
+        "volume": 1.0,
+    }
+
+
+def _write_reviewed_speaker_bindings(ep_dir):
+    provenance = {
+        "speaker_map_override": [
+            {
+                "index": 0,
+                "label": "Host",
+                "person": "Host",
+                "crop_speaker_index": 0,
+                "target_speaker": "speaker_0",
+                "mapping_method": "manual_review",
+            },
+            {
+                "index": 1,
+                "label": "Guest",
+                "person": "Guest",
+                "crop_speaker_index": 1,
+                "target_speaker": "speaker_1",
+                "mapping_method": "manual_review",
+            },
+            {
+                "index": 2,
+                "label": "Crosstalk",
+                "person": None,
+                "crop_speaker_index": None,
+                "target_speaker": "BOTH",
+                "mapping_method": "manual_review",
+            },
+        ]
+    }
+    (ep_dir / "transcript_provenance.json").write_text(json.dumps(provenance))
+
+
 class TestListEpisodes:
     def test_empty_list(self, test_client):
         client, _ = test_client
@@ -502,6 +545,129 @@ class TestCropConfig:
         assert len(config["speakers"]) == 2
         assert config["speakers"][0]["label"] == "Host"
         assert config["speakers"][1]["label"] == "Guest"
+
+    @pytest.mark.parametrize(
+        ("requested_labels", "message"),
+        [
+            (["Host"], "Only unbound speakers at the end may be removed"),
+            (["Guest", "Host", "Observer"], "Cannot rename or reorder crop speaker 1"),
+            (
+                ["Host", "Participant", "Observer"],
+                "Cannot rename or reorder crop speaker 2",
+            ),
+        ],
+        ids=["bound-removal", "bound-reorder", "bound-rename"],
+    )
+    def test_reviewed_speaker_identity_rejects_roster_transfer_before_mutation(
+        self, test_client, requested_labels, message
+    ):
+        client, episodes_dir = test_client
+        existing_speakers = [
+            _crop_speaker("Host", 480),
+            _crop_speaker("Guest", 1440),
+            _crop_speaker("Observer", 960),
+        ]
+        ep_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "status": "awaiting_longform_approval",
+                "crop_config": {"speakers": existing_speakers},
+                "pipeline": {
+                    "agents_completed": ["speaker_cut", "longform_render", "qa"],
+                    "errors": {},
+                },
+            },
+        )
+        _write_reviewed_speaker_bindings(ep_dir)
+        work_dir = ep_dir / "work"
+        work_dir.mkdir()
+        speaker_cache = work_dir / "speaker_0_rms_db.npy"
+        speaker_cache.write_bytes(b"reviewed-cache")
+        episode_path = ep_dir / "episode.json"
+        episode_before = episode_path.read_bytes()
+        provenance_before = (ep_dir / "transcript_provenance.json").read_bytes()
+
+        response = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={
+                "speakers": [
+                    _crop_speaker(label, 400 + index * 400)
+                    for index, label in enumerate(requested_labels)
+                ]
+            },
+        )
+
+        assert response.status_code == 409
+        assert message in response.json()["detail"]
+        assert episode_path.read_bytes() == episode_before
+        assert (ep_dir / "transcript_provenance.json").read_bytes() == provenance_before
+        assert speaker_cache.read_bytes() == b"reviewed-cache"
+
+    @pytest.mark.parametrize(
+        ("existing_labels", "requested_speakers", "expected_labels", "expected_fields"),
+        [
+            (
+                ["Host", "Guest"],
+                [
+                    {**_crop_speaker("Host", 600), "zoom": 1.25},
+                    {**_crop_speaker("Guest", 1320), "longform_zoom": 0.9},
+                ],
+                ["Host", "Guest"],
+                [(0, "center_x", 600), (0, "zoom", 1.25), (1, "longform_zoom", 0.9)],
+            ),
+            (
+                ["Host", "Guest"],
+                [
+                    _crop_speaker("Host", 480),
+                    _crop_speaker("Guest", 1440),
+                    _crop_speaker("Observer", 960),
+                ],
+                ["Host", "Guest", "Observer"],
+                [],
+            ),
+            (
+                ["Host", "Guest", "Observer"],
+                [_crop_speaker("Host", 480), _crop_speaker("Guest", 1440)],
+                ["Host", "Guest"],
+                [],
+            ),
+        ],
+        ids=["geometry-and-zoom", "safe-append", "unbound-tail-removal"],
+    )
+    def test_reviewed_speaker_identity_allows_safe_roster_edits(
+        self,
+        test_client,
+        existing_labels,
+        requested_speakers,
+        expected_labels,
+        expected_fields,
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "crop_config": {
+                    "speakers": [
+                        _crop_speaker(label, 480 + index * 480)
+                        for index, label in enumerate(existing_labels)
+                    ]
+                }
+            },
+        )
+        _write_reviewed_speaker_bindings(ep_dir)
+
+        response = client.post(
+            "/api/episodes/ep_001/crop-config",
+            json={"speakers": requested_speakers},
+        )
+
+        assert response.status_code == 200
+        saved = response.json()["crop_config"]["speakers"]
+        assert [speaker["label"] for speaker in saved] == expected_labels
+        for index, field, value in expected_fields:
+            assert saved[index][field] == value
 
     def test_n_speaker_generates_legacy_fields(self, test_client):
         """N-speaker format should generate backward-compatible L/R fields."""
