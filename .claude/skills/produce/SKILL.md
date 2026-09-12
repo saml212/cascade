@@ -31,6 +31,8 @@ Use bounded inspection endpoints instead of arbitrary filesystem paths:
 - `GET /api/episodes/{id}/inspection/audio-preview` compares bounded recorder or camera inputs.
 - `GET /api/episodes/{id}/audio-qc/findings/{finding_id}/preview` and `/api/episodes/{id}/audio-qc/repair-plan/{entry_id}/preview` expose original and grounded fallback evidence.
 
+Treat speaker-label changes as revision-bound evidence edits. Read `GET /api/episodes/{id}/inspection/transcript/corrections`, support each proposed word or range with current source-clock evidence, and replay it against a temporary copy of the current transcript and shot plan before posting it back with `expected_revision`. Microphone dropout makes the surviving channel louder by construction, so channel dominance inside a zero or near-zero finding cannot establish speaker identity. Quarantine ambiguous turns. A speaker-label-only correction must preserve the selected audio fingerprint and bytes; an unexpected audio-identity change is an error, not a reason to regenerate or silently reselect audio. See the linked recovery workflow for the exact correction contract.
+
 Sample actual frames across crop transitions, speaker changes, overlaps, and captions. An agent may save evidence-backed crop settings through `POST /api/episodes/{id}/crop-config`; the UI lets the user review or override them. When present, consume its `invalidated_agents`, `speaker_segments_preserved`, `migrated_short_render_ids`, and `delivery_audio_preserved` response fields before deciding what to rerun. Keep source timestamps and edited/output timestamps labeled separately.
 
 Preserve original recordings and prior reviewable exports. Stage replacements, verify duration, streams, fingerprints, and representative media, then publish them atomically. Never conceal damaged speech with generated words or synthetic audio. Report objective loudness, ASR, waveform, correlation, and timing evidence accurately; do not claim perceptual listening when none occurred.
@@ -47,6 +49,7 @@ For source-channel continuity:
 2. Review retained probable findings before removed or heuristic findings.
 3. When grounded repair is supported, use `POST /api/episodes/{id}/audio-qc/repair-plan`, then `POST /api/episodes/{id}/audio-qc/repair-candidate`; inspect their request schemas in OpenAPI, the bounded previews, and the full candidate before `POST /api/episodes/{id}/audio-qc/repair-candidate/select`.
 4. Rerun QA after selection so output proof binds the exact selected bytes. Selection does not make unresolved findings safe and does not approve release.
+5. For a finding that exposes a `review` object, fetch its exact `inspection_request` before recording `accepted` or `false_positive` through `POST /api/episodes/{id}/audio-qc/findings/{finding_id}/review`. Send every report, finding, and output revision from that object; this local evidence decision is neither editorial nor publication approval.
 
 ## Review local media before publication
 
@@ -58,7 +61,7 @@ Prepare and inspect the complete local package before any public action:
 4. Run QA against current audio, longform, shorts, thumbnails, and metadata. Missing, stale, failed, or review-required evidence remains visible as a blocker.
 5. Record longform editorial approval with `POST /api/episodes/{id}/approve-longform` only after the current rendered revision has been reviewed. This is separate from permission to publish.
 
-If delivery reports that a current longform's encoded audio needs repair, use `POST /api/episodes/{id}/delivery/video/repair-audio`. For a current short, use `POST /api/episodes/{id}/clips/{clip_id}/repair-audio`. Both operations retain the reviewed video stream, produce a new audio-bearing file for review, and invalidate the affected approval until that exact result is reviewed again.
+If delivery reports that a current longform's encoded audio needs repair, use `POST /api/episodes/{id}/delivery/video/repair-audio`. For a current short, use `POST /api/episodes/{id}/clips/{clip_id}/repair-audio`. Both operations retain the reviewed video stream, produce a new audio-bearing file for review, and invalidate the affected approval until that exact result is reviewed again. Do not treat the accepted job as success: require the resulting manifest to show safe loudness, equal input/output H.264 packet signatures and counts, and the exact new output identity before review.
 
 Local short rendering must not depend on a public YouTube URL. Do not publish a longform merely to unlock short production.
 

@@ -53,8 +53,11 @@ are absent or when its full video is only the continuous-wide recovery export.
 Speaker names, visible seats, diarization labels, and recorder channel numbers
 are separate evidence. A recorder channel identifies a microphone, not a person.
 Use every recorder session, preserve overlapping speech, and keep shot changes
-independent from audio gating. Damaged speech must remain visible for review;
-never conceal it with invented words.
+independent from audio gating. A microphone dropout makes the surviving channel
+look dominant, so channel level within a digital-zero or near-zero finding does
+not establish speaker identity. Quarantine the turn unless transcript semantics
+or independent, unconfounded evidence supports it. Damaged speech must remain
+visible for review; never conceal it with invented words.
 
 Local rendering and review must not depend on a published YouTube URL. The API
 must expose machine-readable manifests, source and output metadata, bounded
@@ -142,6 +145,79 @@ present; regenerate those artifacts after the source timeline is corrected.
   remains available but is labeled **Earlier render**.
 - Dashboard and episode status pills use verified delivery state for display;
   pipeline actions continue to use the raw backend state.
+
+## Revision-bound transcript corrections
+
+Read the current correction document before proposing an edit:
+
+```text
+GET /api/episodes/{episode_id}/inspection/transcript/corrections
+```
+
+The response supplies `transcript_revision`, the source-clock correction
+document, and its existing operations. Use stable operation IDs and preserve
+those existing operations. Support each `replace_word` or `replace_range` with
+current word IDs, times, speaker evidence, and a reason. A louder surviving mic
+inside a known dropout is confounded evidence and must not drive a correction.
+
+Before writing, apply the proposed operation set to a temporary copy of the
+current canonical transcript and segments, run the canonical regrouping and
+speaker alignment, and record the predicted shot boundaries. Keep ambiguous
+turns outside the apply set as review evidence. Then send:
+
+```text
+POST /api/episodes/{episode_id}/inspection/transcript/corrections
+{"expected_revision":"sha256:...","operations":[...]}
+```
+
+The endpoint upserts by operation ID, locally rebuilds the canonical transcript
+and shot plan without a new ASR request, and rolls back on failure. A `409`
+means the source revision changed; reread and rebase instead of forcing the
+write. After success, reread the transcript and shot-plan endpoints and compare
+them with the dry run. A speaker-label-only correction must leave the selected
+audio fingerprint and selected audio bytes unchanged. Let render fingerprints
+identify which videos need a new shot pass; do not regenerate audio solely
+because speaker labels changed.
+
+## Audio repair and exact output proof
+
+Repair only a current, manifest-backed output:
+
+```text
+POST /api/episodes/{episode_id}/delivery/video/repair-audio
+POST /api/episodes/{episode_id}/clips/{clip_id}/repair-audio
+```
+
+The longform operation is asynchronous; poll the delivery and pipeline status
+endpoints. A successful repair stages a replacement, normalizes canonical audio,
+copies the reviewed H.264 stream, validates the completed file, and installs it
+atomically. Do not infer completion from the initial response. Require the
+current render record to contain:
+
+- `output.audio_loudness.verification.safe: true` with measured LUFS and true
+  peak inside the configured policy;
+- `provenance.audio_remaster.video_copy_verification.status: pass` with equal
+  input/output packet SHA-256 values and packet counts;
+- `output.size_bytes` and `output.mtime_ns` matching the exact reviewable file.
+
+Inspect the exact output through `/inspection/frame` or `/inspection/preview`
+using `target=longform` or `target=short`, the correct `source` or `output`
+clock, and `clip_id` for shorts. The replacement has a new output revision and
+invalidates prior editorial or clip approval even though its video packets are
+unchanged.
+
+For a review-required audio finding, use its `review.inspection_request` from
+`GET /api/episodes/{episode_id}/quality` or `/audio-qc` to fetch the exact
+longform preview. Record a local decision only with:
+
+```text
+POST /api/episodes/{episode_id}/audio-qc/findings/{finding_id}/review
+{"decision":"accepted","reviewer":"...","evidence_note":"...","expected_report_fingerprint":"...","expected_finding_fingerprint":"...","expected_output_revision":"..."}
+```
+
+The three expected revisions bind the decision to the report, finding, and
+rendered output. This review does not approve the episode or authorize
+publication.
 
 ## Verification
 
