@@ -1,6 +1,8 @@
 """Tests for pipeline API routes."""
 
+import asyncio
 import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.test_routes_episodes import _create_episode
@@ -350,3 +352,76 @@ class TestRunSingleAgent:
         client, _ = test_client
         resp = client.post("/api/episodes/nonexistent/run-agent/ingest", json={})
         assert resp.status_code == 404
+
+    def test_worker_is_registered_for_source_recovery_guard(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingAgent:
+            def __init__(self, episode_dir, config):
+                pass
+
+            def run(self):
+                started.set()
+                assert release.wait(timeout=5)
+                return {"finished": True}
+
+        from agents import AGENT_REGISTRY
+        from server.routes import pipeline, source_recovery
+
+        monkeypatch.setitem(AGENT_REGISTRY, "blocking_test", BlockingAgent)
+        response = {}
+
+        def request() -> None:
+            response["value"] = client.post(
+                "/api/episodes/ep_001/run-agent/blocking_test", json={}
+            )
+
+        request_thread = threading.Thread(target=request)
+        request_thread.start()
+        try:
+            assert started.wait(timeout=5)
+            assert pipeline._running["ep_001"].is_alive()
+            assert (
+                source_recovery._registered_job_reason(
+                    "ep_001", episodes_dir / "ep_001"
+                )
+                == "pipeline"
+            )
+            cancel = client.post("/api/episodes/ep_001/cancel-pipeline")
+            assert cancel.status_code == 409
+            assert "ep_001" not in pipeline._cancel_requested
+        finally:
+            release.set()
+            request_thread.join(timeout=5)
+
+        assert not request_thread.is_alive()
+        assert response["value"].status_code == 200
+        assert response["value"].json()["result"] == {"finished": True}
+        assert "ep_001" not in pipeline._running
+        assert "ep_001" not in pipeline._cancel_requested
+
+    def test_cancelled_request_keeps_live_worker_registered(self):
+        from server.routes import pipeline
+
+        worker = MagicMock(spec=pipeline._SingleAgentWorker)
+        worker.is_alive.return_value = True
+        pipeline._running["ep_001"] = worker
+        pipeline._cancel_requested.add("ep_001")
+
+        async def exercise() -> None:
+            await pipeline._unregister_single_agent("ep_001", worker)
+            assert pipeline._running["ep_001"] is worker
+            assert "ep_001" in pipeline._cancel_requested
+
+            await pipeline._unregister_single_agent(
+                "ep_001", worker, work_complete=True
+            )
+
+        asyncio.run(exercise())
+        assert "ep_001" not in pipeline._running
+        assert "ep_001" not in pipeline._cancel_requested

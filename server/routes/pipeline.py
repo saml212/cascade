@@ -29,6 +29,10 @@ _cancel_requested = set()  # type: set
 _pipeline_lock = asyncio.Lock()
 
 
+class _SingleAgentWorker(threading.Thread):
+    pass
+
+
 def _start_pipeline_thread(
     episode_id: str,
     source_path: str,
@@ -51,6 +55,20 @@ def _start_pipeline_thread(
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     _running[episode_id] = thread
+
+
+async def _unregister_single_agent(
+    episode_id: str,
+    worker: _SingleAgentWorker,
+    *,
+    work_complete: bool = False,
+) -> None:
+    async with _pipeline_lock:
+        if _running.get(episode_id) is worker and (
+            work_complete or not worker.is_alive()
+        ):
+            _running.pop(episode_id, None)
+            _cancel_requested.discard(episode_id)
 
 
 def _current_longform_for_approval(episode_dir: Path, episode: dict) -> dict | None:
@@ -203,7 +221,37 @@ async def run_single_agent(
     if agent_name == "ingest" and req.source_path:
         agent.source_path = req.source_path
 
-    result = await asyncio.to_thread(agent.run)
+    outcome = {}
+    loop = asyncio.get_running_loop()
+
+    def _run() -> None:
+        try:
+            outcome["result"] = agent.run()
+        except Exception as error:  # noqa: BLE001 - re-raised after the worker joins
+            outcome["error"] = error
+        finally:
+            asyncio.run_coroutine_threadsafe(
+                _unregister_single_agent(episode_id, worker, work_complete=True), loop
+            )
+
+    worker = _SingleAgentWorker(target=_run, daemon=True)
+    async with _pipeline_lock:
+        current = _running.get(episode_id)
+        if current is not None and current.is_alive():
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
+        _cancel_requested.discard(episode_id)
+        _running[episode_id] = worker
+        worker.start()
+    try:
+        await asyncio.to_thread(worker.join)
+    finally:
+        await _unregister_single_agent(episode_id, worker)
+
+    if "error" in outcome:
+        raise outcome["error"]
+    result = outcome["result"]
     if agent_name == "qa" and result.get("overall") != "pass":
         failed_checks = [
             check.get("name", "unknown")
@@ -264,7 +312,13 @@ async def cancel_pipeline(episode_id: str) -> PipelineActionResponse:
     """Request cancellation of a running pipeline."""
     logger.info("POST /api/episodes/%s/cancel-pipeline", episode_id)
     async with _pipeline_lock:
-        is_running = episode_id in _running and _running[episode_id].is_alive()
+        worker = _running.get(episode_id)
+        is_running = worker is not None and worker.is_alive()
+        if is_running and isinstance(worker, _SingleAgentWorker):
+            raise HTTPException(
+                status_code=409,
+                detail="A single-agent run is active and cannot be cancelled",
+            )
         if is_running:
             _cancel_requested.add(episode_id)
 
