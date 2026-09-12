@@ -448,6 +448,36 @@ def test_video_worker_delegates_to_canonical_speaker_cut_renderer(delivery):
     assert status["video_source_fingerprint"] == "canonical-fingerprint"
 
 
+def test_video_audio_repair_worker_uses_public_packet_copy_adapter(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    mod._write_status(episode_dir, {"status": "ready", "episode_id": "ep_test"})
+    video = episode_dir / "upload_video.mp4"
+    video.write_bytes(b"repaired video")
+    repaired = {
+        "path": str(video),
+        "render_fingerprint": "same-pixels-new-audio",
+        "audio_repaired": True,
+        "video_reencoded": False,
+    }
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod, "repair_longform_audio", return_value=repaired) as repair,
+        patch.object(mod, "render_longform") as render,
+    ):
+        mod._video_running.add("ep_test")
+        mod._prepare_video("ep_test", repair_audio=True)
+
+    assert repair.call_args.args[0] == episode_dir
+    assert repair.call_args.kwargs["progress"]
+    render.assert_not_called()
+    status = json.loads((episode_dir / "delivery.json").read_text())
+    assert status["video_status"] == "ready"
+    assert status["video_operation"] == "repair_audio"
+    assert status["video"]["video_reencoded"] is False
+
+
 def test_worker_rejects_out_of_range_loudness(delivery):
     _, mod, episodes_dir = delivery
     episode_dir = make_episode(episodes_dir)
@@ -633,12 +663,125 @@ def test_status_validates_ready_video_against_selected_repair(delivery):
     with (
         patch.object(mod, "selected_audio_source", return_value=selected),
         patch.object(mod, "_video_fingerprint", return_value="current-video") as check,
+        patch.object(
+            mod,
+            "_video_audio_status",
+            return_value={"status": "passed", "safe": True},
+        ),
     ):
         response = client.get("/api/episodes/ep_test/delivery")
 
     assert response.status_code == 200
     assert response.json()["video_status"] == "ready"
     assert check.call_args.args[3] == selected
+
+
+def test_status_blocks_unsafe_aac_without_hiding_repair_path(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    audio = episode_dir / "work" / "audio_mix.wav"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    video = episode_dir / "upload_video.mp4"
+    video.write_bytes(b"reviewed pixels")
+    mod._write_status(
+        episode_dir,
+        {
+            "status": "not_prepared",
+            "video_status": "ready",
+            "video_source_fingerprint": "current-video",
+            "video_output_stat": mod._file_stat(video),
+        },
+    )
+    unsafe = {
+        "status": "failed",
+        "safe": False,
+        "errors": ["true peak 0.9 dBFS exceeds -1.0 dBFS"],
+    }
+
+    with (
+        patch.object(mod, "selected_audio_source", return_value=None),
+        patch.object(mod, "_video_fingerprint", return_value="current-video"),
+        patch.object(mod, "_video_audio_status", return_value=unsafe),
+    ):
+        status = mod._refresh_status(episode_dir)
+
+    assert status["video_status"] == "not_prepared"
+    assert status["video_stale"] is False
+    assert status["video_repair_required"] is True
+    assert status["video_audio"] == unsafe
+    assert "true peak 0.9" in status["video_error"]
+    assert video.read_bytes() == b"reviewed pixels"
+
+
+def test_video_audio_status_uses_recorded_encoded_output_measurement(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    (episode_dir / "render_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "clock": "source",
+                "shorts": {},
+                "longform": {
+                    "output": {
+                        "audio_loudness": {
+                            "integrated_lufs": -16.4,
+                            "true_peak_dbfs": 0.9,
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    result = mod._video_audio_status(episode_dir, {})
+
+    assert result["status"] == "failed"
+    assert result["safe"] is False
+    assert "true peak 0.9" in result["errors"][0]
+
+
+def test_video_audio_repair_route_starts_serialized_background_job(delivery):
+    _, mod, episodes_dir = delivery
+    make_episode(episodes_dir)
+    audio_state = {
+        "status": "failed",
+        "safe": False,
+        "errors": ["encoded output is too loud"],
+    }
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod, "_current_video_record", return_value={"fingerprint": "fp"}),
+        patch.object(mod, "_video_audio_status", return_value=audio_state),
+        patch.object(mod.threading.Thread, "start") as start,
+    ):
+        response = asyncio.run(mod.repair_delivery_video_audio("ep_test"))
+
+    assert response["video_status"] == "preparing"
+    assert response["video_operation"] == "repair_audio"
+    assert response["video_audio"] == audio_state
+    start.assert_called_once()
+    assert "ep_test" in mod._video_running
+    mod._video_running.clear()
+
+
+def test_video_audio_repair_route_rejects_stale_pixels(delivery):
+    _, mod, episodes_dir = delivery
+    make_episode(episodes_dir)
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod, "_current_video_record", return_value=None),
+        patch.object(mod.threading.Thread, "start") as start,
+        pytest.raises(HTTPException) as raised,
+    ):
+        asyncio.run(mod.repair_delivery_video_audio("ep_test"))
+
+    assert raised.value.status_code == 409
+    assert "current manifest-backed" in raised.value.detail
+    start.assert_not_called()
 
 
 def test_download_requires_ready_file(delivery):

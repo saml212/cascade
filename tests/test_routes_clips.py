@@ -453,3 +453,47 @@ class TestClipMutation:
 
         assert response.status_code == 409
         assert response.json()["detail"] == "Clip clip_01 is already rendering"
+
+    def test_audio_repair_uses_public_adapter_and_demotes_prior_approval(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        clip = dict(
+            SAMPLE_CLIPS[0],
+            status="approved",
+            approved_revision="sha256:review",
+            approved_render_fingerprint="sha256:current",
+        )
+        _add_clips(episodes_dir, "ep_001", [clip])
+
+        import agents.shorts_render as render_mod
+
+        monkeypatch.setattr(
+            render_mod,
+            "repair_single_clip_audio",
+            lambda episode_dir, _config, clip_id: {
+                "clip_id": clip_id,
+                "output_path": str(episode_dir / "shorts" / f"{clip_id}.mp4"),
+                "reused": True,
+                "audio_repaired": True,
+                "video_reencoded": False,
+                "render": {"fingerprint": "sha256:current"},
+            },
+            raising=False,
+        )
+
+        response = client.post("/api/episodes/ep_001/clips/clip_01/repair-audio")
+
+        assert response.status_code == 200
+        assert response.json()["audio_repaired"] is True
+        assert response.json()["video_reencoded"] is False
+        stored = json.loads((ep_dir / "clips.json").read_text())["clips"][0]
+        assert stored["status"] == "pending"
+        assert stored["selection_status"] == "selected"
+        assert "approved_revision" not in stored
+        job = json.loads((ep_dir / "work" / "clip_render_jobs.json").read_text())[
+            "jobs"
+        ]["clip_01"]
+        assert job["audio_repaired"] is True
+        assert job["video_reencoded"] is False

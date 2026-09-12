@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,11 +27,11 @@ from lib.delivery_video import (
     render_output_lock,
     render_scratch_dir,
     render_space_budget,
-    staged_render_output,
     render_video_segment,
     require_render_space,
     reusable_terminal_trim_render,
     source_fps,
+    staged_render_output,
 )
 from lib.encoding import (
     get_lut_filter,
@@ -40,7 +41,7 @@ from lib.encoding import (
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
-from lib.loudness import measure_loudness
+from lib.loudness import delivery_loudness_policy, loudness_status
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
@@ -63,7 +64,12 @@ class LongformRenderAgent(BaseAgent):
         with render_output_lock(self.episode_dir / "upload_video.mp4"):
             return self._execute_locked()
 
-    def _execute_locked(self) -> dict:
+    def repair_audio(self) -> dict:
+        """Remaster a current longform's audio without re-encoding its video."""
+        with render_output_lock(self.episode_dir / "upload_video.mp4"):
+            return self._execute_locked(repair_only=True)
+
+    def _execute_locked(self, *, repair_only: bool = False) -> dict:
         episode = self.load_json("episode.json")
         self.config = render_config_for_episode(episode, self.config)
         crop_config = episode.get("crop_config")
@@ -89,7 +95,7 @@ class LongformRenderAgent(BaseAgent):
 
         audio = generate_audio_mix(self.episode_dir, episode, self.config)
         if not audio or not audio.exists():
-            raise RuntimeError("Canonical work/audio_mix.wav is required")
+            raise RuntimeError("Canonical audio source is required")
 
         source_probe = ffprobe(source)
         video_stream = next(
@@ -131,15 +137,37 @@ class LongformRenderAgent(BaseAgent):
             "format": "ass",
             "burned_in": burn_captions,
         }
+        encoding = get_video_encoding_policy(self.config, "longform")
+        loudness_policy = delivery_loudness_policy(self.config, "longform")
+        encoder_args = get_video_encoder_args(self.config, "longform")
         current = current_longform_render(
             self.episode_dir, episode, self.config, audio, segments
         )
         if current:
-            self.logger.info("Canonical speaker-cut longform is already current")
-            return self._result(current, caption_path, reused=True)
+            audio_state = loudness_status(
+                current.get("output", {}).get("audio_loudness"), loudness_policy
+            )
+            if audio_state["safe"]:
+                self.logger.info("Canonical speaker-cut longform is already current")
+                return self._result(current, caption_path, reused=True)
+            return self._remaster_current_audio(
+                episode,
+                audio,
+                segments,
+                timeline,
+                fingerprint,
+                caption_path,
+                caption_record,
+                render_segments,
+                encoding,
+                encoder_args,
+                current,
+            )
+        if repair_only:
+            raise RuntimeError(
+                "Audio repair requires a current manifest-backed longform render"
+            )
 
-        encoding = get_video_encoding_policy(self.config, "longform")
-        encoder_args = get_video_encoder_args(self.config, "longform")
         reuse_record = reusable_terminal_trim_render(
             self.episode_dir,
             episode,
@@ -206,6 +234,7 @@ class LongformRenderAgent(BaseAgent):
                     staged,
                     timeline,
                     audio_bitrate=encoding["audio_bitrate"],
+                    loudness_policy=loudness_policy,
                     runner=self._run_ffmpeg,
                 )
 
@@ -218,11 +247,10 @@ class LongformRenderAgent(BaseAgent):
             self.report_progress(
                 len(render_segments) + 2,
                 progress_total,
-                "Measuring output loudness",
+                "Output audio verified",
             )
-            loudness = measure_loudness(staged)
-            if loudness:
-                media["audio_loudness"] = loudness
+            if "audio_loudness" not in media:
+                raise RuntimeError("Rendered longform has no verified audio loudness")
         record = record_longform_render(
             self.episode_dir,
             fingerprint=fingerprint,
@@ -250,6 +278,71 @@ class LongformRenderAgent(BaseAgent):
         )
         self.report_progress(progress_total, progress_total, "Longform render complete")
         return self._result(record, caption_path, reused=False)
+
+    def _remaster_current_audio(
+        self,
+        episode: dict,
+        audio: Path,
+        segments: list[dict],
+        timeline: Timeline,
+        fingerprint: str,
+        caption_path: Path,
+        caption_record: dict,
+        render_segments: list[dict],
+        encoding: dict,
+        encoder_args: list[str],
+        current: dict,
+    ) -> dict:
+        """Copy verified video packets while replacing and checking only audio."""
+        output = self.episode_dir / "upload_video.mp4"
+        output_bytes = int(current.get("output", {}).get("size_bytes", 0))
+        if output_bytes <= 0:
+            raise RuntimeError("Current longform has no recorded output size")
+        require_render_space(
+            self.episode_dir, {"output_bytes": output_bytes, "scratch_bytes": 0}
+        )
+        policy = delivery_loudness_policy(self.config, "longform")
+        self.report_progress(0, 2, "Remastering canonical audio; preserving video")
+        with staged_render_output(output) as staged:
+            media = mux_timeline_audio(
+                output,
+                audio,
+                staged,
+                timeline,
+                audio_bitrate=encoding["audio_bitrate"],
+                loudness_policy=policy,
+                runner=self._run_ffmpeg,
+            )
+            if "audio_loudness" not in media:
+                raise RuntimeError("Repaired longform has no verified audio loudness")
+            media.update(
+                encoder=current.get("output", {}).get("encoder", encoder_args[1]),
+                edit_count=len(episode.get("longform_edits", [])),
+                segment_count=len(render_segments),
+                expected_duration_seconds=round(timeline.duration, 3),
+            )
+        provenance = copy.deepcopy(current.get("provenance", {}))
+        provenance["audio_remaster"] = {
+            "method": "copy-video-remux-canonical-audio/v1",
+            "source_render_fingerprint": current["fingerprint"],
+            "video_reencoded": False,
+            "policy": policy,
+        }
+        self.report_progress(1, 2, "Recording verified audio repair")
+        record = record_longform_render(
+            self.episode_dir,
+            fingerprint=fingerprint,
+            render_mode="speaker_cut",
+            timeline=timeline,
+            media=media,
+            captions=caption_record,
+            provenance=provenance,
+        )
+        self.report_progress(2, 2, "Longform audio repair complete")
+        result = self._result(record, caption_path, reused=True)
+        result["audio_repaired"] = True
+        result["video_reencoded"] = False
+        return result
 
     def _reuse_terminal_prefix(
         self,
@@ -286,6 +379,7 @@ class LongformRenderAgent(BaseAgent):
                 staged,
                 timeline,
                 audio_bitrate=encoding["audio_bitrate"],
+                loudness_policy=delivery_loudness_policy(self.config, "longform"),
                 runner=self._run_ffmpeg,
             )
             media.update(
@@ -294,10 +388,9 @@ class LongformRenderAgent(BaseAgent):
                 segment_count=len(render_segments),
                 expected_duration_seconds=round(timeline.duration, 3),
             )
-            self.report_progress(1, progress_total, "Measuring output loudness")
-            loudness = measure_loudness(staged)
-            if loudness:
-                media["audio_loudness"] = loudness
+            self.report_progress(1, progress_total, "Output audio verified")
+            if "audio_loudness" not in media:
+                raise RuntimeError("Rendered longform has no verified audio loudness")
         input_fingerprint = longform_trim_reuse_fingerprint(
             self.episode_dir,
             episode,
@@ -511,3 +604,13 @@ def render_longform(
 ) -> dict:
     """Render or reuse the canonical manifest-backed longform artifact."""
     return LongformRenderAgent(episode_dir, config, progress=progress).execute()
+
+
+def repair_longform_audio(
+    episode_dir: Path,
+    config: dict,
+    *,
+    progress: Callable[[float, str], None] | None = None,
+) -> dict:
+    """Repair current longform audio while preserving its encoded video packets."""
+    return LongformRenderAgent(episode_dir, config, progress=progress).repair_audio()

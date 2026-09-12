@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
-from agents.shorts_render import ShortsRenderAgent, render_single_clip
+from agents.shorts_render import (
+    ShortsRenderAgent,
+    render_single_clip,
+    repair_single_clip_audio,
+)
 from lib.delivery_video import render_space_budget
 from lib.encoding import get_video_encoding_policy
 from lib.timeline import Timeline
@@ -163,6 +167,10 @@ def test_render_short_uses_each_retained_source_range_and_rebases_ass(
             "height": 1920,
             "video_codec": "h264",
             "audio_codec": "aac",
+            "audio_loudness": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbfs": -1.5,
+            },
         }
 
     with (
@@ -364,3 +372,84 @@ def test_public_single_clip_adapter_rejects_unknown_clip(
 
     with pytest.raises(KeyError, match="Unknown clip: missing"):
         render_single_clip(tmp_episode_dir, sample_config, "missing")
+
+
+def test_repair_single_clip_audio_copies_video_and_preserves_fingerprint(
+    tmp_episode_dir, sample_config
+):
+    clip = {"id": "clip_02", "start_seconds": 1, "end_seconds": 3}
+    episode = {"crop_config": {"speakers": [{}]}, "longform_edits": []}
+    (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+    (tmp_episode_dir / "clips.json").write_text(json.dumps({"clips": [clip]}))
+    source = tmp_episode_dir / "source_merged.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    output = tmp_episode_dir / "shorts" / "clip_02.mp4"
+    caption = tmp_episode_dir / "subtitles" / "clip_02.ass"
+    source.write_bytes(b"source")
+    audio.parent.mkdir(exist_ok=True)
+    audio.write_bytes(b"audio")
+    output.parent.mkdir(exist_ok=True)
+    output.write_bytes(b"old audio, reviewed video")
+    caption.parent.mkdir(exist_ok=True)
+    caption.write_text("captions")
+    current = {
+        "fingerprint": "current-short",
+        "captions": {"path": "subtitles/clip_02.ass", "burned_in": True},
+        "provenance": {"overlap_policy": "verified"},
+        "output": {
+            "size_bytes": output.stat().st_size,
+            "audio_loudness": {
+                "integrated_lufs": -19.7,
+                "true_peak_dbfs": -1.4,
+            },
+        },
+    }
+    source_probe = {
+        "format": {"duration": "4"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 320,
+                "height": 180,
+                "r_frame_rate": "30/1",
+            }
+        ],
+    }
+
+    def fake_mux(video, _audio, destination, timeline, **kwargs):
+        assert video == output
+        assert timeline.keep_intervals == ((1.0, 3.0),)
+        assert kwargs["loudness_policy"]["profile"] == "shorts"
+        destination.write_bytes(b"same video, normalized audio")
+        return {
+            "duration_seconds": 2,
+            "audio_duration_seconds": 2,
+            "video_duration_seconds": 2,
+            "width": 1080,
+            "height": 1920,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "audio_loudness": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbfs": -1.4,
+            },
+        }
+
+    with (
+        patch(
+            "agents.shorts_render.current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 4, "speaker": "speaker_0"}]},
+        ),
+        patch("agents.shorts_render.generate_audio_mix", return_value=audio),
+        patch("agents.shorts_render.ffprobe", return_value=source_probe),
+        patch("agents.shorts_render.current_short_render", return_value=current),
+        patch("agents.shorts_render.require_render_space"),
+        patch("agents.shorts_render.mux_timeline_audio", side_effect=fake_mux),
+    ):
+        result = repair_single_clip_audio(tmp_episode_dir, sample_config, "clip_02")
+
+    assert output.read_bytes() == b"same video, normalized audio"
+    assert result["audio_repaired"] is True
+    assert result["video_reencoded"] is False
+    assert result["render"]["fingerprint"] == "current-short"
+    assert result["render"]["provenance"]["audio_remaster"]["video_reencoded"] is False

@@ -3,7 +3,16 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from lib.loudness import measure_loudness
+import pytest
+
+from lib.loudness import (
+    delivery_loudness_policy,
+    loudness_status,
+    loudnorm_filter,
+    measure_loudness,
+    parse_loudnorm_analysis,
+    require_delivery_loudness,
+)
 
 # ---------------------------------------------------------------------------
 # Fixture: realistic ebur128 stderr output (trimmed — just the summary block)
@@ -169,3 +178,113 @@ class TestMeasureLoudnessNoAudioStream:
     def test_no_ebur128_keyword_in_output(self):
         """Confirms no false positive from video-only file output."""
         assert "ebur128" not in _EBUR128_STDERR_NO_AUDIO
+
+
+def test_delivery_policy_uses_configured_mastering_targets():
+    policy = delivery_loudness_policy(
+        {
+            "processing": {
+                "audio_target_lufs": -15,
+                "audio_target_tp": -2,
+                "audio_target_lra": 9,
+            }
+        },
+        "shorts",
+    )
+
+    assert policy == {
+        "schema": "cascade.delivery-loudness/v1",
+        "profile": "shorts",
+        "target_lufs": -15.0,
+        "target_true_peak_dbfs": -2.0,
+        "target_loudness_range_lu": 9.0,
+        "integrated_tolerance_lu": 1.0,
+        "max_true_peak_dbfs": -1.5,
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("audio_target_lufs", -4, "loudness target"),
+        ("audio_target_tp", 0.1, "true-peak target"),
+        ("audio_target_lra", 0, "loudness-range target"),
+        ("audio_loudness_tolerance_lu", -0.1, "tolerance"),
+        ("audio_max_true_peak_dbfs", 0.1, "true-peak limit"),
+    ],
+)
+def test_delivery_policy_rejects_invalid_encoder_targets(key, value, message):
+    with pytest.raises(ValueError, match=message):
+        delivery_loudness_policy({"processing": {key: value}}, "longform")
+
+
+def test_two_pass_filter_uses_exact_analysis_measurements():
+    policy = delivery_loudness_policy({}, "longform")
+    analysis = parse_loudnorm_analysis(
+        '{"input_i":"-18.2","input_lra":"5.0","input_tp":"-0.7",'
+        '"input_thresh":"-28.3","target_offset":"0.1"}'
+    )
+
+    value = loudnorm_filter(policy, analysis)
+
+    assert "I=-16.0:TP=-1.5:LRA=11.0" in value
+    assert "measured_I=-18.2" in value
+    assert "measured_TP=-0.7" in value
+    assert "linear=true" in value
+
+
+@pytest.mark.parametrize(
+    ("measurement", "problem"),
+    [
+        (None, "not measured"),
+        ({"integrated_lufs": -13, "true_peak_dbfs": -1.5}, "integrated"),
+        ({"integrated_lufs": -16, "true_peak_dbfs": 0.9}, "true peak"),
+    ],
+)
+def test_delivery_loudness_rejects_missing_or_unsafe_measurement(measurement, problem):
+    policy = delivery_loudness_policy({}, "longform")
+
+    status = loudness_status(measurement, policy)
+
+    assert status["safe"] is False
+    with pytest.raises(RuntimeError, match=problem):
+        require_delivery_loudness(measurement, policy)
+
+
+def test_delivery_loudness_accepts_encoded_result_inside_policy():
+    measurement = {
+        "integrated_lufs": -16.4,
+        "true_peak_dbfs": -1.1,
+        "loudness_range_lu": 7.0,
+    }
+
+    verified = require_delivery_loudness(
+        measurement, delivery_loudness_policy({}, "longform")
+    )
+
+    assert verified["verification"]["status"] == "passed"
+
+
+def test_delivery_verification_records_active_profile_targets():
+    policy = delivery_loudness_policy(
+        {
+            "processing": {
+                "audio_target_lufs": -15,
+                "audio_target_tp": -2,
+            }
+        },
+        "shorts",
+    )
+
+    verified = require_delivery_loudness(
+        {
+            "integrated_lufs": -15,
+            "true_peak_dbfs": -2,
+            "target_lufs": -16,
+        },
+        policy,
+    )
+
+    assert verified["target_lufs"] == -15
+    assert verified["target_true_peak_dbfs"] == -2
+    assert verified["verification"]["measurement"]["target_lufs"] == -15

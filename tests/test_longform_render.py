@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agents.longform_render import LongformRenderAgent
+from agents.longform_render import LongformRenderAgent, repair_longform_audio
 from lib.delivery_video import render_space_budget
 from lib.encoding import get_video_encoding_policy
 from lib.timeline import Timeline
@@ -361,6 +361,10 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
             "height": 90,
             "video_codec": "h264",
             "audio_codec": "aac",
+            "audio_loudness": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbfs": -1.5,
+            },
         }
 
     with (
@@ -397,9 +401,6 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
         ) as render_segments,
         patch("agents.longform_render.concat_video_segments", side_effect=fake_concat),
         patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
-        patch(
-            "agents.longform_render.measure_loudness", return_value=None
-        ) as measure_loudness,
     ):
         result = agent.execute()
 
@@ -407,12 +408,11 @@ def test_longform_writes_sidecar_and_only_burns_captions_when_enabled(
     assert (render_segments.call_args.args[3] is not None) is burn_captions
     assert result["captions_burned_in"] is burn_captions
     assert result["filename"] == "upload_video.mp4"
-    assert measure_loudness.call_args.args[0] != output
     assert output.read_bytes() == b"muxed"
     assert [detail for _, detail in progress] == [
         "Joining rendered segments",
         "Muxing canonical audio",
-        "Measuring output loudness",
+        "Output audio verified",
         "Longform render complete",
     ]
     assert all(percent < 100 for percent, _ in progress[:-1])
@@ -485,6 +485,10 @@ def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segment
             "height": 90,
             "video_codec": "h264",
             "audio_codec": "aac",
+            "audio_loudness": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbfs": -1.5,
+            },
         }
 
     with (
@@ -517,7 +521,6 @@ def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segment
         patch("agents.longform_render.require_render_space") as render_space,
         patch.object(agent, "_render_segments") as render_segments,
         patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
-        patch("agents.longform_render.measure_loudness", return_value=None),
     ):
         result = agent.execute()
 
@@ -535,7 +538,7 @@ def test_longform_reuses_only_verified_terminal_prefix_without_rendering_segment
     }
     assert [detail for _, detail in progress] == [
         "Reusing verified video pixels and muxing canonical audio",
-        "Measuring output loudness",
+        "Output audio verified",
         "Recording verified render manifest",
         "Longform render complete",
     ]
@@ -554,23 +557,11 @@ def test_terminal_prefix_verification_failure_preserves_reviewed_output(
 
     def fake_mux(_video, _audio, destination, _timeline, **_kwargs):
         destination.write_bytes(b"unverified replacement")
-        return {
-            "duration_seconds": 2,
-            "audio_duration_seconds": 2,
-            "video_duration_seconds": 2,
-            "width": 160,
-            "height": 90,
-            "video_codec": "h264",
-            "audio_codec": "aac",
-        }
+        raise RuntimeError("verification failed")
 
     with (
         patch("agents.longform_render.require_render_space"),
         patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
-        patch(
-            "agents.longform_render.measure_loudness",
-            side_effect=RuntimeError("verification failed"),
-        ),
         pytest.raises(RuntimeError, match="verification failed"),
     ):
         agent._reuse_terminal_prefix(
@@ -592,3 +583,146 @@ def test_terminal_prefix_verification_failure_preserves_reviewed_output(
 
     assert output.read_bytes() == b"reviewed master"
     assert not list(tmp_episode_dir.glob(".upload_video-trim-reuse-*.mp4"))
+
+
+def test_audio_repair_copies_current_video_and_records_verified_remaster(
+    tmp_episode_dir, sample_config
+):
+    episode = {
+        "crop_config": {"speakers": [{"center_x": 80, "center_y": 45, "zoom": 1}]},
+        "longform_edits": [],
+        "delivery_apply_lut": False,
+    }
+    (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+    (tmp_episode_dir / "diarized_transcript.json").write_text(
+        json.dumps({"utterances": []})
+    )
+    source = tmp_episode_dir / "source_merged.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    output = tmp_episode_dir / "upload_video.mp4"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"unsafe audio, verified video")
+    current = {
+        "fingerprint": "current-fingerprint",
+        "render_mode": "speaker_cut",
+        "keep_intervals": [[0.0, 2.0]],
+        "captions": {"path": "subtitles/longform.ass", "burned_in": False},
+        "provenance": {"color_grade": "source"},
+        "output": {
+            "size_bytes": output.stat().st_size,
+            "audio_loudness": {
+                "integrated_lufs": -16.4,
+                "true_peak_dbfs": 0.9,
+            },
+        },
+    }
+    source_probe = {
+        "format": {"duration": "2"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 160,
+                "height": 90,
+                "r_frame_rate": "30/1",
+            }
+        ],
+    }
+
+    def fake_mux(video, _audio, destination, timeline, **kwargs):
+        assert video == output
+        assert destination != output
+        assert timeline.keep_intervals == ((0.0, 2.0),)
+        assert kwargs["loudness_policy"]["target_lufs"] == -16
+        destination.write_bytes(b"same video packets, repaired audio")
+        return {
+            "duration_seconds": 2,
+            "audio_duration_seconds": 2,
+            "video_duration_seconds": 2,
+            "width": 160,
+            "height": 90,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "audio_loudness": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbfs": -1.4,
+            },
+        }
+
+    with (
+        patch(
+            "agents.longform_render.current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 2, "speaker": "speaker_0"}]},
+        ),
+        patch(
+            "agents.longform_render.current_diarized_transcript",
+            return_value={"utterances": []},
+        ),
+        patch("agents.longform_render.generate_audio_mix", return_value=audio),
+        patch("agents.longform_render.ffprobe", return_value=source_probe),
+        patch(
+            "agents.longform_render.longform_render_fingerprint",
+            return_value="current-fingerprint",
+        ),
+        patch("agents.longform_render.current_longform_render", return_value=current),
+        patch("agents.longform_render.require_render_space"),
+        patch("agents.longform_render.mux_timeline_audio", side_effect=fake_mux),
+    ):
+        result = repair_longform_audio(tmp_episode_dir, sample_config)
+
+    assert output.read_bytes() == b"same video packets, repaired audio"
+    assert result["audio_repaired"] is True
+    assert result["video_reencoded"] is False
+    assert result["render_fingerprint"] == "current-fingerprint"
+    assert (
+        result["manifest"]["provenance"]["audio_remaster"]["video_reencoded"] is False
+    )
+
+
+def test_audio_repair_refuses_to_render_pixels_when_longform_is_not_current(
+    tmp_episode_dir, sample_config
+):
+    episode = {
+        "crop_config": {"speakers": [{"center_x": 80, "center_y": 45, "zoom": 1}]},
+        "longform_edits": [],
+        "delivery_apply_lut": False,
+    }
+    (tmp_episode_dir / "episode.json").write_text(json.dumps(episode))
+    (tmp_episode_dir / "diarized_transcript.json").write_text('{"utterances": []}')
+    source = tmp_episode_dir / "source_merged.mp4"
+    audio = tmp_episode_dir / "work" / "audio_mix.wav"
+    output = tmp_episode_dir / "upload_video.mp4"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"previous")
+    source_probe = {
+        "format": {"duration": "2"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 160,
+                "height": 90,
+                "r_frame_rate": "30/1",
+            }
+        ],
+    }
+
+    with (
+        patch(
+            "agents.longform_render.current_speaker_segments",
+            return_value={"segments": [{"start": 0, "end": 2, "speaker": "speaker_0"}]},
+        ),
+        patch(
+            "agents.longform_render.current_diarized_transcript",
+            return_value={"utterances": []},
+        ),
+        patch("agents.longform_render.generate_audio_mix", return_value=audio),
+        patch("agents.longform_render.ffprobe", return_value=source_probe),
+        patch("agents.longform_render.current_longform_render", return_value=None),
+        patch.object(LongformRenderAgent, "_render_segments") as render_segments,
+        pytest.raises(RuntimeError, match="current manifest-backed"),
+    ):
+        repair_longform_audio(tmp_episode_dir, sample_config)
+
+    render_segments.assert_not_called()
+    assert output.read_bytes() == b"previous"

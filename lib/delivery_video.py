@@ -28,6 +28,12 @@ from lib.encoding import (
     resolve_lut_path,
 )
 from lib.ffprobe import probe
+from lib.loudness import (
+    loudnorm_filter,
+    measure_loudness,
+    parse_loudnorm_analysis,
+    require_delivery_loudness,
+)
 from lib.timeline import (  # noqa: F401
     Timeline,
     build_keep_intervals,
@@ -368,9 +374,10 @@ def mux_timeline_audio(
     timeline: Timeline,
     *,
     audio_bitrate: str = "192k",
+    loudness_policy: dict | None = None,
     runner: Callable = subprocess.run,
 ) -> dict:
-    """Mux canonical audio using the exact source intervals used by video."""
+    """Master and mux canonical audio using the video's exact source intervals."""
     audio_duration = float(probe(audio_path)["format"]["duration"])
     required_end = max(span.source_end for span in timeline.spans)
     if audio_duration + 0.1 < required_end:
@@ -378,6 +385,49 @@ def mux_timeline_audio(
             f"Canonical audio ends at {audio_duration:.3f}s but the selected video "
             f"requires audio through {required_end:.3f}s"
         )
+
+    filter_graph = _audio_filter_graph(list(timeline.keep_intervals))
+    audio_label = "[a]"
+    mastering = None
+    if loudness_policy is not None:
+        analysis_graph = (
+            _audio_filter_graph(list(timeline.keep_intervals), input_index=0)
+            + f";[a]{loudnorm_filter(loudness_policy)}[analysis]"
+        )
+        analysis_result = runner(
+            [
+                ffmpeg_executable(),
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                str(audio_path),
+                "-filter_complex",
+                analysis_graph,
+                "-map",
+                "[analysis]",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if analysis_result.returncode != 0:
+            raise RuntimeError(
+                "Loudness normalization analysis failed: "
+                + (analysis_result.stderr or "ffmpeg returned an error")[-500:]
+            )
+        measurements = parse_loudnorm_analysis(analysis_result.stderr)
+        filter_graph += (
+            f";[a]{loudnorm_filter(loudness_policy, measurements)}[mastered]"
+        )
+        audio_label = "[mastered]"
+        mastering = {
+            "method": "ffmpeg-loudnorm-two-pass/v1",
+            "policy": loudness_policy,
+            "input_measurement": measurements,
+        }
 
     with staged_render_output(output_path) as temp:
         runner(
@@ -392,11 +442,11 @@ def mux_timeline_audio(
                 "-i",
                 str(audio_path),
                 "-filter_complex",
-                _audio_filter_graph(list(timeline.keep_intervals)),
+                filter_graph,
                 "-map",
                 "0:v",
                 "-map",
-                "[a]",
+                audio_label,
                 "-c:v",
                 "copy",
                 "-c:a",
@@ -417,6 +467,11 @@ def mux_timeline_audio(
             check=True,
         )
         media = validate_av_output(temp, timeline.duration)
+        if loudness_policy is not None:
+            media["audio_loudness"] = require_delivery_loudness(
+                measure_loudness(temp, ffmpeg_bin=ffmpeg_executable()), loudness_policy
+            )
+            media["audio_mastering"] = mastering
         return media
 
 

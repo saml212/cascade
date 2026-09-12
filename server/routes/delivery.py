@@ -14,12 +14,14 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from agents.longform_render import render_longform
+from agents.longform_render import render_longform, repair_longform_audio
 from agents.pipeline import load_config
 from agents.podcast_feed import (
     PODCAST_AUDIO_PROCESSING_KEYS,
     PodcastFeedAgent,
     current_podcast_audio,
+)
+from agents.podcast_feed import (
     podcast_source_fingerprint as _source_fingerprint,
 )
 from agents.qa import quality_snapshot
@@ -35,6 +37,7 @@ from lib.delivery_video import (
     build_keep_intervals,
     current_longform_render,
     longform_render_fingerprint,
+    read_render_manifest,
     render_config_for_episode,
     render_space_budget,
     render_space_status,
@@ -42,7 +45,7 @@ from lib.delivery_video import (
 )
 from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import get_duration
-from lib.loudness import measure_loudness
+from lib.loudness import delivery_loudness_policy, loudness_status, measure_loudness
 from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
@@ -184,6 +187,29 @@ def _video_fingerprint(
     )
 
 
+def _current_video_record(
+    episode_dir: Path, episode: dict, config: dict
+) -> dict | None:
+    """Return the current manifest-backed video using the selected audio source."""
+    audio = selected_audio_source(episode_dir, episode, config) or (
+        episode_dir / "work" / "audio_mix.wav"
+    )
+    segment_document = current_speaker_segments(episode_dir, episode, config)
+    segments = segment_document.get("segments", []) if segment_document else []
+    if not audio.is_file() or not segments:
+        return None
+    return current_longform_render(episode_dir, episode, config, audio, segments)
+
+
+def _video_audio_status(episode_dir: Path, config: dict) -> dict:
+    """Classify recorded final AAC evidence without decoding on status polls."""
+    record = read_render_manifest(episode_dir).get("longform", {})
+    return loudness_status(
+        record.get("output", {}).get("audio_loudness"),
+        delivery_loudness_policy(config, "longform"),
+    )
+
+
 def _video_preflight(
     episode_dir: Path,
     episode: dict,
@@ -313,6 +339,8 @@ def _refresh_status(episode_dir: Path) -> dict:
                 or status.get("video_output_stat") != _file_stat(video_path)
                 or status.get("video_source_fingerprint") != expected_fingerprint
             )
+            video_audio = _video_audio_status(episode_dir, config)
+            status["video_audio"] = video_audio
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             video_stale = True
             video_input_error = str(exc)
@@ -320,10 +348,25 @@ def _refresh_status(episode_dir: Path) -> dict:
             status.update(
                 video_status="not_prepared",
                 video_stale=True,
+                video_repair_required=False,
                 video_error=video_input_error
                 or "Video inputs or output changed; prepare the video again.",
             )
             _write_status(episode_dir, status)
+        elif not video_audio["safe"]:
+            status.update(
+                video_status="not_prepared",
+                video_stale=False,
+                video_repair_required=True,
+                video_error=(
+                    "; ".join(video_audio.get("errors", []))
+                    or video_audio.get("error")
+                    or "Encoded video audio needs repair."
+                ),
+            )
+            _write_status(episode_dir, status)
+        else:
+            status["video_repair_required"] = False
     return status
 
 
@@ -448,7 +491,7 @@ def _prepare_delivery(episode_id: str) -> None:
             _running.discard(episode_id)
 
 
-def _prepare_video(episode_id: str) -> None:
+def _prepare_video(episode_id: str, *, repair_audio: bool = False) -> None:
     episode_dir = EPISODES_DIR / episode_id
     try:
         status = _refresh_status(episode_dir)
@@ -465,7 +508,8 @@ def _prepare_video(episode_id: str) -> None:
             )
             _write_status(episode_dir, current)
 
-        video = render_longform(episode_dir, config, progress=progress)
+        operation = repair_longform_audio if repair_audio else render_longform
+        video = operation(episode_dir, config, progress=progress)
         status = _read_status(episode_dir)
         status.update(
             video_status="ready",
@@ -475,6 +519,8 @@ def _prepare_video(episode_id: str) -> None:
             video_source_fingerprint=video["render_fingerprint"],
             video_output_stat=_file_stat(episode_dir / "upload_video.mp4"),
             video=video,
+            video_operation="repair_audio" if repair_audio else "render",
+            video_repair_required=False,
             video_error=None,
         )
         _write_status(episode_dir, status)
@@ -484,6 +530,7 @@ def _prepare_video(episode_id: str) -> None:
         status.update(
             video_status="failed",
             video_completed_at=_now(),
+            video_repair_required=repair_audio,
             video_error=str(exc),
         )
         _write_status(episode_dir, status)
@@ -506,6 +553,50 @@ class DeliveryTrimRequest(BaseModel):
 class DeliveryVideoRequest(BaseModel):
     apply_lut: bool = False
     burn_captions: bool = False
+
+
+def _start_video_job(
+    episode_id: str,
+    episode_dir: Path,
+    status: dict,
+    *,
+    repair_audio: bool,
+) -> dict:
+    """Start one serialized longform render or audio-only repair job."""
+    with _running_lock:
+        if episode_id in _running:
+            raise HTTPException(
+                status_code=409, detail="Audio preparation is still running"
+            )
+        if _video_running:
+            raise HTTPException(
+                status_code=409,
+                detail="Another video preparation is already running; wait for it to finish",
+            )
+        _video_running.add(episode_id)
+    operation = "repair_audio" if repair_audio else "render"
+    status.update(
+        video_status="preparing",
+        video_progress=0.0,
+        video_detail=(
+            "Checking current render and audio"
+            if repair_audio
+            else "Checking inputs and disk space"
+        ),
+        video_error=None,
+        video_repair_required=False,
+        video_started_at=_now(),
+        video_operation=operation,
+    )
+    _write_status(episode_dir, status)
+    threading.Thread(
+        target=_prepare_video,
+        args=(episode_id,),
+        kwargs={"repair_audio": repair_audio},
+        name=f"delivery-video-{operation}-{episode_id}",
+        daemon=True,
+    ).start()
+    return status
 
 
 @router.put("/{episode_id}/delivery/trim")
@@ -549,6 +640,7 @@ async def save_delivery_trim(episode_id: str, request: DeliveryTrimRequest) -> d
         error="Trim changed; prepare audio again.",
         video_status="not_prepared",
         video_stale=True,
+        video_repair_required=False,
         video_error="Trim changed; prepare video again after audio.",
         trim_start_seconds=round(start, 3),
         trim_end_seconds=round(end, 3),
@@ -688,36 +780,33 @@ async def prepare_delivery_video(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    with _running_lock:
-        if episode_id in _running:
-            raise HTTPException(
-                status_code=409, detail="Audio preparation is still running"
-            )
-        if _video_running:
-            raise HTTPException(
-                status_code=409,
-                detail="Another video preparation is already running; wait for it to finish",
-            )
-        _video_running.add(episode_id)
     atomic_write_json(episode_dir / "episode.json", episode)
     status.update(
-        video_status="preparing",
-        video_progress=0.0,
-        video_detail="Checking inputs and disk space",
-        video_error=None,
-        video_started_at=_now(),
         delivery_apply_lut=request.apply_lut,
         delivery_burn_captions=request.burn_captions,
         video_preflight=preflight,
     )
-    _write_status(episode_dir, status)
-    threading.Thread(
-        target=_prepare_video,
-        args=(episode_id,),
-        name=f"delivery-video-{episode_id}",
-        daemon=True,
-    ).start()
-    return status
+    return _start_video_job(episode_id, episode_dir, status, repair_audio=False)
+
+
+@router.post("/{episode_id}/delivery/video/repair-audio", status_code=202)
+async def repair_delivery_video_audio(episode_id: str) -> dict:
+    """Normalize a current longform's AAC while preserving its video packets."""
+    episode_dir = _episode_dir(episode_id)
+    status = _refresh_status(episode_dir)
+    try:
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        config = render_config_for_episode(episode, load_config())
+        current = _current_video_record(episode_dir, episode, config)
+    except (OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if current is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Audio repair requires a current manifest-backed longform render",
+        )
+    status["video_audio"] = _video_audio_status(episode_dir, config)
+    return _start_video_job(episode_id, episode_dir, status, repair_audio=True)
 
 
 @router.get("/{episode_id}/delivery/video")

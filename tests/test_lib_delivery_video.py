@@ -38,6 +38,7 @@ from lib.delivery_video import (
     source_fps,
     staged_render_output,
 )
+from lib.loudness import delivery_loudness_policy
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
@@ -422,16 +423,112 @@ def test_mux_uses_a_unique_atomic_temp_for_each_attempt(tmp_path):
     assert not any(destination.exists() for destination in destinations)
 
 
+def test_mux_two_pass_normalizes_retained_timeline_and_records_final_proof(tmp_path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "result.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    commands = []
+    analysis = (
+        '{"input_i":"-19.0","input_lra":"4.0","input_tp":"-3.0",'
+        '"input_thresh":"-29.0","target_offset":"0.0"}'
+    )
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if command[-1] == "-":
+            return SimpleNamespace(returncode=0, stderr=analysis)
+        Path(command[-1]).write_bytes(b"mastered")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    final = {
+        "integrated_lufs": -16.0,
+        "true_peak_dbfs": -1.4,
+        "loudness_range_lu": 4.0,
+    }
+    with (
+        patch("lib.delivery_video.probe", return_value={"format": {"duration": "5"}}),
+        patch(
+            "lib.delivery_video.validate_av_output",
+            return_value={"duration_seconds": 3},
+        ),
+        patch("lib.delivery_video.measure_loudness", return_value=final),
+    ):
+        media = mux_timeline_audio(
+            video,
+            audio,
+            output,
+            Timeline(5, [(1, 2), (3, 5)]),
+            loudness_policy=delivery_loudness_policy({}, "shorts"),
+            runner=runner,
+        )
+
+    analysis_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    render_graph = commands[1][commands[1].index("-filter_complex") + 1]
+    assert "atrim=start=1.0:end=2.0" in analysis_graph
+    assert "print_format=json" in analysis_graph
+    assert "measured_I=-19.0" in render_graph
+    assert commands[1][commands[1].index("-map") + 3] == "[mastered]"
+    assert media["audio_loudness"]["verification"]["safe"] is True
+    assert media["audio_mastering"]["method"] == "ffmpeg-loudnorm-two-pass/v1"
+    assert output.read_bytes() == b"mastered"
+
+
+def test_mux_loudness_failure_preserves_existing_output(tmp_path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "result.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"reviewed")
+    analysis = (
+        '{"input_i":"-19.0","input_lra":"4.0","input_tp":"-3.0",'
+        '"input_thresh":"-29.0","target_offset":"0.0"}'
+    )
+
+    def runner(command, **_kwargs):
+        if command[-1] == "-":
+            return SimpleNamespace(returncode=0, stderr=analysis)
+        Path(command[-1]).write_bytes(b"unsafe")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    with (
+        patch("lib.delivery_video.probe", return_value={"format": {"duration": "1"}}),
+        patch(
+            "lib.delivery_video.validate_av_output",
+            return_value={"duration_seconds": 1},
+        ),
+        patch(
+            "lib.delivery_video.measure_loudness",
+            return_value={"integrated_lufs": -16, "true_peak_dbfs": 0.9},
+        ),
+        pytest.raises(RuntimeError, match="true peak 0.9"),
+    ):
+        mux_timeline_audio(
+            video,
+            audio,
+            output,
+            Timeline.from_edits(1),
+            loudness_policy=delivery_loudness_policy({}, "longform"),
+            runner=runner,
+        )
+
+    assert output.read_bytes() == b"reviewed"
+
+
 def test_staged_render_output_preserves_reviewed_file_when_verification_fails(
     tmp_path,
 ):
     output = tmp_path / "upload_video.mp4"
     output.write_bytes(b"reviewed")
 
-    with pytest.raises(RuntimeError, match="verification failed"):
-        with staged_render_output(output) as staged:
-            staged.write_bytes(b"unverified")
-            raise RuntimeError("verification failed")
+    with (
+        pytest.raises(RuntimeError, match="verification failed"),
+        staged_render_output(output) as staged,
+    ):
+        staged.write_bytes(b"unverified")
+        raise RuntimeError("verification failed")
 
     assert output.read_bytes() == b"reviewed"
     assert not list(tmp_path.glob(".upload_video-*.mp4"))
@@ -495,6 +592,87 @@ def test_mux_can_atomically_shorten_its_video_input_in_place(tmp_path):
     assert media["duration_seconds"] == pytest.approx(2, abs=0.1)
     assert media["audio_duration_seconds"] == pytest.approx(2, abs=0.1)
     assert media["video_duration_seconds"] == pytest.approx(2, abs=0.1)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_mux_normalizes_aac_and_copies_video_packets(tmp_path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "output.mp4"
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=30:duration=3",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            video,
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3",
+            "-af",
+            "volume=0.08",
+            "-c:a",
+            "pcm_s24le",
+            audio,
+        ],
+        check=True,
+    )
+
+    def video_hash(path):
+        result = subprocess.run(
+            [
+                ffmpeg_executable(),
+                "-v",
+                "error",
+                "-i",
+                path,
+                "-map",
+                "0:v:0",
+                "-c",
+                "copy",
+                "-f",
+                "md5",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    before = video_hash(video)
+    media = mux_timeline_audio(
+        video,
+        audio,
+        output,
+        Timeline.from_edits(3),
+        loudness_policy=delivery_loudness_policy({}, "shorts"),
+    )
+
+    assert video_hash(output) == before
+    assert media["audio_loudness"]["integrated_lufs"] == pytest.approx(-16, abs=0.5)
+    assert media["audio_loudness"]["true_peak_dbfs"] <= -1
 
 
 def test_manifest_updates_survive_multiple_writer_processes(tmp_path):

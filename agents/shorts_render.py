@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -35,6 +36,7 @@ from lib.encoding import (
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
+from lib.loudness import delivery_loudness_policy, loudness_status
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
@@ -66,6 +68,117 @@ class ShortsRenderAgent(BaseAgent):
             "caption_path": str(self.episode_dir / "subtitles" / f"{clip_id}.ass"),
             "reused": bool(result["renders"][clip_id].get("reused")),
             "render": result["renders"][clip_id],
+        }
+
+    def repair_clip_audio(self, clip_id: str) -> dict:
+        """Normalize one current short while preserving its encoded video packets."""
+        output = self.episode_dir / "shorts" / f"{clip_id}.mp4"
+        with render_output_lock(output):
+            return self._repair_clip_audio_locked(clip_id, output)
+
+    def _repair_clip_audio_locked(self, clip_id: str, output: Path) -> dict:
+        clips = self.load_json("clips.json").get("clips", [])
+        clip = next((item for item in clips if item.get("id") == clip_id), None)
+        if clip is None:
+            raise KeyError(f"Unknown clip: {clip_id}")
+        episode = self.load_json("episode.json")
+        self.config = render_config_for_episode(episode, self.config)
+        segment_document = current_speaker_segments(
+            self.episode_dir, episode, self.config
+        )
+        segments = segment_document.get("segments", []) if segment_document else []
+        if not segments:
+            raise ValueError(
+                "Current source-clock speaker segments are required for shorts repair"
+            )
+        audio = generate_audio_mix(self.episode_dir, episode, self.config)
+        if not audio or not audio.exists():
+            raise RuntimeError("Canonical audio source is required")
+        source = self.episode_dir / "source_merged.mp4"
+        source_probe = ffprobe(source)
+        video_stream = next(
+            stream
+            for stream in source_probe["streams"]
+            if stream["codec_type"] == "video"
+        )
+        fps = source_fps(video_stream, episode)
+        timeline = (
+            Timeline.from_edits(
+                float(source_probe["format"]["duration"]),
+                episode.get("longform_edits", []),
+            )
+            .slice(float(clip["start_seconds"]), float(clip["end_seconds"]))
+            .quantize(fps)
+        )
+        current = current_short_render(
+            self.episode_dir,
+            episode,
+            self.config,
+            audio,
+            segments,
+            clip,
+        )
+        if current is None:
+            raise RuntimeError(
+                "Audio repair requires a current manifest-backed short render"
+            )
+        policy = delivery_loudness_policy(self.config, "shorts")
+        audio_state = loudness_status(
+            current.get("output", {}).get("audio_loudness"), policy
+        )
+        if audio_state["safe"]:
+            return self._clip_repair_result(
+                clip_id, output, {**current, "reused": True}, repaired=False
+            )
+
+        output_bytes = int(current.get("output", {}).get("size_bytes", 0))
+        if output_bytes <= 0:
+            raise RuntimeError("Current short has no recorded output size")
+        require_render_space(
+            output.parent, {"output_bytes": output_bytes, "scratch_bytes": 0}
+        )
+        encoding = get_video_encoding_policy(self.config, "shorts")
+        media = mux_timeline_audio(
+            output,
+            audio,
+            output,
+            timeline,
+            audio_bitrate=encoding["audio_bitrate"],
+            loudness_policy=policy,
+            runner=self._run_ffmpeg,
+        )
+        if "audio_loudness" not in media:
+            raise RuntimeError("Repaired short has no verified audio loudness")
+        provenance = copy.deepcopy(current.get("provenance", {}))
+        provenance["audio_remaster"] = {
+            "method": "copy-video-remux-canonical-audio/v1",
+            "source_render_fingerprint": current["fingerprint"],
+            "video_reencoded": False,
+            "policy": policy,
+        }
+        record = record_short_render(
+            self.episode_dir,
+            clip_id,
+            fingerprint=current["fingerprint"],
+            timeline=timeline,
+            media=media,
+            captions=copy.deepcopy(current.get("captions")),
+            provenance=provenance,
+        )
+        return self._clip_repair_result(clip_id, output, record, repaired=True)
+
+    def _clip_repair_result(
+        self, clip_id: str, output: Path, record: dict, *, repaired: bool
+    ) -> dict:
+        caption = str(record.get("captions", {}).get("path", ""))
+        return {
+            "clip_id": clip_id,
+            "output_path": str(output),
+            "caption_path": str(self.episode_dir / caption) if caption else None,
+            "reused": True,
+            "audio_repaired": repaired,
+            "video_reencoded": False,
+            "render": record,
         }
 
     def _render_clips(self, clips: list[dict]) -> dict:
@@ -104,7 +217,7 @@ class ShortsRenderAgent(BaseAgent):
             )
         audio = generate_audio_mix(self.episode_dir, episode, self.config)
         if not audio or not audio.exists():
-            raise RuntimeError("Canonical work/audio_mix.wav is required")
+            raise RuntimeError("Canonical audio source is required")
 
         source_probe = ffprobe(source)
         video_stream = next(
@@ -252,7 +365,7 @@ class ShortsRenderAgent(BaseAgent):
         episode = episode or self.load_json("episode.json")
         diarized = diarized or self.load_json("diarized_transcript.json")
         if not audio_mix_path or not Path(audio_mix_path).exists():
-            raise RuntimeError("Canonical work/audio_mix.wav is required")
+            raise RuntimeError("Canonical audio source is required")
         if timeline is None:
             source_probe = ffprobe(source)
             video_stream = next(
@@ -329,8 +442,11 @@ class ShortsRenderAgent(BaseAgent):
                 Path(output),
                 timeline,
                 audio_bitrate=audio_bitrate,
+                loudness_policy=delivery_loudness_policy(self.config, "shorts"),
                 runner=self._run_ffmpeg,
             )
+            if "audio_loudness" not in media:
+                raise RuntimeError("Rendered short has no verified audio loudness")
 
         clip = clip or {
             "id": Path(output).stem,
@@ -488,3 +604,8 @@ class ShortsRenderAgent(BaseAgent):
 def render_single_clip(episode_dir: Path, config: dict, clip_id: str) -> dict:
     """Public API adapter for an atomic, manifest-backed single-clip render."""
     return ShortsRenderAgent(episode_dir, config).render_clip(clip_id)
+
+
+def repair_single_clip_audio(episode_dir: Path, config: dict, clip_id: str) -> dict:
+    """Repair one current short's audio while preserving encoded video packets."""
+    return ShortsRenderAgent(episode_dir, config).repair_clip_audio(clip_id)

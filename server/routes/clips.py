@@ -147,6 +147,8 @@ def _finish_render_job(
         state.update(
             render_fingerprint=result.get("render", {}).get("fingerprint"),
             reused=bool(result.get("reused")),
+            audio_repaired=bool(result.get("audio_repaired")),
+            video_reencoded=result.get("video_reencoded"),
         )
     _write_render_job(ep_dir, clip_id, state)
 
@@ -572,9 +574,10 @@ async def delete_clip(episode_id: str, clip_id: str) -> dict:
     return {"status": "deleted", "clip_id": clip_id}
 
 
-@router.post("/{clip_id}/render")
-async def render_clip(episode_id: str, clip_id: str) -> dict:
-    """Render one exact clip through the public shorts-render adapter."""
+async def _run_clip_render_operation(
+    episode_id: str, clip_id: str, *, repair_audio: bool
+) -> dict:
+    """Run one serialized clip media operation and persist its review state."""
     clips, _ = load_clips(episode_id)
     find_clip(clips, clip_id)
     ep_dir = EPISODES_DIR / episode_id
@@ -589,17 +592,21 @@ async def render_clip(episode_id: str, clip_id: str) -> dict:
     _write_render_job(
         ep_dir,
         clip_id,
-        {"status": "rendering", "started_at": started_at},
+        {
+            "status": "rendering",
+            "operation": "repair_audio" if repair_audio else "render",
+            "started_at": started_at,
+        },
     )
 
     from agents.pipeline import load_config
-    from agents.shorts_render import render_single_clip
+    from agents.shorts_render import render_single_clip, repair_single_clip_audio
+
+    operation = repair_single_clip_audio if repair_audio else render_single_clip
 
     try:
         try:
-            result = await asyncio.to_thread(
-                render_single_clip, ep_dir, load_config(), clip_id
-            )
+            result = await asyncio.to_thread(operation, ep_dir, load_config(), clip_id)
         except KeyError as error:
             raise HTTPException(
                 status_code=404, detail=f"Clip {clip_id} not found"
@@ -607,17 +614,17 @@ async def render_clip(episode_id: str, clip_id: str) -> dict:
         except (FileNotFoundError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (OSError, RuntimeError) as error:
-            logger.exception("single clip render failed for %s", clip_id)
+            logger.exception("single clip media operation failed for %s", clip_id)
             raise HTTPException(status_code=500, detail=str(error)) from error
 
-        # Newly produced pixels need review. Reusing the exact current fingerprint
-        # keeps an existing final approval valid.
+        # New pixels or repaired audio need review. A byte-identical current reuse
+        # keeps its prior approval; a remaster deliberately clears it.
         clips, clips_file = load_clips(episode_id)
         clip, index = find_clip(clips, clip_id)
         fingerprint = result.get("render", {}).get("fingerprint")
-        if (
-            clip.get("status") == "approved"
-            and clip.get("approved_render_fingerprint") != fingerprint
+        if clip.get("status") == "approved" and (
+            result.get("audio_repaired")
+            or clip.get("approved_render_fingerprint") != fingerprint
         ):
             _clear_final_approval(clip)
             clips[index] = clip
@@ -630,3 +637,15 @@ async def render_clip(episode_id: str, clip_id: str) -> dict:
     finally:
         with _render_jobs_lock:
             _active_render_jobs.discard(job_key)
+
+
+@router.post("/{clip_id}/render")
+async def render_clip(episode_id: str, clip_id: str) -> dict:
+    """Render one exact clip through the public shorts-render adapter."""
+    return await _run_clip_render_operation(episode_id, clip_id, repair_audio=False)
+
+
+@router.post("/{clip_id}/repair-audio")
+async def repair_clip_audio(episode_id: str, clip_id: str) -> dict:
+    """Normalize one current short while copying its reviewed video packets."""
+    return await _run_clip_render_operation(episode_id, clip_id, repair_audio=True)
