@@ -22,14 +22,17 @@ def delivery(tmp_path, monkeypatch):
 
     import lib.paths
     import server.routes.delivery as delivery_mod
+    import server.routes.trim as trim_mod
 
     importlib.reload(lib.paths)
     importlib.reload(delivery_mod)
+    importlib.reload(trim_mod)
 
     from fastapi import FastAPI
 
     app = FastAPI()
     app.include_router(delivery_mod.router)
+    app.include_router(trim_mod.router)
     yield TestClient(app), delivery_mod, episodes_dir
 
 
@@ -516,6 +519,60 @@ def test_trim_clamps_millisecond_display_rounding(delivery):
     assert response.status_code == 200
     edits = json.loads((episode_dir / "episode.json").read_text())["longform_edits"]
     assert edits[-1] == {"type": "trim_end", "seconds": 5359.895}
+
+
+def test_legacy_trim_endpoint_preserves_source_bytes_and_replaces_edit_bounds(
+    delivery, monkeypatch
+):
+    client, delivery_mod, episodes_dir = delivery
+    from server.routes import trim as trim_mod
+
+    episode_dir = make_episode(episodes_dir)
+    source = episode_dir / "source_merged.mp4"
+    source.write_bytes(b"immutable source media")
+    longform = episode_dir / "longform.mp4"
+    longform.write_bytes(b"immutable legacy render")
+    episode_path = episode_dir / "episode.json"
+    episode = json.loads(episode_path.read_text())
+    episode["longform_edits"] = [
+        {"type": "cut", "start_seconds": 40, "end_seconds": 45},
+        {"type": "trim_start", "seconds": 5},
+    ]
+    episode_path.write_text(json.dumps(episode))
+    source_before = source.read_bytes(), source.stat().st_mtime_ns
+    longform_before = longform.read_bytes(), longform.stat().st_mtime_ns
+    monkeypatch.setattr(trim_mod, "get_duration", lambda _path: 100.0)
+    monkeypatch.setattr(delivery_mod, "get_duration", lambda _path: 100.0)
+
+    response = client.post(
+        "/api/episodes/ep_test/trim",
+        json={"trim_start_seconds": 10, "trim_end_seconds": 90},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["new_duration"] == 80
+    assert response.json()["source_unchanged"] is True
+    stored = json.loads(episode_path.read_text())
+    assert stored["duration_seconds"] == 3600.25
+    assert stored["longform_edits"] == [
+        {"type": "cut", "start_seconds": 40, "end_seconds": 45},
+        {"type": "trim_start", "seconds": 10.0},
+        {"type": "trim_end", "seconds": 90.0},
+    ]
+    assert (source.read_bytes(), source.stat().st_mtime_ns) == source_before
+    assert (longform.read_bytes(), longform.stat().st_mtime_ns) == longform_before
+    assert not (episode_dir / "source_merged_original.mp4").exists()
+    assert not (episode_dir / "source_merged_trimmed.mp4").exists()
+
+    stored_before = episode_path.read_bytes()
+    repeated = client.post(
+        "/api/episodes/ep_test/trim",
+        json={"trim_start_seconds": 10, "trim_end_seconds": 90},
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "noop"
+    assert episode_path.read_bytes() == stored_before
+    assert (source.read_bytes(), source.stat().st_mtime_ns) == source_before
 
 
 def test_worker_persists_verified_ready_status(delivery):

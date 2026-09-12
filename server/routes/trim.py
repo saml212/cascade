@@ -1,30 +1,23 @@
-"""Trim endpoint — trim source and longform video files."""
+"""Compatibility endpoint for non-destructive episode trims."""
 
-import asyncio
+from __future__ import annotations
+
 import json
 import logging
-import os
-import shutil
+import math
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from lib.ffprobe import probe as ffprobe_json
+from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
+from server.routes.delivery import DeliveryTrimRequest, save_delivery_trim
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/episodes/{episode_id}", tags=["trim"])
-
 EPISODES_DIR = get_episodes_dir()
-
-
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
 
 
 class TrimRequest(BaseModel):
@@ -32,250 +25,80 @@ class TrimRequest(BaseModel):
     trim_end_seconds: float = 0.0
 
 
-class TrimResponse(BaseModel):
-    new_duration: float
-    backup_path: str
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _episode_dir(episode_id: str) -> Path:
-    ep_dir = EPISODES_DIR / episode_id
-    if not ep_dir.exists():
+    root = EPISODES_DIR.resolve()
+    episode_dir = (root / episode_id).resolve()
+    if episode_dir.parent != root or not (episode_dir / "episode.json").is_file():
         raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-    return ep_dir
+    return episode_dir
 
 
-def _load_json_safe(path: Path) -> Optional[dict]:
-    """Load a JSON file if it exists, otherwise return None."""
-    if not path.exists():
-        return None
+def _terminal_bounds(episode_dir: Path, duration: float) -> tuple[float, float]:
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _fix_track_durations(mp4_path: Path) -> Path:
-    """Ensure audio and video tracks have matching durations.
-
-    Stream-copy trims cut video at keyframes but audio precisely, leaving a
-    duration mismatch that platforms like Spotify reject.  If the tracks
-    differ by more than 50 ms, re-mux with -t set to the shorter duration.
-    Returns the (possibly replaced) output path.
-    """
-    try:
-        probe_data = ffprobe_json(mp4_path)
-        streams = probe_data.get("streams", [])
-    except (subprocess.CalledProcessError, KeyError):
-        return mp4_path  # Can't probe — return as-is
-
-    durations = {}
-    for s in streams:
-        if "duration" in s:
-            durations[s["codec_type"]] = float(s["duration"])
-
-    v_dur = durations.get("video")
-    a_dur = durations.get("audio")
-    if v_dur is None or a_dur is None:
-        return mp4_path
-
-    diff = abs(v_dur - a_dur)
-    if diff <= 0.05:
-        return mp4_path  # Close enough
-
-    shorter = min(v_dur, a_dur)
-    fixed_path = mp4_path.with_suffix(".fixed.mp4")
-    fix_cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(mp4_path),
-        "-t",
-        str(shorter),
-        "-c",
-        "copy",
-        "-use_editlist",
-        "0",
-        "-movflags",
-        "+faststart",
-        str(fixed_path),
-    ]
-    try:
-        subprocess.run(fix_cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError:
-        return mp4_path  # Fix failed — return original
-
-    os.remove(str(mp4_path))
-    shutil.move(str(fixed_path), str(mp4_path))
-    return mp4_path
-
-
-# ---------------------------------------------------------------------------
-# Trim endpoint
-# ---------------------------------------------------------------------------
+        episode = json.loads((episode_dir / "episode.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        episode = {}
+    trims = {
+        edit.get("type"): edit
+        for edit in episode.get("longform_edits", [])
+        if edit.get("type") in {"trim_start", "trim_end"}
+    }
+    return (
+        float(trims.get("trim_start", {}).get("seconds", 0)),
+        float(trims.get("trim_end", {}).get("seconds", duration)),
+    )
 
 
 @router.post("/trim")
 async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
-    """Trim the source_merged.mp4 by cutting off the beginning and/or end.
-
-    Creates a backup of the original before replacing it.
-
-    Short-circuits when the trim is a no-op (trim_start=0 and
-    trim_end=0 or equal to full duration) — a 1.6GB ffmpeg copy for zero
-    trim was wedging the endpoint for 10+ minutes on accidental calls.
-    ffmpeg runs on a thread so the asyncio event loop stays responsive.
-    """
-
-    logger.info(
-        "POST /api/episodes/%s/trim start=%.1f end=%.1f",
-        episode_id,
-        req.trim_start_seconds,
-        req.trim_end_seconds,
-    )
-    ep_dir = _episode_dir(episode_id)
-    source_path = ep_dir / "source_merged.mp4"
-
-    if not source_path.exists():
+    """Save legacy trim requests as source-clock edit bounds."""
+    episode_dir = _episode_dir(episode_id)
+    source = episode_dir / "source_merged.mp4"
+    if not source.is_file():
         raise HTTPException(status_code=404, detail="source_merged.mp4 not found")
-
-    # Probe current duration
+    if not math.isfinite(req.trim_start_seconds) or not math.isfinite(
+        req.trim_end_seconds
+    ):
+        raise HTTPException(status_code=400, detail="Trim values must be finite")
     try:
-        probe_data = ffprobe_json(source_path)
-        current_duration = float(probe_data["format"]["duration"])
-    except (subprocess.CalledProcessError, KeyError, ValueError) as e:
-        logger.error("Failed to probe source file for %s: %s", episode_id, e)
-        raise HTTPException(status_code=500, detail=f"Could not probe source file: {e}")
+        duration = get_duration(source)
+    except (subprocess.CalledProcessError, KeyError, ValueError) as exc:
+        logger.error("Failed to probe source file for %s: %s", episode_id, exc)
+        raise HTTPException(
+            status_code=500, detail=f"Could not probe source file: {exc}"
+        ) from exc
 
-    trim_start = req.trim_start_seconds
-    trim_end = req.trim_end_seconds if req.trim_end_seconds > 0 else current_duration
-
-    if trim_start < 0 or trim_end < 0:
+    start = req.trim_start_seconds
+    end = req.trim_end_seconds if req.trim_end_seconds > 0 else duration
+    if start < 0 or end < 0:
         raise HTTPException(status_code=400, detail="Trim values must be non-negative")
-    if trim_end > current_duration:
-        trim_end = current_duration
-    if trim_start >= trim_end:
+    end = min(end, duration)
+    if start >= end:
         raise HTTPException(
             status_code=400, detail="Trim start must be before trim end"
         )
 
-    # Short-circuit: if the trim is effectively a no-op (both ends match the
-    # current bounds within 0.05s), skip the 1.6GB ffmpeg copy entirely.
-    epsilon = 0.05
-    if trim_start < epsilon and abs(current_duration - trim_end) < epsilon:
+    current_start, current_end = _terminal_bounds(episode_dir, duration)
+    if math.isclose(start, current_start, abs_tol=0.0005) and math.isclose(
+        end, current_end, abs_tol=0.0005
+    ):
         return {
             "status": "noop",
             "message": "Trim matched existing bounds — nothing to do.",
-            "duration_seconds": current_duration,
+            "duration_seconds": end - start,
+            "source_unchanged": True,
         }
 
-    new_duration = trim_end - trim_start
-
-    # Render trimmed version
-    trimmed_path = ep_dir / "source_merged_trimmed.mp4"
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        str(trim_start),
-        "-to",
-        str(trim_end),
-        "-i",
-        str(source_path),
-        "-c",
-        "copy",
-        "-shortest",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-use_editlist",
-        "0",
-        "-movflags",
-        "+faststart",
-        str(trimmed_path),
-    ]
-
-    try:
-        await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, check=True
-        )
-    except subprocess.CalledProcessError as e:
-        logger.error("ffmpeg trim failed for %s: %s", episode_id, e.stderr[:500])
-        raise HTTPException(
-            status_code=500, detail=f"ffmpeg trim failed: {e.stderr[:500]}"
-        )
-
-    # Backup original and replace
-    backup_path = ep_dir / "source_merged_original.mp4"
-    if not backup_path.exists():
-        # Only backup if we haven't already (first trim)
-        shutil.move(str(source_path), str(backup_path))
-    else:
-        # Subsequent trims — just remove the current version
-        os.remove(str(source_path))
-
-    shutil.move(str(trimmed_path), str(source_path))
-
-    # Trim longform.mp4 the same way if it exists
-    longform_path = ep_dir / "longform.mp4"
-    if longform_path.exists():
-        longform_backup = ep_dir / "longform_original.mp4"
-        longform_trimmed = ep_dir / "longform_trimmed.mp4"
-        lf_cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(trim_start),
-            "-to",
-            str(trim_end),
-            "-i",
-            str(longform_path),
-            "-c",
-            "copy",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-use_editlist",
-            "0",
-            "-movflags",
-            "+faststart",
-            str(longform_trimmed),
-        ]
-        try:
-            await asyncio.to_thread(
-                subprocess.run, lf_cmd, capture_output=True, text=True, check=True
-            )
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                "ffmpeg longform trim failed for %s: %s", episode_id, e.stderr[:500]
-            )
-            raise HTTPException(
-                status_code=500, detail=f"ffmpeg longform trim failed: {e.stderr[:500]}"
-            )
-
-        # Verify audio/video track durations match; fix if they diverge
-        longform_trimmed = _fix_track_durations(longform_trimmed)
-
-        if not longform_backup.exists():
-            shutil.move(str(longform_path), str(longform_backup))
-        else:
-            os.remove(str(longform_path))
-        shutil.move(str(longform_trimmed), str(longform_path))
-
-    # Update episode.json with new duration
-    episode_file = ep_dir / "episode.json"
-    if episode_file.exists():
-        with open(episode_file) as f:
-            episode = json.load(f)
-        episode["duration_seconds"] = new_duration
-        with open(episode_file, "w") as f:
-            json.dump(episode, f, indent=2)
-
-    logger.info("Trim complete for %s: new_duration=%.1f", episode_id, new_duration)
+    status = await save_delivery_trim(
+        episode_id,
+        DeliveryTrimRequest(start_seconds=start, end_seconds=end),
+    )
+    original = episode_dir / "source_merged_original.mp4"
     return {
-        "new_duration": new_duration,
-        "backup_path": str(backup_path),
+        "status": "saved",
+        "new_duration": end - start,
+        "duration_seconds": end - start,
+        "backup_path": str(original) if original.is_file() else None,
+        "source_unchanged": True,
+        "delivery": status,
     }
