@@ -15,7 +15,7 @@
  *   u      — undo last cut
  *
  * Performance note: the utterance list (2559 rows for Arnold) is rebuilt only
- * when utterances/edits/speakerMap change. currentTime, inPoint, outPoint
+ * when utterances/edits/speakerLabels change. currentTime, inPoint, outPoint
  * updates are applied imperatively to existing row elements via rowRegistry.
  */
 
@@ -25,7 +25,10 @@ import { api, type EpisodeReviewState, type UnknownRecord } from '../lib/api';
 import { describeStatus, episodeTitle, formatDuration, formatTimecode } from '../lib/format';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
-import { link, navigate } from '../lib/router';
+import { EpisodeBackButton } from '../components/EpisodeBackButton';
+import { Icon } from '../components/icons';
+import { navigate } from '../lib/router';
+import { transcriptSpeakerLabels } from '../lib/speaker-labels';
 import { showToast } from '../state/ui';
 
 /* ─── Types ─────────────────────────────────────────────────────────────── */
@@ -43,12 +46,6 @@ interface Utterance {
   start: number;
   end: number;
   text: string;
-}
-
-interface SpeakerInfo {
-  index: number;
-  label: string;
-  track?: number;
 }
 
 function removedRange(edit: Edit, sourceDuration: number): [number, number] | null {
@@ -98,16 +95,8 @@ function speakerColor(speakerId: number): string {
 
 /* ─── Timecode ───────────────────────────────────────────────────────────── */
 
-function hhmmss(seconds: number): string {
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  const mm = String(m).padStart(2, '0');
-  const ss = String(sec).padStart(2, '0');
-  if (h > 0) return `${h}:${mm}:${ss}`;
-  return `${mm}:${ss}`;
-}
+const hhmmss = (seconds: number): string =>
+  formatTimecode(Math.floor(seconds));
 
 /* ─── Row state helper ───────────────────────────────────────────────────── */
 
@@ -153,9 +142,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
   const review = signal<EpisodeReviewState | null>(null);
   const edits = signal<Edit[]>([]);
   const utterances = signal<Utterance[]>([]);
-  const speakerMap = signal<SpeakerInfo[]>([]);
-  /* Dict-form speaker_map from transcript: { "0": "Host", "1": "Guest 1", ... } */
-  const speakerDictMap = signal<Record<string, string>>({});
+  const speakerLabels = signal<Map<number, string>>(new Map());
   const chatSending = signal<boolean>(false);
   const loadError = signal<string | null>(null);
 
@@ -194,15 +181,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       const data = await api.getTranscript(episodeId);
       utterances.set(data.utterances ?? []);
 
-      /* speaker_map may arrive as an array ({index,label,track}[]) from older
-         speaker_cut runs, or as a string-keyed dict {"0":"Host",...} from newer
-         runs. Handle both shapes. */
-      const rawMap = (data as unknown as { speaker_map?: unknown }).speaker_map;
-      if (Array.isArray(rawMap)) {
-        speakerMap.set(rawMap as SpeakerInfo[]);
-      } else if (rawMap && typeof rawMap === 'object') {
-        speakerDictMap.set(rawMap as Record<string, string>);
-      }
+      speakerLabels.set(transcriptSpeakerLabels(data.speaker_map));
     } catch {
       /* Transcript not yet available — degrades gracefully */
     }
@@ -570,12 +549,11 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       );
     });
 
-    /* ── Utterance list — rebuilds only when utterances/edits/speakerMap change ── */
+    /* ── Utterance list — rebuilds only when transcript inputs change ── */
     const listHost = h('div', { class: 'panel overflow-hidden' });
     effect(() => {
       const utts = utterances();
-      const sm = speakerMap();
-      const dictMap = speakerDictMap();
+      const labelMap = new Map(speakerLabels());
       const editList = edits();
       const sourceDuration = duration();
 
@@ -599,22 +577,9 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       );
 
       /* Transcript speaker IDs and crop indexes are separate namespaces. */
-      const labelMap = new Map<number, string>();
-      const allSpeakerIds = new Set<number>([
-        ...sm.map((s) => s.index),
-        ...utts.map((u) => u.speaker),
-      ]);
-      for (const id of allSpeakerIds) {
-        const key = String(id);
-        if (dictMap[key] !== undefined) {
-          labelMap.set(id, dictMap[key]);
-        } else {
-          const fromArray = sm.find((s) => s.index === id);
-          if (fromArray) {
-            labelMap.set(id, fromArray.label);
-          } else if (cropSpeakers[id]?.label !== undefined) {
-            labelMap.set(id, cropSpeakers[id].label);
-          }
+      for (const id of new Set(utts.map((utterance) => utterance.speaker))) {
+        if (!labelMap.has(id) && cropSpeakers[id]?.label) {
+          labelMap.set(id, cropSpeakers[id].label);
         }
       }
 
@@ -802,15 +767,7 @@ function renderHeader(episodeId: string, ep: UnknownRecord): HTMLElement {
         'sticky top-0 z-10 bg-canvas border-b border-border-subtle px-8 py-3.5 flex items-center gap-5',
       style: { height: '57px' },
     },
-    h(
-      'a',
-      {
-        ...link(`/episodes/${episodeId}`),
-        class:
-          'w-8 h-8 flex items-center justify-center rounded-md text-ink-tertiary hover:text-ink-primary hover:bg-surface-2',
-      },
-      inlineSvgChevronLeft()
-    ),
+    EpisodeBackButton(episodeId),
     h(
       'div',
       { class: 'flex-1 min-w-0' },
@@ -1165,7 +1122,7 @@ function renderAdvancedPanel(
         ].join(' '),
       },
       'Advanced: describe edits in plain text',
-      inlineSvgChevronDown()
+      Icon.chevronDown({ size: 14 })
     ),
     h(
       'div',
@@ -1179,32 +1136,4 @@ function renderAdvancedPanel(
       h('div', { class: 'flex items-center justify-end gap-2' }, submitHost)
     )
   );
-}
-
-/* ─── Inline SVG helpers ─────────────────────────────────────────────────── */
-
-function makeSvg(d: string, w = 20, h = 20): SVGElement {
-  const ns = 'http://www.w3.org/2000/svg';
-  const el = document.createElementNS(ns, 'svg');
-  el.setAttribute('viewBox', '0 0 20 20');
-  el.setAttribute('fill', 'none');
-  el.setAttribute('stroke', 'currentColor');
-  el.setAttribute('stroke-width', '1.5');
-  el.setAttribute('stroke-linecap', 'round');
-  el.setAttribute('stroke-linejoin', 'round');
-  el.setAttribute('width', String(w));
-  el.setAttribute('height', String(h));
-  el.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS(ns, 'path');
-  path.setAttribute('d', d);
-  el.appendChild(path);
-  return el;
-}
-
-function inlineSvgChevronLeft(): SVGElement {
-  return makeSvg('M12 4l-5 6 5 6');
-}
-
-function inlineSvgChevronDown(): SVGElement {
-  return makeSvg('M4 7l6 5 6-5', 14, 14);
 }

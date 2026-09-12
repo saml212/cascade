@@ -36,8 +36,13 @@ import {
 } from '../lib/format';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
+import { EpisodeBackButton } from '../components/EpisodeBackButton';
 import { Icon } from '../components/icons';
-import { link, navigate } from '../lib/router';
+import { navigate } from '../lib/router';
+import {
+  displaySpeakerLabel,
+  transcriptSpeakerLabels,
+} from '../lib/speaker-labels';
 import { showToast } from '../state/ui';
 
 interface PlatformSpec {
@@ -98,6 +103,7 @@ export function ClipReview(
   const clips = signal<UnknownRecord[] | null>(null);
   const episode = signal<UnknownRecord | null>(null);
   const review = signal<EpisodeReviewState | null>(null);
+  const speakerLabels = signal<Map<number, string>>(new Map());
   const expandedId = signal<string | null>(initialClipId ?? null);
   const loadError = signal<string | null>(null);
   const chatMessages = signal<ChatMessage[]>([]);
@@ -160,6 +166,15 @@ export function ClipReview(
     }
   }
 
+  async function loadSpeakerLabels(): Promise<void> {
+    try {
+      const transcript = await api.getTranscript(episodeId);
+      speakerLabels.set(transcriptSpeakerLabels(transcript.speaker_map));
+    } catch {
+      /* A missing transcript keeps neutral speaker numbers visible. */
+    }
+  }
+
   async function sendChat(message: string): Promise<void> {
     if (!message.trim() || chatSending.peek()) return;
     chatMessages.set((prev) => [...prev, { role: 'user', content: message }]);
@@ -190,6 +205,7 @@ export function ClipReview(
 
   void load();
   void loadChatHistory();
+  void loadSpeakerLabels();
 
   const body = h('div');
   const clipList = h('div', { class: 'flex flex-col gap-4 pb-4' });
@@ -238,15 +254,18 @@ export function ClipReview(
     }
 
     const state = review();
+    const labels = speakerLabels();
     const platforms = enabledPlatforms(state?.enabled_destinations ?? []);
     const desired: HTMLElement[] = [];
     const present = new Set<string>();
 
     for (const clip of cs) {
       const id = String(clip.id ?? clip.clip_id);
+      const speaker = displaySpeakerLabel(clip.speaker, labels);
       present.add(id);
       const signature = JSON.stringify({
         clip,
+        speaker,
         platforms: platforms.map((platform) => platform.key),
       });
       let entry = cardEntries.get(id);
@@ -254,6 +273,7 @@ export function ClipReview(
         const next = clipCard(
           episodeId,
           clip,
+          speaker,
           expandedId,
           clip.review as ClipReviewState,
           platforms,
@@ -407,15 +427,7 @@ function renderHeader(
       class:
         'sticky top-0 z-10 bg-canvas border-b border-border-subtle px-8 py-4 flex items-center gap-5',
     },
-    h(
-      'a',
-      {
-        ...link(`/episodes/${episodeId}`),
-        class:
-          'w-8 h-8 flex items-center justify-center rounded-md text-ink-tertiary hover:text-ink-primary hover:bg-surface-2',
-      },
-      Icon.chevronLeft()
-    ),
+    EpisodeBackButton(episodeId),
     title,
     Button({
       variant: 'secondary',
@@ -469,6 +481,7 @@ function errorCard(err: string): HTMLElement {
 function clipCard(
   episodeId: string,
   clip: UnknownRecord,
+  speaker: string | null,
   expandedId: Signal<string | null>,
   review: ClipReviewState,
   platforms: PlatformSpec[],
@@ -485,7 +498,6 @@ function clipCard(
   const end = (clip.end_seconds as number) ?? 0;
   const score = (clip.virality_score as number) ?? null;
   const rank = (clip.rank as number) ?? null;
-  const speaker = (clip.speaker as string) ?? '';
   const status = describeStatus((clip.status as string) ?? 'pending');
   const metadata = (clip.metadata as Record<string, UnknownRecord>) ?? {};
 
@@ -562,7 +574,7 @@ function clipHead(
   end: number,
   score: number | null,
   rank: number | null,
-  speaker: string,
+  speaker: string | null,
   status: StatusDescriptor,
   expanded: boolean,
   render: ReviewArtifact,

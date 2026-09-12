@@ -440,13 +440,17 @@ export const api = {
   /* Transcript */
   getTranscript: (id: string): Promise<{
     utterances: Array<{ speaker: number; start: number; end: number; text: string }>;
-    speaker_map?: Array<{ index: number; label: string; track?: number }>;
+    speaker_map?:
+      | Array<{ index: number; label: string; track?: number }>
+      | Record<string, string>;
   }> =>
     fetch(`/media/episodes/${id}/diarized_transcript.json`).then((r) => {
       if (!r.ok) throw new Error(`Transcript not available (status ${r.status})`);
       return r.json() as Promise<{
         utterances: Array<{ speaker: number; start: number; end: number; text: string }>;
-        speaker_map?: Array<{ index: number; label: string; track?: number }>;
+        speaker_map?:
+          | Array<{ index: number; label: string; track?: number }>
+          | Record<string, string>;
       }>;
     }),
 

@@ -32,10 +32,11 @@ import { episodeDetail, watchEpisode } from '../state/episodes';
 import { agentPanelCollapsed, showToast } from '../state/ui';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
+import { EpisodeBackButton } from '../components/EpisodeBackButton';
 import { Icon } from '../components/icons';
 import { SyncVerifier } from '../components/audio/SyncVerifier';
 import { TrackMixer } from '../components/audio/TrackMixer';
-import { link, navigate } from '../lib/router';
+import { navigate } from '../lib/router';
 
 interface SpeakerState {
   label: string;
@@ -324,16 +325,7 @@ function renderHeader(
     h(
       'div',
       { class: 'flex items-center gap-4 w-full min-w-0' },
-      h(
-        'a',
-        {
-          ...link(`/episodes/${episodeId}`),
-          class:
-            'shrink-0 w-8 h-8 flex items-center justify-center text-ink-tertiary hover:text-ink-primary rounded-md hover:bg-surface-2',
-          title: 'Back to episode',
-        },
-        Icon.chevronLeft()
-      ),
+      EpisodeBackButton(episodeId, 'shrink-0'),
       h('div', { class: 'flex-1 min-w-0' },
         h(
           'div',
