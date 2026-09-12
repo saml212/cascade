@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -614,6 +615,11 @@ def _prepare_video(episode_id: str, *, repair_audio: bool = False) -> None:
 @router.get("/{episode_id}/delivery")
 async def delivery_status(episode_id: str) -> dict:
     episode_dir = _episode_dir(episode_id)
+    return await asyncio.to_thread(_delivery_status, episode_dir)
+
+
+def _delivery_status(episode_dir: Path) -> dict:
+    """Build the validated status document without blocking the API event loop."""
     return {**_refresh_status(episode_dir), "quality": quality_snapshot(episode_dir)}
 
 
@@ -764,7 +770,7 @@ async def prepare_delivery(episode_id: str) -> dict:
 @router.get("/{episode_id}/delivery/audio")
 async def download_delivery_audio(episode_id: str):
     episode_dir = _episode_dir(episode_id)
-    status = _refresh_status(episode_dir)
+    status = await asyncio.to_thread(_refresh_status, episode_dir)
     audio_path = episode_dir / "podcast_audio.mp3"
     if status.get("status") != "ready" or not audio_path.exists():
         raise HTTPException(
@@ -776,7 +782,7 @@ async def download_delivery_audio(episode_id: str):
 @router.get("/{episode_id}/delivery/metadata")
 async def download_delivery_metadata(episode_id: str):
     episode_dir = _episode_dir(episode_id)
-    status = _refresh_status(episode_dir)
+    status = await asyncio.to_thread(_refresh_status, episode_dir)
     if status.get("status") != "ready":
         raise HTTPException(status_code=404, detail="Delivery metadata is not ready")
     episode = json.loads((episode_dir / "episode.json").read_text())
@@ -896,7 +902,7 @@ async def repair_delivery_video_audio(episode_id: str) -> dict:
 @router.get("/{episode_id}/delivery/video")
 async def download_delivery_video(episode_id: str):
     episode_dir = _episode_dir(episode_id)
-    status = _refresh_status(episode_dir)
+    status = await asyncio.to_thread(_refresh_status, episode_dir)
     video_path = episode_dir / "upload_video.mp4"
     if status.get("video_status") != "ready" or not video_path.exists():
         raise HTTPException(

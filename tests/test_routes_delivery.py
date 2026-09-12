@@ -4,9 +4,11 @@ import asyncio
 import importlib
 import json
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -46,6 +48,32 @@ def make_episode(episodes_dir, episode_id="ep_test", *, with_source=True):
     if with_source:
         (episode_dir / "source_merged.mp4").write_bytes(b"video")
     return episode_dir
+
+
+def request_with_concurrent_health(
+    app, path: str, started: threading.Event, release: threading.Event, **kwargs
+):
+    """Issue a slow request beside a cheap request on the same ASGI event loop."""
+
+    @app.get("/health")
+    async def health():
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+        return {"status": "ok"}
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            slow_request = asyncio.create_task(client.get(path, **kwargs))
+            health_request = asyncio.create_task(client.get("/health"))
+            health_response = await asyncio.wait_for(health_request, timeout=2.0)
+            response = await asyncio.wait_for(slow_request, timeout=2.0)
+            return health_response, response
+
+    return asyncio.run(exercise())
 
 
 def verified_video_status():
@@ -916,6 +944,64 @@ def test_download_requires_ready_file(delivery):
     make_episode(episodes_dir)
     response = client.get("/api/episodes/ep_test/delivery/audio")
     assert response.status_code == 404
+
+
+def test_audio_range_validation_does_not_block_other_requests(delivery):
+    client, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    audio = episode_dir / "podcast_audio.mp3"
+    audio.write_bytes(b"0123456789")
+    started = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    def slow_refresh(_episode_dir):
+        started.set()
+        observed["health_ran_before_refresh_returned"] = release.wait(timeout=1.0)
+        return {"status": "ready"}
+
+    with patch.object(mod, "_refresh_status", side_effect=slow_refresh):
+        health_response, audio_response = request_with_concurrent_health(
+            client.app,
+            "/api/episodes/ep_test/delivery/audio",
+            started,
+            release,
+            headers={"Range": "bytes=0-0"},
+        )
+
+    assert health_response.status_code == 200
+    assert observed["health_ran_before_refresh_returned"] is True
+    assert audio_response.status_code == 206
+    assert audio_response.content == b"0"
+
+
+def test_quality_snapshot_does_not_block_other_requests(delivery):
+    client, mod, episodes_dir = delivery
+    make_episode(episodes_dir)
+    started = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    def slow_quality(_episode_dir):
+        started.set()
+        observed["health_ran_before_snapshot_returned"] = release.wait(timeout=1.0)
+        return {"release_gate": {"status": "blocked", "safe": False}}
+
+    with (
+        patch.object(mod, "_refresh_status", return_value={"status": "ready"}),
+        patch.object(mod, "quality_snapshot", side_effect=slow_quality),
+    ):
+        health_response, status_response = request_with_concurrent_health(
+            client.app,
+            "/api/episodes/ep_test/delivery",
+            started,
+            release,
+        )
+
+    assert health_response.status_code == 200
+    assert observed["health_ran_before_snapshot_returned"] is True
+    assert status_response.status_code == 200
+    assert status_response.json()["quality"]["release_gate"]["status"] == "blocked"
 
 
 def test_source_duration_prefers_probed_artifact(delivery):
