@@ -47,14 +47,14 @@ from lib.delivery_video import (
     short_render_fingerprint,
 )
 from lib.ffprobe import media_fingerprint, probe
-from lib.media_inspection import (
+from lib.paths import get_episodes_dir
+from server.media_inspection import (
     InspectionTarget,
     file_revision,
     inspect_audio_window,
     inspect_media_window,
     resolve_target,
 )
-from lib.paths import get_episodes_dir
 from server.routes.clips import render_job_state
 
 router = APIRouter(prefix="/api/episodes", tags=["review"])

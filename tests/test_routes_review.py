@@ -426,9 +426,9 @@ def test_inspection_preview_maps_output_across_source_cut(test_client, monkeypat
     media = episode_dir / "upload_video.mp4"
     media.write_bytes(b"render")
 
-    import lib.media_inspection as inspection
-    from lib.media_inspection import InspectionTarget
+    import server.media_inspection as inspection
     from lib.timeline import Timeline
+    from server.media_inspection import InspectionTarget
     from server.routes import review
 
     target = InspectionTarget(
@@ -480,8 +480,8 @@ def test_inspection_rejects_nonfinite_and_unbounded_windows(test_client, monkeyp
     media = episode_dir / "source_merged.mp4"
     media.write_bytes(b"source")
 
-    from lib.media_inspection import InspectionTarget
     from lib.timeline import Timeline
+    from server.media_inspection import InspectionTarget
     from server.routes import review
 
     target = InspectionTarget(
@@ -531,7 +531,7 @@ def test_audio_inspection_names_camera_channel_and_uncertainty(
     client, episodes_dir = test_client
     _create_episode(episodes_dir, "ep_001")
 
-    import lib.media_inspection as inspection
+    import server.media_inspection as inspection
 
     def export(_dir, _episode, _track, start, end, output, **_selector):
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -890,7 +890,7 @@ def test_transcript_correction_api_upserts_without_losing_existing_operations(
     }
     (episode_dir / "transcript_corrections.json").write_text(json.dumps(existing))
 
-    from lib.media_inspection import file_revision
+    from server.media_inspection import file_revision
     from server.routes import review
 
     expected_revision = file_revision(episode_dir / "diarized_transcript.json")
@@ -1041,7 +1041,7 @@ def test_transcript_correction_api_preserves_a_concurrent_transcript_generation(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"original {name}")
 
-    from lib.media_inspection import file_revision
+    from server.media_inspection import file_revision
     from server.routes import review
 
     expected_revision = file_revision(episode_dir / "diarized_transcript.json")
@@ -1088,7 +1088,7 @@ def test_transcript_correction_api_restores_derived_artifacts_on_local_failure(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"original {name}")
 
-    from lib.media_inspection import file_revision
+    from server.media_inspection import file_revision
     from server.routes import review
 
     expected_revision = file_revision(episode_dir / "diarized_transcript.json")
@@ -1132,7 +1132,7 @@ def test_transcript_correction_api_rolls_back_render_reuse_failure(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"original {name}")
 
-    from lib.media_inspection import file_revision
+    from server.media_inspection import file_revision
     from server.routes import review
 
     monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})
@@ -1176,7 +1176,7 @@ def test_transcript_correction_api_requires_unique_operation_ids(
     (episode_dir / "transcript.json").write_text("{}")
     (episode_dir / "diarized_transcript.json").write_text("{}")
 
-    from lib.media_inspection import file_revision
+    from server.media_inspection import file_revision
     from server.routes import review
 
     monkeypatch.setattr(review, "current_diarized_transcript", lambda *_args: {})

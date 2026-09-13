@@ -1,9 +1,9 @@
-"""Tests for bounded machine-readable media inspection."""
+"""Tests for bounded machine-readable server media inspection."""
 
+import ast
 import math
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -12,26 +12,34 @@ import pytest
 from agents.transcribe import export_logical_track_window
 from lib.delivery_video import ffmpeg_executable
 from lib.ffprobe import probe
-from lib.media_inspection import (
+from lib.timeline import Timeline
+from server.media_inspection import (
     InspectionTarget,
     map_timestamp,
     render_cached_inspection,
     resolve_target,
     source_ranges,
 )
-from lib.timeline import Timeline
 
 
-def test_media_inspection_can_be_imported_before_agents_package():
-    result = subprocess.run(
-        [sys.executable, "-c", "from lib.media_inspection import file_revision"],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=Path(__file__).resolve().parents[1],
-    )
+def test_library_layer_does_not_import_agent_orchestration():
+    violations = []
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted((root / "lib").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            modules = (
+                [node.module]
+                if isinstance(node, ast.ImportFrom)
+                else [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else []
+            )
+            if any(
+                module and module.split(".", 1)[0] == "agents" for module in modules
+            ):
+                violations.append(path.relative_to(root))
 
-    assert result.returncode == 0, result.stderr
+    assert violations == []
 
 
 def test_output_window_maps_across_source_cut():
@@ -63,7 +71,7 @@ def test_resolve_longform_uses_revision_selected_audio(tmp_path, monkeypatch):
     }
     segments = [{"start": 0, "end": 100, "speaker": "speaker_0"}]
 
-    import lib.media_inspection as inspection
+    import server.media_inspection as inspection
 
     monkeypatch.setattr(
         inspection,
@@ -99,7 +107,7 @@ def test_resolve_render_rejects_stale_selected_audio(tmp_path, monkeypatch):
     source = tmp_path / "source_merged.mp4"
     source.write_bytes(b"source")
 
-    import lib.media_inspection as inspection
+    import server.media_inspection as inspection
 
     monkeypatch.setattr(inspection, "_video", lambda *_args: (10.0, "30/1"))
     monkeypatch.setattr(
