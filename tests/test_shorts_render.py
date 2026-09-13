@@ -104,14 +104,44 @@ def test_two_person_both_span_stacks_close_crops(tmp_episode_dir, sample_config)
     assert "[top][bottom]vstack=inputs=2" in video_filter
 
 
-def test_overlap_without_exactly_two_speakers_fits_wide(tmp_episode_dir, sample_config):
+@pytest.mark.parametrize("overlap", ["BOTH", "NONE"])
+def test_three_person_overlap_stacks_all_crops_in_spatial_order(
+    tmp_episode_dir, sample_config, overlap
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {"center_x": 240, "center_y": 90, "zoom": 1},
+            {"center_x": 160, "center_y": 90, "zoom": 1},
+            {"center_x": 80, "center_y": 90, "zoom": 1},
+        ]
+    }
+
+    video_filter = agent._get_short_crop_filter_no_subs(overlap, 320, 180, crop_config)
+
+    assert video_filter.startswith("split=3[stack0][stack1][stack2]")
+    assert "[stack2]crop=100:58:30:20" in video_filter
+    assert "[stack1]crop=100:58:110:20" in video_filter
+    assert "[stack0]crop=100:58:190:20" in video_filter
+    assert video_filter.index("[stack2]crop") < video_filter.index("[stack1]crop")
+    assert video_filter.index("[stack1]crop") < video_filter.index("[stack0]crop")
+    assert video_filter.count("scale=1080:640") == 3
+    assert "[row0][row1][row2]vstack=inputs=3" in video_filter
+    assert "drawbox=x=0:y=637:w=1080:h=6" in video_filter
+    assert "drawbox=x=0:y=1277:w=1080:h=6" in video_filter
+
+
+@pytest.mark.parametrize(
+    ("overlap", "speakers"),
+    [("BOTH", [{}]), ("NONE", [{}, {}]), ("BOTH", [{}, {}, {}, {}])],
+)
+def test_overlap_without_supported_stack_fits_wide(
+    tmp_episode_dir, sample_config, overlap, speakers
+):
     agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
 
     video_filter = agent._get_short_crop_filter_no_subs(
-        "BOTH",
-        3840,
-        2160,
-        {"speakers": [{}, {}, {}], "wide_zoom": 1},
+        overlap, 3840, 2160, {"speakers": speakers, "wide_zoom": 1}
     )
 
     assert "force_original_aspect_ratio=decrease" in video_filter

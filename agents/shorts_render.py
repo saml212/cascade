@@ -483,7 +483,9 @@ class ShortsRenderAgent(BaseAgent):
                     "lut" if episode.get("delivery_apply_lut", False) else "source"
                 ),
                 "overlap_policy": (
-                    "hold_neighbor_up_to_threshold_else_two_person_stack_or_fit_wide"
+                    "hold_neighbor_up_to_threshold_else_three_person_stack"
+                    if len(episode.get("crop_config", {}).get("speakers", [])) == 3
+                    else "hold_neighbor_up_to_threshold_else_two_person_stack_or_fit_wide"
                 ),
                 "overlap_hold_seconds": self.config.get("processing", {}).get(
                     "shorts_hold_wide_seconds", 3.0
@@ -493,7 +495,7 @@ class ShortsRenderAgent(BaseAgent):
         )
 
     def _apply_overlap_policy(self, segments: list[dict]) -> list[dict]:
-        """Hold a nearby speaker through brief BOTH spans; keep long spans wide."""
+        """Hold a nearby speaker briefly; retain long overlap states for layout."""
         threshold = float(
             self.config.get("processing", {}).get("shorts_hold_wide_seconds", 3.0)
         )
@@ -580,6 +582,43 @@ class ShortsRenderAgent(BaseAgent):
                 f"{panels[0]};{panels[1]};"
                 "[top][bottom]vstack=inputs=2,"
                 "drawbox=x=0:y=957:w=1080:h=6:color=black@0.8:t=fill,"
+                "format=yuv420p"
+            )
+            polish = get_video_polish_filters(self.config)
+            return f"{chain},{polish}" if polish else chain
+        if speaker in {"BOTH", "NONE"} and len(crop_config.get("speakers", [])) == 3:
+            regions = []
+            for index in range(3):
+                portrait_w, portrait_h, portrait_x, portrait_y = (
+                    self._get_short_crop_region(
+                        f"speaker_{index}", src_w, src_h, crop_config
+                    )
+                )
+                panel_w = min(src_w, portrait_w)
+                panel_h = panel_w * 16 / 27
+                if panel_h > src_h:
+                    panel_h = src_h
+                    panel_w = panel_h * 27 / 16
+                panel_w = max(2, int(panel_w) // 2 * 2)
+                panel_h = max(2, int(panel_h) // 2 * 2)
+                cx = portrait_x + portrait_w / 2
+                x = max(0, min(round(cx - panel_w / 2), src_w - panel_w))
+                upper_body_y = portrait_y + max(0, portrait_h - panel_h) / 6
+                y = max(0, min(round(upper_body_y), src_h - panel_h))
+                regions.append((cx, index, panel_w, panel_h, x // 2 * 2, y // 2 * 2))
+
+            panels = []
+            for row, (_, index, panel_w, panel_h, x, y) in enumerate(sorted(regions)):
+                panels.append(
+                    f"[stack{index}]crop={panel_w}:{panel_h}:{x}:{y},"
+                    f"{get_scale_filter(1080, 640)},format=yuv420p[row{row}]"
+                )
+            chain = (
+                "split=3[stack0][stack1][stack2];"
+                f"{';'.join(panels)};"
+                "[row0][row1][row2]vstack=inputs=3,"
+                "drawbox=x=0:y=637:w=1080:h=6:color=black@0.8:t=fill,"
+                "drawbox=x=0:y=1277:w=1080:h=6:color=black@0.8:t=fill,"
                 "format=yuv420p"
             )
             polish = get_video_polish_filters(self.config)
