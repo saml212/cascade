@@ -75,7 +75,6 @@ title_position = "top"                   # Per-episode override: top or bottom
 
 [clip_mining]
 method = "llm"                            # "baseline", "transcript", or "llm"
-boundary_snap_tolerance_seconds = 3.0     # Max distance to snap to silence
 
 [chat]
 model = "claude-sonnet-4-20250514"

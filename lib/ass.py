@@ -71,9 +71,6 @@ DEFAULT_WORDS_PER_PHRASE = 3
 MIN_PHRASE_DURATION = 0.4
 MAX_PHRASE_DURATION = 2.5
 
-# Reading-speed cap: never display more than ~6 words per second (typical
-# spoken-word pace is ~3 words/sec, so this is a safety net for fast bursts).
-MAX_WORDS_PER_SECOND = 6.0
 CAPTION_SINGLE_LANE_VERSION = "single-lane/v1"
 CAPTION_EVENT_GAP_SECONDS = 0.02
 
@@ -272,8 +269,7 @@ def requires_single_lane_caption_timing(
         resolve_overlaps=False,
     )
     return any(
-        current["end"] > following["start"]
-        for current, following in pairwise(phrases)
+        current["end"] > following["start"] for current, following in pairwise(phrases)
     )
 
 

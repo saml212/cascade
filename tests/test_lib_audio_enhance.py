@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 from lib.audio_enhance import (
     _apply_clearervoice,
     _apply_deepfilternet,
-    _build_ffmpeg_enhance_filter,
     _build_static_filter_chain,
     enhance_audio,
 )
@@ -79,26 +78,6 @@ class TestBuildStaticFilterChain:
             {"audio_enhance_mode": "restoration", "audio_compressor": True}
         )
         assert "acompressor=" in af
-
-
-class TestBuildFfmpegEnhanceFilter:
-    """Backwards-compat wrapper tests."""
-
-    def test_includes_loudnorm(self):
-        af = _build_ffmpeg_enhance_filter({})
-        assert "loudnorm=I=-16" in af  # New default
-
-    def test_custom_lufs_target(self):
-        af = _build_ffmpeg_enhance_filter({"audio_target_lufs": -14})
-        assert "loudnorm=I=-14" in af
-
-    def test_custom_lra(self):
-        af = _build_ffmpeg_enhance_filter({"audio_target_lra": 6})
-        assert "LRA=6" in af
-
-    def test_custom_true_peak(self):
-        af = _build_ffmpeg_enhance_filter({"audio_target_tp": -2})
-        assert "TP=-2" in af
 
 
 class TestEnhanceAudio:

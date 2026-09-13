@@ -133,13 +133,6 @@ def test_get_dominant_speaker(episode_inputs, sample_config):
     assert agent._get_dominant_speaker(130.0, 140.0, segments) == "BOTH"
 
 
-def test_snap_to_silence_without_rms_is_unchanged(episode_inputs, sample_config):
-    agent = ClipMinerAgent(episode_inputs, sample_config)
-    clips = [{"start_seconds": 30.0, "end_seconds": 90.0}]
-
-    assert agent._snap_to_silence(clips, {}) == clips
-
-
 def test_execute_uses_shared_provider_and_preserves_editorial_episode_title(
     episode_inputs, sample_config
 ):

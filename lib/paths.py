@@ -6,11 +6,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def get_project_root() -> Path:
-    """Return the project root directory."""
-    return PROJECT_ROOT
-
-
 def resolve_path(configured_path: str, local_fallback: str) -> Path:
     """Resolve a configured path with automatic local fallback.
 

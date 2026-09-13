@@ -113,7 +113,6 @@ def sample_config():
         "clip_mining": {
             "llm_model": "claude-sonnet-4-6",
             "llm_temperature": 0.3,
-            "boundary_snap_tolerance_seconds": 3.0,
         },
         "podcast": {
             "title": "Test Podcast",

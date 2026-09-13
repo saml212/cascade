@@ -563,24 +563,6 @@ class LongformRenderAgent(BaseAgent):
         x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, mode)
         return f"crop={crop_w}:{crop_h}:{x}:{y},{scale}"
 
-    def _apply_edits(self, segments: list, edits: list) -> list:
-        """Compatibility wrapper; production render uses the probed source duration."""
-        if not segments:
-            return []
-        duration = max(float(segment["end"]) for segment in segments)
-        for edit in edits:
-            if edit.get("type") == "cut":
-                duration = max(duration, float(edit["end_seconds"]))
-            elif edit.get("type") in {"trim_start", "trim_end"}:
-                duration = max(duration, float(edit["seconds"]))
-        try:
-            timeline = Timeline.from_edits(duration, edits)
-        except ValueError as exc:
-            if "remove the entire episode" in str(exc):
-                return []
-            raise
-        return timeline.project(segments, minimum_duration=0.1)
-
     def _run_ffmpeg(self, cmd, **kwargs):
         return timed_ffmpeg(cmd, agent_logger=self.logger, **kwargs)
 

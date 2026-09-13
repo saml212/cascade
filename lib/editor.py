@@ -7,7 +7,7 @@ Each entry is one of:
     {"type": "trim_start", "seconds": X,                          "reason": "..."}
     {"type": "trim_end",   "seconds": X,                          "reason": "..."}
 
-These are consumed by `_apply_edits()` in agents/longform_render.py at render time.
+These are consumed by `Timeline.from_edits()` in the render and review paths.
 
 This module provides a thin wrapper for safe load/append/remove/list operations
 plus search-driven helpers (find_and_propose_cut) and dry-run preview support.
@@ -18,16 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from lib.atomic_write import atomic_write_json
 
 logger = logging.getLogger("cascade")
-
-
-VALID_EDIT_TYPES = {"cut", "trim_start", "trim_end"}
 
 
 def load_edits(episode_dir: Path) -> list[dict]:
@@ -67,7 +62,9 @@ def add_cut(
 ) -> dict:
     """Append a cut edit. Returns the appended edit dict."""
     if end_seconds <= start_seconds:
-        raise ValueError(f"end_seconds ({end_seconds}) must be > start_seconds ({start_seconds})")
+        raise ValueError(
+            f"end_seconds ({end_seconds}) must be > start_seconds ({start_seconds})"
+        )
     edits = load_edits(episode_dir)
     edit = {
         "type": "cut",
@@ -193,14 +190,16 @@ def find_and_propose_cut(
     proposals = []
     for m in matches:
         cut_start, cut_end = expand_to_sentence(m, words, pad_seconds=0.3)
-        proposals.append({
-            "start_seconds": cut_start,
-            "end_seconds": cut_end,
-            "duration": round(cut_end - cut_start, 3),
-            "speaker": m.speaker,
-            "matched_text": m.matched_text,
-            "context": m.context,
-            "score": round(m.score, 1),
-            "method": m.method,
-        })
+        proposals.append(
+            {
+                "start_seconds": cut_start,
+                "end_seconds": cut_end,
+                "duration": round(cut_end - cut_start, 3),
+                "speaker": m.speaker,
+                "matched_text": m.matched_text,
+                "context": m.context,
+                "score": round(m.score, 1),
+                "method": m.method,
+            }
+        )
     return proposals

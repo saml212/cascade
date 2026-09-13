@@ -253,21 +253,6 @@ def _build_static_filter_chain(processing: dict, *, mode: str | None = None) -> 
     return ",".join(filters)
 
 
-# Backwards-compat alias used by tests / external callers
-def _build_ffmpeg_enhance_filter(processing: dict) -> str:
-    """Compat wrapper that returns the full chain INCLUDING single-pass loudnorm.
-
-    Tests still call this; production now uses _build_static_filter_chain
-    plus a separate two-pass loudnorm step.
-    """
-    static = _build_static_filter_chain(processing)
-    target_lufs = processing.get("audio_target_lufs", -16)
-    target_lra = processing.get("audio_target_lra", 7)
-    target_tp = processing.get("audio_target_tp", -1.0)
-    loudnorm = f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
-    return static + "," + loudnorm if static else loudnorm
-
-
 def _apply_deepfilternet(input_path: Path, output_path: Path) -> bool:
     """Apply DeepFilterNet 3 ML denoising. Returns True on success.
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 
@@ -131,7 +130,9 @@ class ClipMinerAgent(BaseAgent):
         if not alternatives:
             raise RuntimeError("Generator did not return a non-overlapping alternative")
         if self.load_json("clips.json") != stored:
-            raise ValueError("clips.json changed while generating an alternative; retry")
+            raise ValueError(
+                "clips.json changed while generating an alternative; retry"
+            )
 
         rejected["status"] = "rejected"
         rejected["selection_status"] = "rejected"
@@ -337,40 +338,6 @@ SOURCE-CLOCK TRANSCRIPT:
             if len(chosen) >= 5 and word.rstrip().endswith((".", "?", "!")):
                 break
         return " ".join(chosen)
-
-    def _snap_to_silence(self, clips: list, segments_data: dict) -> list:
-        """Compatibility helper for explicitly requested energy-based snapping."""
-        tolerance = self.get_config(
-            "clip_mining", "boundary_snap_tolerance_seconds", default=3.0
-        )
-        import numpy as np
-
-        left_path = self.episode_dir / "work" / "left_rms_db.npy"
-        right_path = self.episode_dir / "work" / "right_rms_db.npy"
-        meta_path = self.episode_dir / "work" / "rms_meta.json"
-        if not left_path.exists() or not right_path.exists() or not meta_path.exists():
-            return clips
-        try:
-            left_rms = np.load(str(left_path))
-            right_rms = np.load(str(right_path))
-            with meta_path.open() as source:
-                frame_seconds = json.load(source).get("frame_seconds", 0.1)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return clips
-        combined = left_rms + right_rms
-        if not len(combined):
-            return clips
-        for clip in clips:
-            for key in ("start_seconds", "end_seconds"):
-                value = float(clip[key])
-                first = max(0, int((value - tolerance) / frame_seconds))
-                last = min(len(combined), int((value + tolerance) / frame_seconds))
-                if first < last:
-                    clip[key] = round(
-                        (first + int(np.argmin(combined[first:last]))) * frame_seconds,
-                        2,
-                    )
-        return clips
 
     @staticmethod
     def _get_dominant_speaker(start: float, end: float, segments: list) -> str:
