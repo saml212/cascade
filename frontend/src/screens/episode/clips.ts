@@ -1,4 +1,5 @@
 import { Button } from '../../components/Button';
+import { Icon } from '../../components/icons';
 import { h } from '../../lib/dom';
 import {
   api,
@@ -79,6 +80,12 @@ function renderClipState(
   const previousPlayable = selected.filter(
     (clip) => clip.review.render.playable && !clip.review.render.current
   );
+  const playableClips = clips.filter((clip) => clip.review.render.playable);
+  const currentClips = playableClips.filter((clip) => clip.review.render.current);
+  const playable = currentClips.length ? currentClips : playableClips;
+  const firstPlayableId = playable[0]
+    ? String(playable[0].id ?? playable[0].clip_id)
+    : null;
 
   target.replaceChildren(
     h(
@@ -99,8 +106,16 @@ function renderClipState(
         Button({
           variant: 'primary',
           size: 'lg',
-          label: 'Open editorial review',
-          onClick: () => navigate(`/episodes/${episodeId}/clips/review`),
+          label: playable.length
+            ? `Watch ${pluralize(playable.length, 'clip')}`
+            : 'Open editorial review',
+          icon: playable.length ? Icon.play({ size: 18 }) : undefined,
+          onClick: () =>
+            navigate(
+              firstPlayableId
+                ? `/episodes/${episodeId}/clips/review/${encodeURIComponent(firstPlayableId)}`
+                : `/episodes/${episodeId}/clips/review`
+            ),
         })
       ),
       h(
@@ -117,7 +132,7 @@ function renderClipState(
           h(
             'span',
             { class: 'text-body-sm text-ink-tertiary' },
-            'Hover playable media. Open a card for full review.'
+            'Choose a rendered clip to watch with sound and full playback controls.'
           )
         ),
         renderNeeded.length > 0
@@ -187,23 +202,17 @@ function renderTile(
         : 'bg-ink-tertiary';
 
   let preview: HTMLElement;
-  let hoverHandlers: Record<string, unknown> = {};
   if (state.render.playable && state.render.url) {
     const video = h('video', {
       src: state.render.url,
-      muted: true,
       playsinline: true,
       preload: 'metadata',
-      class: 'w-full h-full object-cover',
+      tabindex: '-1',
+      'aria-hidden': 'true',
+      class: 'w-full h-full object-cover pointer-events-none',
     }) as HTMLVideoElement;
+    video.muted = true;
     preview = video;
-    hoverHandlers = {
-      onmouseenter: () => video.play().catch(() => {}),
-      onmouseleave: () => {
-        video.pause();
-        video.currentTime = 0;
-      },
-    };
   } else {
     preview = h('div', {
       class: 'w-full h-full bg-surface-inset flex items-center justify-center',
@@ -216,15 +225,14 @@ function renderTile(
       type: 'button',
       onclick: () =>
         navigate(`/episodes/${episodeId}/clips/review/${encodeURIComponent(id)}`),
-      ...hoverHandlers,
       class: 'group text-left flex flex-col gap-1.5 focus:outline-none',
-      'aria-label': `Review ${title}`,
+      'aria-label': `${state.render.playable ? 'Watch' : 'Review'} ${title}`,
     },
     h(
       'div',
       {
         class:
-          'relative aspect-[9/16] w-full rounded-md overflow-hidden bg-surface-inset border border-border-subtle group-hover:border-border-strong transition-colors',
+          'relative aspect-[9/16] w-full rounded-md overflow-hidden bg-surface-inset border border-border-subtle group-hover:border-border-strong group-focus-visible:border-accent group-focus-visible:ring-2 group-focus-visible:ring-accent/40 transition-colors',
       },
       preview,
       h(
@@ -252,6 +260,17 @@ function renderTile(
                 'absolute top-1.5 right-1.5 text-code-sm text-white bg-black/70 rounded px-1.5 py-0.5',
             },
             state.render.current ? 'Current' : 'Previous'
+          )
+        : null,
+      state.render.playable
+        ? h(
+            'span',
+            {
+              class:
+                'absolute bottom-1.5 left-1.5 inline-flex items-center gap-1 text-code-sm text-white bg-black/75 rounded px-1.5 py-0.5',
+            },
+            Icon.play({ size: 11 }),
+            'Watch'
           )
         : null,
       h(

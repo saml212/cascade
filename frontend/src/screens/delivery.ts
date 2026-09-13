@@ -1,6 +1,8 @@
 import { Button } from '../components/Button';
+import { Icon } from '../components/icons';
 import { h, mount } from '../lib/dom';
 import { api, type DeliveryStatus, type UnknownRecord } from '../lib/api';
+import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
 import { effect, onCleanup, signal } from '../lib/signals';
 import { showToast } from '../state/ui';
@@ -103,6 +105,9 @@ function renderPage(
   const loading = !delivery;
   const audioBusy = state === 'preparing';
   const videoBusy = delivery?.video_status === 'preparing';
+  const quality =
+    delivery?.quality ??
+    (episode?.quality as QualitySnapshot | null | undefined);
 
   return h(
     'div',
@@ -128,12 +133,11 @@ function renderPage(
       ? h('div', { class: 'panel p-6 animate-pulse-breath text-ink-tertiary' }, 'Loading release state…')
       : QualityReview({
           episodeId,
-          quality:
-            delivery.quality ??
-            (episode?.quality as QualitySnapshot | null | undefined),
+          quality,
           onUpdated: refresh,
           controls: controls.quality,
         }),
+    clipReviewEntry(episodeId, episode, quality),
     delivery ? trimDetails(delivery, controls, saveTrim) : null,
     h(
       'div',
@@ -166,6 +170,51 @@ function renderPage(
       delivery?.status === 'ready' ? readyDetails(delivery, controls) : null
     ),
     delivery?.status === 'ready' ? videoDetails(delivery, controls, prepareVideo) : null
+  );
+}
+
+function clipReviewEntry(
+  episodeId: string,
+  episode: UnknownRecord | null,
+  quality?: QualitySnapshot | null
+): HTMLElement | null {
+  const renderedCount = quality?.artifacts.rendered_short_count ?? 0;
+  const candidateCount = quality?.artifacts.candidate_count ??
+    (Array.isArray(episode?.clips) ? episode.clips.length : 0);
+  if (renderedCount === 0 && candidateCount === 0) return null;
+
+  const firstClip = quality?.artifacts.rendered_short_ids[0];
+  const path = firstClip
+    ? `/episodes/${episodeId}/clips/review/${encodeURIComponent(firstClip)}`
+    : `/episodes/${episodeId}/clips/review`;
+  const count = renderedCount || candidateCount;
+  const rendered = renderedCount > 0;
+  const heading = rendered
+    ? `${pluralize(count, 'rendered clip')} ready to watch`
+    : `${pluralize(count, 'clip candidate')} ready to review`;
+  const detail = rendered
+    ? 'Play every short with sound, seeking, and fullscreen controls.'
+    : 'Open editorial review to select, render, and inspect clips.';
+
+  return h(
+    'section',
+    { class: 'panel p-6 flex items-center justify-between gap-5 flex-wrap border-accent/40' },
+    h(
+      'div',
+      null,
+      h('div', { class: 'text-heading-sm text-ink-primary' }, heading),
+      h('p', { class: 'text-body-sm text-ink-tertiary mt-1' }, detail)
+    ),
+    h(
+      'a',
+      {
+        ...link(path),
+        class:
+          'inline-flex h-11 px-5 items-center justify-center gap-2.5 rounded-md bg-accent text-ink-on-accent text-body-lg font-medium hover:brightness-110',
+      },
+      rendered ? Icon.play({ size: 18 }) : null,
+      `${rendered ? 'Watch' : 'Review'} ${pluralize(count, 'clip')}`
+    )
   );
 }
 

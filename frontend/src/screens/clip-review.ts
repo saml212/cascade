@@ -51,6 +51,13 @@ interface PlatformSpec {
   fields: Array<{ name: string; label: string; multiline?: boolean; hint?: string }>;
 }
 
+interface ClipNavigation {
+  index: number;
+  total: number;
+  previousId?: string;
+  nextId?: string;
+}
+
 const PLATFORMS: PlatformSpec[] = [
   {
     key: 'youtube',
@@ -105,9 +112,26 @@ export function ClipReview(
   const review = signal<EpisodeReviewState | null>(null);
   const speakerLabels = signal<Map<number, string>>(new Map());
   const expandedId = signal<string | null>(initialClipId ?? null);
+  const setExpanded = (nextId: string | null, focusPlayer = false): void => {
+    expandedId.set(nextId);
+    const suffix = nextId ? `/${encodeURIComponent(nextId)}` : '';
+    window.history.replaceState(
+      null,
+      '',
+      `#/episodes/${episodeId}/clips/review${suffix}`
+    );
+    if (focusPlayer && nextId) {
+      requestAnimationFrame(() => {
+        const region = document.getElementById(`clip-review-${nextId}`);
+        const player = region?.querySelector<HTMLVideoElement>('video[controls]');
+        (player ?? region)?.focus({ preventScroll: true });
+      });
+    }
+  };
   const loadError = signal<string | null>(null);
   const chatMessages = signal<ChatMessage[]>([]);
   const chatSending = signal<boolean>(false);
+  let initialClipResolved = false;
   let pollTimer: number | undefined;
   let loadSequence = 0;
 
@@ -137,6 +161,15 @@ export function ClipReview(
       episode.set(ep);
       review.set(state);
       clips.set(state.clips);
+      if (!initialClipResolved) {
+        initialClipResolved = true;
+        const currentId = expandedId.peek();
+        const currentExists = state.clips.some(
+          (clip) => String(clip.id ?? clip.clip_id) === currentId
+        );
+        const firstPlayable = playbackClipIds(state.clips)[0];
+        if (!currentExists && firstPlayable) setExpanded(firstPlayable);
+      }
       loadError.set(null);
       schedulePoll(state);
     } catch (e) {
@@ -213,15 +246,6 @@ export function ClipReview(
     string,
     { element: HTMLElement; signature: string; dispose: () => void }
   >();
-  const setExpanded = (nextId: string | null): void => {
-    expandedId.set(nextId);
-    const suffix = nextId ? `/${encodeURIComponent(nextId)}` : '';
-    window.history.replaceState(
-      null,
-      '',
-      `#/episodes/${episodeId}/clips/review${suffix}`
-    );
-  };
   onCleanup(() => {
     for (const entry of cardEntries.values()) entry.dispose();
     cardEntries.clear();
@@ -256,6 +280,7 @@ export function ClipReview(
     const state = review();
     const labels = speakerLabels();
     const platforms = enabledPlatforms(state?.enabled_destinations ?? []);
+    const playableIds = playbackClipIds(cs);
     const desired: HTMLElement[] = [];
     const present = new Set<string>();
 
@@ -267,6 +292,7 @@ export function ClipReview(
         clip,
         speaker,
         platforms: platforms.map((platform) => platform.key),
+        playableIds,
       });
       let entry = cardEntries.get(id);
       if (!entry || entry.signature !== signature) {
@@ -278,7 +304,8 @@ export function ClipReview(
           clip.review as ClipReviewState,
           platforms,
           async () => load(),
-          setExpanded
+          setExpanded,
+          clipNavigation(playableIds, id)
         );
         if (entry?.element.parentNode === clipList) {
           entry.element.replaceWith(next.element);
@@ -326,6 +353,29 @@ export function ClipReview(
       renderChatDock(chatMessages, chatSending, sendChat)
     )
   );
+}
+
+function playbackClipIds(clips: UnknownRecord[]): string[] {
+  const playable = clips.filter(
+    (clip) => (clip.review as ClipReviewState).render.playable
+  );
+  const current = playable.filter(
+    (clip) => (clip.review as ClipReviewState).render.current
+  );
+  return (current.length ? current : playable).map((clip) =>
+    String(clip.id ?? clip.clip_id)
+  );
+}
+
+function clipNavigation(ids: string[], id: string): ClipNavigation | undefined {
+  const index = ids.indexOf(id);
+  if (index < 0) return undefined;
+  return {
+    index,
+    total: ids.length,
+    previousId: ids[index - 1],
+    nextId: ids[index + 1],
+  };
 }
 
 function renderHeader(
@@ -486,7 +536,8 @@ function clipCard(
   review: ClipReviewState,
   platforms: PlatformSpec[],
   reload: () => Promise<void>,
-  setExpanded: (clipId: string | null) => void
+  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void,
+  navigation?: ClipNavigation
 ): { element: HTMLElement; dispose: () => void } {
   const id = (clip.id as string) ?? (clip.clip_id as string);
   const title = (clip.title as string) || 'Untitled clip';
@@ -530,7 +581,7 @@ function clipCard(
         review.render,
         review.selection.status,
         Boolean(clip.manual),
-        () => setExpanded(expanded ? null : id)
+        () => setExpanded(expanded ? null : id, !expanded)
       );
       expandedScope?.dispose();
       expandedScope = null;
@@ -546,7 +597,9 @@ function clipCard(
             metadata,
             review,
             platforms,
-            reload
+            reload,
+            navigation,
+            setExpanded
           );
         });
         expandedScope = { element, dispose: disposeExpanded };
@@ -555,7 +608,7 @@ function clipCard(
       card.replaceChildren(...children);
       if (expanded) {
         requestAnimationFrame(() =>
-          card.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          expandedScope?.element.scrollIntoView({ behavior: 'smooth', block: 'start' })
         );
       }
     });
@@ -588,7 +641,7 @@ function clipHead(
       type: 'button',
       'aria-expanded': expanded,
       'aria-controls': `clip-review-${id}`,
-      'aria-label': `${expanded ? 'Collapse' : 'Review'} ${title}`,
+      'aria-label': `${expanded ? 'Collapse' : render.playable ? 'Watch' : 'Review'} ${title}`,
       class:
         'w-full p-4 sm:p-5 grid grid-cols-[88px_1fr_auto] sm:grid-cols-[140px_1fr_auto] gap-3 sm:gap-5 items-start text-left hover:bg-surface-2/40',
       onclick: toggle,
@@ -690,27 +743,18 @@ function clipThumb(
   // Only set a src when the shorts MP4 actually exists on disk.
   // Without this guard every card fires a 404 for the missing file.
   let innerEl: HTMLElement;
-  let hoverHandlers: Record<string, unknown> = {};
-
   if (render.playable && render.url) {
     const url = render.url;
     const video = h('video', {
       src: url,
-      muted: true,
       playsinline: true,
       preload: 'metadata',
       tabindex: '-1',
       'aria-hidden': 'true',
       class: 'w-full h-full object-cover bg-surface-inset pointer-events-none',
     }) as HTMLVideoElement;
+    video.muted = true;
     innerEl = video;
-    hoverHandlers = {
-      onmouseenter: () => video.play().catch(() => {}),
-      onmouseleave: () => {
-        video.pause();
-        video.currentTime = 0;
-      },
-    };
   } else {
     // Placeholder — no network request, no 404
     innerEl = h(
@@ -728,14 +772,24 @@ function clipThumb(
     {
       class:
         'w-[88px] sm:w-[140px] aspect-[9/16] rounded-md overflow-hidden bg-surface-inset relative',
-      ...hoverHandlers,
     },
     innerEl,
+    render.playable
+      ? h(
+          'span',
+          {
+            class:
+              'absolute bottom-1 left-1 inline-flex items-center gap-1 text-code-sm text-white bg-black/75 rounded px-1.5 py-0.5',
+          },
+          Icon.play({ size: 11 }),
+          'Watch'
+        )
+      : null,
     h(
       'div',
       {
         class:
-          'absolute bottom-1 right-1 text-code-sm text-ink-primary font-mono tabular bg-black/60 rounded px-1.5 py-0.5',
+          'absolute top-1 right-1 text-code-sm text-ink-primary font-mono tabular bg-black/60 rounded px-1.5 py-0.5',
       },
       formatDuration(duration)
     )
@@ -752,12 +806,18 @@ function clipExpanded(
   metadata: Record<string, UnknownRecord>,
   review: ClipReviewState,
   platforms: PlatformSpec[],
-  reload: () => Promise<void>
+  reload: () => Promise<void>,
+  navigation: ClipNavigation | undefined,
+  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
   return h(
     'div',
-    { id: `clip-review-${clipId}`, class: 'border-t border-border-subtle' },
-    renderReviewPlayer(clipId, review.render),
+    {
+      id: `clip-review-${clipId}`,
+      class: 'border-t border-border-subtle',
+      tabindex: '-1',
+    },
+    renderReviewPlayer(clipId, review.render, navigation, setExpanded),
     renderActions(episodeId, clipId, review, reload),
     renderTrim(episodeId, clipId, start, end, reload),
     renderMetadataAccordion(
@@ -773,7 +833,9 @@ function clipExpanded(
 
 function renderReviewPlayer(
   clipId: string,
-  render: ReviewArtifact
+  render: ReviewArtifact,
+  navigation: ClipNavigation | undefined,
+  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
   if (!render.playable || !render.url) {
     return h(
@@ -797,9 +859,10 @@ function renderReviewPlayer(
     'section',
     {
       class:
-        'px-5 py-5 bg-surface-inset/50 border-b border-border-subtle',
+        'px-5 py-4 bg-surface-inset/50 border-b border-border-subtle',
       'aria-label': 'Clip video review',
     },
+    navigation ? renderPlaybackNavigation(navigation, setExpanded) : null,
     !render.current
       ? h(
           'div',
@@ -833,7 +896,7 @@ function renderReviewPlayer(
       }),
       h(
         'div',
-        { class: 'flex items-center justify-between gap-3 mt-3' },
+        { class: 'flex items-center justify-between gap-3 mt-2' },
         h(
           'span',
           { class: 'text-body-sm text-ink-tertiary' },
@@ -851,6 +914,41 @@ function renderReviewPlayer(
         )
       )
     )
+  );
+}
+
+function renderPlaybackNavigation(
+  navigation: ClipNavigation,
+  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
+): HTMLElement {
+  return h(
+    'nav',
+    {
+      class: 'max-w-[720px] mx-auto mb-3 flex items-center justify-between gap-3',
+      'aria-label': 'Rendered clips',
+    },
+    Button({
+      variant: 'secondary',
+      size: 'sm',
+      label: 'Previous',
+      icon: Icon.chevronLeft({ size: 14 }),
+      disabled: !navigation.previousId,
+      onClick: () =>
+        navigation.previousId && setExpanded(navigation.previousId, true),
+    }),
+    h(
+      'span',
+      { class: 'text-body-sm text-ink-secondary font-mono tabular' },
+      `Clip ${navigation.index + 1} of ${navigation.total}`
+    ),
+    Button({
+      variant: 'secondary',
+      size: 'sm',
+      label: 'Next',
+      iconRight: Icon.chevronRight({ size: 14 }),
+      disabled: !navigation.nextId,
+      onClick: () => navigation.nextId && setExpanded(navigation.nextId, true),
+    })
   );
 }
 
