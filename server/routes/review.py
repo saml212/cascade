@@ -627,7 +627,12 @@ def _metadata_state(copy: dict, destinations: list[dict]) -> dict:
     }
 
 
-def _approval_state(clip: dict, render: dict, metadata: dict) -> dict:
+def _approval_state(
+    clip: dict,
+    render: dict,
+    render_record: dict,
+    metadata_entry: dict | None,
+) -> dict:
     if clip.get("status") == "rejected":
         return {"status": "rejected", "current": False}
     if clip.get("status") != "approved":
@@ -636,7 +641,9 @@ def _approval_state(clip: dict, render: dict, metadata: dict) -> dict:
         return {"status": "stale", "current": False}
     current = clip.get("approved_render_fingerprint") == render[
         "recorded_fingerprint"
-    ] and clip.get("approved_revision") == clip_review_revision(clip, render, metadata)
+    ] and clip.get("approved_revision") == clip_review_revision(
+        clip, render_record, metadata_entry
+    )
     return {"status": "current" if current else "stale", "current": current}
 
 
@@ -730,6 +737,14 @@ def episode_review_state(episode_dir: Path) -> dict:
         for item in metadata.get("clips", [])
         if isinstance(item, dict) and item.get("id")
     }
+    approval_metadata = _read_json(
+        episode_dir / "metadata" / "metadata.json", {"clips": []}
+    )
+    approval_metadata_by_id = {
+        str(item["id"]): item
+        for item in approval_metadata.get("clips", [])
+        if isinstance(item, dict) and item.get("id")
+    }
     manifest = read_render_manifest(episode_dir)
     expected_longform, expected_shorts = _expected_fingerprints(
         episode_dir, episode, clips, config
@@ -768,11 +783,12 @@ def episode_review_state(episode_dir: Path) -> dict:
     for clip in clips:
         clip_id = str(clip["id"])
         copy = metadata_by_id.get(clip_id, {"id": clip_id})
+        render_record = short_records.get(clip_id, {})
         render = _with_media_url(
             render_artifact_state(
                 episode_dir,
                 Path("shorts") / f"{clip_id}.mp4",
-                short_records.get(clip_id),
+                render_record,
                 expected_fingerprint=expected_shorts.get(clip_id),
                 expected_mode="speaker_cut_short",
             ),
@@ -785,7 +801,12 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "review": {
                     "selection": {"status": clip_selection_status(clip)},
                     "render": render,
-                    "approval": _approval_state(clip, render, copy),
+                    "approval": _approval_state(
+                        clip,
+                        render,
+                        render_record,
+                        approval_metadata_by_id.get(clip_id),
+                    ),
                     "metadata": _metadata_state(copy, destinations),
                     "render_job": render_job_state(episode_dir, clip_id),
                 },

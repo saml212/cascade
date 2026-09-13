@@ -186,6 +186,53 @@ def test_review_keeps_stale_short_playable(test_client, monkeypatch):
     assert metadata["complete_destination_count"] == 1
 
 
+def test_review_keeps_new_clip_approval_current_until_copy_changes(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    clip = {
+        "id": "clip_01",
+        "start_seconds": 10,
+        "end_seconds": 30,
+        "status": "pending",
+        "metadata": {"youtube": {"title": "Title", "description": "Copy"}},
+    }
+    _write_clips(episode_dir, [clip])
+    output = episode_dir / "shorts" / "clip_01.mp4"
+    output.write_bytes(b"current pixels")
+    record = _record(output, "sha256:current", "speaker_cut_short")
+    (episode_dir / "render_manifest.json").write_text(
+        json.dumps({"version": 1, "shorts": {"clip_01": record}})
+    )
+
+    from server.routes import clips as clips_route
+    from server.routes import review
+
+    monkeypatch.setattr(clips_route, "_current_render", lambda *_args: record)
+    monkeypatch.setattr(
+        review,
+        "_expected_fingerprints",
+        lambda *_args: (None, {"clip_01": "sha256:current"}),
+    )
+
+    approved = client.post("/api/episodes/ep_001/clips/clip_01/approve")
+    assert approved.status_code == 200
+    current = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"][
+        "approval"
+    ]
+    assert current == {"status": "current", "current": True}
+
+    stored = json.loads((episode_dir / "clips.json").read_text())
+    stored["clips"][0]["metadata"]["youtube"]["title"] = "Changed title"
+    _write_clips(episode_dir, stored["clips"])
+
+    stale = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"][
+        "approval"
+    ]
+    assert stale == {"status": "stale", "current": False}
+
+
 def test_review_exposes_untracked_longform_despite_episode_status(test_client):
     client, episodes_dir = test_client
     episode_dir = _create_episode(episodes_dir, "ep_001", {"status": "ready_to_render"})
