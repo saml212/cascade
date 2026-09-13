@@ -156,10 +156,7 @@ def _canonical_episode_clips(ep_dir: Path, inline_clips: object) -> list[dict]:
     ]
 
 
-@router.get("/")
-async def list_episodes() -> list[dict]:
-    """List all episodes with summary info."""
-    logger.info("GET /api/episodes/")
+def _episode_summaries() -> list[dict]:
     if not EPISODES_DIR.exists():
         return []
 
@@ -209,6 +206,13 @@ async def list_episodes() -> list[dict]:
             continue
 
     return episodes
+
+
+@router.get("/")
+async def list_episodes() -> list[dict]:
+    """List all episodes with summary info."""
+    logger.info("GET /api/episodes/")
+    return await asyncio.to_thread(_episode_summaries)
 
 
 _DJI_TIMESTAMP_RE = re.compile(r"^DJI_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_")
@@ -293,10 +297,7 @@ async def create_episode(req: NewEpisodeRequest) -> dict:
     return {"episode_id": episode_id, "status": "processing"}
 
 
-@router.get("/{episode_id}")
-async def get_episode(episode_id: str) -> dict:
-    """Get full episode detail."""
-    logger.info("GET /api/episodes/%s", episode_id)
+def _episode_detail(episode_id: str) -> dict:
     ep = read_episode(episode_id)
     ep_dir = EPISODES_DIR / episode_id
     ep["delivery"] = _delivery_snapshot(ep_dir)
@@ -315,6 +316,13 @@ async def get_episode(episode_id: str) -> dict:
     ep["clips"] = _canonical_episode_clips(ep_dir, ep.get("clips"))
 
     return ep
+
+
+@router.get("/{episode_id}")
+async def get_episode(episode_id: str) -> dict:
+    """Get full episode detail."""
+    logger.info("GET /api/episodes/%s", episode_id)
+    return await asyncio.to_thread(_episode_detail, episode_id)
 
 
 class EpisodeUpdateRequest(BaseModel):

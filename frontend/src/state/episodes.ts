@@ -4,14 +4,19 @@ import { api, type EpisodeSummary, type UnknownRecord } from '../lib/api';
 export const episodes = signal<EpisodeSummary[] | null>(null);
 
 let episodesTimer: number | null = null;
+let episodesRequestPending = false;
 const EPISODES_POLL_MS = 8000;
 
 async function refreshEpisodes(): Promise<void> {
+  if (episodesRequestPending) return;
+  episodesRequestPending = true;
   try {
     const next = await api.listEpisodes();
     if (JSON.stringify(next) !== JSON.stringify(episodes.peek())) episodes.set(next);
   } catch {
     // Poll will retry.
+  } finally {
+    episodesRequestPending = false;
   }
 }
 
@@ -28,9 +33,12 @@ export const episodeDetailError = signal<string | null>(null);
 export const episodeDetailId = signal<string | null>(null);
 
 let detailTimer: number | null = null;
+const detailRequestsPending = new Set<string>();
 const DETAIL_POLL_MS = 4000;
 
 async function loadDetail(id: string): Promise<void> {
+  if (detailRequestsPending.has(id)) return;
+  detailRequestsPending.add(id);
   try {
     const d = await api.getEpisode(id);
     if (episodeDetailId.peek() === id) {
@@ -41,6 +49,8 @@ async function loadDetail(id: string): Promise<void> {
     if (episodeDetailId.peek() === id) {
       episodeDetailError.set((e as Error).message ?? 'Could not load episode');
     }
+  } finally {
+    detailRequestsPending.delete(id);
   }
 }
 

@@ -1,11 +1,14 @@
 """Tests for episode API routes."""
 
-import json
+import asyncio
 import importlib
+import json
 import subprocess
-import pytest
+import threading
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from agents.qa import canonical_release_metadata, quality_revision
 
@@ -152,6 +155,34 @@ class TestListEpisodes:
         data = resp.json()
         assert data[0]["guest_name"] == "John Doe"
         assert data[0]["episode_name"] == "Test Episode"
+
+    @pytest.mark.parametrize("url", ["/api/episodes/", "/api/episodes/ep_001"])
+    def test_snapshot_quality_work_runs_off_event_loop(
+        self, test_client, monkeypatch, url
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+
+        import server.routes.episodes as episodes_mod
+
+        threads = {}
+        original_to_thread = asyncio.to_thread
+
+        async def tracked_to_thread(function, *args, **kwargs):
+            threads["route"] = threading.get_ident()
+            return await original_to_thread(function, *args, **kwargs)
+
+        def quality_snapshot(*_args, **_kwargs):
+            threads["quality"] = threading.get_ident()
+            return {}
+
+        monkeypatch.setattr(episodes_mod.asyncio, "to_thread", tracked_to_thread)
+        monkeypatch.setattr(episodes_mod, "quality_snapshot", quality_snapshot)
+
+        response = client.get(url)
+
+        assert response.status_code == 200
+        assert threads["quality"] != threads["route"]
 
     def test_list_uses_canonical_clips_and_explicit_counts(self, test_client):
         client, episodes_dir = test_client
