@@ -242,6 +242,23 @@ export function ClipReview(
 
   const body = h('div');
   const clipList = h('div', { class: 'flex flex-col gap-4 pb-4' });
+  const scrollViewport = h(
+    'div',
+    { class: 'flex-1 min-h-0 overflow-y-auto' },
+    h(
+      'div',
+      { class: 'max-w-[1080px] mx-auto px-4 sm:px-10 py-6 pb-32' },
+      body
+    )
+  );
+  const revealExpanded = (region: HTMLElement): void => {
+    requestAnimationFrame(() => {
+      const offset =
+        region.getBoundingClientRect().top -
+        scrollViewport.getBoundingClientRect().top;
+      scrollViewport.scrollTop += offset;
+    });
+  };
   const cardEntries = new Map<
     string,
     { element: HTMLElement; signature: string; dispose: () => void }
@@ -305,7 +322,8 @@ export function ClipReview(
           platforms,
           async () => load(),
           setExpanded,
-          clipNavigation(playableIds, id)
+          clipNavigation(playableIds, id),
+          revealExpanded
         );
         if (entry?.element.parentNode === clipList) {
           entry.element.replaceWith(next.element);
@@ -339,17 +357,9 @@ export function ClipReview(
     target,
     h(
       'div',
-      { class: 'min-h-full flex flex-col' },
+      { class: 'h-full min-h-0 flex flex-col overflow-hidden' },
       renderHeader(episodeId, clips, episode, review),
-      h(
-        'div',
-        { class: 'flex-1 min-h-0 overflow-y-auto' },
-        h(
-          'div',
-          { class: 'max-w-[1080px] mx-auto px-4 sm:px-10 py-6 pb-32' },
-          body
-        )
-      ),
+      scrollViewport,
       renderChatDock(chatMessages, chatSending, sendChat)
     )
   );
@@ -537,7 +547,8 @@ function clipCard(
   platforms: PlatformSpec[],
   reload: () => Promise<void>,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void,
-  navigation?: ClipNavigation
+  navigation: ClipNavigation | undefined,
+  revealExpanded: (region: HTMLElement) => void
 ): { element: HTMLElement; dispose: () => void } {
   const id = (clip.id as string) ?? (clip.clip_id as string);
   const title = (clip.title as string) || 'Untitled clip';
@@ -606,11 +617,7 @@ function clipCard(
         children.push(element);
       }
       card.replaceChildren(...children);
-      if (expanded) {
-        requestAnimationFrame(() =>
-          expandedScope?.element.scrollIntoView({ behavior: 'smooth', block: 'start' })
-        );
-      }
+      if (expanded && expandedScope) revealExpanded(expandedScope.element);
     });
   });
 
