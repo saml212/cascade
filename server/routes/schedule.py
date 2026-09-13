@@ -8,13 +8,21 @@ from zoneinfo import ZoneInfo
 import tomllib
 from fastapi import APIRouter, HTTPException
 
+from agents.qa import quality_snapshot
 from lib.paths import get_episodes_dir
 from server.routes.review import review_state
 
 router = APIRouter(prefix="/api", tags=["schedule"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_RECORDED_PUBLICATION_STATES = {"submitted", "published", "already_submitted"}
+_RECORDED_PUBLICATION_STATES = {
+    "submitted",
+    "published",
+    "already_submitted",
+    "failed",
+    "partial_failure",
+    "unknown",
+}
 
 
 def _load_config() -> dict:
@@ -86,6 +94,8 @@ def _publication_evidence(ep_dir: Path, episode: dict) -> list[dict]:
                 "destination": longform.get("platform") or "unknown",
                 "status": longform["status"],
                 "request_id": longform.get("request_id"),
+                "job_id": longform.get("job_id"),
+                "error": longform.get("error"),
                 "evidence_source": "publish.json",
             }
         )
@@ -110,7 +120,11 @@ def _publication_evidence(ep_dir: Path, episode: dict) -> list[dict]:
                 "clip_id": str(short["clip_id"]),
                 "destinations": [str(value) for value in destinations],
                 "status": short["status"],
+                "scheduled": short.get("scheduled") is True,
+                "scheduled_date": short.get("scheduled_date"),
                 "request_id": short.get("request_id"),
+                "job_id": short.get("job_id"),
+                "error": short.get("error"),
                 "evidence_source": "publish.json",
             }
         )
@@ -125,21 +139,60 @@ def _youtube_longform_recorded(records: list[dict]) -> bool:
     )
 
 
-def _short_publication_recorded(records: list[dict], clip_id: str) -> bool:
-    return any(
-        record["content_type"] == "short" and record.get("clip_id") == clip_id
-        for record in records
+def _receipt_state(receipt: dict) -> str | None:
+    if receipt.get("status") in {"failed", "partial_failure"}:
+        return "failed"
+    if receipt.get("status") == "unknown":
+        return "unknown"
+    if receipt.get("status") in {"submitted", "already_submitted"}:
+        return "scheduled"
+    return None
+
+
+def _release_gate(ep_dir: Path, config: dict) -> dict:
+    try:
+        gate = quality_snapshot(ep_dir, include_findings=False, config=config).get(
+            "release_gate", {}
+        )
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        gate = {}
+    if isinstance(gate, dict) and "can_approve_publish" in gate:
+        return gate
+    return {
+        "can_approve_publish": False,
+        "blockers": [{"message": "Current release checks are unavailable."}],
+    }
+
+
+def _short_item(
+    episode_id: str, name: str, clip_id: str, clip: dict, destinations: list[str]
+) -> dict:
+    metadata = clip.get("metadata", {})
+    youtube = metadata.get("youtube", {}) if isinstance(metadata, dict) else {}
+    title = (
+        (youtube.get("title") if isinstance(youtube, dict) else None)
+        or clip.get("title")
+        or f"Clip {clip_id}"
     )
+    return {
+        "type": "short",
+        "episode_id": episode_id,
+        "clip_id": clip_id,
+        "name": name,
+        "title": title,
+        "destinations": destinations,
+    }
 
 
 async def _get_approved_items(
-    episodes_dir: Path,
-) -> tuple[list[dict], list[dict]]:
-    """Collect only currently approved, current, unsubmitted release items."""
+    episodes_dir: Path, config: dict
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Collect exact plans, receipts, suggestions, and QA-held items."""
     items = []
     publication_evidence = []
+    held_episodes = []
     if not episodes_dir.exists():
-        return items, publication_evidence
+        return items, publication_evidence, held_episodes
 
     for ep_dir in sorted(episodes_dir.iterdir()):
         episode = _read_json(ep_dir / "episode.json", {})
@@ -149,36 +202,105 @@ async def _get_approved_items(
         name = episode.get("name") or episode.get("guest_name") or episode_id
         evidence = _publication_evidence(ep_dir, episode)
         publication_evidence.extend(evidence)
+        gate = _release_gate(ep_dir, config)
+        publish = _read_json(ep_dir / "publish.json", {})
+        publish = publish if isinstance(publish, dict) else {}
+        receipts = publish.get("shorts", [])
+        receipts = receipts if isinstance(receipts, list) else []
         try:
             review = await review_state(episode_id)
         except (HTTPException, OSError, TypeError, ValueError):
-            continue
+            review = {}
 
+        reviewed_clips = [
+            clip for clip in review.get("clips", []) if isinstance(clip, dict)
+        ]
+        planned = {
+            str(entry["clip_id"]): entry
+            for entry in episode.get("publish_schedule", []) or []
+            if isinstance(entry, dict)
+            and entry.get("clip_id")
+            and isinstance(entry.get("scheduled_date"), str)
+        }
+        gate_ready = gate.get("can_approve_publish") is True
+        blockers = [
+            str(blocker.get("message"))
+            for blocker in gate.get("blockers", [])
+            if isinstance(blocker, dict) and blocker.get("message")
+        ]
         enabled_destinations = [
             str(destination["key"])
             for destination in review.get("enabled_destinations", [])
             if isinstance(destination, dict) and destination.get("key")
         ]
+        clips_by_id = {
+            str(clip["id"]): clip for clip in reviewed_clips if clip.get("id")
+        }
+        receipt_ids = {
+            str(receipt["clip_id"])
+            for receipt in receipts
+            if isinstance(receipt, dict) and receipt.get("clip_id")
+        }
+        current_release = (
+            publish.get("release_revision") == gate.get("revision")
+            if publish.get("release_revision") and gate.get("revision")
+            else None
+        )
+        for receipt in receipts:
+            receipt_state = (
+                _receipt_state(receipt) if isinstance(receipt, dict) else None
+            )
+            if (
+                not isinstance(receipt, dict)
+                or not receipt.get("clip_id")
+                or receipt.get("scheduled") is not True
+                or not receipt.get("scheduled_date")
+                or receipt_state is None
+            ):
+                continue
+            clip_id = str(receipt["clip_id"])
+            clip = clips_by_id.get(clip_id, {})
+            plan = planned.get(clip_id)
+            item = _short_item(
+                episode_id,
+                name,
+                clip_id,
+                clip,
+                receipt.get("platforms") or ["unknown"],
+            )
+            item.update(
+                state=receipt_state,
+                scheduled_date=receipt["scheduled_date"],
+                planned_date=(plan or {}).get("scheduled_date"),
+                job_id=receipt.get("job_id"),
+                request_id=receipt.get("request_id"),
+                error=receipt.get("error"),
+                current_release=current_release,
+            )
+            items.append(item)
+
+        pending = []
         longform = review.get("longform", {})
-        canonical = longform.get("canonical_render", {})
+        canonical_render = longform.get("canonical_render", {})
         approval = longform.get("approval", {})
         if (
             "youtube" in enabled_destinations
-            and canonical.get("current") is True
+            and canonical_render.get("current") is True
             and approval.get("current") is True
             and not _youtube_longform_recorded(evidence)
         ):
-            items.append(
+            pending.append(
                 {
                     "type": "longform",
                     "episode_id": episode_id,
                     "name": name,
                     "title": episode.get("title") or name,
                     "destination": "youtube",
+                    "state": "suggested",
                 }
             )
 
-        for clip in review.get("clips", []):
+        for clip in reviewed_clips:
             if not isinstance(clip, dict) or not clip.get("id"):
                 continue
             clip_id = str(clip["id"])
@@ -188,26 +310,42 @@ async def _get_approved_items(
                 or clip_review.get("selection", {}).get("status") != "selected"
                 or clip_review.get("render", {}).get("current") is not True
                 or clip_review.get("approval", {}).get("current") is not True
-                or _short_publication_recorded(evidence, clip_id)
             ):
                 continue
-            items.append(
-                {
-                    "type": "short",
-                    "episode_id": episode_id,
-                    "clip_id": clip_id,
-                    "name": name,
-                    "title": clip.get("title") or f"Clip {clip_id}",
-                    "destinations": enabled_destinations,
-                }
+            if clip_id in receipt_ids:
+                continue
+            item = _short_item(episode_id, name, clip_id, clip, enabled_destinations)
+            plan = planned.get(clip_id)
+            if plan:
+                item.update(state="planned", scheduled_date=plan["scheduled_date"])
+            else:
+                item["state"] = "suggested"
+            pending.append(item)
+
+        if gate_ready:
+            items.extend(pending)
+        elif pending:
+            held_episodes.append(
+                {"episode_id": episode_id, "name": name, "blockers": blockers}
             )
 
-    return items, publication_evidence
+    return items, publication_evidence, held_episodes
+
+
+def _schedule_datetime(item: dict, zone: ZoneInfo) -> datetime | None:
+    value = item.get("scheduled_date")
+    if not isinstance(value, str) or "T" not in value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(zone) if parsed.tzinfo else None
 
 
 @router.get("/schedule")
 async def get_schedule():
-    """Build a seven-day proposal; this endpoint performs no external action."""
+    """Build a read-only calendar from exact plans, receipts, and suggestions."""
     config = _load_config()
     sched_cfg = config.get("schedule", {})
     weekday_limit = sched_cfg.get("shorts_per_day_weekday", 1)
@@ -215,22 +353,49 @@ async def get_schedule():
     longform_delay = sched_cfg.get("longform_delay_days", 0)
     tz_name = sched_cfg.get("timezone", "America/Los_Angeles")
 
-    items, publication_evidence = await _get_approved_items(get_episodes_dir())
-    longforms = [item for item in items if item["type"] == "longform"]
-    shorts = [item for item in items if item["type"] == "short"]
+    zone = ZoneInfo(tz_name)
+    items, publication_evidence, held_items = await _get_approved_items(
+        get_episodes_dir(), config
+    )
+    exact = []
+    for item in items:
+        scheduled = _schedule_datetime(item, zone)
+        if scheduled:
+            exact.append((scheduled, item))
+    longforms = [
+        item
+        for item in items
+        if item["type"] == "longform" and item.get("state") == "suggested"
+    ]
+    shorts = [
+        item
+        for item in items
+        if item["type"] == "short" and item.get("state") == "suggested"
+    ]
 
-    today = datetime.now(ZoneInfo(tz_name)).date()
+    today = datetime.now(zone).date()
+    dates = {today + timedelta(days=offset) for offset in range(7)}
+    dates.update(scheduled.date() for scheduled, _item in exact)
     days = []
-    short_idx = 0
-    for offset in range(7):
-        date = today + timedelta(days=offset)
-        is_weekend = date.weekday() >= 4
-        limit = weekend_limit if is_weekend else weekday_limit
+    day_by_date = {}
+    for date in sorted(dates):
         day = {
             "date": date.isoformat(),
             "day_name": date.strftime("%A"),
             "items": [],
         }
+        days.append(day)
+        day_by_date[date] = day
+    for scheduled, item in sorted(exact, key=lambda value: value[0]):
+        if scheduled and scheduled.date() in day_by_date:
+            day_by_date[scheduled.date()]["items"].append(item)
+
+    short_idx = 0
+    for offset in range(7):
+        date = today + timedelta(days=offset)
+        day = day_by_date[date]
+        is_weekend = date.weekday() >= 4
+        limit = weekend_limit if is_weekend else weekday_limit
         if longforms and offset >= longform_delay:
             longform = longforms.pop(0)
             day["items"].append({**longform, "scheduled_date": date.isoformat()})
@@ -241,13 +406,13 @@ async def get_schedule():
             short = shorts[short_idx]
             day["items"].append({**short, "scheduled_date": date.isoformat()})
             short_idx += 1
-        days.append(day)
 
     return {
         "schedule": days,
-        "total_items": len(items),
+        "total_items": sum(len(day["items"]) for day in days),
         "unscheduled_shorts": len(shorts) - short_idx,
         "unscheduled_longforms": len(longforms),
+        "held_items": held_items,
         "publication_evidence": publication_evidence,
         "mode": "proposal",
         "timezone": tz_name,

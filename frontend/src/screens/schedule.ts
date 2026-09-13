@@ -17,13 +17,24 @@ interface ScheduleItem {
   destination?: string;
   destinations?: string[];
   clip_id?: string;
-  scheduled_time?: string;
+  planned_date?: string;
+  state?: 'planned' | 'scheduled' | 'failed' | 'unknown' | 'suggested';
+  job_id?: string;
+  request_id?: string;
+  error?: string;
+  current_release?: boolean | null;
 }
 
 interface ScheduleDay {
   date: string;
   day_name: string;
   items: ScheduleItem[];
+}
+
+interface HeldEpisode {
+  episode_id: string;
+  name?: string;
+  blockers?: string[];
 }
 
 interface PublicationEvidence {
@@ -35,6 +46,10 @@ interface PublicationEvidence {
   status: string;
   clip_id?: string;
   url?: string;
+  scheduled?: boolean;
+  job_id?: string;
+  request_id?: string;
+  error?: string;
 }
 
 const TYPE_COLOR: Record<string, string> = {
@@ -96,6 +111,8 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
   const unscheduled = unscheduledShorts + unscheduledLongforms;
   const publicationEvidence =
     (d.publication_evidence as PublicationEvidence[]) ?? [];
+  const heldItems = (d.held_items as HeldEpisode[]) ?? [];
+  const timezone = (d.timezone as string) || undefined;
 
   return h(
     'div',
@@ -115,8 +132,8 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           'p',
           { class: 'text-body text-ink-secondary mt-2' },
           total > 0
-            ? `Suggested slots for ${pluralize(total, 'post')}. Confirm release dates in your publishing service.`
-            : 'No release suggestions for the next seven days.'
+            ? `${pluralize(total, 'post')} with current release dates and states.`
+            : 'No releasable posts are on the calendar.'
         )
       ),
       unscheduled > 0
@@ -144,7 +161,9 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
           h(
             'p',
             { class: 'text-body text-ink-tertiary max-w-md mx-auto' },
-            'Current, approved episodes and clips appear here as a draft release plan.'
+            heldItems.length
+              ? 'Release checks are holding the work listed below.'
+              : 'Current, approved episodes and clips appear here as a release plan.'
           )
         )
       : h(
@@ -155,15 +174,16 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
               gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
             },
           },
-          ...days.map(renderDayColumn)
+          ...days.map((day) => renderDayColumn(day, timezone))
         ),
+    heldItems.length ? renderHeldItems(heldItems) : null,
     publicationEvidence.length > 0
       ? renderPublicationEvidence(publicationEvidence)
       : null
   );
 }
 
-function renderDayColumn(day: ScheduleDay): HTMLElement {
+function renderDayColumn(day: ScheduleDay, timezone?: string): HTMLElement {
   const dateObj = new Date(day.date + 'T00:00:00');
   const dayOfMonth = dateObj.toLocaleDateString(undefined, {
     day: 'numeric',
@@ -211,11 +231,15 @@ function renderDayColumn(day: ScheduleDay): HTMLElement {
           },
           isToday ? 'Open day' : 'No suggested posts'
         )
-      : h('div', { class: 'flex flex-col gap-2' }, ...day.items.map(renderItem))
+      : h(
+          'div',
+          { class: 'flex flex-col gap-2' },
+          ...day.items.map((item) => renderItem(item, timezone))
+        )
   );
 }
 
-function renderItem(item: ScheduleItem): HTMLElement {
+function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
   const color = TYPE_COLOR[item.type] ?? '#7a7466';
   const typeLabel =
     item.type === 'longform'
@@ -225,6 +249,17 @@ function renderItem(item: ScheduleItem): HTMLElement {
       : item.type;
   const destinations =
     item.destinations ?? (item.destination ? [item.destination] : []);
+  const state = item.state ?? 'suggested';
+  const stateClass =
+    state === 'scheduled'
+      ? 'text-status-success'
+      : state === 'failed'
+        ? 'text-status-danger'
+        : state === 'unknown'
+          ? 'text-status-warning'
+          : state === 'planned'
+            ? 'text-accent'
+            : 'text-ink-tertiary';
   return h(
     'a',
     {
@@ -247,14 +282,18 @@ function renderItem(item: ScheduleItem): HTMLElement {
         },
         typeLabel
       ),
-      item.scheduled_time
+      item.scheduled_date.includes('T')
         ? h(
             'span',
             {
               class:
                 'text-code-sm text-ink-tertiary font-mono tabular ml-auto',
             },
-            item.scheduled_time
+            new Date(item.scheduled_date).toLocaleTimeString([], {
+              hour: 'numeric',
+              minute: '2-digit',
+              timeZone: timezone,
+            })
           )
         : destinations.length > 0
         ? h(
@@ -271,6 +310,77 @@ function renderItem(item: ScheduleItem): HTMLElement {
       'div',
       { class: 'text-body-sm text-ink-primary leading-snug line-clamp-3' },
       item.title || item.name || 'Untitled'
+    ),
+    h(
+      'div',
+      { class: `text-code-sm font-mono uppercase ${stateClass}` },
+      state
+    ),
+    item.job_id || item.request_id
+      ? h(
+          'div',
+          { class: 'text-code-sm text-ink-tertiary font-mono break-all' },
+          `${item.job_id ? 'Job' : 'Request'} ${item.job_id ?? item.request_id}`
+        )
+      : null,
+    item.planned_date && item.planned_date !== item.scheduled_date
+      ? h(
+          'div',
+          { class: 'text-code-sm text-status-warning font-mono' },
+          `Planned ${new Date(item.planned_date).toLocaleString([], {
+            timeZone: timezone,
+          })}`
+        )
+      : null,
+    item.current_release === false
+      ? h(
+          'div',
+          { class: 'text-code-sm text-status-warning font-mono' },
+          'Receipt belongs to a prior release revision'
+        )
+      : null,
+    item.error
+      ? h('div', { class: 'text-code-sm text-status-danger' }, item.error)
+      : null
+  );
+}
+
+function renderHeldItems(items: HeldEpisode[]): HTMLElement {
+  return h(
+    'section',
+    { class: 'mt-10' },
+    h(
+      'h2',
+      { class: 'font-display text-display-md text-ink-primary mb-4' },
+      'Held by release checks'
+    ),
+    h(
+      'div',
+      { class: 'grid gap-3 md:grid-cols-2' },
+      ...items.map((item) =>
+        h(
+          'div',
+          { class: 'panel p-4 border-status-warning/30' },
+          h(
+            'a',
+            {
+              ...link(`/episodes/${item.episode_id}`),
+              class: 'text-heading-sm text-ink-primary hover:text-accent',
+            },
+            item.name || item.episode_id
+          ),
+          h(
+            'p',
+            { class: 'text-body-sm text-status-warning mt-2' },
+            'Release checks must pass before scheduling.'
+          ),
+          ...(item.blockers ?? [])
+            .slice(0, 2)
+            .map((message) =>
+              h('p', { class: 'text-body-sm text-ink-secondary mt-1' }, message)
+            )
+        )
+      )
     )
   );
 }
@@ -343,6 +453,12 @@ function renderPublicationRecord(record: PublicationEvidence): HTMLElement {
   const status =
     record.status === 'published'
       ? 'Published URL recorded'
+      : record.status === 'failed' || record.status === 'partial_failure'
+      ? 'Failed'
+      : record.status === 'unknown'
+      ? 'Unknown outcome'
+      : record.scheduled
+      ? 'Scheduled'
       : record.status === 'submitted'
       ? 'Submission recorded'
       : record.status === 'already_submitted'
@@ -355,7 +471,13 @@ function renderPublicationRecord(record: PublicationEvidence): HTMLElement {
   const label = h(
     'span',
     { class: 'text-body-sm text-ink-secondary' },
-    `${content} · ${destinationLabel} · ${status}`
+    `${content} · ${destinationLabel} · ${status}${
+      record.job_id
+        ? ` · Job ${record.job_id}`
+        : record.request_id
+          ? ` · Request ${record.request_id}`
+          : ''
+    }${record.error ? ` · ${record.error}` : ''}`
   );
   return safeUrl
     ? h(
