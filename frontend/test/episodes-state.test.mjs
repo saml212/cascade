@@ -1,21 +1,17 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import ts from 'typescript';
 
-function compile(path) {
-  return ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-}
+import { dataUrl, transpileTs } from './load-ts.mjs';
 
-function dataUrl(source) {
-  return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
-}
-
-const signalsUrl = dataUrl(compile('../src/lib/signals.ts'));
-const apiUrl = dataUrl(compile('../src/lib/api.ts'));
-const stateSource = compile('../src/state/episodes.ts')
+const signalsUrl = dataUrl(
+  await transpileTs(new URL('../src/lib/signals.ts', import.meta.url))
+);
+const apiUrl = dataUrl(
+  await transpileTs(new URL('../src/lib/api.ts', import.meta.url))
+);
+const stateSource = (
+  await transpileTs(new URL('../src/state/episodes.ts', import.meta.url))
+)
   .replace("'../lib/signals'", JSON.stringify(signalsUrl))
   .replace("'../lib/api'", JSON.stringify(apiUrl));
 

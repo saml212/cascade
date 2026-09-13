@@ -1,17 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import ts from 'typescript';
 
-const source = readFileSync(
-  new URL('../src/lib/metadata-draft.ts', import.meta.url),
-  'utf8'
-);
-const compiled = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText;
-const { acceptSavedPatch, buildMetadataPatch, metadataValues } = await import(
-  `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`
+import { importTs } from './load-ts.mjs';
+
+const { acceptSavedPatch, buildMetadataPatch, metadataValues } = await importTs(
+  new URL('../src/lib/metadata-draft.ts', import.meta.url)
 );
 
 test('saving a title does not overwrite a remotely populated URL', () => {
