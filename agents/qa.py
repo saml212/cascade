@@ -1321,9 +1321,12 @@ def quality_snapshot(
         )
 
     metadata = canonical_release_metadata(episode_dir, episode, clips)
-    metadata_by_id = {
+    approval_metadata = _load_json(
+        episode_dir / "metadata" / "metadata.json", {"clips": []}
+    )
+    approval_metadata_by_id = {
         item.get("id"): item
-        for item in metadata.get("clips", [])
+        for item in approval_metadata.get("clips", [])
         if isinstance(item, dict) and item.get("id")
     }
     approved = []
@@ -1376,7 +1379,7 @@ def quality_snapshot(
             != clip_review_revision(
                 clip,
                 current_shorts[str(clip["id"])],
-                metadata_by_id.get(clip["id"]),
+                approval_metadata_by_id.get(clip["id"]),
             )
         )
     ]

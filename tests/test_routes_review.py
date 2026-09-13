@@ -206,10 +206,14 @@ def test_review_keeps_new_clip_approval_current_until_copy_changes(
         json.dumps({"version": 1, "shorts": {"clip_01": record}})
     )
 
+    from agents import qa
     from server.routes import clips as clips_route
     from server.routes import review
 
     monkeypatch.setattr(clips_route, "_current_render", lambda *_args: record)
+    monkeypatch.setattr(
+        qa, "_render_status", lambda *_args: (None, {"clip_01": record})
+    )
     monkeypatch.setattr(
         review,
         "_expected_fingerprints",
@@ -222,6 +226,11 @@ def test_review_keeps_new_clip_approval_current_until_copy_changes(
         "approval"
     ]
     assert current == {"status": "current", "current": True}
+    quality = qa.quality_snapshot(episode_dir, config={})
+    blockers = quality["release_gate"]["blockers"]
+    assert "clip_approval_missing_or_stale" not in {
+        blocker["code"] for blocker in blockers
+    }
 
     stored = json.loads((episode_dir / "clips.json").read_text())
     stored["clips"][0]["metadata"]["youtube"]["title"] = "Changed title"
@@ -231,6 +240,11 @@ def test_review_keeps_new_clip_approval_current_until_copy_changes(
         "approval"
     ]
     assert stale == {"status": "stale", "current": False}
+    changed_quality = qa.quality_snapshot(episode_dir, config={})
+    changed_blockers = changed_quality["release_gate"]["blockers"]
+    assert "clip_approval_missing_or_stale" in {
+        blocker["code"] for blocker in changed_blockers
+    }
 
 
 def test_review_exposes_untracked_longform_despite_episode_status(test_client):
