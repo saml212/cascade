@@ -663,12 +663,8 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       const canApprove =
         renderCurrent &&
         !reviewState.longform.approval.current &&
-        workflowStatus.key === 'awaiting_longform_review';
-      const alreadyPast =
-        workflowStatus.key === 'awaiting_clip_review' ||
-        workflowStatus.key === 'awaiting_publish' ||
-        workflowStatus.key === 'awaiting_backup' ||
-        workflowStatus.key === 'live';
+        workflowStatus.tone !== 'working';
+      const alreadyPast = reviewState.longform.approval.current;
       const continueProduction = reviewState.clip_summary.candidate_count === 0;
 
       const headline = needsRender

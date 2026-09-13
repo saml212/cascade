@@ -50,6 +50,7 @@ function renderLongformState(
   const playable = artifact.playable && Boolean(artifact.url);
   const current = artifact.current;
   const approved = review.longform.approval.current;
+  const approvalBusy = status.tone === 'working';
   const quality = ep.quality as QualitySnapshot | null | undefined;
   const recordedDuration =
     (artifact.output_duration_seconds as number | undefined) ?? null;
@@ -167,7 +168,7 @@ function renderLongformState(
                 'Download this render'
               )
             : null,
-          current && !approved && status.key === 'awaiting_longform_review'
+          current && !approved && !approvalBusy
             ? Button({
                 variant: 'secondary',
                 size: 'md',

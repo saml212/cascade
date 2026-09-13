@@ -366,7 +366,7 @@ function findingCard(
         : null,
       preview?.source
         ? previewPlayer(
-            'Original source mix',
+            'Camera reference (original)',
             preview.source,
             `${revision}:${finding.id}:source`,
             controls
@@ -374,7 +374,7 @@ function findingCard(
         : null,
       preview?.grounded_fallback
         ? previewPlayer(
-            'Grounded surviving-channel preview',
+            'Camera reference (surviving-channel patch)',
             preview.grounded_fallback,
             `${revision}:${finding.id}:grounded-fallback`,
             controls
