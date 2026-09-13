@@ -48,6 +48,7 @@ AAC_CONTENT_TIMING_SCHEMA = "cascade.ffmpeg-aac-content-timing/v1"
 AAC_OUTPUT_SAMPLE_RATE = 48_000
 AAC_ENCODER_DELAY_SAMPLES = 1_024
 SHORTS_TWO_PERSON_STACK_VERSION = "two-person-stack/v1"
+SHORTS_THREE_PERSON_STACK_VERSION = "three-person-stack/v1"
 ASPECT_CROP_FINGERPRINT_VERSION = "aspect-crop/v1"
 LONGFORM_TRIM_REUSE_VERSION = "verified-terminal-prefix/v1"
 TRANSCRIPT_RENDER_REUSE_VERSION = "verified-transcript-rebind/v1"
@@ -875,6 +876,8 @@ def _short_render_fingerprint(
     state["lut_sha256"] = lut_digest
     if _uses_two_person_stack(episode, processing, segments, clip):
         state["shorts_overlap_layout"] = SHORTS_TWO_PERSON_STACK_VERSION
+    elif _uses_three_person_stack(episode, processing, segments, clip):
+        state["shorts_overlap_layout"] = SHORTS_THREE_PERSON_STACK_VERSION
     if caption_input is not None:
         state["caption_input"] = {
             "version": CAPTION_SINGLE_LANE_VERSION,
@@ -912,6 +915,27 @@ def _uses_two_person_stack(
         hold_seconds = float(processing.get("shorts_hold_wide_seconds", 3.0))
         return any(
             segment.get("speaker") == "BOTH"
+            and min(clip_end, float(segment["end"]))
+            - max(clip_start, float(segment["start"]))
+            > hold_seconds
+            for segment in segments
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _uses_three_person_stack(
+    episode: dict, processing: dict, segments: list[dict], clip: dict
+) -> bool:
+    """Return whether this clip can reach the sustained three-person layout."""
+    if len(episode.get("crop_config", {}).get("speakers", [])) != 3:
+        return False
+    try:
+        clip_start = float(clip["start_seconds"])
+        clip_end = float(clip["end_seconds"])
+        hold_seconds = float(processing.get("shorts_hold_wide_seconds", 3.0))
+        return any(
+            segment.get("speaker") in {"BOTH", "NONE"}
             and min(clip_end, float(segment["end"]))
             - max(clip_start, float(segment["start"]))
             > hold_seconds

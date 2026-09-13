@@ -336,6 +336,58 @@ def test_short_fingerprint_marks_only_sustained_two_person_overlap(tmp_path):
     assert sustained["shorts_overlap_layout"] == "two-person-stack/v1"
 
 
+def test_short_fingerprint_marks_sustained_three_person_both_or_none(tmp_path):
+    source = tmp_path / "source_merged.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"source")
+    audio.write_bytes(b"audio")
+    three_people = {"crop_config": {"speakers": [{}, {}, {}]}}
+    config = {"processing": {"shorts_hold_wide_seconds": 3}}
+    clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 20}
+
+    def state_for(episode, segment):
+        with patch(
+            "lib.delivery_video.render_fingerprint",
+            side_effect=lambda _paths, state: state,
+        ):
+            return short_render_fingerprint(
+                tmp_path,
+                episode,
+                config,
+                audio,
+                [segment],
+                clip,
+            )
+
+    held_at_threshold = state_for(
+        three_people, {"start": 11, "end": 14, "speaker": "BOTH"}
+    )
+    sustained_both = state_for(
+        three_people, {"start": 11, "end": 15, "speaker": "BOTH"}
+    )
+    sustained_none = state_for(
+        three_people, {"start": 11, "end": 15, "speaker": "NONE"}
+    )
+    clipped_to_threshold = state_for(
+        three_people, {"start": 7, "end": 13, "speaker": "NONE"}
+    )
+    one_person = state_for(
+        {"crop_config": {"speakers": [{}]}},
+        {"start": 11, "end": 15, "speaker": "BOTH"},
+    )
+    two_person_none = state_for(
+        {"crop_config": {"speakers": [{}, {}]}},
+        {"start": 11, "end": 15, "speaker": "NONE"},
+    )
+
+    assert "shorts_overlap_layout" not in held_at_threshold
+    assert "shorts_overlap_layout" not in clipped_to_threshold
+    assert "shorts_overlap_layout" not in one_person
+    assert "shorts_overlap_layout" not in two_person_none
+    assert sustained_both["shorts_overlap_layout"] == "three-person-stack/v1"
+    assert sustained_none["shorts_overlap_layout"] == "three-person-stack/v1"
+
+
 def test_short_fingerprint_marks_only_clips_with_overlapping_caption_events(tmp_path):
     (tmp_path / "source_merged.mp4").write_bytes(b"source")
     audio = tmp_path / "audio.wav"
