@@ -52,6 +52,10 @@ import {
   saveClipApproval,
   type ClipApprovalFeedback,
 } from '../lib/clip-approval';
+import {
+  groupClipReviewCandidates,
+  isRejectedClipId,
+} from '../lib/clip-review-list';
 
 interface PlatformSpec {
   key: string;
@@ -123,7 +127,11 @@ export function ClipReview(
   );
   const speakerLabels = signal<Map<number, string>>(new Map());
   const expandedId = signal<string | null>(initialClipId ?? null);
+  const showRejected = signal(false);
   const setExpanded = (nextId: string | null, focusPlayer = false): void => {
+    if (nextId && isRejectedClipId(clips.peek() ?? [], nextId)) {
+      showRejected.set(true);
+    }
     expandedId.set(nextId);
     const suffix = nextId ? `/${encodeURIComponent(nextId)}` : '';
     window.history.replaceState(
@@ -173,18 +181,22 @@ export function ClipReview(
         approvalFeedback.peek(),
         state.clips
       );
+      const currentId = expandedId.peek();
+      if (currentId && isRejectedClipId(state.clips, currentId)) {
+        showRejected.set(true);
+      }
       episode.set(ep);
       review.set(state);
       clips.set(state.clips);
       approvalFeedback.set(reconciledFeedback);
       if (!initialClipResolved) {
         initialClipResolved = true;
-        const currentId = expandedId.peek();
         const currentExists = state.clips.some(
           (clip) => String(clip.id ?? clip.clip_id) === currentId
         );
-        const firstPlayable = playbackClipIds(state.clips)[0];
-        if (!currentExists && firstPlayable) setExpanded(firstPlayable);
+        const active = groupClipReviewCandidates(state.clips).active;
+        const firstPlayable = playbackClipIds(active)[0];
+        if (!currentExists) setExpanded(firstPlayable ?? null);
       }
       loadError.set(null);
       schedulePoll(state);
@@ -257,7 +269,20 @@ export function ClipReview(
   void loadSpeakerLabels();
 
   const body = h('div');
-  const clipList = h('div', { class: 'flex flex-col gap-4 pb-4' });
+  const activeClipList = h('div', { class: 'flex flex-col gap-4' });
+  const rejectedToggleHost = h('div');
+  const rejectedClipList = h('div', {
+    id: 'clip-review-rejected',
+    class: 'hidden',
+    hidden: true,
+  });
+  const clipList = h(
+    'div',
+    { class: 'flex flex-col gap-4 pb-4' },
+    activeClipList,
+    rejectedToggleHost,
+    rejectedClipList
+  );
   const scrollViewport = h(
     'div',
     { class: 'flex-1 min-h-0 overflow-y-auto' },
@@ -305,7 +330,9 @@ export function ClipReview(
     if (cs.length === 0) {
       for (const entry of cardEntries.values()) entry.dispose();
       cardEntries.clear();
-      clipList.replaceChildren();
+      activeClipList.replaceChildren();
+      rejectedToggleHost.replaceChildren();
+      rejectedClipList.replaceChildren();
       body.replaceChildren(emptyClipsPanel());
       return;
     }
@@ -313,11 +340,17 @@ export function ClipReview(
     const state = review();
     const labels = speakerLabels();
     const platforms = enabledPlatforms(state?.enabled_destinations ?? []);
-    const playableIds = playbackClipIds(cs);
-    const desired: HTMLElement[] = [];
+    const groups = groupClipReviewCandidates(cs);
+    const rejectedVisible = showRejected();
+    const displayed = rejectedVisible
+      ? [...groups.active, ...groups.rejected]
+      : groups.active;
+    const playableIds = playbackClipIds(displayed);
+    const desiredActive: HTMLElement[] = [];
+    const desiredRejected: HTMLElement[] = [];
     const present = new Set<string>();
 
-    for (const clip of cs) {
+    for (const clip of displayed) {
       const id = String(clip.id ?? clip.clip_id);
       const speaker = displaySpeakerLabel(clip.speaker, labels);
       present.add(id);
@@ -342,14 +375,18 @@ export function ClipReview(
           clipNavigation(playableIds, id),
           revealExpanded
         );
-        if (entry?.element.parentNode === clipList) {
+        if (entry?.element.isConnected) {
           entry.element.replaceWith(next.element);
         }
         entry?.dispose();
         entry = { ...next, signature };
         cardEntries.set(id, entry);
       }
-      desired.push(entry.element);
+      if ((clip.review as ClipReviewState).selection.status === 'rejected') {
+        desiredRejected.push(entry.element);
+      } else {
+        desiredActive.push(entry.element);
+      }
     }
 
     for (const [id, entry] of cardEntries) {
@@ -359,14 +396,37 @@ export function ClipReview(
       cardEntries.delete(id);
     }
 
-    desired.forEach((element, index) => {
-      if (clipList.children[index] !== element) {
-        clipList.insertBefore(element, clipList.children[index] ?? null);
-      }
-    });
-    while (clipList.children.length > desired.length) {
-      clipList.lastElementChild?.remove();
+    syncChildren(activeClipList, desiredActive);
+    syncChildren(rejectedClipList, desiredRejected);
+
+    if (groups.rejected.length > 0) {
+      const toggle = Button({
+        variant: 'secondary',
+        size: 'sm',
+        label: `${rejectedVisible ? 'Hide' : 'Show'} rejected (${groups.rejected.length})`,
+        iconRight: Icon.chevronDown({ size: 14 }),
+        class: 'w-full sm:w-auto',
+        onClick: () => {
+          if (rejectedVisible) {
+            const currentId = expandedId.peek();
+            if (currentId && isRejectedClipId(cs, currentId)) {
+              setExpanded(null);
+            }
+          }
+          showRejected.set(!rejectedVisible);
+        },
+      });
+      toggle.setAttribute('aria-expanded', String(rejectedVisible));
+      toggle.setAttribute('aria-controls', 'clip-review-rejected');
+      rejectedToggleHost.replaceChildren(toggle);
+    } else {
+      rejectedToggleHost.replaceChildren();
     }
+
+    rejectedClipList.hidden = !rejectedVisible;
+    rejectedClipList.className = rejectedVisible
+      ? 'flex flex-col gap-4'
+      : 'hidden';
     if (body.firstElementChild !== clipList) body.replaceChildren(clipList);
   });
 
@@ -380,6 +440,17 @@ export function ClipReview(
       renderChatDock(chatMessages, chatSending, sendChat)
     )
   );
+}
+
+function syncChildren(parent: HTMLElement, desired: HTMLElement[]): void {
+  desired.forEach((element, index) => {
+    if (parent.children[index] !== element) {
+      parent.insertBefore(element, parent.children[index] ?? null);
+    }
+  });
+  while (parent.children.length > desired.length) {
+    parent.lastElementChild?.remove();
+  }
 }
 
 function playbackClipIds(clips: UnknownRecord[]): string[] {
