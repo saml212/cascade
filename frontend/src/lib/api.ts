@@ -548,8 +548,15 @@ export const api = {
     request<UnknownRecord>('GET', `/api/episodes/${id}/pipeline-status`),
   resumePipeline: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/resume-pipeline`),
-  approveLongform: (id: string) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/approve-longform`),
+  approveLongform: (
+    id: string,
+    body?: { continue_production?: boolean }
+  ) =>
+    request<UnknownRecord>(
+      'POST',
+      `/api/episodes/${id}/approve-longform`,
+      body
+    ),
   approvePublish: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/approve-publish`),
   approveBackup: (id: string) =>

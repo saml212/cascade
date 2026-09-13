@@ -116,6 +116,10 @@ class RunAgentRequest(BaseModel):
     source_path: Optional[str] = None
 
 
+class ApproveLongformRequest(BaseModel):
+    continue_production: bool = True
+
+
 # ── Response models ─────────────────────────────────────────────────────────
 # Typed responses so the frontend can read the contract from the Pydantic
 # model instead of inferring it from handler bodies.
@@ -134,6 +138,10 @@ class ResumePipelineResponse(PipelineActionResponse):
     """Resume endpoint additionally reports the remaining agent list."""
 
     remaining_agents: Optional[list[str]] = None
+
+
+class ApproveLongformResponse(PipelineActionResponse):
+    production_started: bool
 
 
 class RunAgentResponse(BaseModel):
@@ -473,8 +481,11 @@ async def approve_backup(episode_id: str) -> PipelineActionResponse:
 
 
 @router.post("/{episode_id}/approve-longform")
-async def approve_longform(episode_id: str) -> PipelineActionResponse:
-    """Approve the current edit and continue local production only."""
+async def approve_longform(
+    episode_id: str, request: ApproveLongformRequest | None = None
+) -> ApproveLongformResponse:
+    """Approve the current edit, optionally continuing local production."""
+    request = request or ApproveLongformRequest()
     logger.info("POST /api/episodes/%s/approve-longform", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
@@ -505,25 +516,33 @@ async def approve_longform(episode_id: str) -> PipelineActionResponse:
         episode.pop("publish_approved", None)
         episode.pop("publish_approved_at", None)
         episode.pop("publish_approval", None)
-        episode["status"] = "processing"
+        if request.continue_production:
+            episode["status"] = "processing"
         atomic_write_json(episode_file, episode)
 
-        source_path = episode.get("source_path", "")
+        if request.continue_production:
+            _start_pipeline_thread(
+                episode_id,
+                episode.get("source_path", ""),
+                [
+                    "clip_miner",
+                    "shorts_render",
+                    "metadata_gen",
+                    "thumbnail_gen",
+                    "qa",
+                ],
+            )
 
-        _start_pipeline_thread(
-            episode_id,
-            source_path,
-            [
-                "clip_miner",
-                "shorts_render",
-                "metadata_gen",
-                "thumbnail_gen",
-                "qa",
-            ],
-        )
-
-    logger.info("Longform approved; local clip production started for %s", episode_id)
-    return {"status": "approved", "episode_id": episode_id}
+    logger.info(
+        "Longform approved for %s; production_started=%s",
+        episode_id,
+        request.continue_production,
+    )
+    return {
+        "status": "approved",
+        "episode_id": episode_id,
+        "production_started": request.continue_production,
+    }
 
 
 @router.post("/{episode_id}/approve-publish")

@@ -669,6 +669,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         workflowStatus.key === 'awaiting_publish' ||
         workflowStatus.key === 'awaiting_backup' ||
         workflowStatus.key === 'live';
+      const continueProduction = reviewState.clip_summary.candidate_count === 0;
 
       const headline = needsRender
         ? `${editList.length} cut${editList.length === 1 ? '' : 's'} saved · current render required`
@@ -683,7 +684,9 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
           ? 'The previous file remains reviewable. Re-render before approving.'
           : 'Prepare the speaker-cut video before approving.'
         : canApprove
-        ? 'Approving uploads to YouTube, updates the RSS feed, and fires clip mining.'
+        ? continueProduction
+          ? 'Approving starts local clip production. Publishing remains a separate approval.'
+          : 'Approving records this render and keeps the existing clip package unchanged.'
         : alreadyPast
         ? 'Downstream work has started. Request edits here to re-open.'
         : currentStatus.hint;
@@ -723,8 +726,15 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
                 label: 'Approve longform',
                 onClick: async () => {
                   try {
-                    await api.approveLongform(epId);
-                    showToast('Longform approved — clip mining begins.', 'success');
+                    await api.approveLongform(epId, {
+                      continue_production: continueProduction,
+                    });
+                    showToast(
+                      continueProduction
+                        ? 'Longform approved — local clip production started.'
+                        : 'Longform approved — existing clips preserved.',
+                      'success'
+                    );
                     navigate(`/episodes/${epId}`);
                   } catch (e) {
                     showToast((e as Error).message, 'error');

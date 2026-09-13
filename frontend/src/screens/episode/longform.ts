@@ -174,8 +174,16 @@ function renderLongformState(
                 label: 'Approve current render',
                 onClick: async () => {
                   try {
-                    await api.approveLongform(episodeId);
-                    showToast('Current longform approved.', 'success');
+                    const continueProduction = review.clip_summary.candidate_count === 0;
+                    await api.approveLongform(episodeId, {
+                      continue_production: continueProduction,
+                    });
+                    showToast(
+                      continueProduction
+                        ? 'Current longform approved. Local clip production started.'
+                        : 'Current longform approved. Existing clips were preserved.',
+                      'success'
+                    );
                     navigate(`/episodes/${episodeId}`);
                   } catch (error) {
                     showToast((error as Error).message, 'error');

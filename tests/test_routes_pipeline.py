@@ -148,11 +148,87 @@ class TestEditorialApproval:
         assert response.status_code == 200
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert episode["editorial_approval"]["revision"].startswith("sha256:")
+        assert episode["status"] == "processing"
         assert "publish_approved" not in episode
         assert "publish_approval" not in episode
         requested = run_pipeline.call_args.kwargs["agents"]
-        assert "publish" not in requested
-        assert "podcast_feed" not in requested
+        assert requested == [
+            "clip_miner",
+            "shorts_render",
+            "metadata_gen",
+            "thumbnail_gen",
+            "qa",
+        ]
+        assert response.json()["production_started"] is True
+
+    def test_approval_without_production_preserves_existing_package(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {
+                "status": "ready_for_review",
+                "publish_approved": True,
+                "publish_approved_at": "legacy",
+                "publish_approval": {"revision": "old"},
+            },
+        )
+        clips_path = episode_dir / "clips.json"
+        metadata_path = episode_dir / "metadata" / "metadata.json"
+        clips_path.write_text(
+            json.dumps(
+                {
+                    "clips": [
+                        {
+                            "id": "clip_01",
+                            "status": "approved",
+                            "approved_revision": "sha256:reviewed",
+                        }
+                    ]
+                }
+            )
+        )
+        metadata_path.write_text(
+            json.dumps({"clips": [{"id": "clip_01", "title": "Reviewed"}]})
+        )
+        protected_files = {
+            clips_path: clips_path.read_bytes(),
+            metadata_path: metadata_path.read_bytes(),
+        }
+
+        with (
+            patch(
+                "server.routes.pipeline._current_longform_for_approval",
+                return_value={"fingerprint": "sha256:current"},
+            ),
+            patch(
+                "server.routes.pipeline.editorial_revision",
+                return_value="sha256:current-editorial",
+            ),
+            patch("server.routes.pipeline._start_pipeline_thread") as start_pipeline,
+        ):
+            response = client.post(
+                "/api/episodes/ep_001/approve-longform",
+                json={"continue_production": False},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "approved",
+            "episode_id": "ep_001",
+            "production_started": False,
+        }
+        assert not start_pipeline.called
+        assert all(
+            path.read_bytes() == contents for path, contents in protected_files.items()
+        )
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert episode["status"] == "ready_for_review"
+        assert episode["editorial_approval"]["revision"] == "sha256:current-editorial"
+        assert episode["longform_approved"] is True
+        assert "publish_approved" not in episode
+        assert "publish_approved_at" not in episode
+        assert "publish_approval" not in episode
 
     def test_approval_rejects_previous_or_missing_render(self, test_client):
         client, episodes_dir = test_client
@@ -160,7 +236,10 @@ class TestEditorialApproval:
         (episode_dir / "upload_video.mp4").write_bytes(b"previous pixels")
 
         with patch("server.routes.pipeline.threading.Thread") as thread_class:
-            response = client.post("/api/episodes/ep_001/approve-longform")
+            response = client.post(
+                "/api/episodes/ep_001/approve-longform",
+                json={"continue_production": False},
+            )
 
         assert response.status_code == 409
         assert "current speaker-cut" in response.json()["detail"]
