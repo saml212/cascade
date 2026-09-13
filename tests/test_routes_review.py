@@ -169,7 +169,9 @@ def test_review_keeps_stale_short_playable(test_client, monkeypatch):
     assert render["playable"] is True
     assert render["current"] is False
     assert "/shorts/clip_01.mp4?v=" in render["url"]
-    assert payload["clips"][0]["review"]["approval"]["current"] is False
+    approval = payload["clips"][0]["review"]["approval"]
+    assert approval["current"] is False
+    assert approval["revision"].startswith("sha256:")
     assert [item["key"] for item in payload["enabled_destinations"]] == [
         "youtube",
         "x",
@@ -225,7 +227,11 @@ def test_review_keeps_new_clip_approval_current_until_copy_changes(
     current = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"][
         "approval"
     ]
-    assert current == {"status": "current", "current": True}
+    assert current == {
+        "status": "current",
+        "current": True,
+        "revision": approved.json()["approved_revision"],
+    }
     quality = qa.quality_snapshot(episode_dir, config={})
     blockers = quality["release_gate"]["blockers"]
     assert "clip_approval_missing_or_stale" not in {
@@ -239,7 +245,9 @@ def test_review_keeps_new_clip_approval_current_until_copy_changes(
     stale = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"][
         "approval"
     ]
-    assert stale == {"status": "stale", "current": False}
+    assert stale["status"] == "stale"
+    assert stale["current"] is False
+    assert stale["revision"] != current["revision"]
     changed_quality = qa.quality_snapshot(episode_dir, config={})
     changed_blockers = changed_quality["release_gate"]["blockers"]
     assert "clip_approval_missing_or_stale" in {

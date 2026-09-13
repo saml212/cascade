@@ -633,18 +633,23 @@ def _approval_state(
     render_record: dict,
     metadata_entry: dict | None,
 ) -> dict:
+    revision = clip_review_revision(clip, render_record, metadata_entry)
+    state = {"revision": revision}
     if clip.get("status") == "rejected":
-        return {"status": "rejected", "current": False}
+        return {"status": "rejected", "current": False, **state}
     if clip.get("status") != "approved":
-        return {"status": "unapproved", "current": False}
+        return {"status": "unapproved", "current": False, **state}
     if not render["current"]:
-        return {"status": "stale", "current": False}
-    current = clip.get("approved_render_fingerprint") == render[
-        "recorded_fingerprint"
-    ] and clip.get("approved_revision") == clip_review_revision(
-        clip, render_record, metadata_entry
+        return {"status": "stale", "current": False, **state}
+    current = (
+        clip.get("approved_render_fingerprint") == render["recorded_fingerprint"]
+        and clip.get("approved_revision") == revision
     )
-    return {"status": "current" if current else "stale", "current": current}
+    return {
+        "status": "current" if current else "stale",
+        "current": current,
+        **state,
+    }
 
 
 def _expected_fingerprints(

@@ -313,7 +313,7 @@ export interface ReviewDestination extends UnknownRecord {
 export interface ClipReviewState extends UnknownRecord {
   selection: { status: 'selected' | 'unselected' | 'rejected' };
   render: ReviewArtifact;
-  approval: { status: string; current: boolean };
+  approval: { status: string; current: boolean; revision: string };
   metadata: {
     complete: boolean;
     enabled_destination_count: number;

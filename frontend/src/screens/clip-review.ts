@@ -44,6 +44,14 @@ import {
   transcriptSpeakerLabels,
 } from '../lib/speaker-labels';
 import { showToast } from '../state/ui';
+import {
+  clipApprovalIdentity,
+  clipIsApproved,
+  matchingClipApprovalFeedback,
+  reconcileClipApprovalFeedback,
+  saveClipApproval,
+  type ClipApprovalFeedback,
+} from '../lib/clip-approval';
 
 interface PlatformSpec {
   key: string;
@@ -110,6 +118,9 @@ export function ClipReview(
   const clips = signal<UnknownRecord[] | null>(null);
   const episode = signal<UnknownRecord | null>(null);
   const review = signal<EpisodeReviewState | null>(null);
+  const approvalFeedback = signal<ReadonlyMap<string, ClipApprovalFeedback>>(
+    new Map()
+  );
   const speakerLabels = signal<Map<number, string>>(new Map());
   const expandedId = signal<string | null>(initialClipId ?? null);
   const setExpanded = (nextId: string | null, focusPlayer = false): void => {
@@ -158,9 +169,14 @@ export function ClipReview(
         api.review(episodeId),
       ]);
       if (sequence !== loadSequence) return;
+      const reconciledFeedback = reconcileClipApprovalFeedback(
+        approvalFeedback.peek(),
+        state.clips
+      );
       episode.set(ep);
       review.set(state);
       clips.set(state.clips);
+      approvalFeedback.set(reconciledFeedback);
       if (!initialClipResolved) {
         initialClipResolved = true;
         const currentId = expandedId.peek();
@@ -319,6 +335,7 @@ export function ClipReview(
           speaker,
           expandedId,
           clip.review as ClipReviewState,
+          approvalFeedback,
           platforms,
           async () => load(),
           setExpanded,
@@ -544,6 +561,7 @@ function clipCard(
   speaker: string | null,
   expandedId: Signal<string | null>,
   review: ClipReviewState,
+  approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   platforms: PlatformSpec[],
   reload: () => Promise<void>,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void,
@@ -607,6 +625,8 @@ function clipCard(
             end,
             metadata,
             review,
+            clip,
+            approvalFeedback,
             platforms,
             reload,
             navigation,
@@ -812,6 +832,8 @@ function clipExpanded(
   end: number,
   metadata: Record<string, UnknownRecord>,
   review: ClipReviewState,
+  clip: UnknownRecord,
+  approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   platforms: PlatformSpec[],
   reload: () => Promise<void>,
   navigation: ClipNavigation | undefined,
@@ -825,7 +847,14 @@ function clipExpanded(
       tabindex: '-1',
     },
     renderReviewPlayer(clipId, review.render, navigation, setExpanded),
-    renderActions(episodeId, clipId, review, reload),
+    renderActions(
+      episodeId,
+      clipId,
+      clip,
+      review,
+      approvalFeedback,
+      reload
+    ),
     renderTrim(episodeId, clipId, start, end, reload),
     renderMetadataAccordion(
       episodeId,
@@ -962,41 +991,73 @@ function renderPlaybackNavigation(
 function renderActions(
   episodeId: string,
   clipId: string,
+  clip: UnknownRecord,
   review: ClipReviewState,
+  approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   reload: () => Promise<void>
 ): HTMLElement {
   const rendering = signal(review.render_job.status === 'rendering');
   const primary = h('span');
+  const feedbackHost = h('p', {
+    class: 'basis-full text-body-sm min-h-5',
+    'aria-live': 'polite',
+  });
   effect(() => {
     const active = rendering();
-    const approved = review.approval.current;
+    const feedback = matchingClipApprovalFeedback(
+      clip,
+      approvalFeedback().get(clipId)
+    );
+    const saving = feedback?.status === 'saving';
+    const approved = clipIsApproved(clip, feedback);
+    const failed = feedback?.status === 'error';
     primary.replaceChildren(
       Button({
         variant: 'primary',
         size: 'sm',
-        label: approved
-          ? 'Approved'
-          : review.render.current
-            ? 'Final approve'
-            : active
-              ? 'Rendering…'
-              : review.render.playable
-                ? 'Re-render clip'
-                : 'Render clip',
-        disabled: approved || active,
-        loading: active,
+        label: saving
+          ? 'Saving…'
+          : approved
+            ? 'Approved'
+            : review.render.current
+              ? failed
+                ? 'Retry approval'
+                : 'Final approve'
+              : active
+                ? 'Rendering…'
+                : review.render.playable
+                  ? 'Re-render clip'
+                  : 'Render clip',
+        disabled: approved || active || saving,
+        loading: active || saving,
         onClick: async () => {
-          try {
-            if (review.render.current) {
-              await api.approveClip(episodeId, clipId);
-              showToast('Current render approved.', 'success');
-            } else {
-              rendering.set(true);
-              await api.selectClip(episodeId, clipId);
-              showToast('Rendering the selected clip locally…');
-              await api.renderClip(episodeId, clipId);
-              showToast('Clip rendered. Review it before final approval.', 'success');
+          if (review.render.current) {
+            const identity = clipApprovalIdentity(clip);
+            const outcome = await saveClipApproval(
+              identity,
+              () => api.approveClip(episodeId, clipId),
+              (next) => {
+                approvalFeedback.set((current) => {
+                  const updated = new Map(current);
+                  updated.set(clipId, next);
+                  return updated;
+                });
+              }
+            );
+            if (outcome.status === 'error') {
+              showToast(outcome.message ?? 'Could not approve clip', 'error');
+              return;
             }
+            showToast('Current render approved.', 'success');
+            await reload();
+            return;
+          }
+          try {
+            rendering.set(true);
+            await api.selectClip(episodeId, clipId);
+            showToast('Rendering the selected clip locally…');
+            await api.renderClip(episodeId, clipId);
+            showToast('Clip rendered. Review it before final approval.', 'success');
             await reload();
           } catch (e) {
             showToast((e as Error).message, 'error');
@@ -1006,6 +1067,26 @@ function renderActions(
         },
       })
     );
+    feedbackHost.className = `basis-full text-body-sm min-h-5 ${
+      failed
+        ? 'text-status-danger'
+        : saving
+          ? 'text-ink-secondary'
+          : approved
+            ? 'text-status-success'
+            : 'text-ink-tertiary'
+    }`;
+    if (failed) {
+      feedbackHost.setAttribute('role', 'alert');
+      feedbackHost.textContent = `Approval failed: ${feedback?.message ?? 'Could not approve clip'}`;
+    } else {
+      feedbackHost.removeAttribute('role');
+      feedbackHost.textContent = saving
+        ? 'Saving approval…'
+        : approved
+          ? 'Approval saved for this render.'
+          : '';
+    }
   });
 
   return h(
@@ -1040,7 +1121,8 @@ function renderActions(
           showToast((e as Error).message, 'error');
         }
       },
-    })
+    }),
+    feedbackHost
   );
 }
 
