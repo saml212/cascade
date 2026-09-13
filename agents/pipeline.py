@@ -28,12 +28,19 @@ AGENT_DEPS = {
     "thumbnail_gen": {"transcribe"},
     "qa": {"longform_render", "shorts_render", "metadata_gen", "thumbnail_gen"},
     "podcast_feed": {"qa"},
+    "video_feed": {"qa"},
     "publish": {"qa"},
     "backup": {"publish", "podcast_feed", "thumbnail_gen"},
 }
 
-NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup", "thumbnail_gen"}
-EXPLICIT_PUBLICATION_AGENTS = frozenset({"podcast_feed", "publish"})
+NON_CRITICAL_AGENTS = {
+    "podcast_feed",
+    "video_feed",
+    "publish",
+    "backup",
+    "thumbnail_gen",
+}
+EXPLICIT_PUBLICATION_AGENTS = frozenset({"podcast_feed", "video_feed", "publish"})
 
 
 def _cleanup_stitched_sources(episode_dir: Path) -> None:

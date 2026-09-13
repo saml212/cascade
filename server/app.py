@@ -25,6 +25,7 @@ from server.routes import (
     schedule,
     source_recovery,
     trim,
+    video_feed,
 )
 
 # Project root is the parent of server/
@@ -61,6 +62,7 @@ app.include_router(delivery.router)
 app.include_router(quality.router)
 app.include_router(review.router)
 app.include_router(source_recovery.router)
+app.include_router(video_feed.router)
 
 # Mount output directory for video file serving
 if OUTPUT_DIR.exists():

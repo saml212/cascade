@@ -71,6 +71,9 @@ class TestDagDependencies:
     def test_podcast_feed_depends_on_qa(self):
         assert AGENT_DEPS["podcast_feed"] == {"qa"}
 
+    def test_video_feed_depends_on_qa(self):
+        assert AGENT_DEPS["video_feed"] == {"qa"}
+
     def test_backup_depends_on_publish_and_podcast_feed_and_thumbnail(self):
         assert AGENT_DEPS["backup"] == {"publish", "podcast_feed", "thumbnail_gen"}
 
@@ -112,6 +115,7 @@ class TestDagDependencies:
 class TestNonCriticalAgents:
     def test_non_critical_agents_defined(self):
         assert "podcast_feed" in NON_CRITICAL_AGENTS
+        assert "video_feed" in NON_CRITICAL_AGENTS
         assert "publish" in NON_CRITICAL_AGENTS
         assert "backup" in NON_CRITICAL_AGENTS
         assert "thumbnail_gen" in NON_CRITICAL_AGENTS
@@ -130,7 +134,10 @@ class TestExplicitPublicationAgents:
         monkeypatch.setenv("CASCADE_OUTPUT_DIR", str(episodes_dir))
 
         with (
-            patch("agents.pipeline.PIPELINE_ORDER", ["podcast_feed", "publish"]),
+            patch(
+                "agents.pipeline.PIPELINE_ORDER",
+                ["podcast_feed", "video_feed", "publish"],
+            ),
             patch(
                 "agents.pipeline.load_config",
                 return_value={"paths": {"output_dir": str(episodes_dir)}},
@@ -139,7 +146,11 @@ class TestExplicitPublicationAgents:
             result = run_pipeline("/tmp/source", episode_id="ep_test")
 
         assert result["pipeline"]["agents_requested"] == []
-        assert EXPLICIT_PUBLICATION_AGENTS == {"podcast_feed", "publish"}
+        assert EXPLICIT_PUBLICATION_AGENTS == {
+            "podcast_feed",
+            "video_feed",
+            "publish",
+        }
 
 
 class TestSlugify:
@@ -230,7 +241,7 @@ class TestAgentRegistry:
         assert len(AGENT_REGISTRY) == len(PIPELINE_ORDER)
 
     def test_pipeline_order_has_14_agents(self):
-        assert len(PIPELINE_ORDER) == 14
+        assert len(PIPELINE_ORDER) == 15
 
 
 class TestPipelinePauseAtCropSetup:
