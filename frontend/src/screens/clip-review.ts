@@ -666,6 +666,7 @@ function clipCard(
       card.classList.toggle('border-border-strong', expanded);
 
       const head = clipHead(
+        episodeId,
         id,
         title,
         hook,
@@ -716,6 +717,7 @@ function clipCard(
 }
 
 function clipHead(
+  episodeId: string,
   id: string,
   title: string,
   hook: string,
@@ -744,7 +746,7 @@ function clipHead(
         'w-full p-4 sm:p-5 grid grid-cols-[88px_1fr_auto] sm:grid-cols-[140px_1fr_auto] gap-3 sm:gap-5 items-start text-left hover:bg-surface-2/40',
       onclick: toggle,
     },
-    clipThumb(duration, render),
+    clipThumb(episodeId, id, duration, render),
     h(
       'div',
       { class: 'min-w-0' },
@@ -835,24 +837,22 @@ function clipHead(
 }
 
 function clipThumb(
+  episodeId: string,
+  clipId: string,
   duration: number,
   render: ReviewArtifact
 ): HTMLElement {
-  // Only set a src when the shorts MP4 actually exists on disk.
-  // Without this guard every card fires a 404 for the missing file.
   let innerEl: HTMLElement;
-  if (render.playable && render.url) {
-    const url = render.url;
-    const video = h('video', {
-      src: url,
-      playsinline: true,
-      preload: 'metadata',
-      tabindex: '-1',
+  if (render.playable) {
+    innerEl = h('img', {
+      src: `/api/episodes/${encodeURIComponent(episodeId)}/thumbnail?type=clip&clip_id=${encodeURIComponent(clipId)}`,
+      alt: '',
+      loading: 'lazy',
+      decoding: 'async',
       'aria-hidden': 'true',
       class: 'w-full h-full object-cover bg-surface-inset pointer-events-none',
-    }) as HTMLVideoElement;
-    video.muted = true;
-    innerEl = video;
+      onerror: (event: Event) => (event.currentTarget as HTMLImageElement).remove(),
+    });
   } else {
     // Placeholder — no network request, no 404
     innerEl = h(
