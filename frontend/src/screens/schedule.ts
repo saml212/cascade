@@ -113,6 +113,10 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
     (d.publication_evidence as PublicationEvidence[]) ?? [];
   const heldItems = (d.held_items as HeldEpisode[]) ?? [];
   const timezone = (d.timezone as string) || undefined;
+  const summary =
+    total > 0
+      ? `${pluralize(total, 'post')} with current release dates and states.`
+      : 'No releasable posts are on the calendar.';
 
   return h(
     'div',
@@ -131,9 +135,7 @@ function renderCalendar(d: UnknownRecord): HTMLElement {
         h(
           'p',
           { class: 'text-body text-ink-secondary mt-2' },
-          total > 0
-            ? `${pluralize(total, 'post')} with current release dates and states.`
-            : 'No releasable posts are on the calendar.'
+          `${summary}${timezone ? ` Timezone: ${timezone}.` : ''}`
         )
       ),
       unscheduled > 0
@@ -188,6 +190,9 @@ function renderDayColumn(day: ScheduleDay, timezone?: string): HTMLElement {
   const dayOfMonth = dateObj.toLocaleDateString(undefined, {
     day: 'numeric',
   });
+  const month = dateObj
+    .toLocaleDateString(undefined, { month: 'short' })
+    .toUpperCase();
   const weekday = day.day_name?.slice(0, 3) || '';
   const isToday = day.date === new Date().toLocaleDateString('en-CA');
 
@@ -218,7 +223,7 @@ function renderDayColumn(day: ScheduleDay, timezone?: string): HTMLElement {
         h(
           'span',
           { class: 'text-display-md font-display text-ink-primary' },
-          dayOfMonth
+          `${month} ${dayOfMonth}`
         )
       )
     ),
