@@ -204,7 +204,7 @@ Ease curve (default for all state transitions): `cubic-bezier(0.2, 0.8, 0.2, 1)`
 └─────┴─────────────────────────────────────┴─────────────────┘
 ```
 
-- **Left nav (72px, icon-only).** Dashboard, New Episode, Schedule, Analytics. Settings at bottom. Icons + subtle labels on hover. Active item gets the amber accent as a 2px left border + slight surface-2 background.
+- **Left nav (72px, icon-only).** Dashboard, New Episode, and Schedule. Icons + subtle labels on hover. Active item gets the amber accent as a 2px left border + slight surface-2 background.
 - **Main content.** Fluid width, max 1440px, centered. Screens that need full width (crop setup, longform review, clip review) can opt out of the max-width and expand edge-to-edge.
 - **Agent panel (right rail, 380px, reserved).** Always present in the layout. Today: renders an "Agent" header + a single placeholder card reading *"Agent chat arrives in Phase C. For now, agents speak through this panel's status feed."* Below the placeholder, a live event log of the current episode's pipeline events (the existing poll-based status translated into plain English). This panel is collapsible (chevron in top-right) — collapsed state is 48px wide with just the "Agent" spine label rotated 90°.
 
@@ -282,7 +282,6 @@ Cascade talks like a production assistant, not a robot and not a startup.
 Every empty state uses Instrument Serif for the headline, Satoshi for the body. Examples:
 - Dashboard with no episodes: *"Nothing on deck."* — "Plug in an SD card or hit New Episode."
 - Clip review before clip-mining runs: *"The clip miner hasn't run yet."* — "It'll go once the longform is approved."
-- Analytics: *"Too early to tell."* — "Performance data lands a week after each episode publishes."
 
 ---
 
@@ -301,7 +300,6 @@ These are the screens being built, each with a planned layout shape. Details liv
 | Publish | `/episodes/:id/publish` | Schedule timeline (week view) + per-platform status column |
 | Backup | `/episodes/:id/backup` | Confirmation screen with explicit dangerous-action UI |
 | Schedule | `/schedule` | 7-day calendar, clips laid on platform-colored lanes |
-| Analytics | `/analytics` | Placeholder ("Too early to tell.") for now |
 
 ---
 
@@ -367,7 +365,6 @@ frontend/
       publish.ts
       backup.ts
       schedule.ts
-      analytics.ts
     styles/
       index.css                 # Tailwind + tokens + @layer overrides
       fonts.css                 # @font-face declarations, self-hosted

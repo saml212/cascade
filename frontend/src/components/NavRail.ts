@@ -29,12 +29,6 @@ const ITEMS: NavItem[] = [
     icon: () => Icon.calendar(),
     matcher: (p) => p === '/schedule',
   },
-  {
-    path: '/analytics',
-    label: 'Analytics',
-    icon: () => Icon.chart(),
-    matcher: (p) => p === '/analytics',
-  },
 ];
 
 export function NavRail(): HTMLElement {

@@ -11,7 +11,6 @@ import { LongformReview } from './screens/longform-review';
 import { Publish } from './screens/publish';
 import { Backup } from './screens/backup';
 import { Schedule } from './screens/schedule';
-import { Analytics } from './screens/analytics';
 import { Delivery } from './screens/delivery';
 import { NotFound } from './screens/not-found';
 import { watchEpisode } from './state/episodes';
@@ -43,10 +42,6 @@ route('/new', () => {
 route('/schedule', () => {
   watchEpisode(null);
   Schedule(main);
-});
-route('/analytics', () => {
-  watchEpisode(null);
-  Analytics(main);
 });
 
 episodeRoute('/episodes/:id', (id) => Episode(main, id));

@@ -48,8 +48,6 @@ export const Icon = {
       'M3 5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
       'M3 8h14M7 2v3M13 2v3',
     ], p),
-  chart: (p?: IconProps) =>
-    icon(['M3 17V8M8 17V4M13 17v-7M17 17v-3'], p),
   chevronLeft: (p?: IconProps) => icon(['M12 4l-5 6 5 6'], p),
   chevronRight: (p?: IconProps) => icon(['M8 4l5 6-5 6'], p),
   chevronDown: (p?: IconProps) => icon(['M4 7l6 5 6-5'], p),
