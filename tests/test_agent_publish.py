@@ -18,8 +18,11 @@ patched in every test. We never make a real network call.
 """
 
 import json
+import subprocess
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -38,6 +41,7 @@ from lib.delivery_video import (
 )
 from lib.timeline import Timeline
 
+REAL_REMOTE_SCHEDULE = PublishAgent._remote_schedule
 
 # ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -47,6 +51,11 @@ def env(monkeypatch):
     monkeypatch.setenv("UPLOAD_POST_API_KEY", "test_key")
     monkeypatch.setenv("UPLOAD_POST_USER", "test_user")
     yield
+
+
+@pytest.fixture(autouse=True)
+def empty_upload_post_calendar(monkeypatch):
+    monkeypatch.setattr(PublishAgent, "_remote_schedule", lambda *_args: [])
 
 
 @pytest.fixture
@@ -80,7 +89,15 @@ def _publish_config() -> dict:
     }
 
 
-def _seed_episode(episode_dir, *, clips=None, longform=True, config=None):
+def _seed_episode(
+    episode_dir,
+    *,
+    clips=None,
+    longform=True,
+    config=None,
+    youtube_url="https://youtube.com/watch?v=ready",
+    schedule=None,
+):
     """Write the minimum files publish agent needs to run successfully."""
     config = config or _publish_config()
     episode = {
@@ -89,6 +106,11 @@ def _seed_episode(episode_dir, *, clips=None, longform=True, config=None):
         "crop_config": {"speakers": [{"label": "Host"}]},
         "longform_edits": [],
     }
+    if schedule is not None:
+        episode["publish_schedule"] = schedule
+    if youtube_url:
+        episode["youtube_longform_url"] = youtube_url
+        episode["youtube_longform_url_source"] = "supplied"
     _write_json(episode_dir / "episode.json", episode)
     clips = clips or [
         {
@@ -217,16 +239,20 @@ class TestSafetyGate:
         episode["publish_approved"] = True
         _write_json(episode_path, episode)
         agent = _make_agent(episode_dir)
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="release gate blocked"):
-                agent.execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="release gate blocked"),
+        ):
+            agent.execute()
         run.assert_not_called()
 
     def test_refuses_when_episode_json_missing(self, env, episode_dir):
         agent = _make_agent(episode_dir)
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="release gate blocked"):
-                agent.execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="release gate blocked"),
+        ):
+            agent.execute()
         run.assert_not_called()
 
     def test_runs_with_current_publish_approval(self, env, episode_dir):
@@ -245,9 +271,11 @@ class TestSafetyGate:
         _seed_episode(episode_dir, config=config)
         config["platforms"]["tiktok"]["enabled"] = False
 
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="release gate blocked"):
-                _make_agent(episode_dir, config).execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="release gate blocked"),
+        ):
+            _make_agent(episode_dir, config).execute()
         run.assert_not_called()
 
     def test_account_change_after_approval_is_blocked(
@@ -256,9 +284,11 @@ class TestSafetyGate:
         _seed_episode(episode_dir)
         monkeypatch.setenv("UPLOAD_POST_USER", "different-account")
 
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="release gate blocked"):
-                _make_agent(episode_dir).execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="release gate blocked"),
+        ):
+            _make_agent(episode_dir).execute()
         run.assert_not_called()
 
     @pytest.mark.parametrize("report_state", ["missing", "failed", "stale"])
@@ -276,9 +306,11 @@ class TestSafetyGate:
             episode["title"] = "Changed after QA"
             _write_json(episode_dir / "episode.json", episode)
 
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="release gate blocked"):
-                _make_agent(episode_dir).execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="release gate blocked"),
+        ):
+            _make_agent(episode_dir).execute()
         run.assert_not_called()
 
     def test_pending_clip_is_never_submitted(self, env, episode_dir):
@@ -299,14 +331,16 @@ class TestSafetyGate:
         ]
         _seed_episode(episode_dir, clips=clips)
 
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="release gate blocked"):
-                _make_agent(episode_dir).execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="release gate blocked"),
+        ):
+            _make_agent(episode_dir).execute()
         run.assert_not_called()
 
     def test_episode_editor_copy_is_the_publisher_payload(self, env, episode_dir):
         config = _publish_config()
-        _seed_episode(episode_dir, config=config)
+        _seed_episode(episode_dir, config=config, youtube_url=None)
         episode_path = episode_dir / "episode.json"
         episode = json.loads(episode_path.read_text())
         episode["title"] = "Title saved in the episode editor"
@@ -382,14 +416,14 @@ class TestErrorSurfacing:
             result["shorts"][0]["response"]["error"] == "x_long_text_as_post required"
         )
 
-    def test_missing_request_id_reported_as_failed(self, env, episode_dir):
+    def test_missing_request_id_is_ambiguous(self, env, episode_dir):
         _seed_episode(episode_dir)
         agent = _make_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(stdout=json.dumps({"unexpected": "shape"}))
             result = agent.execute()
-        assert result["shorts_failed"] == 1
-        assert result["shorts"][0]["status"] == "failed"
+        assert result["shorts_unknown"] == 1
+        assert result["shorts"][0]["status"] == "unknown"
 
     def test_curl_failure_persists_stdout(self, env, episode_dir):
         _seed_episode(episode_dir)
@@ -401,17 +435,17 @@ class TestErrorSurfacing:
                 returncode=7,
             )
             result = agent.execute()
-        assert result["shorts"][0]["status"] == "failed"
+        assert result["shorts"][0]["status"] == "unknown"
         assert result["shorts"][0]["stdout"] == "some body"
         assert "connection refused" in result["shorts"][0]["error"]
 
-    def test_non_json_response_reported_as_failed(self, env, episode_dir):
+    def test_non_json_response_is_ambiguous(self, env, episode_dir):
         _seed_episode(episode_dir)
         agent = _make_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(stdout="<html>nginx error</html>")
             result = agent.execute()
-        assert result["shorts"][0]["status"] == "failed"
+        assert result["shorts"][0]["status"] == "unknown"
         assert "non-JSON" in result["shorts"][0]["error"]
 
     def test_successful_submission_persists_response(self, env, episode_dir):
@@ -423,9 +457,42 @@ class TestErrorSurfacing:
             )
             result = agent.execute()
         assert result["shorts"][0]["status"] == "submitted"
-        assert result["shorts"][0]["request_id"] == "req_xyz"
-        # Full response body retained for debugging / per-platform polling later
+        assert result["shorts"][0]["request_id"].startswith("cascade-short-")
+        assert result["shorts"][0]["server_request_id"] == "req_xyz"
         assert result["shorts"][0]["response"]["extra"] == "data"
+
+    def test_platform_failure_is_not_reported_as_success(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        response = {
+            "success": True,
+            "results": {
+                "youtube": {"success": True, "url": "https://youtu.be/ok"},
+                "x": {"success": False, "error": "No access token"},
+            },
+        }
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps(response))
+            agent = _make_agent(episode_dir)
+            result = agent.run()
+            repeated = agent.execute()
+
+        assert result["shorts_failed"] == 1
+        assert result["shorts"][0]["platform_failures"]["x"]["error"] == (
+            "No access token"
+        )
+        assert run.call_count == 1
+        assert repeated["shorts"][0]["reused_receipt"] is True
+        assert "failed-platform retry" in repeated["next_action"]
+
+    def test_top_level_failure_wins_over_empty_results(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        response = {"success": False, "error": "rejected", "results": {}}
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps(response))
+            result = _make_agent(episode_dir).execute()
+
+        assert result["shorts_failed"] == 1
+        assert result["shorts"][0]["status"] == "failed"
 
 
 # ── X-specific defensive flag ───────────────────────────────────────────────
@@ -444,7 +511,7 @@ class TestXLongTextFlag:
 
             run.side_effect = _capture
             agent.execute()
-        # First call is the short upload; longform is second
+        # The recorded longform URL makes this a shorts-only retry.
         short_cmd = captured[0]
         # Walk -F flags looking for x_long_text_as_post
         flags = [
@@ -472,9 +539,11 @@ class TestXLongTextFlag:
         ]
         _seed_episode(episode_dir, clips=clips)
         agent = _make_agent(episode_dir)
-        with patch("agents.publish.subprocess.run") as run:
-            with pytest.raises(RuntimeError, match="x copy is missing: text"):
-                agent.execute()
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="x copy is missing: text"),
+        ):
+            agent.execute()
         run.assert_not_called()
 
 
@@ -482,11 +551,7 @@ class TestXLongTextFlag:
 
 
 class TestYouTubeLongformFunnel:
-    """The single highest-CTR funnel from a Short to the longform episode is
-    the auto-pinned YouTube first comment with a direct link. Industry data
-    puts this at 1-3% CTR vs <0.5% for "link in bio". These tests pin that
-    publish.py sends the youtube_first_comment field on every short upload
-    when a youtube_longform_url is configured on the episode."""
+    """Short submissions include a YouTube comment linking to longform."""
 
     def _seed_with_longform_url(
         self, episode_dir, *, youtube_url=None, spotify_url=None, channel_handle=None
@@ -494,7 +559,7 @@ class TestYouTubeLongformFunnel:
         config = _publish_config()
         if channel_handle:
             config["podcast"] = {"channel_handle": channel_handle}
-        _seed_episode(episode_dir, config=config)
+        _seed_episode(episode_dir, config=config, youtube_url=None)
         ep_path = episode_dir / "episode.json"
         ep = json.loads(ep_path.read_text())
         if youtube_url is not None:
@@ -538,7 +603,7 @@ class TestYouTubeLongformFunnel:
         ]
         assert len(first_comment_flags) == 1, (
             "publish.py must send youtube_first_comment on every short when "
-            "youtube_longform_url is set — this is the highest-CTR funnel."
+            "youtube_longform_url is set"
         )
         assert "youtube.com/watch?v=abc123" in first_comment_flags[0]
         assert "Full episode" in first_comment_flags[0]
@@ -574,20 +639,34 @@ class TestYouTubeLongformFunnel:
         first_comment = next(f for f in flags if f.startswith("youtube_first_comment="))
         assert "@local-pod" in first_comment
 
-    def test_first_comment_skipped_when_no_youtube_url(self, env, episode_dir):
-        # If user hasn't filled in the URL yet, we must NOT send an empty
-        # first comment — that would post a useless empty pinned comment.
-        _seed_episode(episode_dir)
+    def test_shorts_deferred_when_no_youtube_url(self, env, episode_dir):
+        _seed_episode(episode_dir, youtube_url=None)
         agent = _make_agent(episode_dir)
-        captured = self._capture_upload_cmds(env, episode_dir, agent)
-        short_cmd = captured[0]
-        flags = [
-            a for i, a in enumerate(short_cmd) if i > 0 and short_cmd[i - 1] == "-F"
-        ]
-        first_comment_flags = [
-            f for f in flags if f.startswith("youtube_first_comment=")
-        ]
-        assert len(first_comment_flags) == 0
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda cmd, **_kwargs: (
+                captured.append(cmd)
+                or _mock_proc(stdout=json.dumps({"request_id": "longform"}))
+            )
+            result = agent.execute()
+
+        assert result["shorts_deferred"] is True
+        assert result["shorts"] == []
+        assert len(captured) == 1
+        assert "upload_video.mp4" in " ".join(captured[0])
+
+    def test_longform_failure_requires_action(self, env, episode_dir):
+        _seed_episode(episode_dir, youtube_url=None)
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(
+                stdout=json.dumps({"success": False, "error": "youtube rejected"})
+            )
+            result = _make_agent(episode_dir).execute()
+
+        assert result["publish_status"] == "longform_failed"
+        assert result["action_required"] is True
+        assert "youtube rejected" in result["longform"]["error"]
+        assert "awaiting a public URL" not in result["shorts_deferred_reason"]
 
     def test_longform_idempotent_when_url_already_set(self, env, episode_dir):
         # When youtube_longform_url is already recorded, publish skips the
@@ -605,17 +684,61 @@ class TestYouTubeLongformFunnel:
         assert "upload_video.mp4" not in " ".join(captured[0])
 
     def test_receipt_url_keeps_the_approved_batch_current(self, env, episode_dir):
-        _seed_episode(episode_dir)
+        _seed_episode(episode_dir, youtube_url=None)
         episode_path = episode_dir / "episode.json"
         episode = json.loads(episode_path.read_text())
+        revision = episode["publish_approval"]["revision"]
+        identity = _make_agent(episode_dir)._identity(revision, "longform")
         episode["youtube_longform_url"] = "https://youtube.com/watch?v=receipt"
         episode["youtube_longform_url_source"] = "upload_post_receipt"
+        episode["youtube_longform_url_external_id"] = identity
+        episode["youtube_longform_url_release_revision"] = revision
         _write_json(episode_path, episode)
 
         captured = self._capture_upload_cmds(env, episode_dir, _make_agent(episode_dir))
 
         assert len(captured) == 1
         assert "upload_video.mp4" not in " ".join(captured[0])
+
+    def test_unbound_receipt_url_is_rejected(self, env, episode_dir):
+        _seed_episode(episode_dir, youtube_url=None)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode["youtube_longform_url"] = "https://youtube.com/watch?v=stale"
+        episode["youtube_longform_url_source"] = "upload_post_receipt"
+        _write_json(episode_path, episode)
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="does not belong"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_stale_longform_receipt_does_not_skip_current_upload(
+        self, env, episode_dir
+    ):
+        _seed_episode(episode_dir, youtube_url=None)
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "longform": {
+                    "status": "submitted",
+                    "external_id": "cascade-longform-stale",
+                }
+            },
+        )
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "current"}))
+            )
+            result = _make_agent(episode_dir).execute()
+
+        assert len(captured) == 1
+        assert "upload_video.mp4" in " ".join(captured[0])
+        assert result["longform"].get("reused_receipt") is not True
 
 
 # ── rejected clips skipped ──────────────────────────────────────────────────
@@ -657,36 +780,461 @@ class TestRejectedClips:
 
             run.side_effect = _capture
             agent.execute()
-        # 1 short + 1 longform = 2 calls total. clip_1 must NOT be uploaded.
-        assert len(upload_calls) == 2
+        assert len(upload_calls) == 1
         # Make sure clip_1.mp4 doesn't appear in any upload command
         for cmd in upload_calls:
             assert "clip_1.mp4" not in " ".join(cmd)
+
+
+class TestIdempotency:
+    @staticmethod
+    def _values(command, flag):
+        return [
+            value
+            for index, value in enumerate(command)
+            if index > 0 and command[index - 1] == flag
+        ]
+
+    def test_short_timeout_is_not_automatically_resubmitted(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        commands = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                commands.append(command)
+                or (_ for _ in ()).throw(subprocess.TimeoutExpired(command, 600))
+            )
+            agent = _make_agent(episode_dir)
+            first = agent.run()
+            second = agent.execute()
+
+        assert len(commands) == 1
+        headers = self._values(commands[0], "-H")
+        fields = self._values(commands[0], "-F")
+        identity = first["shorts"][0]["external_id"]
+        assert f"Idempotency-Key: {identity}" in headers
+        assert f"request_id={identity}" in fields
+        assert f"external_id={identity}" in fields
+        assert first["shorts"][0]["status"] == "unknown"
+        assert second["shorts"][0]["status"] == "unknown"
+        assert second["shorts"][0]["reused_receipt"] is True
+
+    def test_longform_upload_has_stable_identity(self, env, episode_dir):
+        _seed_episode(episode_dir, youtube_url=None)
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "longform"}))
+            )
+            _make_agent(episode_dir).execute()
+
+        headers = self._values(captured[0], "-H")
+        fields = self._values(captured[0], "-F")
+        assert any(
+            value.startswith("Idempotency-Key: cascade-longform-") for value in headers
+        )
+        assert any(value.startswith("request_id=cascade-longform-") for value in fields)
+        assert any(
+            value.startswith("external_id=cascade-longform-") for value in fields
+        )
+
+    def test_longform_timeout_is_not_automatically_resubmitted(self, env, episode_dir):
+        _seed_episode(episode_dir, youtube_url=None)
+        commands = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                commands.append(command)
+                or (_ for _ in ()).throw(subprocess.TimeoutExpired(command, 1200))
+            )
+            agent = _make_agent(episode_dir)
+            first = agent.run()
+            second = agent.execute()
+
+        assert len(commands) == 1
+        assert first["longform"]["status"] == "unknown"
+        assert second["longform"]["status"] == "unknown"
+        assert second["longform"]["reused_receipt"] is True
 
 
 # ── schedule conversion ─────────────────────────────────────────────────────
 
 
 class TestScheduleConversion:
-    def test_schedule_to_datetime_morning_slot(self, env, episode_dir):
+    def test_spring_dst_uses_new_local_offset(self, env, episode_dir):
         agent = _make_agent(episode_dir)
         sched = {"day_offset": 1, "time_slot": "morning"}
-        dt = agent._schedule_to_datetime(sched, "America/Los_Angeles")
-        assert dt.hour == 9
-        assert dt.minute == 0
+        reference = datetime(2026, 3, 7, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+        dt = agent._schedule_to_datetime(
+            sched, "America/Los_Angeles", reference=reference
+        )
+        assert dt.isoformat() == "2026-03-08T09:00:00-07:00"
+        assert dt.utcoffset() == timedelta(hours=-7)
 
-    def test_schedule_to_datetime_evening_slot(self, env, episode_dir):
+    def test_fall_dst_uses_new_local_offset(self, env, episode_dir):
         agent = _make_agent(episode_dir)
-        sched = {"day_offset": 0, "time_slot": "evening"}
-        dt = agent._schedule_to_datetime(sched, "America/Los_Angeles")
-        assert dt.hour == 18
+        sched = {"day_offset": 1, "time_slot": "evening"}
+        reference = datetime(2026, 10, 31, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+        dt = agent._schedule_to_datetime(
+            sched, "America/Los_Angeles", reference=reference
+        )
+        assert dt.isoformat() == "2026-11-01T18:00:00-08:00"
+        assert dt.utcoffset() == timedelta(hours=-8)
+
+    def test_absolute_date_preserves_approved_local_time(self, env, episode_dir):
+        dt = _make_agent(episode_dir)._schedule_to_datetime(
+            {"scheduled_date": "2026-11-01T18:00:00-08:00"},
+            "America/Los_Angeles",
+        )
+        assert dt.isoformat() == "2026-11-01T18:00:00-08:00"
+
+    def test_absolute_date_requires_matching_timezone_offset(self, env, episode_dir):
+        with pytest.raises(ValueError, match="offset does not match"):
+            _make_agent(episode_dir)._schedule_to_datetime(
+                {"scheduled_date": "2026-07-01T09:00:00-08:00"},
+                "America/Los_Angeles",
+            )
+
+    @pytest.mark.parametrize("offset", ["-07:00", "-08:00"])
+    def test_absolute_date_rejects_ambiguous_dst_fold(self, env, episode_dir, offset):
+        with pytest.raises(ValueError, match="ambiguous or nonexistent"):
+            _make_agent(episode_dir)._schedule_to_datetime(
+                {"scheduled_date": f"2026-11-01T01:30:00{offset}"},
+                "America/Los_Angeles",
+            )
+
+    @pytest.mark.parametrize(
+        "schedule,error",
+        [
+            ({"day_offset": -1, "time_slot": "morning"}, "cannot be negative"),
+            ({"day_offset": 1, "time_slot": "midnight"}, "unknown time_slot"),
+        ],
+    )
+    def test_relative_schedule_rejects_invalid_values(
+        self, env, episode_dir, schedule, error
+    ):
+        reference = datetime(2026, 1, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
+        with pytest.raises(ValueError, match=error):
+            _make_agent(episode_dir)._schedule_to_datetime(
+                schedule, "America/Los_Angeles", reference=reference
+            )
 
     def test_generate_schedule_distributes_clips_across_days(self, env, episode_dir):
         agent = _make_agent(episode_dir)
         clips = [{"id": f"clip_{i}"} for i in range(5)]
-        sched = agent._generate_schedule(clips, weekday_per_day=1, weekend_per_day=2)
+        reference = datetime(2026, 1, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
+        sched = agent._generate_schedule(
+            clips,
+            weekday_per_day=1,
+            weekend_per_day=2,
+            reference=reference,
+        )
         assert len(sched) == 5
-        # No clip should be scheduled with day_offset=0 (always tomorrow earliest)
         assert all(s["day_offset"] >= 1 for s in sched)
-        # Every clip_id must appear exactly once
         assert sorted(s["clip_id"] for s in sched) == [f"clip_{i}" for i in range(5)]
+
+    def test_stale_approval_uses_current_time_as_schedule_reference(
+        self, env, episode_dir
+    ):
+        zone = ZoneInfo("America/Los_Angeles")
+        before = datetime.now(zone)
+        reference = _make_agent(episode_dir)._schedule_reference(
+            {"publish_approval": {"approved_at": "2020-01-01T00:00:00-08:00"}},
+            "America/Los_Angeles",
+        )
+        after = datetime.now(zone)
+        assert before <= reference <= after
+
+
+class TestScheduleReservation:
+    reference = datetime(2099, 1, 4, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+    @pytest.fixture(autouse=True)
+    def fixed_schedule_reference(self, monkeypatch):
+        monkeypatch.setattr(
+            PublishAgent,
+            "_schedule_reference",
+            staticmethod(lambda *_args: self.reference),
+        )
+
+    @staticmethod
+    def _scheduled_field(command):
+        fields = [
+            value
+            for index, value in enumerate(command)
+            if index > 0 and command[index - 1] == "-F"
+        ]
+        return next(value for value in fields if value.startswith("scheduled_date="))
+
+    def test_remote_job_reserves_global_daily_slot(self, env, monkeypatch, episode_dir):
+        _seed_episode(episode_dir)
+        monkeypatch.setattr(
+            PublishAgent,
+            "_remote_schedule",
+            lambda *_args: [
+                {
+                    "job_id": "other-job",
+                    "external_id": "another-episode",
+                    "scheduled_date": "2099-01-05T18:00:00Z",
+                }
+            ],
+        )
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"job_id": "new-job"}))
+            )
+            _make_agent(episode_dir).execute()
+
+        assert self._scheduled_field(captured[0]) == (
+            "scheduled_date=2099-01-06T09:00:00"
+        )
+
+    def test_local_episode_receipt_reserves_global_daily_slot(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        other = episode_dir.parent / "ep_other"
+        other.mkdir()
+        _write_json(
+            other / "publish.json",
+            {
+                "profile_username": "test_user",
+                "shorts": [
+                    {
+                        "status": "submitted",
+                        "scheduled": True,
+                        "scheduled_date": "2099-01-05T09:00:00-08:00",
+                        "request_id": "other-job",
+                    }
+                ],
+            },
+        )
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"job_id": "new-job"}))
+            )
+            _make_agent(episode_dir).execute()
+
+        assert self._scheduled_field(captured[0]) == (
+            "scheduled_date=2099-01-06T09:00:00"
+        )
+
+    def test_explicit_collision_blocks_before_upload(
+        self, env, monkeypatch, episode_dir
+    ):
+        _seed_episode(
+            episode_dir,
+            schedule=[{"clip_id": "clip_0", "day_offset": 1, "time_slot": "morning"}],
+        )
+        monkeypatch.setattr(
+            PublishAgent,
+            "_remote_schedule",
+            lambda *_args: [
+                {
+                    "job_id": "other-job",
+                    "scheduled_date": "2099-01-05T17:00:00Z",
+                }
+            ],
+        )
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="Schedule collision"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_absolute_schedule_is_sent_as_local_wall_time(self, env, episode_dir):
+        _seed_episode(
+            episode_dir,
+            schedule=[
+                {
+                    "clip_id": "clip_0",
+                    "scheduled_date": "2099-07-01T09:00:00-07:00",
+                }
+            ],
+        )
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"job_id": "scheduled-job"}))
+            )
+            result = _make_agent(episode_dir).execute()
+
+        assert self._scheduled_field(captured[0]) == (
+            "scheduled_date=2099-07-01T09:00:00"
+        )
+        assert result["shorts"][0]["job_id"] == "scheduled-job"
+        assert result["shorts"][0]["request_id"].startswith("cascade-short-")
+
+    def test_stale_absolute_schedule_blocks_before_upload(self, env, episode_dir):
+        _seed_episode(
+            episode_dir,
+            schedule=[
+                {
+                    "clip_id": "clip_0",
+                    "scheduled_date": "2025-01-01T09:00:00-08:00",
+                }
+            ],
+        )
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="not in the future"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_duplicate_external_labels_do_not_collapse_remote_jobs(
+        self, env, monkeypatch, episode_dir
+    ):
+        monkeypatch.setattr(
+            PublishAgent,
+            "_remote_schedule",
+            lambda *_args: [
+                {
+                    "job_id": "job-one",
+                    "external_id": "reused-label",
+                    "scheduled_date": "2099-01-05T17:00:00Z",
+                },
+                {
+                    "job_id": "job-two",
+                    "external_id": "reused-label",
+                    "scheduled_date": "2099-01-05T18:00:00Z",
+                },
+            ],
+        )
+
+        occupied = _make_agent(episode_dir)._occupied_schedule("key", "test_user")
+
+        assert {item["job_id"] for item in occupied} == {"job-one", "job-two"}
+
+    def test_malformed_sibling_receipt_blocks_before_upload(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        other = episode_dir.parent / "ep_other"
+        other.mkdir()
+        (other / "publish.json").write_text("not json")
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="Cannot inspect local publish receipt"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_malformed_current_receipt_blocks_before_upload(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        (episode_dir / "publish.json").write_text("not json")
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="current publish receipt"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_unknown_scheduled_receipt_recovers_remote_job_id(
+        self, env, monkeypatch, episode_dir
+    ):
+        _seed_episode(episode_dir)
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        identity = _make_agent(episode_dir)._identity(
+            episode["publish_approval"]["revision"], "short", "clip_0"
+        )
+        scheduled_date = "2099-01-05T09:00:00-08:00"
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "profile_username": "test_user",
+                "shorts": [
+                    {
+                        "clip_id": "clip_0",
+                        "status": "unknown",
+                        "scheduled": True,
+                        "scheduled_date": scheduled_date,
+                        "request_id": identity,
+                        "external_id": identity,
+                        "idempotency_key": identity,
+                    }
+                ],
+            },
+        )
+        monkeypatch.setattr(
+            PublishAgent,
+            "_remote_schedule",
+            lambda *_args: [
+                {
+                    "job_id": "remote-job",
+                    "external_id": identity,
+                    "scheduled_date": "2099-01-05T17:00:00Z",
+                }
+            ],
+        )
+
+        with patch("agents.publish.subprocess.run") as run:
+            result = _make_agent(episode_dir).execute()
+
+        run.assert_not_called()
+        assert result["shorts"][0]["status"] == "submitted"
+        assert result["shorts"][0]["job_id"] == "remote-job"
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            _mock_proc(stdout="not json"),
+            _mock_proc(stdout=json.dumps({"unexpected": []})),
+            _mock_proc(stdout="upstream error", stderr="HTTP 503", returncode=22),
+        ],
+    )
+    def test_remote_calendar_response_must_be_valid(self, env, episode_dir, response):
+        with (
+            patch("agents.publish.subprocess.run", return_value=response),
+            pytest.raises(RuntimeError, match="Cannot inspect Upload-Post schedule"),
+        ):
+            REAL_REMOTE_SCHEDULE(_make_agent(episode_dir), "key", "test_user")
+
+    def test_calendar_inspection_failure_blocks_before_upload(
+        self, env, monkeypatch, episode_dir
+    ):
+        _seed_episode(episode_dir)
+
+        def unavailable(*_args):
+            raise RuntimeError("Cannot inspect Upload-Post schedule")
+
+        monkeypatch.setattr(PublishAgent, "_remote_schedule", unavailable)
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="Cannot inspect"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_partial_explicit_schedule_does_not_publish_immediately(
+        self, env, episode_dir
+    ):
+        _seed_episode(
+            episode_dir,
+            schedule=[
+                {"clip_id": "another_clip", "day_offset": 1, "time_slot": "morning"}
+            ],
+        )
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="missing schedule entries"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_duplicate_explicit_schedule_blocks_before_upload(self, env, episode_dir):
+        entry = {
+            "clip_id": "clip_0",
+            "scheduled_date": "2099-07-01T09:00:00-07:00",
+        }
+        _seed_episode(episode_dir, schedule=[entry, entry])
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="duplicate entries"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()

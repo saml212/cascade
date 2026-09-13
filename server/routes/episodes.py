@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from agents.pipeline import load_config
 from agents.podcast_feed import current_podcast_audio
@@ -325,6 +325,22 @@ async def get_episode(episode_id: str) -> dict:
     return await asyncio.to_thread(_episode_detail, episode_id)
 
 
+class PublishScheduleEntry(BaseModel):
+    clip_id: str
+    scheduled_date: str
+
+    @field_validator("scheduled_date")
+    @classmethod
+    def require_utc_offset(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("scheduled_date must be ISO-8601") from error
+        if parsed.tzinfo is None:
+            raise ValueError("scheduled_date must include a UTC offset")
+        return value
+
+
 class EpisodeUpdateRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
@@ -337,6 +353,7 @@ class EpisodeUpdateRequest(BaseModel):
     youtube_longform_url: Optional[str] = None
     spotify_longform_url: Optional[str] = None
     link_tree_url: Optional[str] = None
+    publish_schedule: Optional[list[PublishScheduleEntry]] = None
 
 
 @router.patch("/{episode_id}")
@@ -363,10 +380,14 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         ep["youtube_longform_url"] = req.youtube_longform_url
         ep["youtube_longform_url_source"] = "supplied"
         ep.pop("youtube_longform_url_captured_at", None)
+        ep.pop("youtube_longform_url_external_id", None)
+        ep.pop("youtube_longform_url_release_revision", None)
     if req.spotify_longform_url is not None:
         ep["spotify_longform_url"] = req.spotify_longform_url
     if req.link_tree_url is not None:
         ep["link_tree_url"] = req.link_tree_url
+    if req.publish_schedule is not None:
+        ep["publish_schedule"] = [entry.model_dump() for entry in req.publish_schedule]
     write_episode(episode_id, ep)
     return {"status": "updated", "episode_id": episode_id}
 

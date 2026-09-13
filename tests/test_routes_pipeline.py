@@ -5,6 +5,8 @@ import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from tests.test_routes_episodes import _create_episode
 
 pytest_plugins = ["tests.test_routes_episodes"]
@@ -450,7 +452,12 @@ class TestUploadPostReceipts:
         (episode_dir / "publish.json").write_text(
             json.dumps(
                 {
-                    "longform": {"status": "submitted", "request_id": "request-1"},
+                    "release_revision": "sha256:release",
+                    "longform": {
+                        "status": "unknown",
+                        "request_id": "request-1",
+                        "external_id": "cascade-longform-current",
+                    },
                     "shorts": [],
                 }
             )
@@ -458,7 +465,16 @@ class TestUploadPostReceipts:
         monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
         response = MagicMock()
         response.raise_for_status.return_value = None
-        response.json.return_value = {"youtube_url": "https://youtu.be/receipt"}
+        response.json.return_value = {
+            "status": "completed",
+            "results": [
+                {
+                    "platform": "youtube",
+                    "success": True,
+                    "post_url": "https://youtu.be/receipt",
+                }
+            ],
+        }
         http_client = AsyncMock()
         http_client.get.return_value = response
 
@@ -470,6 +486,112 @@ class TestUploadPostReceipts:
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert episode["youtube_longform_url"] == "https://youtu.be/receipt"
         assert episode["youtube_longform_url_source"] == "upload_post_receipt"
+        assert episode["youtube_longform_url_external_id"] == "cascade-longform-current"
+        assert episode["youtube_longform_url_release_revision"] == "sha256:release"
+        assert http_client.get.call_args.kwargs["params"] == {"request_id": "request-1"}
+
+    @pytest.mark.parametrize(
+        ("receipt", "expected_params"),
+        [
+            (
+                {
+                    "status": "submitted",
+                    "scheduled": True,
+                    "job_id": "job-1",
+                    "request_id": "request-1",
+                },
+                {"job_id": "job-1"},
+            ),
+            (
+                {
+                    "status": "unknown",
+                    "scheduled": False,
+                    "request_id": "request-2",
+                },
+                {"request_id": "request-2"},
+            ),
+        ],
+    )
+    def test_short_status_uses_receipt_kind_and_retries_unknown(
+        self, test_client, monkeypatch, receipt, expected_params
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "longform": None,
+                    "shorts": [{"clip_id": "clip-1", **receipt}],
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"status": "processing"}
+        http_client = AsyncMock()
+        http_client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert http_client.get.call_args.kwargs["params"] == expected_params
+        assert result.json()["shorts"] == [
+            {"clip_id": "clip-1", "status": "pending", "url": None}
+        ]
+
+    def test_short_status_surfaces_each_platform_failure(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "longform": None,
+                    "shorts": [
+                        {
+                            "clip_id": "clip-1",
+                            "status": "submitted",
+                            "scheduled": True,
+                            "job_id": "job-1",
+                        }
+                    ],
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "completed",
+            "results": [
+                {
+                    "platform": "youtube",
+                    "success": True,
+                    "post_url": "https://youtu.be/clip",
+                },
+                {
+                    "platform": "x",
+                    "success": False,
+                    "status": "failed",
+                    "error": "No access token",
+                },
+            ],
+        }
+        http_client = AsyncMock()
+        http_client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        short = result.json()["shorts"][0]
+        assert short["status"] == "partial_failure"
+        assert short["url"] == "https://youtu.be/clip"
+        assert short["platform_failures"]["x"]["error"] == "No access token"
 
 
 class TestRunSingleAgent:

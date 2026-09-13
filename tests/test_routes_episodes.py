@@ -480,6 +480,8 @@ class TestUpdateEpisode:
                 "youtube_longform_url": "https://youtu.be/receipt",
                 "youtube_longform_url_source": "upload_post_receipt",
                 "youtube_longform_url_captured_at": "2026-01-01T00:00:00+00:00",
+                "youtube_longform_url_external_id": "cascade-longform-old",
+                "youtube_longform_url_release_revision": "sha256:old",
             },
         )
 
@@ -492,6 +494,53 @@ class TestUpdateEpisode:
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert episode["youtube_longform_url_source"] == "supplied"
         assert "youtube_longform_url_captured_at" not in episode
+        assert "youtube_longform_url_external_id" not in episode
+        assert "youtube_longform_url_release_revision" not in episode
+
+    def test_publish_schedule_is_canonical_and_approval_bound(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        before = quality_revision(episode_dir)
+        schedule = [
+            {
+                "clip_id": "clip_01",
+                "scheduled_date": "2026-09-14T09:00:00-07:00",
+            }
+        ]
+
+        response = client.patch(
+            "/api/episodes/ep_001", json={"publish_schedule": schedule}
+        )
+
+        assert response.status_code == 200
+        assert canonical_release_metadata(episode_dir)["schedule"] == schedule
+        assert quality_revision(episode_dir) != before
+
+    def test_publish_schedule_requires_exact_dates(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+
+        response = client.patch(
+            "/api/episodes/ep_001",
+            json={"publish_schedule": [{"clip_id": "clip_01"}]},
+        )
+
+        assert response.status_code == 422
+
+    def test_publish_schedule_requires_offset_aware_dates(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+
+        response = client.patch(
+            "/api/episodes/ep_001",
+            json={
+                "publish_schedule": [
+                    {"clip_id": "clip_01", "scheduled_date": "2026-09-14T09:00:00"}
+                ]
+            },
+        )
+
+        assert response.status_code == 422
 
     def test_update_not_found(self, test_client):
         client, _ = test_client

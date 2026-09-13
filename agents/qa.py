@@ -354,7 +354,7 @@ def canonical_release_metadata(
     return {
         "longform": longform,
         "clips": resolved_clips,
-        "schedule": legacy.get("schedule", []),
+        "schedule": episode.get("publish_schedule", legacy.get("schedule", [])),
     }
 
 

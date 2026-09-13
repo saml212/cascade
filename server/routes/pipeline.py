@@ -684,7 +684,7 @@ async def approve_publish(
 # After longform is submitted via Upload-Post, YouTube takes 15 min to several
 # hours to process before the public URL is returned. Rather than force Sam to
 # paste the URL by hand, this endpoint queries Upload-Post's status API for
-# any pending request IDs on the episode and PATCHes episode.json with the
+# any pending request or scheduled-job IDs and PATCHes episode.json with the
 # URLs once they're live. Frontend polls this on a cadence.
 
 
@@ -695,7 +695,7 @@ class CheckUploadUrlsResponse(BaseModel):
 
 @router.post("/{episode_id}/check-upload-urls")
 async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
-    """Poll Upload-Post for any pending request_ids on this episode and
+    """Poll Upload-Post for pending request or scheduled-job IDs and
     update episode.json.youtube_longform_url when the URL becomes available.
 
     Returns a per-submission status so the frontend can show "YouTube is
@@ -730,7 +730,7 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
     result = CheckUploadUrlsResponse()
     status_url = "https://api.upload-post.com/api/uploadposts/status"
 
-    def _extract_youtube_url(resp_data: dict) -> Optional[str]:
+    def _extract_youtube_url(resp_data: dict) -> str | None:
         """Upload-Post's response shape varies; try several known paths."""
         # Direct URL at top level
         for key in ("video_url", "youtube_url", "url"):
@@ -744,22 +744,52 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
                 for key in ("video_url", "url", "post_url"):
                     if yt.get(key):
                         return yt[key]
+        results = resp_data.get("results", [])
+        if isinstance(results, list):
+            for item in results:
+                if not isinstance(item, dict) or item.get("platform") != "youtube":
+                    continue
+                for key in ("video_url", "url", "post_url"):
+                    if item.get(key):
+                        return item[key]
         return None
+
+    def _platform_failures(resp_data: dict) -> dict[str, dict]:
+        results = resp_data.get("results", [])
+        if not isinstance(results, list):
+            return {}
+        return {
+            str(item.get("platform", "unknown")): item
+            for item in results
+            if isinstance(item, dict)
+            and (
+                item.get("success") is False
+                or item.get("status") in {"failed", "skipped"}
+                or item.get("skipped") is True
+            )
+        }
+
+    def _status_query(receipt: dict) -> dict[str, str] | None:
+        if receipt.get("scheduled") is True:
+            job_id = receipt.get("job_id") or receipt.get("request_id")
+            return {"job_id": str(job_id)} if job_id else None
+        request_id = receipt.get("request_id")
+        return {"request_id": str(request_id)} if request_id else None
 
     # Longform check
     longform_res = publish_data.get("longform") or {}
     longform_status = longform_res.get("status")
-    longform_request_id = longform_res.get("request_id")
+    longform_query = _status_query(longform_res)
     existing_url = episode.get("youtube_longform_url", "")
 
     if existing_url:
         result.longform = {"status": "live", "url": existing_url}
-    elif longform_status == "submitted" and longform_request_id:
+    elif longform_status in {"submitted", "unknown"} and longform_query:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     status_url,
-                    params={"request_id": longform_request_id},
+                    params=longform_query,
                     headers={"Authorization": f"Apikey {api_key}"},
                 )
                 resp.raise_for_status()
@@ -773,9 +803,22 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
             result.longform = {"status": "pending", "url": None, "error": str(e)}
         else:
             url = _extract_youtube_url(data)
-            if url:
+            failures = _platform_failures(data)
+            if failures:
+                result.longform = {
+                    "status": "failed",
+                    "url": url,
+                    "platform_failures": failures,
+                }
+            elif url:
                 episode["youtube_longform_url"] = url
                 episode["youtube_longform_url_source"] = "upload_post_receipt"
+                episode["youtube_longform_url_external_id"] = longform_res.get(
+                    "external_id"
+                )
+                episode["youtube_longform_url_release_revision"] = publish_data.get(
+                    "release_revision"
+                )
                 episode["youtube_longform_url_captured_at"] = datetime.now(
                     timezone.utc
                 ).isoformat()
@@ -793,8 +836,8 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
     # Per-clip checks (best-effort; failures don't error the endpoint)
     for clip_result in publish_data.get("shorts", []):
         clip_id = clip_result.get("clip_id", "")
-        clip_request_id = clip_result.get("request_id")
-        if clip_result.get("status") != "submitted" or not clip_request_id:
+        clip_query = _status_query(clip_result)
+        if clip_result.get("status") not in {"submitted", "unknown"} or not clip_query:
             result.shorts.append(
                 {
                     "clip_id": clip_id,
@@ -807,17 +850,27 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     status_url,
-                    params={"request_id": clip_request_id},
+                    params=clip_query,
                     headers={"Authorization": f"Apikey {api_key}"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
             url = _extract_youtube_url(data)
+            failures = _platform_failures(data)
             result.shorts.append(
                 {
                     "clip_id": clip_id,
-                    "status": "live" if url else "pending",
+                    "status": (
+                        "partial_failure"
+                        if url and failures
+                        else "failed"
+                        if failures
+                        else "live"
+                        if url
+                        else "pending"
+                    ),
                     "url": url,
+                    **({"platform_failures": failures} if failures else {}),
                 }
             )
         except httpx.HTTPError as e:
