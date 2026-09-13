@@ -29,6 +29,7 @@ from lib.encoding import (
 )
 from lib.ffprobe import probe
 from lib.loudness import (
+    loudness_status,
     loudnorm_filter,
     measure_loudness,
     parse_loudnorm_analysis,
@@ -52,6 +53,7 @@ LONGFORM_TRIM_REUSE_VERSION = "verified-terminal-prefix/v1"
 TRANSCRIPT_RENDER_REUSE_VERSION = "verified-transcript-rebind/v1"
 OUTPUT_RESERVE_BYTES = 1_000_000_000
 SCRATCH_RESERVE_BYTES = 10_000_000_000
+_ENCODED_PEAK_RETRY_MARGIN_DB = 0.5
 _manifest_lock = threading.Lock()
 _render_locks_guard = threading.Lock()
 _render_locks: dict[str, threading.Lock] = {}
@@ -472,96 +474,141 @@ def mux_timeline_audio(
             f"requires audio through {required_end:.3f}s"
         )
 
-    filter_graph = _audio_filter_graph(list(timeline.keep_intervals))
-    audio_label = "[a]"
-    mastering = None
-    if loudness_policy is not None:
-        analysis_graph = (
-            _audio_filter_graph(list(timeline.keep_intervals), input_index=0)
-            + f";[a]{loudnorm_filter(loudness_policy)}[analysis]"
-        )
-        analysis_result = runner(
-            [
-                ffmpeg_executable(),
-                "-hide_banner",
-                "-nostats",
-                "-i",
-                str(audio_path),
-                "-filter_complex",
-                analysis_graph,
-                "-map",
-                "[analysis]",
-                "-f",
-                "null",
-                "-",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if analysis_result.returncode != 0:
-            raise RuntimeError(
-                "Loudness normalization analysis failed: "
-                + (analysis_result.stderr or "ffmpeg returned an error")[-500:]
-            )
-        measurements = parse_loudnorm_analysis(analysis_result.stderr)
-        filter_graph += (
-            f";[a]{loudnorm_filter(loudness_policy, measurements)}[mastered]"
-        )
-        audio_label = "[mastered]"
-        mastering = {
-            "method": "ffmpeg-loudnorm-two-pass/v1",
-            "policy": loudness_policy,
-            "input_measurement": measurements,
-        }
-
     input_video = (
         video_packet_signature(video_path, runner=runner) if verify_video_copy else None
     )
+    active_policy = loudness_policy
+    retry_record = None
     with staged_render_output(output_path) as temp:
-        runner(
-            [
-                ffmpeg_executable(),
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(video_path),
-                "-i",
-                str(audio_path),
-                "-filter_complex",
-                filter_graph,
-                "-map",
-                "0:v",
-                "-map",
-                audio_label,
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                audio_bitrate,
-                "-ar",
-                str(AAC_OUTPUT_SAMPLE_RATE),
-                *([] if verify_video_copy else ["-shortest"]),
-                "-use_editlist",
-                "0",
-                "-movflags",
-                "+faststart",
-                str(temp),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        media = validate_av_output(temp, timeline.duration)
-        media["audio_timing"] = aac_content_timing_proof()
-        if loudness_policy is not None:
-            media["audio_loudness"] = require_delivery_loudness(
-                measure_loudness(temp, ffmpeg_bin=ffmpeg_executable()), loudness_policy
+        for attempt in range(2):
+            filter_graph = _audio_filter_graph(list(timeline.keep_intervals))
+            audio_label = "[a]"
+            measurements = None
+            if active_policy is not None:
+                analysis_graph = (
+                    _audio_filter_graph(list(timeline.keep_intervals), input_index=0)
+                    + f";[a]{loudnorm_filter(active_policy)}[analysis]"
+                )
+                analysis_result = runner(
+                    [
+                        ffmpeg_executable(),
+                        "-hide_banner",
+                        "-nostats",
+                        "-i",
+                        str(audio_path),
+                        "-filter_complex",
+                        analysis_graph,
+                        "-map",
+                        "[analysis]",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if analysis_result.returncode != 0:
+                    raise RuntimeError(
+                        "Loudness normalization analysis failed: "
+                        + (analysis_result.stderr or "ffmpeg returned an error")[-500:]
+                    )
+                measurements = parse_loudnorm_analysis(analysis_result.stderr)
+                filter_graph += (
+                    f";[a]{loudnorm_filter(active_policy, measurements)}[mastered]"
+                )
+                audio_label = "[mastered]"
+
+            runner(
+                [
+                    ffmpeg_executable(),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(video_path),
+                    "-i",
+                    str(audio_path),
+                    "-filter_complex",
+                    filter_graph,
+                    "-map",
+                    "0:v",
+                    "-map",
+                    audio_label,
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    audio_bitrate,
+                    "-ar",
+                    str(AAC_OUTPUT_SAMPLE_RATE),
+                    *([] if verify_video_copy else ["-shortest"]),
+                    "-use_editlist",
+                    "0",
+                    "-movflags",
+                    "+faststart",
+                    str(temp),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
             )
-            media["audio_mastering"] = mastering
+            media = validate_av_output(temp, timeline.duration)
+            media["audio_timing"] = aac_content_timing_proof()
+            if loudness_policy is None:
+                break
+
+            encoded_measurement = measure_loudness(temp, ffmpeg_bin=ffmpeg_executable())
+            status = loudness_status(encoded_measurement, loudness_policy)
+            if status["safe"]:
+                media["audio_loudness"] = require_delivery_loudness(
+                    encoded_measurement, loudness_policy
+                )
+                media["audio_mastering"] = {
+                    "method": "ffmpeg-loudnorm-two-pass/v1",
+                    "policy": loudness_policy,
+                    "input_measurement": measurements,
+                }
+                if retry_record is not None:
+                    media["audio_mastering"]["encoded_peak_retry"] = retry_record
+                break
+
+            try:
+                true_peak = float(encoded_measurement["true_peak_dbfs"])
+            except (KeyError, TypeError, ValueError):
+                true_peak = float("nan")
+            if (
+                attempt == 0
+                and math.isfinite(true_peak)
+                and true_peak > loudness_policy["max_true_peak_dbfs"]
+                and status.get("integrated_delta_lu", float("inf"))
+                <= loudness_policy["integrated_tolerance_lu"]
+            ):
+                overshoot = true_peak - loudness_policy["max_true_peak_dbfs"]
+                retry_target = max(
+                    -9.0,
+                    active_policy["target_true_peak_dbfs"]
+                    - overshoot
+                    - _ENCODED_PEAK_RETRY_MARGIN_DB,
+                )
+                retry_record = {
+                    "method": "measured-aac-headroom/v1",
+                    "initial_encoded_measurement": encoded_measurement,
+                    "initial_target_true_peak_dbfs": active_policy[
+                        "target_true_peak_dbfs"
+                    ],
+                    "retry_target_true_peak_dbfs": round(retry_target, 3),
+                    "safety_margin_db": _ENCODED_PEAK_RETRY_MARGIN_DB,
+                }
+                active_policy = {
+                    **active_policy,
+                    "target_true_peak_dbfs": retry_target,
+                }
+                continue
+
+            require_delivery_loudness(encoded_measurement, loudness_policy)
         if input_video is not None:
             output_video = video_packet_signature(temp, runner=runner)
             if output_video != input_video:

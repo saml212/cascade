@@ -759,6 +759,73 @@ def test_mux_two_pass_normalizes_retained_timeline_and_records_final_proof(tmp_p
     assert output.read_bytes() == b"mastered"
 
 
+def test_mux_retries_aac_true_peak_overshoot_without_reencoding_video(tmp_path):
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "result.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    commands = []
+    mux_count = 0
+    analysis = (
+        '{"input_i":"-16.24","input_lra":"10.8","input_tp":"-1.48",'
+        '"input_thresh":"-27.25","target_offset":"0.22"}'
+    )
+
+    def runner(command, **_kwargs):
+        nonlocal mux_count
+        commands.append(command)
+        if command[-1] == "-":
+            return SimpleNamespace(returncode=0, stderr=analysis)
+        mux_count += 1
+        Path(command[-1]).write_bytes(f"mux-{mux_count}".encode())
+        return SimpleNamespace(returncode=0, stderr="")
+
+    unsafe = {
+        "integrated_lufs": -16.4,
+        "true_peak_dbfs": 0.9,
+        "loudness_range_lu": 10.8,
+    }
+    safe = {
+        "integrated_lufs": -16.2,
+        "true_peak_dbfs": -1.3,
+        "loudness_range_lu": 10.8,
+    }
+    with (
+        patch("lib.delivery_video.probe", return_value={"format": {"duration": "5"}}),
+        patch(
+            "lib.delivery_video.validate_av_output",
+            return_value={"duration_seconds": 5},
+        ),
+        patch(
+            "lib.delivery_video.measure_loudness", side_effect=[unsafe, safe]
+        ) as measure,
+    ):
+        media = mux_timeline_audio(
+            video,
+            audio,
+            output,
+            Timeline.from_edits(5),
+            loudness_policy=delivery_loudness_policy({}, "longform"),
+            runner=runner,
+        )
+
+    assert measure.call_count == 2
+    mux_commands = [command for command in commands if command[-1] != "-"]
+    assert len(mux_commands) == 2
+    assert all(command[command.index("-c:v") + 1] == "copy" for command in mux_commands)
+    initial_graph = mux_commands[0][mux_commands[0].index("-filter_complex") + 1]
+    retry_graph = mux_commands[1][mux_commands[1].index("-filter_complex") + 1]
+    assert "TP=-1.5" in initial_graph
+    assert "TP=-3.9" in retry_graph
+    assert output.read_bytes() == b"mux-2"
+    assert media["audio_loudness"]["true_peak_dbfs"] == -1.3
+    retry = media["audio_mastering"]["encoded_peak_retry"]
+    assert retry["initial_encoded_measurement"] == unsafe
+    assert retry["retry_target_true_peak_dbfs"] == -3.9
+    assert retry["safety_margin_db"] == 0.5
+
+
 def test_mux_loudness_failure_preserves_existing_output(tmp_path):
     video = tmp_path / "video.mp4"
     audio = tmp_path / "audio.wav"
