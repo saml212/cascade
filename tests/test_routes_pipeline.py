@@ -10,7 +10,7 @@ from tests.test_routes_episodes import _create_episode
 pytest_plugins = ["tests.test_routes_episodes"]
 
 
-def _release_snapshot(*, upload_post=True, podcast_rss=False):
+def _release_snapshot(*, upload_post=True, podcast_rss=False, video_podcast_rss=False):
     return {
         "release_gate": {
             "can_approve_publish": True,
@@ -26,6 +26,15 @@ def _release_snapshot(*, upload_post=True, podcast_rss=False):
                     "account_identity": "sha256:r2-account",
                     "destination_configured": True,
                     "channel_configured": True,
+                },
+                "video_podcast_rss": {
+                    "enabled": video_podcast_rss,
+                    "format": "video",
+                    "feed_key": "feed-video.xml",
+                    "account_identity": "sha256:r2-account",
+                    "destination_configured": True,
+                    "channel_configured": True,
+                    "episode_configured": True,
                 },
             },
         }
@@ -312,6 +321,49 @@ class TestPublishApproval:
         )
         assert "publish_approved" not in episode
         assert "publish_approved_at" not in episode
+
+    def test_records_video_plan_without_starting_any_publisher(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"status": "ready_for_review"},
+        )
+
+        with (
+            patch("server.routes.pipeline.quality_snapshot") as snapshot,
+            patch("server.routes.pipeline._start_pipeline_thread") as start_pipeline,
+        ):
+            snapshot.return_value = _release_snapshot(
+                upload_post=False,
+                podcast_rss=False,
+                video_podcast_rss=True,
+            )
+            response = client.post(
+                "/api/episodes/ep_001/approve-publish",
+                json={"start_publication": False},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "approved",
+            "episode_id": "ep_001",
+            "publication_started": False,
+            "publication_agents": [],
+        }
+        start_pipeline.assert_not_called()
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert episode["status"] == "ready_for_review"
+        assert episode["publish_approval"]["revision"] == "sha256:approved-plan"
+        assert episode["publish_approval"]["plan"]["video_podcast_rss"] == {
+            "enabled": True,
+            "format": "video",
+            "feed_key": "feed-video.xml",
+            "account_identity": "sha256:r2-account",
+            "destination_configured": True,
+            "channel_configured": True,
+            "episode_configured": True,
+        }
 
     def test_rss_only_plan_dispatches_only_podcast_feed(self, test_client):
         client, episodes_dir = test_client

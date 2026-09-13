@@ -333,6 +333,7 @@ class EpisodeUpdateRequest(BaseModel):
     guest_title: Optional[str] = None
     episode_name: Optional[str] = None
     episode_description: Optional[str] = None
+    video_explicit: Optional[bool] = None
     youtube_longform_url: Optional[str] = None
     spotify_longform_url: Optional[str] = None
     link_tree_url: Optional[str] = None
@@ -356,6 +357,8 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         ep["episode_name"] = req.episode_name
     if req.episode_description is not None:
         ep["episode_description"] = req.episode_description
+    if req.video_explicit is not None:
+        ep["video_explicit"] = req.video_explicit
     if req.youtube_longform_url is not None:
         ep["youtube_longform_url"] = req.youtube_longform_url
         ep["youtube_longform_url_source"] = "supplied"

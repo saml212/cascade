@@ -115,6 +115,11 @@ audio_format = "mp3"
 audio_bitrate = "128k"
 artwork_path = ""
 
+[platforms.video_podcast_rss]
+# Dedicated Apple video show. Uses feed-video.xml and immutable video objects;
+# it never changes or invokes the audio podcast feed.
+enabled = false
+
 [podcast]
 title = "My Podcast"                      # Your podcast name
 description = "A podcast about things"    # Short description

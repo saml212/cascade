@@ -49,7 +49,7 @@ from lib.timeline import Timeline
 from lib.transcript_search import clip_boundary_evidence
 
 QUALITY_SCHEMA = "cascade.release-quality/v1"
-PUBLISH_PLAN_SCHEMA = "cascade.publish-plan/v1"
+PUBLISH_PLAN_SCHEMA = "cascade.publish-plan/v2"
 QUALITY_REPORT_PATH = Path("qa/qa.json")
 AUDIO_REPORT_PATH = Path("qa/audio-quality.json")
 PLATFORM_COPY_FIELDS = {
@@ -69,6 +69,19 @@ PODCAST_CHANNEL_FIELDS = (
     "link",
     "owner_email",
 )
+
+
+def normalize_podcast_explicit(value: object) -> str | None:
+    """Return Apple's canonical explicit value without truthy-string coercion."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "explicit"}:
+            return "true"
+        if normalized in {"false", "no", "clean"}:
+            return "false"
+    return None
 
 
 def _load_json(path: Path, default=None):
@@ -207,6 +220,82 @@ def _podcast_rss_plan(
     return plan
 
 
+def _video_podcast_rss_plan(
+    config: dict, episode: dict, environment: Mapping[str, str]
+) -> dict:
+    """Describe the dedicated, immutable-video RSS destination."""
+    platforms = config.get("platforms", {})
+    enabled = platforms.get("video_podcast_rss", {}).get("enabled") is True
+    plan = {"enabled": enabled, "format": "video"}
+    if not enabled:
+        return plan
+
+    podcast = config.get("podcast", {})
+    r2 = podcast.get("r2", {})
+    account = environment.get("CLOUDFLARE_ACCOUNT_ID", "")
+    required_text_fields = (
+        "title",
+        "description",
+        "author",
+        "artwork_url",
+        "link",
+        "owner_email",
+    )
+    channel_explicit = normalize_podcast_explicit(podcast.get("explicit", "false"))
+    episode_explicit = normalize_podcast_explicit(
+        episode.get("video_explicit", podcast.get("explicit", "false"))
+    )
+    episode_title = episode.get("title") or episode.get("episode_name", "")
+    episode_description = episode.get("description") or episode.get(
+        "episode_description", ""
+    )
+    channel_identity = {field: podcast.get(field) for field in PODCAST_CHANNEL_FIELDS}
+    channel_identity["explicit"] = channel_explicit
+    plan.update(
+        feed_key="feed-video.xml",
+        media_prefix="video",
+        enclosure_type="video/mp4",
+        account_identity=(
+            _private_identity("cloudflare-account", account) if account else None
+        ),
+        destination_identity=_private_identity(
+            "video-podcast-r2-destination",
+            {
+                "bucket": r2.get("bucket", ""),
+                "public_url": str(r2.get("public_url", "")).rstrip("/"),
+                "feed_key": "feed-video.xml",
+                "media_prefix": "video",
+            },
+        ),
+        destination_configured=bool(r2.get("bucket") and r2.get("public_url")),
+        channel_identity=_private_identity(
+            "video-podcast-channel",
+            channel_identity,
+        ),
+        channel_configured=(
+            all(podcast.get(field) for field in required_text_fields)
+            and channel_explicit is not None
+        ),
+        episode_identity=_private_identity(
+            "video-podcast-episode",
+            {
+                "episode_id": episode.get("episode_id", ""),
+                "title": episode_title,
+                "description": episode_description,
+                "explicit": episode_explicit,
+                "created_at": episode.get("created_at", ""),
+            },
+        ),
+        episode_configured=bool(
+            episode.get("episode_id")
+            and episode_title
+            and episode_description
+            and episode_explicit is not None
+        ),
+    )
+    return plan
+
+
 def current_publish_plan(
     config: dict,
     episode: dict,
@@ -219,6 +308,7 @@ def current_publish_plan(
         "schema": PUBLISH_PLAN_SCHEMA,
         "upload_post": _upload_post_plan(config, episode, environment),
         "podcast_rss": _podcast_rss_plan(config, episode, environment),
+        "video_podcast_rss": _video_podcast_rss_plan(config, episode, environment),
     }
 
 

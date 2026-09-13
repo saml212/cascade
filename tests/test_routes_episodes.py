@@ -433,6 +433,7 @@ class TestUpdateEpisode:
                 "guest_name": "Jane Doe",
                 "guest_title": "Engineer",
                 "episode_name": "The Interview",
+                "video_explicit": True,
             },
         )
         assert resp.status_code == 200
@@ -441,6 +442,7 @@ class TestUpdateEpisode:
         assert data["guest_name"] == "Jane Doe"
         assert data["guest_title"] == "Engineer"
         assert data["episode_name"] == "The Interview"
+        assert data["video_explicit"] is True
 
     def test_update_release_copy_changes_quality_revision(self, test_client):
         client, episodes_dir = test_client

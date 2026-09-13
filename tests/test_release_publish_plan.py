@@ -13,6 +13,7 @@ def _config() -> dict:
             "instagram": {"enabled": False},
             "x": {"enabled": False},
             "podcast_rss": {"enabled": False},
+            "video_podcast_rss": {"enabled": False},
         },
         "schedule": {
             "timezone": "America/Los_Angeles",
@@ -155,6 +156,40 @@ def test_rss_destination_channel_and_account_change_release_revision(tmp_path):
 
     config["podcast"]["title"] = "Private show title"
     environment["CLOUDFLARE_ACCOUNT_ID"] = "b"
+    assert (
+        release_revision(tmp_path, episode, config=config, environment=environment)
+        != approved
+    )
+
+
+def test_video_rss_destination_is_explicit_and_revision_bound(tmp_path):
+    config = _config()
+    episode = _episode()
+    environment = {"UPLOAD_POST_USER": "account", "CLOUDFLARE_ACCOUNT_ID": "a"}
+    before = release_revision(tmp_path, episode, config=config, environment=environment)
+
+    config["platforms"]["video_podcast_rss"]["enabled"] = True
+    plan = current_publish_plan(config, episode, environment=environment)
+    video = plan["video_podcast_rss"]
+    assert video["enabled"] is True
+    assert video["format"] == "video"
+    assert video["feed_key"] == "feed-video.xml"
+    assert video["media_prefix"] == "video"
+    assert video["enclosure_type"] == "video/mp4"
+    assert video["episode_configured"] is True
+    approved = release_revision(
+        tmp_path, episode, config=config, environment=environment
+    )
+    assert approved != before
+
+    config["podcast"]["r2"]["bucket"] = "another-video-bucket"
+    assert (
+        release_revision(tmp_path, episode, config=config, environment=environment)
+        != approved
+    )
+
+    config["podcast"]["r2"]["bucket"] = "private-bucket"
+    episode["video_explicit"] = True
     assert (
         release_revision(tmp_path, episode, config=config, environment=environment)
         != approved

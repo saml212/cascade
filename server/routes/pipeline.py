@@ -120,6 +120,10 @@ class ApproveLongformRequest(BaseModel):
     continue_production: bool = True
 
 
+class ApprovePublishRequest(BaseModel):
+    start_publication: bool = True
+
+
 # ── Response models ─────────────────────────────────────────────────────────
 # Typed responses so the frontend can read the contract from the Pydantic
 # model instead of inferring it from handler bodies.
@@ -142,6 +146,11 @@ class ResumePipelineResponse(PipelineActionResponse):
 
 class ApproveLongformResponse(PipelineActionResponse):
     production_started: bool
+
+
+class ApprovePublishResponse(PipelineActionResponse):
+    publication_started: bool
+    publication_agents: list[str]
 
 
 class RunAgentResponse(BaseModel):
@@ -546,8 +555,11 @@ async def approve_longform(
 
 
 @router.post("/{episode_id}/approve-publish")
-async def approve_publish(episode_id: str) -> PipelineActionResponse:
-    """Approve and publish one fully reviewed, current release revision."""
+async def approve_publish(
+    episode_id: str, request: ApprovePublishRequest | None = None
+) -> ApprovePublishResponse:
+    """Approve the current release, optionally starting legacy publishers."""
+    request = request or ApprovePublishRequest()
     logger.info("POST /api/episodes/%s/approve-publish", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
@@ -582,10 +594,19 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
             publication_agents.append("publish")
         if plan["podcast_rss"]["enabled"]:
             publication_agents.append("podcast_feed")
-        if not publication_agents:
+        video_rss_plan = plan.get("video_podcast_rss", {"enabled": False})
+        if not publication_agents and not video_rss_plan.get("enabled"):
             raise HTTPException(
                 status_code=409,
                 detail="No publication destinations are enabled",
+            )
+        if request.start_publication and not publication_agents:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Video RSS publication uses its dedicated endpoint; record approval "
+                    "with start_publication=false first"
+                ),
             )
         configuration_blockers = []
         if plan["upload_post"].get("enabled") and not plan["upload_post"].get(
@@ -599,6 +620,26 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
             configuration_blockers.append("Podcast R2 destination is not configured")
         if rss_plan.get("enabled") and not rss_plan.get("channel_configured"):
             configuration_blockers.append("Podcast channel metadata is incomplete")
+        if video_rss_plan.get("enabled") and not video_rss_plan.get("account_identity"):
+            configuration_blockers.append("CLOUDFLARE_ACCOUNT_ID is not configured")
+        if video_rss_plan.get("enabled") and not video_rss_plan.get(
+            "destination_configured"
+        ):
+            configuration_blockers.append(
+                "Video podcast R2 destination is not configured"
+            )
+        if video_rss_plan.get("enabled") and not video_rss_plan.get(
+            "channel_configured"
+        ):
+            configuration_blockers.append(
+                "Video podcast channel metadata is incomplete"
+            )
+        if video_rss_plan.get("enabled") and not video_rss_plan.get(
+            "episode_configured"
+        ):
+            configuration_blockers.append(
+                "Video podcast episode title, description, or explicit flag is incomplete"
+            )
         if configuration_blockers:
             raise HTTPException(
                 status_code=409,
@@ -615,20 +656,28 @@ async def approve_publish(episode_id: str) -> PipelineActionResponse:
             "approved_at": now,
             "plan": plan,
         }
-        episode["status"] = "processing"
+        if request.start_publication:
+            episode["status"] = "processing"
 
         atomic_write_json(episode_file, episode)
 
-        source_path = episode.get("source_path", "")
-
-        _start_pipeline_thread(episode_id, source_path, publication_agents)
+        if request.start_publication:
+            _start_pipeline_thread(
+                episode_id, episode.get("source_path", ""), publication_agents
+            )
 
     logger.info(
-        "Publication approved and started for %s: %s",
+        "Publication approved for %s; started=%s agents=%s",
         episode_id,
+        request.start_publication,
         publication_agents,
     )
-    return {"status": "shorts_publishing", "episode_id": episode_id}
+    return {
+        "status": "shorts_publishing" if request.start_publication else "approved",
+        "episode_id": episode_id,
+        "publication_started": request.start_publication,
+        "publication_agents": publication_agents if request.start_publication else [],
+    }
 
 
 # ── Upload-Post URL polling ─────────────────────────────────────────────────
