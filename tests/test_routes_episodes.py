@@ -1206,29 +1206,12 @@ class TestAudioPreview:
         assert cmd[cmd.index("-ss") + 1] == "32.5"
 
 
-class TestApproveEpisode:
-    def test_approve(self, test_client):
-        client, episodes_dir = test_client
-        clips = [{"id": "clip_01", "status": "pending"}]
-        _create_episode(episodes_dir, "ep_001", {"clips": clips})
-        resp = client.post("/api/episodes/ep_001/approve")
-        assert resp.status_code == 200
+def test_generic_batch_approval_route_is_not_exposed(test_client):
+    client, _ = test_client
 
-        resp2 = client.get("/api/episodes/ep_001")
-        data = resp2.json()
-        assert data["status"] == "approved"
-        assert all(c["status"] == "approved" for c in data["clips"])
+    paths = client.get("/openapi.json").json()["paths"]
 
-    def test_approve_updates_clips_json(self, test_client):
-        """Approving should also update clips.json if it exists."""
-        client, episodes_dir = test_client
-        clips = [{"id": "clip_01", "status": "pending"}]
-        ep_dir = _create_episode(episodes_dir, "ep_001", {"clips": clips})
-        with open(ep_dir / "clips.json", "w") as f:
-            json.dump({"clips": clips}, f)
-
-        client.post("/api/episodes/ep_001/approve")
-
-        with open(ep_dir / "clips.json") as f:
-            data = json.load(f)
-        assert data["clips"][0]["status"] == "approved"
+    assert "/api/episodes/{episode_id}/approve" not in paths
+    assert "/api/episodes/{episode_id}/approve-longform" in paths
+    assert "/api/episodes/{episode_id}/approve-publish" in paths
+    assert "/api/episodes/{episode_id}/clips/{clip_id}/approve" in paths

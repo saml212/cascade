@@ -434,41 +434,6 @@ async def delete_episode(episode_id: str) -> dict:
     return {"status": "deleted", "episode_id": episode_id}
 
 
-@router.post("/{episode_id}/approve")
-async def approve_episode(episode_id: str) -> dict:
-    """Approve the entire episode batch."""
-    ep = read_episode(episode_id)
-    ep["status"] = "approved"
-    ep["approved_at"] = datetime.now(timezone.utc).isoformat()
-
-    # Mark all pending clips as approved
-    for clip in ep.get("clips", []):
-        if clip.get("status", "pending") == "pending":
-            clip["status"] = "approved"
-
-    # Also update clips.json if it exists
-    clips_file = EPISODES_DIR / episode_id / "clips.json"
-    if clips_file.exists():
-        try:
-            with open(clips_file) as f:
-                clips_data = json.load(f)
-            clips_list = (
-                clips_data.get("clips", clips_data)
-                if isinstance(clips_data, dict)
-                else clips_data
-            )
-            for clip in clips_list:
-                if clip.get("status", "pending") == "pending":
-                    clip["status"] = "approved"
-            with open(clips_file, "w") as f:
-                json.dump(clips_data, f, indent=2)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    write_episode(episode_id, ep)
-    return {"status": "approved", "episode_id": episode_id}
-
-
 @router.get("/{episode_id}/crop-frame")
 async def get_crop_frame(episode_id: str):
     """Serve the crop_frame.jpg extracted by the stitch agent."""
