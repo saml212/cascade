@@ -97,15 +97,15 @@ Longer-term workstreams captured during the 2026-04-21 session. Ordered roughly 
 
 **Size:** Focused 1-2 sessions of research + tuning, then iterate per-episode as Sam's ear catches new issues.
 
-### 11. Full frontend redesign (in parallel, separate dev-agent session)
+### 11. Full frontend redesign (completed)
 
-**What:** Hand off the entire cascade frontend to a dedicated Claude Code session using the frontend-design skill. Sam has that skill installed elsewhere and it has produced quality UI on other projects. The current UI is functional but visually/interactionally underwhelming — especially the crop-setup page (too dense, confusing affordances), the audio mixer (widgets and sync verification keep surprising us), and the dashboard (no strong sense of "what's happening" at a glance).
+**What:** The frontend was rebuilt as a Vite + TypeScript application with dedicated dashboard, crop setup, review, publishing, backup, and scheduling surfaces.
 
 **Why:** Every UI bug we hit today (port 8420 vs 8000, camera mute button desync, initSyncAudio missing from one of two pages, mixer placebo, duplicate track assignments) is both a specific fix AND a symptom of a UI that grew organically rather than being designed. A dedicated design pass pays off in fewer surprises per episode.
 
-**How:** A separate Claude Code session with the frontend-design skill. The handoff prompt lives at `docs/frontend-redesign-handoff.md`. While that work is happening, the backend dev-agent (this session's successor) keeps hardening the API + CLI + subagent layer. Backend API contract is FROZEN from the redesign agent's perspective — routes, pydantic models, episode.json schema all stay stable.
+**Requirements retained:** Keep `frontend/src/lib/api.ts` synchronized with the Pydantic route contracts, preserve the manual crop and audio-verification controls, and follow `docs/design-system.md` plus `frontend/README.md` for durable UI and build guidance.
 
-**Size:** likely 2-3 full sessions by the design agent.
+**Status:** Shipped. Continue improving individual screens through the normal backlog rather than another handoff document.
 
 ### 12. Agent-inside-UI (eventual)
 

@@ -8,7 +8,7 @@ The frontend rebuild in `frontend/` is done and served by `server/app.py`. The s
 
 ## Summary of what shipped
 
-Every page referenced in `docs/frontend-redesign-handoff.md` is built and rendering against real data from the four episodes on `/Volumes/1TB_SSD/cascade/episodes/`. The editorial surfaces (Clip Review with 9-platform metadata accordion + chat dock, Longform Review with cut timeline and natural-language edit input) and the Crop Setup surface (video scrubber + H6E waveform verifier + Web Audio track mixer) are all wired to the existing backend contract you own.
+The shipped frontend includes the editorial surfaces (Clip Review with 9-platform metadata accordion + chat dock, Longform Review with cut timeline and natural-language edit input) and the Crop Setup surface (video scrubber + H6E waveform verifier + Web Audio track mixer). They are wired to the existing backend contract.
 
 The typed API client lives at `frontend/src/lib/api.ts`. **Every route my UI calls is enumerated there.** If you rename or reshape any of those routes, that file is the first place to sync.
 
