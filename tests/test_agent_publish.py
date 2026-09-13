@@ -887,6 +887,13 @@ class TestScheduleConversion:
         )
         assert dt.isoformat() == "2026-11-01T18:00:00-08:00"
 
+    def test_absolute_date_still_requires_an_explicit_offset(self, env, episode_dir):
+        with pytest.raises(ValueError, match="no UTC offset"):
+            _make_agent(episode_dir)._schedule_to_datetime(
+                {"scheduled_date": "2026-09-19T09:00:00"},
+                "America/Los_Angeles",
+            )
+
     def test_absolute_date_requires_matching_timezone_offset(self, env, episode_dir):
         with pytest.raises(ValueError, match="offset does not match"):
             _make_agent(episode_dir)._schedule_to_datetime(
@@ -1108,6 +1115,24 @@ class TestScheduleReservation:
         occupied = _make_agent(episode_dir)._occupied_schedule("key", "test_user")
 
         assert {item["job_id"] for item in occupied} == {"job-one", "job-two"}
+
+    def test_offsetless_remote_calendar_date_is_utc(
+        self, env, monkeypatch, episode_dir
+    ):
+        monkeypatch.setattr(
+            PublishAgent,
+            "_remote_schedule",
+            lambda *_args: [
+                {
+                    "job_id": "remote-job",
+                    "scheduled_date": "2026-09-19T16:00:00",
+                }
+            ],
+        )
+
+        occupied = _make_agent(episode_dir)._occupied_schedule("key", "test_user")
+
+        assert occupied[0]["scheduled_at"].isoformat() == "2026-09-19T16:00:00+00:00"
 
     def test_malformed_sibling_receipt_blocks_before_upload(self, env, episode_dir):
         _seed_episode(episode_dir)

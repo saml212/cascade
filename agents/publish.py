@@ -50,6 +50,13 @@ def _parse_time(value: str) -> datetime:
     return result
 
 
+def _parse_remote_schedule_time(value: str) -> datetime:
+    """Parse Upload-Post calendar dates, whose offsetless values are UTC."""
+    value = value.strip().replace("Z", "+00:00")
+    result = datetime.fromisoformat(value)
+    return result if result.tzinfo is not None else result.replace(tzinfo=timezone.utc)
+
+
 def _instant(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(microsecond=0)
 
@@ -632,7 +639,7 @@ class PublishAgent(BaseAgent):
                     "Cannot inspect Upload-Post schedule; a job is not an object"
                 )
             try:
-                scheduled_at = _parse_time(item["scheduled_date"])
+                scheduled_at = _parse_remote_schedule_time(item["scheduled_date"])
             except (AttributeError, KeyError, TypeError, ValueError) as error:
                 raise RuntimeError(
                     "Cannot inspect Upload-Post schedule; a job has no valid time"
