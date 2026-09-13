@@ -41,6 +41,8 @@ from lib.loudness import delivery_loudness_policy, loudness_status
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
+THREE_PERSON_STACK_CAPTION_MARGIN_V = 600
+
 
 class ShortsRenderAgent(BaseAgent):
     name = "shorts_render"
@@ -393,6 +395,9 @@ class ShortsRenderAgent(BaseAgent):
         render_segments = self._apply_overlap_policy(render_segments)
         captions = rebase_diarized(diarized, timeline)
         style = CaptionStyle()
+        three_person_stack_enabled = bool(
+            episode.get("shorts_three_person_stack", False)
+        )
         caption_path = Path(caption_path).with_suffix(".ass")
         caption_path.parent.mkdir(parents=True, exist_ok=True)
         generate_ass_from_diarized(captions, 0, timeline.duration, caption_path, style)
@@ -409,12 +414,15 @@ class ShortsRenderAgent(BaseAgent):
                 segment_timeline = Timeline(
                     timeline.duration, [(segment["start"], segment["end"])]
                 )
+                segment_style = self._short_caption_style(
+                    segment["speaker"], crop_config, three_person_stack_enabled
+                )
                 generate_ass_from_diarized(
                     rebase_diarized(captions, segment_timeline),
                     0,
                     segment["duration"],
                     segment_ass,
-                    style,
+                    segment_style,
                 )
                 filters = []
                 if lut_filter:
@@ -422,7 +430,11 @@ class ShortsRenderAgent(BaseAgent):
                 filters.extend(
                     [
                         self._get_short_crop_filter_no_subs(
-                            segment["speaker"], src_w, src_h, crop_config
+                            segment["speaker"],
+                            src_w,
+                            src_h,
+                            crop_config,
+                            three_person_stack=three_person_stack_enabled,
                         ),
                     ]
                 )
@@ -484,7 +496,8 @@ class ShortsRenderAgent(BaseAgent):
                 ),
                 "overlap_policy": (
                     "hold_neighbor_up_to_threshold_else_three_person_stack"
-                    if len(episode.get("crop_config", {}).get("speakers", [])) == 3
+                    if three_person_stack_enabled
+                    and len(episode.get("crop_config", {}).get("speakers", [])) == 3
                     else "hold_neighbor_up_to_threshold_else_two_person_stack_or_fit_wide"
                 ),
                 "overlap_hold_seconds": self.config.get("processing", {}).get(
@@ -551,7 +564,30 @@ class ShortsRenderAgent(BaseAgent):
         x, y, crop_w, crop_h = compute_crop(src_w, src_h, cx, cy, zoom, "short")
         return crop_w, crop_h, x, y
 
-    def _get_short_crop_filter_no_subs(self, speaker, src_w, src_h, crop_config):
+    @staticmethod
+    def _uses_three_person_stack(speaker, crop_config, enabled):
+        return (
+            enabled
+            and speaker in {"BOTH", "NONE"}
+            and len(crop_config.get("speakers", [])) == 3
+        )
+
+    def _short_caption_style(self, speaker, crop_config, three_person_stack_enabled):
+        if self._uses_three_person_stack(
+            speaker, crop_config, three_person_stack_enabled
+        ):
+            return CaptionStyle(margin_v=THREE_PERSON_STACK_CAPTION_MARGIN_V)
+        return CaptionStyle()
+
+    def _get_short_crop_filter_no_subs(
+        self,
+        speaker,
+        src_w,
+        src_h,
+        crop_config,
+        *,
+        three_person_stack=False,
+    ):
         if speaker == "BOTH" and len(crop_config.get("speakers", [])) == 2:
             panels = []
             for index, output_label in enumerate(("top", "bottom")):
@@ -586,7 +622,7 @@ class ShortsRenderAgent(BaseAgent):
             )
             polish = get_video_polish_filters(self.config)
             return f"{chain},{polish}" if polish else chain
-        if speaker in {"BOTH", "NONE"} and len(crop_config.get("speakers", [])) == 3:
+        if self._uses_three_person_stack(speaker, crop_config, three_person_stack):
             regions = []
             for index in range(3):
                 portrait_w, portrait_h, portrait_x, portrait_y = (

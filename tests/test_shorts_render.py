@@ -7,10 +7,12 @@ from unittest.mock import patch
 import pytest
 
 from agents.shorts_render import (
+    THREE_PERSON_STACK_CAPTION_MARGIN_V,
     ShortsRenderAgent,
     render_single_clip,
     repair_single_clip_audio,
 )
+from lib.ass import DEFAULT_MARGIN_V
 from lib.delivery_video import render_space_budget
 from lib.encoding import get_video_encoding_policy
 from lib.timeline import Timeline
@@ -117,7 +119,9 @@ def test_three_person_overlap_stacks_all_crops_in_spatial_order(
         ]
     }
 
-    video_filter = agent._get_short_crop_filter_no_subs(overlap, 320, 180, crop_config)
+    video_filter = agent._get_short_crop_filter_no_subs(
+        overlap, 320, 180, crop_config, three_person_stack=True
+    )
 
     assert video_filter.startswith("split=3[stack0][stack1][stack2]")
     assert "[stack2]crop=100:58:30:20" in video_filter
@@ -133,7 +137,12 @@ def test_three_person_overlap_stacks_all_crops_in_spatial_order(
 
 @pytest.mark.parametrize(
     ("overlap", "speakers"),
-    [("BOTH", [{}]), ("NONE", [{}, {}]), ("BOTH", [{}, {}, {}, {}])],
+    [
+        ("BOTH", [{}]),
+        ("NONE", [{}, {}]),
+        ("BOTH", [{}, {}, {}]),
+        ("BOTH", [{}, {}, {}, {}]),
+    ],
 )
 def test_overlap_without_supported_stack_fits_wide(
     tmp_episode_dir, sample_config, overlap, speakers
@@ -251,6 +260,32 @@ def test_render_short_uses_each_retained_source_range_and_rebases_ass(
     assert "removed" not in caption_path.read_text()
     assert "after" in (scratch / "segment_001.ass").read_text()
     assert "0:00:00.20" in (scratch / "segment_001.ass").read_text()
+
+
+@pytest.mark.parametrize(
+    ("speaker", "speaker_count", "stack_enabled", "expected_margin"),
+    [
+        ("BOTH", 3, False, DEFAULT_MARGIN_V),
+        ("BOTH", 3, True, THREE_PERSON_STACK_CAPTION_MARGIN_V),
+        ("NONE", 3, True, THREE_PERSON_STACK_CAPTION_MARGIN_V),
+        ("BOTH", 2, True, DEFAULT_MARGIN_V),
+        ("speaker_0", 3, True, DEFAULT_MARGIN_V),
+    ],
+)
+def test_short_caption_style_changes_only_for_opted_in_three_person_stack(
+    tmp_episode_dir,
+    sample_config,
+    speaker,
+    speaker_count,
+    stack_enabled,
+    expected_margin,
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {"speakers": [{} for _ in range(speaker_count)]}
+
+    style = agent._short_caption_style(speaker, crop_config, stack_enabled)
+
+    assert style.margin_v == expected_margin
 
 
 def test_empty_clip_set_can_render_for_review_without_youtube_url(

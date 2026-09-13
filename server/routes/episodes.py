@@ -359,6 +359,7 @@ class EpisodeUpdateRequest(BaseModel):
     link_tree_url: Optional[str] = None
     publish_schedule: Optional[list[PublishScheduleEntry]] = None
     speaker_cut_config: Optional[SpeakerCutConfigUpdate] = None
+    shorts_three_person_stack: bool | None = None
 
 
 @router.patch("/{episode_id}")
@@ -397,6 +398,8 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         speaker_cut_config = dict(ep.get("speaker_cut_config") or {})
         speaker_cut_config.update(req.speaker_cut_config.model_dump())
         ep["speaker_cut_config"] = speaker_cut_config
+    if req.shorts_three_person_stack is not None:
+        ep["shorts_three_person_stack"] = req.shorts_three_person_stack
     write_episode(episode_id, ep)
     return {"status": "updated", "episode_id": episode_id}
 

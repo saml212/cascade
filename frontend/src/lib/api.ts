@@ -369,6 +369,7 @@ export interface EpisodeUpdateRequest {
   youtube_longform_url?: string;
   spotify_longform_url?: string;
   link_tree_url?: string;
+  shorts_three_person_stack?: boolean;
 }
 
 export interface SpeakerCropConfig {

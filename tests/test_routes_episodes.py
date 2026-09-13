@@ -472,6 +472,19 @@ class TestUpdateEpisode:
         )
         assert invalid.status_code == 422
 
+    def test_update_three_person_short_layout_opt_in(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+
+        response = client.patch(
+            "/api/episodes/ep_001",
+            json={"shorts_three_person_stack": True},
+        )
+
+        assert response.status_code == 200
+        episode = client.get("/api/episodes/ep_001").json()
+        assert episode["shorts_three_person_stack"] is True
+
     def test_update_release_copy_changes_quality_revision(self, test_client):
         client, episodes_dir = test_client
         episode_dir = _create_episode(

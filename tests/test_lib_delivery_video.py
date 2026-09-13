@@ -336,12 +336,16 @@ def test_short_fingerprint_marks_only_sustained_two_person_overlap(tmp_path):
     assert sustained["shorts_overlap_layout"] == "two-person-stack/v1"
 
 
-def test_short_fingerprint_marks_sustained_three_person_both_or_none(tmp_path):
+def test_short_fingerprint_marks_only_opted_in_three_person_overlap(tmp_path):
     source = tmp_path / "source_merged.mp4"
     audio = tmp_path / "audio.wav"
     source.write_bytes(b"source")
     audio.write_bytes(b"audio")
-    three_people = {"crop_config": {"speakers": [{}, {}, {}]}}
+    default_three_people = {"crop_config": {"speakers": [{}, {}, {}]}}
+    enabled_three_people = {
+        **default_three_people,
+        "shorts_three_person_stack": True,
+    }
     config = {"processing": {"shorts_hold_wide_seconds": 3}}
     clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 20}
 
@@ -360,16 +364,31 @@ def test_short_fingerprint_marks_sustained_three_person_both_or_none(tmp_path):
             )
 
     held_at_threshold = state_for(
-        three_people, {"start": 11, "end": 14, "speaker": "BOTH"}
+        enabled_three_people, {"start": 11, "end": 14, "speaker": "BOTH"}
     )
     sustained_both = state_for(
-        three_people, {"start": 11, "end": 15, "speaker": "BOTH"}
+        enabled_three_people, {"start": 11, "end": 15, "speaker": "BOTH"}
     )
     sustained_none = state_for(
-        three_people, {"start": 11, "end": 15, "speaker": "NONE"}
+        enabled_three_people, {"start": 11, "end": 15, "speaker": "NONE"}
     )
     clipped_to_threshold = state_for(
-        three_people, {"start": 7, "end": 13, "speaker": "NONE"}
+        enabled_three_people, {"start": 7, "end": 13, "speaker": "NONE"}
+    )
+    default_sustained = state_for(
+        default_three_people, {"start": 11, "end": 15, "speaker": "BOTH"}
+    )
+    explicitly_disabled = state_for(
+        {**default_three_people, "shorts_three_person_stack": False},
+        {"start": 11, "end": 15, "speaker": "BOTH"},
+    )
+    default_nonstack = state_for(
+        default_three_people,
+        {"start": 11, "end": 15, "speaker": "speaker_0"},
+    )
+    enabled_nonstack = state_for(
+        enabled_three_people,
+        {"start": 11, "end": 15, "speaker": "speaker_0"},
     )
     one_person = state_for(
         {"crop_config": {"speakers": [{}]}},
@@ -382,10 +401,16 @@ def test_short_fingerprint_marks_sustained_three_person_both_or_none(tmp_path):
 
     assert "shorts_overlap_layout" not in held_at_threshold
     assert "shorts_overlap_layout" not in clipped_to_threshold
+    assert "shorts_overlap_layout" not in default_sustained
+    assert default_sustained == explicitly_disabled
+    assert default_nonstack == enabled_nonstack
     assert "shorts_overlap_layout" not in one_person
     assert "shorts_overlap_layout" not in two_person_none
-    assert sustained_both["shorts_overlap_layout"] == "three-person-stack/v1"
-    assert sustained_none["shorts_overlap_layout"] == "three-person-stack/v1"
+    assert sustained_both["shorts_overlap_layout"] == "three-person-stack/v2"
+    assert sustained_none["shorts_overlap_layout"] == "three-person-stack/v2"
+    assert longform_render_fingerprint(
+        tmp_path, default_three_people, config, audio, []
+    ) == longform_render_fingerprint(tmp_path, enabled_three_people, config, audio, [])
 
 
 def test_short_fingerprint_marks_only_clips_with_overlapping_caption_events(tmp_path):
