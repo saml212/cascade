@@ -44,6 +44,14 @@ def strict_bool(value: object) -> bool:
     return False
 
 
+def _same_speaker_gap_hold_seconds(episode: dict) -> float:
+    cut_config = episode.get("speaker_cut_config") or {}
+    value = float(cut_config.get("same_speaker_gap_hold_seconds", 0))
+    if not 0 <= value <= 3:
+        raise ValueError("same_speaker_gap_hold_seconds must be between 0 and 3")
+    return value
+
+
 def speaker_cut_fingerprint(
     episode_dir: Path, episode: dict, audio_analysis: dict, config: dict
 ) -> str:
@@ -70,6 +78,23 @@ def speaker_cut_fingerprint(
             }
         )
     processing = config.get("processing", {})
+    cut_config = episode.get("speaker_cut_config") or {}
+    settings = {
+        "frame_seconds": cut_config.get(
+            "frame_seconds", processing.get("frame_seconds", 0.1)
+        ),
+        "speech_db_margin": cut_config.get(
+            "speech_db_margin", processing.get("speech_db_margin", 6)
+        ),
+        "min_segment_seconds": cut_config.get(
+            "min_segment_seconds", processing.get("min_segment_seconds", 2.0)
+        ),
+        "dominance_db": DOMINANCE_DB,
+        "sample_rate": ANALYSIS_SAMPLE_RATE,
+    }
+    gap_hold_seconds = _same_speaker_gap_hold_seconds(episode)
+    if gap_hold_seconds:
+        settings["same_speaker_gap_hold_seconds"] = gap_hold_seconds
     payload = {
         "version": SPEAKER_CUT_VERSION,
         "clock": "source",
@@ -81,19 +106,7 @@ def speaker_cut_fingerprint(
         ),
         "audio_sync": episode.get("audio_sync", {}),
         "crop_config": episode.get("crop_config", {}),
-        "settings": {
-            "frame_seconds": episode.get("speaker_cut_config", {}).get(
-                "frame_seconds", processing.get("frame_seconds", 0.1)
-            ),
-            "speech_db_margin": episode.get("speaker_cut_config", {}).get(
-                "speech_db_margin", processing.get("speech_db_margin", 6)
-            ),
-            "min_segment_seconds": episode.get("speaker_cut_config", {}).get(
-                "min_segment_seconds", processing.get("min_segment_seconds", 2.0)
-            ),
-            "dominance_db": DOMINANCE_DB,
-            "sample_rate": ANALYSIS_SAMPLE_RATE,
-        },
+        "settings": settings,
         "sources": sources,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -141,7 +154,9 @@ def _speaker_identity(mapping: dict) -> list[tuple[str, object]]:
     return identities
 
 
-def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dict]:
+def _transcript_speaker_targets(
+    transcript: dict, segments: dict
+) -> dict[int, tuple[str, str | None]]:
     target_by_identity = {}
     valid_targets = set()
     camera_only = True
@@ -175,6 +190,11 @@ def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dic
             if target:
                 source_to_target[source] = (target, None)
                 break
+    return source_to_target
+
+
+def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dict]:
+    source_to_target = _transcript_speaker_targets(transcript, segments)
 
     turns = []
     for utterance in transcript.get("utterances", []):
@@ -214,6 +234,70 @@ def _transcript_turns_for_segments(transcript: dict, segments: dict) -> list[dic
             }
         )
     return turns
+
+
+def _hold_same_speaker_wide_gaps(
+    decisions: list[dict],
+    transcript: dict,
+    segment_document: dict,
+    maximum_seconds: float,
+) -> tuple[list[dict], list[dict]]:
+    """Keep one crop through brief word-safe gaps inside the same speaker turn."""
+    if maximum_seconds <= 0:
+        return decisions, []
+
+    targets = _transcript_speaker_targets(transcript, segment_document)
+    reliable_words = []
+    for utterance in transcript.get("utterances", []):
+        utterance_speaker = utterance.get("speaker")
+        for word in utterance.get("words", []):
+            if word.get("suspect") and not word.get("corrected"):
+                continue
+            binding = targets.get(word.get("speaker", utterance_speaker))
+            reliable_words.append(
+                (
+                    float(word.get("start", 0)),
+                    float(word.get("end", 0)),
+                    binding[0] if binding else None,
+                )
+            )
+
+    held = []
+    resolved = []
+    for index, segment in enumerate(decisions):
+        updated = dict(segment)
+        start = float(segment["start"])
+        end = float(segment["end"])
+        left = decisions[index - 1].get("speaker") if index else None
+        right = (
+            decisions[index + 1].get("speaker") if index + 1 < len(decisions) else None
+        )
+        overlapping_words = [
+            target
+            for word_start, word_end, target in reliable_words
+            if word_start < end and word_end > start
+        ]
+        if (
+            segment.get("speaker") in {"BOTH", "NONE"}
+            and end - start <= maximum_seconds
+            and str(left).startswith("speaker_")
+            and left == right
+            and set(overlapping_words) <= {left}
+        ):
+            updated["speaker"] = left
+            held.append(
+                {
+                    "kind": "same_speaker_gap_hold",
+                    "from_speaker": segment.get("speaker"),
+                    "to_speaker": left,
+                    "start": round(start, 6),
+                    "end": round(end, 6),
+                    "maximum_seconds": maximum_seconds,
+                    "reliable_word_count": len(overlapping_words),
+                }
+            )
+        resolved.append(updated)
+    return _merge_adjacent_segments(resolved), held
 
 
 def _corrected_ownership_intervals(turns: list[dict]) -> list[dict]:
@@ -481,6 +565,13 @@ def align_speaker_segments_to_transcript(episode_dir: Path) -> dict | None:
 
     decisions, corrected_adjustments = _apply_corrected_ownership(decisions, turns)
     adjustments.extend(corrected_adjustments)
+    decisions, gap_adjustments = _hold_same_speaker_wide_gaps(
+        decisions,
+        transcript,
+        segments,
+        float(segments.get("same_speaker_gap_hold_seconds", 0)),
+    )
+    adjustments.extend(gap_adjustments)
 
     segments["segments"] = decisions
     segments["segment_count"] = len(decisions)
@@ -651,6 +742,7 @@ class SpeakerCutAgent(BaseAgent):
 
     def execute(self) -> dict:
         episode = self.load_json("episode.json")
+        gap_hold_seconds = _same_speaker_gap_hold_seconds(episode)
         audio_data = self.load_json("audio_analysis.json")
         total_duration = self.load_json("stitch.json")["duration_seconds"]
         assignments = self._recorder_assignments(episode)
@@ -686,11 +778,13 @@ class SpeakerCutAgent(BaseAgent):
                 "track_mapping": track_mapping,
                 "crop_validation": crop_validation,
             }
+            if gap_hold_seconds:
+                result["same_speaker_gap_hold_seconds"] = gap_hold_seconds
             self.save_json("segments.json", result)
             return result
 
         proc = self.config.get("processing", {})
-        cut_cfg = episode.get("speaker_cut_config", {})
+        cut_cfg = episode.get("speaker_cut_config") or {}
         frame_sec = cut_cfg.get("frame_seconds", proc.get("frame_seconds", 0.1))
         margin = cut_cfg.get("speech_db_margin", proc.get("speech_db_margin", 6))
         min_seg = cut_cfg.get(
@@ -824,6 +918,8 @@ class SpeakerCutAgent(BaseAgent):
             "track_mapping": track_mapping,
             "crop_validation": crop_validation,
         }
+        if gap_hold_seconds:
+            result["same_speaker_gap_hold_seconds"] = gap_hold_seconds
         self.save_json("segments.json", result)
         return result
 

@@ -444,6 +444,34 @@ class TestUpdateEpisode:
         assert data["episode_name"] == "The Interview"
         assert data["video_explicit"] is True
 
+    def test_update_episode_speaker_gap_hold_preserves_other_cut_settings(
+        self, test_client
+    ):
+        client, episodes_dir = test_client
+        _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"speaker_cut_config": {"min_segment_seconds": 2.0}},
+        )
+
+        response = client.patch(
+            "/api/episodes/ep_001",
+            json={"speaker_cut_config": {"same_speaker_gap_hold_seconds": 1.0}},
+        )
+
+        assert response.status_code == 200
+        episode = client.get("/api/episodes/ep_001").json()
+        assert episode["speaker_cut_config"] == {
+            "min_segment_seconds": 2.0,
+            "same_speaker_gap_hold_seconds": 1.0,
+        }
+
+        invalid = client.patch(
+            "/api/episodes/ep_001",
+            json={"speaker_cut_config": {"same_speaker_gap_hold_seconds": 3.1}},
+        )
+        assert invalid.status_code == 422
+
     def test_update_release_copy_changes_quality_revision(self, test_client):
         client, episodes_dir = test_client
         episode_dir = _create_episode(

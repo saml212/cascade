@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from agents.pipeline import load_config
 from agents.podcast_feed import current_podcast_audio
@@ -341,6 +341,10 @@ class PublishScheduleEntry(BaseModel):
         return value
 
 
+class SpeakerCutConfigUpdate(BaseModel):
+    same_speaker_gap_hold_seconds: float = Field(ge=0, le=3)
+
+
 class EpisodeUpdateRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
@@ -354,6 +358,7 @@ class EpisodeUpdateRequest(BaseModel):
     spotify_longform_url: Optional[str] = None
     link_tree_url: Optional[str] = None
     publish_schedule: Optional[list[PublishScheduleEntry]] = None
+    speaker_cut_config: Optional[SpeakerCutConfigUpdate] = None
 
 
 @router.patch("/{episode_id}")
@@ -388,6 +393,10 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         ep["link_tree_url"] = req.link_tree_url
     if req.publish_schedule is not None:
         ep["publish_schedule"] = [entry.model_dump() for entry in req.publish_schedule]
+    if req.speaker_cut_config is not None:
+        speaker_cut_config = dict(ep.get("speaker_cut_config") or {})
+        speaker_cut_config.update(req.speaker_cut_config.model_dump())
+        ep["speaker_cut_config"] = speaker_cut_config
     write_episode(episode_id, ep)
     return {"status": "updated", "episode_id": episode_id}
 

@@ -8,9 +8,11 @@ from agents.audio_analysis import audio_analysis_fingerprint
 from agents.speaker_cut import (
     SpeakerCutAgent,
     _corrected_ownership_intervals,
+    _hold_same_speaker_wide_gaps,
     align_speaker_segments_to_transcript,
     current_speaker_segments,
     rebind_visual_crop_segments,
+    speaker_cut_fingerprint,
     strict_bool,
     transcript_alignment_fingerprint,
     validate_speaker_crops,
@@ -213,6 +215,53 @@ def test_segments_json_saved_with_fields(tmp_episode_dir, sample_config):
     assert (tmp_episode_dir / "segments.json").exists()
     for seg in result["segments"]:
         assert all(k in seg for k in ("start", "end", "speaker", "duration"))
+
+
+def test_episode_gap_hold_preserves_default_fingerprint_and_requires_rerun(
+    tmp_episode_dir, sample_config
+):
+    episode = {
+        "source_properties": {"width": 1920, "height": 1080},
+        "crop_config": {
+            "speakers": [
+                {"label": "Host", "center_x": 400, "center_y": 500, "zoom": 1.2},
+                {
+                    "label": "Guest",
+                    "center_x": 1400,
+                    "center_y": 500,
+                    "zoom": 1.2,
+                },
+            ]
+        },
+    }
+    _write(tmp_episode_dir / "episode.json", episode)
+    first = _agent(tmp_episode_dir, sample_config, identical=True).execute()
+    audio_analysis = json.loads((tmp_episode_dir / "audio_analysis.json").read_text())
+    absent = speaker_cut_fingerprint(
+        tmp_episode_dir, episode, audio_analysis, sample_config
+    )
+    zero = speaker_cut_fingerprint(
+        tmp_episode_dir,
+        {**episode, "speaker_cut_config": {"same_speaker_gap_hold_seconds": 0}},
+        audio_analysis,
+        sample_config,
+    )
+    assert absent == zero == first["fingerprint"]
+    assert current_speaker_segments(tmp_episode_dir, episode, sample_config) is not None
+
+    opted_in = {
+        **episode,
+        "speaker_cut_config": {"same_speaker_gap_hold_seconds": 1.0},
+    }
+    _write(tmp_episode_dir / "episode.json", opted_in)
+    assert current_speaker_segments(tmp_episode_dir, opted_in, sample_config) is None
+
+    rerun = _agent(tmp_episode_dir, sample_config, identical=True).execute()
+    assert rerun["same_speaker_gap_hold_seconds"] == 1.0
+    assert rerun["fingerprint"] != absent
+    assert (
+        current_speaker_segments(tmp_episode_dir, opted_in, sample_config) is not None
+    )
 
 
 @pytest.mark.parametrize(
@@ -628,6 +677,100 @@ def test_reviewed_overlap_does_not_assert_competing_speaker_ownership():
             "end": 7.0,
             "correction_ids": ["guest-review"],
         },
+    ]
+
+
+def test_same_speaker_gap_hold_keeps_competing_words_and_long_wides():
+    decisions = [
+        {"speaker": "speaker_0", "start": 0.0, "end": 2.0, "duration": 2.0},
+        {"speaker": "BOTH", "start": 2.0, "end": 2.8, "duration": 0.8},
+        {"speaker": "speaker_0", "start": 2.8, "end": 4.0, "duration": 1.2},
+        {"speaker": "BOTH", "start": 4.0, "end": 4.8, "duration": 0.8},
+        {"speaker": "speaker_0", "start": 4.8, "end": 6.0, "duration": 1.2},
+        {"speaker": "BOTH", "start": 6.0, "end": 7.2, "duration": 1.2},
+        {"speaker": "speaker_0", "start": 7.2, "end": 9.0, "duration": 1.8},
+        {"speaker": "BOTH", "start": 9.0, "end": 9.8, "duration": 0.8},
+        {"speaker": "speaker_0", "start": 9.8, "end": 11.0, "duration": 1.2},
+    ]
+    segment_document = {
+        "track_mapping": [
+            {"speaker": "speaker_0", "person": "Host"},
+            {"speaker": "speaker_1", "person": "Guest"},
+        ]
+    }
+    transcript = {
+        "speaker_map": [
+            {
+                "index": 0,
+                "target_speaker": "speaker_0",
+                "mapping_method": "manual_review",
+            },
+            {
+                "index": 1,
+                "target_speaker": "speaker_1",
+                "mapping_method": "manual_review",
+            },
+        ],
+        "utterances": [
+            {
+                "speaker": 0,
+                "words": [
+                    {
+                        "speaker": 0,
+                        "start": 2.2,
+                        "end": 2.5,
+                        "suspect": False,
+                    }
+                ],
+            },
+            {
+                "speaker": 1,
+                "words": [
+                    {
+                        "speaker": 1,
+                        "start": 4.2,
+                        "end": 4.5,
+                        "suspect": False,
+                    }
+                ],
+            },
+            {
+                "speaker": 2,
+                "words": [
+                    {
+                        "speaker": 2,
+                        "start": 9.2,
+                        "end": 9.5,
+                        "suspect": False,
+                    }
+                ],
+            },
+        ],
+    }
+
+    smoothed, adjustments = _hold_same_speaker_wide_gaps(
+        decisions, transcript, segment_document, 1.0
+    )
+
+    assert [(item["speaker"], item["start"], item["end"]) for item in smoothed] == [
+        ("speaker_0", 0.0, 4.0),
+        ("BOTH", 4.0, 4.8),
+        ("speaker_0", 4.8, 6.0),
+        ("BOTH", 6.0, 7.2),
+        ("speaker_0", 7.2, 9.0),
+        ("BOTH", 9.0, 9.8),
+        ("speaker_0", 9.8, 11.0),
+    ]
+    assert adjustments == [
+        {
+            "kind": "same_speaker_gap_hold",
+            "from_speaker": "BOTH",
+            "to_speaker": "speaker_0",
+            "start": 2.0,
+            "end": 2.8,
+            "maximum_seconds": 1.0,
+            "reliable_word_count": 1,
+        }
     ]
 
 
