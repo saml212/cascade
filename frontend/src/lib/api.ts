@@ -350,6 +350,8 @@ export interface ClipDistributionState extends UnknownRecord {
   current: boolean;
   approval_current: boolean;
   revision: string;
+  change_locked: boolean;
+  change_lock_reason: string | null;
 }
 
 export interface EpisodeReviewState extends UnknownRecord {

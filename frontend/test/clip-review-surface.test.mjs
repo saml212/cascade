@@ -7,6 +7,8 @@ const {
   ClipReviewSurfaceMemory,
   clipDistributionLabel,
   clipDistributionReady,
+  clipDistributionSelectable,
+  distributionChangeLockReason,
   distributionVersionLabel,
   selectedDistributionVersion,
 } = await importTs(
@@ -35,6 +37,8 @@ function reviewState({ distributionVersion = 'base', backgroundApproved = false 
         distributionVersion === 'background_motion_v1'
           ? backgroundRevision
           : baseRevision,
+      change_locked: false,
+      change_lock_reason: null,
     },
     variants: {
       background_motion_v1: {
@@ -105,6 +109,41 @@ test('fails closed when distribution identity is malformed or incomplete', () =>
   delete missingVariant.variants.background_motion_v1;
   assert.equal(selectedDistributionVersion(missingVariant), null);
   assert.equal(clipDistributionReady(missingVariant), false);
+});
+
+test('shows the backend publication-history reason before changing versions', () => {
+  const baseSelected = reviewState({ backgroundApproved: true });
+  assert.equal(clipDistributionSelectable(baseSelected, 'background'), true);
+  baseSelected.distribution.change_locked = true;
+  baseSelected.distribution.change_lock_reason =
+    'A scheduled Base receipt exists. Start an explicit re-release to change it.';
+
+  assert.equal(
+    distributionChangeLockReason(baseSelected),
+    'A scheduled Base receipt exists. Start an explicit re-release to change it.'
+  );
+  assert.equal(clipDistributionSelectable(baseSelected, 'background'), false);
+
+  const backgroundSelected = reviewState({
+    distributionVersion: 'background_motion_v1',
+    backgroundApproved: true,
+  });
+  assert.equal(clipDistributionSelectable(backgroundSelected, 'base'), true);
+  backgroundSelected.distribution.change_locked = true;
+  assert.equal(clipDistributionSelectable(backgroundSelected, 'base'), false);
+
+  baseSelected.distribution.change_lock_reason = '   ';
+  assert.match(
+    distributionChangeLockReason(baseSelected),
+    /Publication history locks/
+  );
+
+  baseSelected.distribution.change_locked = false;
+  assert.equal(distributionChangeLockReason(baseSelected), null);
+
+  delete baseSelected.distribution.change_locked;
+  assert.match(distributionChangeLockReason(baseSelected), /status is unavailable/);
+  assert.equal(clipDistributionSelectable(baseSelected, 'background'), false);
 });
 
 test('labels schedule and receipt versions without hiding malformed identities', () => {

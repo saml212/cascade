@@ -72,6 +72,31 @@ export function clipDistributionLabel(review: ClipReviewState): string {
   return selectedDistributionVersion(review)?.label ?? 'Unknown version';
 }
 
+export function distributionChangeLockReason(
+  review: ClipReviewState
+): string | null {
+  if (review.distribution.change_locked === false) return null;
+  const reason = review.distribution.change_lock_reason;
+  if (typeof reason === 'string' && reason.trim()) return reason.trim();
+  return review.distribution.change_locked === true
+    ? 'Publication history locks this version. Start an explicit re-release to change it.'
+    : 'Version change status is unavailable. Refresh before changing distribution.';
+}
+
+export function clipDistributionSelectable(
+  review: ClipReviewState,
+  surface: ClipReviewSurface
+): boolean {
+  const version = clipVersionState(review, surface);
+  return Boolean(
+    version &&
+      selectedDistributionVersion(review)?.surface !== surface &&
+      review.distribution.change_locked === false &&
+      version.render.current &&
+      version.approval.current
+  );
+}
+
 export function distributionVersionLabel(
   version: unknown,
   variantId: unknown

@@ -59,8 +59,10 @@ import {
 } from '../lib/clip-review-list';
 import {
   clipDistributionLabel,
+  clipDistributionSelectable,
   clipVersionState,
   ClipReviewSurfaceMemory,
+  distributionChangeLockReason,
   selectedDistributionVersion,
   type ClipReviewSurface,
 } from '../lib/clip-review-surface';
@@ -1324,12 +1326,18 @@ function renderDistributionAction(
   reload: () => Promise<void>
 ): HTMLElement {
   const host = h('span');
+  const lockMessage = h('span', {
+    class: 'hidden text-body-sm text-status-warning max-w-md',
+    'aria-live': 'polite',
+  });
   effect(() => {
     const version = clipVersionState(review, surface);
     const selected = selectedDistributionVersion(review)?.surface === surface;
     const active = selecting();
+    const lockReason = distributionChangeLockReason(review);
     const current = version?.render.current === true;
     const approved = version?.approval.current === true;
+    const selectable = clipDistributionSelectable(review, surface);
     const label = version?.label ?? 'Unknown version';
     host.replaceChildren(
       Button({
@@ -1342,11 +1350,13 @@ function renderDistributionAction(
             : !approved
               ? `Approve ${label.toLowerCase()} first`
               : `Use ${label} for distribution`,
-        disabled: selected || !current || !approved || active || !version,
+        disabled: !selectable || active,
         loading: active,
-        title: selected
-          ? `${label} is the version that will be published and scheduled`
-          : `Select the current, separately approved ${label.toLowerCase()} version for publication and scheduling`,
+        title:
+          lockReason ??
+          (selected
+            ? `${label} is the version that will be published and scheduled`
+            : `Select the current, separately approved ${label.toLowerCase()} version for publication and scheduling`),
         onClick: async () => {
           if (!version) return;
           selecting.set(true);
@@ -1367,8 +1377,15 @@ function renderDistributionAction(
         },
       })
     );
+    lockMessage.classList.toggle('hidden', !lockReason);
+    lockMessage.textContent = lockReason ?? '';
   });
-  return host;
+  return h(
+    'span',
+    { class: 'inline-flex flex-col items-start gap-1' },
+    host,
+    lockMessage
+  );
 }
 
 function renderActions(
