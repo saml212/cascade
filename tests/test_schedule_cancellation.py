@@ -107,6 +107,22 @@ def _absent_evidence():
     }
 
 
+def _inert_tombstone_evidence():
+    return {
+        "status_not_found": False,
+        "status": {
+            "job_id": "job-old",
+            "external_id": "cascade-short-old",
+            "status": "failed",
+            "message": "Upload appears to have failed (no activity for over 1 hour)",
+            "completed": 0,
+            "total": 2,
+            "results": [],
+        },
+        "history": {"in_progress": [], "history": []},
+    }
+
+
 def _state(candidate):
     variant_id = candidate.get("distribution_variant_id")
     return {
@@ -421,7 +437,7 @@ def test_publishing_race_after_delete_stays_reconcilable_without_second_delete(
     monkeypatch.setenv("UPLOAD_POST_USER", "up")
 
     monkeypatch.setattr(
-        clips, "_upload_post_job_evidence", lambda *_args: _absent_evidence()
+        clips, "_upload_post_job_evidence", lambda *_args: _inert_tombstone_evidence()
     )
     retry = client.post(
         "/api/episodes/ep_001/clips/clip_01/schedule-cancellation",
@@ -429,6 +445,9 @@ def test_publishing_race_after_delete_stays_reconcilable_without_second_delete(
     )
     assert retry.status_code == 200
     assert deleted["calls"] == 1
+    stored = json.loads((episode_dir / "publish.json").read_text())["shorts"][0]
+    assert stored["status"] == "cancelled"
+    assert stored["schedule_cancellation"]["state"] == "cancelled"
 
 
 @pytest.mark.parametrize(
@@ -670,3 +689,43 @@ def test_post_delete_evidence_rejects_contradictory_or_unresolved_status(evidenc
     )
 
     assert safe is False
+
+
+def test_post_delete_accepts_exact_inert_tombstone_only_after_delete():
+    from agents.publish import schedule_cancellation_provider_safe
+
+    evidence = _inert_tombstone_evidence()
+    assert schedule_cancellation_provider_safe(
+        _receipt(), evidence, profile_username="up", after_delete=True
+    ) == (True, None)
+    assert (
+        schedule_cancellation_provider_safe(
+            _receipt(), evidence, profile_username="up", after_delete=False
+        )[0]
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("message", "Upload failed"),
+        ("completed", 1),
+        ("total", 1),
+        ("results", [{"platform": "youtube", "status": "failed"}]),
+        ("retryable", 1),
+        ("post_url", "https://example.com/post"),
+        ("job_id", "other-job"),
+    ],
+)
+def test_post_delete_rejects_mutated_inert_tombstone(field, value):
+    from agents.publish import schedule_cancellation_provider_safe
+
+    evidence = _inert_tombstone_evidence()
+    evidence["status"][field] = value
+    assert (
+        schedule_cancellation_provider_safe(
+            _receipt(), evidence, profile_username="up", after_delete=True
+        )[0]
+        is False
+    )

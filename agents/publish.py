@@ -1177,6 +1177,41 @@ def _provider_status_is_queued(receipt: dict, status: dict, bound: list[dict]) -
     )
 
 
+def _provider_status_is_inert_tombstone(receipt: dict, status: dict) -> bool:
+    """Recognize Upload-Post's exact post-DELETE inactivity tombstone."""
+    platforms = receipt.get("platforms")
+    return bool(
+        isinstance(platforms, list)
+        and platforms
+        and status.get("job_id") == receipt.get("job_id")
+        and status.get("external_id") == receipt.get("external_id")
+        and _provider_states(status) == {"failed"}
+        and status.get("message")
+        == "Upload appears to have failed (no activity for over 1 hour)"
+        and status.get("results") == []
+        and type(status.get("completed")) is int
+        and status["completed"] == 0
+        and type(status.get("total")) is int
+        and status["total"] == len(platforms)
+        and all(
+            status.get(field) in (None, 0)
+            for field in ("failed", "skipped", "retryable")
+        )
+        and status.get("success") in (None, False)
+        and status.get("scheduler_status") in (None, "")
+        and not any(
+            status.get(field)
+            for field in (
+                "fallback_to_inbox",
+                "is_retryable",
+                "post_url",
+                "video_url",
+                "url",
+            )
+        )
+    )
+
+
 def schedule_cancellation_provider_safe(
     receipt: dict,
     evidence: object,
@@ -1228,7 +1263,7 @@ def schedule_cancellation_provider_safe(
         if not bound:
             return False, "Provider status did not confirm the scheduled job"
         if after_delete:
-            if any(
+            if not _provider_status_is_inert_tombstone(receipt, status) and any(
                 not _provider_states(item)
                 or not _provider_states(item) <= {"cancelled", "canceled"}
                 or item.get("success") not in (None, False)
