@@ -183,8 +183,9 @@ This produces `links/index.html` — a single-file, dark-themed page with your p
 Supported platforms: Spotify, Apple Podcasts, YouTube, Instagram, X, TikTok, iHeartRadio, GitHub. Empty URLs are automatically excluded.
 
 To prepare revision-bound landing pages for each episode, write a reviewable site to
-a separate directory. An optional Apple catalog supplies exact Apple episode URLs;
-otherwise the page labels the configured Apple show URL as a show-level fallback.
+a separate directory. An optional Apple catalog supplies exact Apple episode URLs
+only for entries with a matching `episode_id`; otherwise the page labels its Apple
+destination as a show-level fallback.
 
 ```bash
 .venv/bin/python -m links.episode_hub prepare \

@@ -89,10 +89,7 @@ def _apple_destination(
             item
             for item in catalog_episodes
             if isinstance(item, dict)
-            and (
-                item.get("episode_id") == episode["episode_id"]
-                or item.get("title") == episode["title"]
-            )
+            and item.get("episode_id") == episode["episode_id"]
         ]
         if len(matches) == 1:
             exact_url = _https_url(matches[0].get("url"))
@@ -107,7 +104,7 @@ def _apple_destination(
     if fallback:
         return {
             "key": "apple_podcasts",
-            "label": "Browse the show on Apple Podcasts",
+            "label": "All episodes on Apple Podcasts",
             "url": fallback,
             "scope": "show",
             "note": "Show-level fallback — this is not an exact episode link.",
@@ -140,7 +137,7 @@ def build_episode_watch_document(
     destinations = []
     for key, label in (
         ("youtube", "Watch on YouTube"),
-        ("spotify", "Listen on Spotify"),
+        ("spotify", "Watch or listen on Spotify"),
     ):
         url = _https_url(resolved.get(key))
         if url:
@@ -189,11 +186,7 @@ def _page_shell(title: str, body: str, identity: dict, description: str) -> str:
 def render_episode_page(document: dict) -> str:
     buttons = []
     for item in document["destinations"]:
-        scope = (
-            "Exact episode"
-            if item["scope"] == "episode"
-            else item.get("note", "Show-level link")
-        )
+        scope = "Exact episode" if item["scope"] == "episode" else "Browse the show"
         buttons.append(
             '<a class="button" target="_blank" rel="noopener" '
             f'href="{html.escape(item["url"], quote=True)}">'

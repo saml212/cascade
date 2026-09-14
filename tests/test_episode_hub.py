@@ -61,12 +61,13 @@ def test_document_uses_exact_current_urls_and_labels_apple_fallback(tmp_path):
         "episode",
         "show",
     ]
-    assert document["destinations"][-1]["label"] == (
-        "Browse the show on Apple Podcasts"
-    )
+    assert document["destinations"][1]["label"] == "Watch or listen on Spotify"
+    assert document["destinations"][-1]["label"] == ("All episodes on Apple Podcasts")
     assert "this is not an exact episode link" in document["destinations"][-1]["note"]
     assert "Guest &amp; Host" in rendered
     assert "v=1&amp;list=2" in rendered
+    assert "Browse the show" in rendered
+    assert "this is not an exact episode link" not in rendered
 
 
 def test_prepare_builds_branded_index_and_exact_apple_page(tmp_path, monkeypatch):
@@ -93,6 +94,7 @@ def test_prepare_builds_branded_index_and_exact_apple_page(tmp_path, monkeypatch
             "show_url": "https://podcasts.apple.com/show/local",
             "episodes": [
                 {
+                    "episode_id": "ep_001",
                     "title": "First <Episode>",
                     "url": "https://podcasts.apple.com/episode/first",
                 }
@@ -204,3 +206,26 @@ def test_upload_rejects_unreviewed_or_unsafe_manifest_without_network(
         episode_hub.upload_prepared_site(site, _config())
 
     put.assert_not_called()
+
+
+def test_apple_title_match_without_episode_identity_stays_show_level(tmp_path):
+    episode_dir = _episode(tmp_path, "ep_new", "Repeated Title")
+
+    document = episode_hub.build_episode_watch_document(
+        episode_dir,
+        _config(),
+        funnel_urls={"youtube": "", "spotify": "https://spotify.example/episode"},
+        apple_catalog={
+            "show_url": "https://podcasts.apple.com/show/local",
+            "episodes": [
+                {
+                    "title": "Repeated Title",
+                    "url": "https://podcasts.apple.com/episode/old",
+                }
+            ],
+        },
+    )
+
+    apple = document["destinations"][-1]
+    assert apple["scope"] == "show"
+    assert apple["url"] == "https://podcasts.apple.com/show/local"
