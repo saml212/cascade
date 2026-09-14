@@ -61,6 +61,36 @@ class TestPipelineStatus:
         assert resp.status_code == 404
 
 
+class TestShortDestinationPreview:
+    def test_returns_exact_agent_preview_and_forbids_extra_fields(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        request = {
+            "destinations": ["youtube", "tiktok"],
+            "clip_ids": ["clip_01"],
+            "request_id": "e5753781-47f9-455e-9ce5-0eead48a19cd",
+            "actor": "operator",
+            "reason": "Approved motion release",
+            "expected_release_revision": "sha256:release",
+        }
+        with patch(
+            "agents.publish.PublishAgent.preview_short_destinations",
+            return_value={"preview_revision": "sha256:preview"},
+        ) as preview:
+            response = client.post(
+                "/api/episodes/ep_001/publish-shorts/preview", json=request
+            )
+        assert response.status_code == 200
+        assert response.json() == {"preview_revision": "sha256:preview"}
+        assert preview.call_args.args[0]["request_id"] == request["request_id"]
+
+        response = client.post(
+            "/api/episodes/ep_001/publish-shorts/preview",
+            json={**request, "unexpected": True},
+        )
+        assert response.status_code == 422
+
+
 class TestRunPipeline:
     def test_run_without_source_path(self, test_client):
         client, episodes_dir = test_client
@@ -1097,6 +1127,66 @@ class TestRunSingleAgent:
         client, _ = test_client
         resp = client.post("/api/episodes/nonexistent/run-agent/ingest", json={})
         assert resp.status_code == 404
+
+    def test_publish_execution_body_reaches_publish_agent(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        captured = {}
+
+        class PublishAgent:
+            def __init__(self, _episode_dir, _config):
+                pass
+
+            def run(self):
+                captured.update(self.short_destination_request)
+                return {"submitted": True}
+
+        from agents import AGENT_REGISTRY
+
+        monkeypatch.setitem(AGENT_REGISTRY, "publish", PublishAgent)
+        publish = {
+            "destinations": ["youtube", "tiktok"],
+            "clip_ids": ["clip_01"],
+            "request_id": "e5753781-47f9-455e-9ce5-0eead48a19cd",
+            "actor": "operator",
+            "reason": "Approved motion release",
+            "expected_release_revision": "sha256:release",
+            "preview_revision": "sha256:preview",
+        }
+        response = client.post(
+            "/api/episodes/ep_001/run-agent/publish", json={"publish": publish}
+        )
+        assert response.status_code == 200
+        assert captured == publish
+
+    def test_publish_execution_rejects_misspelled_top_level_input(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        called = False
+
+        class PublishAgent:
+            def __init__(self, _episode_dir, _config):
+                nonlocal called
+                called = True
+
+        from agents import AGENT_REGISTRY
+
+        monkeypatch.setitem(AGENT_REGISTRY, "publish", PublishAgent)
+        response = client.post(
+            "/api/episodes/ep_001/run-agent/publish",
+            json={
+                "publsih": {
+                    "destinations": ["youtube"],
+                    "request_id": "e5753781-47f9-455e-9ce5-0eead48a19cd",
+                }
+            },
+        )
+        assert response.status_code == 422
+        assert called is False
 
     def test_worker_is_registered_for_source_recovery_guard(
         self, test_client, monkeypatch

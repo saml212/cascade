@@ -285,6 +285,32 @@ Unknown or stale targets, changed receipt history, malformed state, and a second
 unconsumed request fail with `409`. Never delete or rewrite receipt history to
 bypass these checks.
 
+## Publish an approved destination subset
+
+Keep the global platform plan intact when an account is temporarily unavailable.
+Give each selected clip an explicit future `publish_schedule`, approve the new
+release revision, then preview the requested subset:
+
+```text
+POST /api/episodes/{episode_id}/publish-shorts/preview
+{"destinations":["youtube","tiktok"],"clip_ids":["clip_01"],"request_id":"<new UUID>","actor":"...","reason":"...","expected_release_revision":"sha256:..."}
+```
+
+Review the exact artifact, transformed copy, profile, and date. Send the returned
+`execute` object unchanged as `publish` in
+`POST /api/episodes/{episode_id}/run-agent/publish`. Cascade saves an
+`intent_recorded` short receipt before the first remote request. The final receipt
+keeps the request identity and lists Instagram/X as deferred.
+
+Use a new UUID and only the deferred destinations later. A disjoint wave may
+share its own still-future clip date; a past date requires a new schedule and
+fresh publish approval. An overlapping destination for the same selected
+artifact is rejected across later episode revisions. The legacy empty publish
+body is also rejected after a subset exists. Hashtags are normalized at send
+time. YouTube/TikTok copy names the show and includes a copyable exact episode
+hub URL without claiming caption links are clickable. X names the show without
+asserting an unverified bio link.
+
 ## Verification
 
 Run the Python suite and frontend checks before handing a recovery back for

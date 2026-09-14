@@ -72,6 +72,33 @@ def _queued_evidence(*, state="queued", success=None):
     }
 
 
+def _scheduler_queued_evidence():
+    """Anonymized shape returned for Ty's unattempted scheduled job."""
+    evidence = _queued_evidence()
+    evidence["status"] = {
+        "job_id": "job-old",
+        "request_id": "cascade-short-old",
+        "external_id": "cascade-short-old",
+        "status": "queued",
+        "scheduler_status": "pending",
+        "completed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "retryable": 0,
+        "total": 2,
+        "results": [
+            {
+                "platform": platform,
+                "status": "queued",
+                "attempts": 0,
+                "success": False,
+            }
+            for platform in ("youtube", "tiktok")
+        ],
+    }
+    return evidence
+
+
 def _absent_evidence():
     return {
         "status_not_found": True,
@@ -453,6 +480,61 @@ def test_preview_rejects_unsafe_provider_states(
     )
     assert response.status_code == 409
     assert message in response.json()["detail"]
+
+
+def test_preview_accepts_exact_unattempted_scheduler_status(test_client, monkeypatch):
+    client, _episode_dir, _original, _deleted, request = _setup(
+        test_client, monkeypatch
+    )
+    from server.routes import clips
+
+    monkeypatch.setattr(
+        clips, "_upload_post_job_evidence", lambda *_args: _scheduler_queued_evidence()
+    )
+
+    response = client.post(
+        "/api/episodes/ep_001/clips/clip_01/schedule-cancellation/preview",
+        json=request,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancellable"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "failed_counter",
+        "attempted_child",
+        "published_child",
+        "duplicate_platform",
+        "wrong_child_identity",
+        "wrong_child_profile",
+    ],
+)
+def test_unattempted_scheduler_status_still_fails_closed(mutation):
+    from agents.publish import schedule_cancellation_provider_safe
+
+    evidence = _scheduler_queued_evidence()
+    status = evidence["status"]
+    if mutation == "failed_counter":
+        status["failed"] = 1
+    elif mutation == "attempted_child":
+        status["results"][0]["attempts"] = 1
+    elif mutation == "published_child":
+        status["results"][0]["post_url"] = "https://example.com/published"
+    elif mutation == "duplicate_platform":
+        status["results"][0]["platform"] = "tiktok"
+    elif mutation == "wrong_child_identity":
+        status["results"][0]["job_id"] = "other-job"
+    else:
+        status["results"][0]["profile_username"] = "other-profile"
+
+    safe, _ = schedule_cancellation_provider_safe(
+        _receipt(), evidence, profile_username="up", after_delete=False
+    )
+
+    assert safe is False
 
 
 def test_changed_snapshot_and_traversal_fail_before_delete(test_client, monkeypatch):

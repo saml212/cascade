@@ -10,6 +10,7 @@ import subprocess
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from agents.base import BaseAgent
 from agents.transcribe import current_diarized_transcript
@@ -63,6 +64,7 @@ from lib.transcript_search import clip_boundary_evidence
 
 QUALITY_SCHEMA = "cascade.release-quality/v1"
 PUBLISH_PLAN_SCHEMA = "cascade.publish-plan/v2"
+SHORT_COPY_SCHEMA = "cascade.short-copy/v1"
 QUALITY_REPORT_PATH = Path("qa/qa.json")
 AUDIO_REPORT_PATH = Path("qa/audio-quality.json")
 PLATFORM_COPY_FIELDS = {
@@ -132,6 +134,15 @@ def _private_identity(scope: str, value: object) -> str:
         default=str,
     )
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def episode_hub_url(config: dict, episode_id: str) -> str | None:
+    base = str(config.get("podcast", {}).get("r2", {}).get("public_url", "")).rstrip(
+        "/"
+    )
+    if not episode_id or not base.startswith("https://"):
+        return None
+    return f"{base}/links/episodes/{quote(episode_id, safe='')}.html"
 
 
 def publication_identity(
@@ -296,6 +307,12 @@ def _upload_post_plan(
                 "channel_handle": config.get("podcast", {}).get("channel_handle", ""),
             },
         ),
+        short_copy={
+            "schema": SHORT_COPY_SCHEMA,
+            "episode_hub_url": episode_hub_url(
+                config, str(episode.get("episode_id", ""))
+            ),
+        },
     )
     return plan
 

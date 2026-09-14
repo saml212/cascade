@@ -7,10 +7,11 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from agents.qa import (
     current_funnel_urls_for_episode,
@@ -20,6 +21,7 @@ from agents.qa import (
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import selected_audio_source
 from lib.paths import get_episodes_dir
+from server.routes import require_episode_dir
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +118,26 @@ class ResumePipelineRequest(BaseModel):
     agents: Optional[list[str]] = None
 
 
+class ShortDestinationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    destinations: list[str] = Field(min_length=1)
+    clip_ids: list[str] | None = None
+    request_id: UUID
+    actor: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=3, max_length=1000)
+    expected_release_revision: str = Field(min_length=1)
+
+
+class ShortDestinationExecution(ShortDestinationRequest):
+    preview_revision: str = Field(min_length=1)
+
+
 class RunAgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source_path: Optional[str] = None
+    publish: ShortDestinationExecution | None = None
 
 
 class ApproveLongformRequest(BaseModel):
@@ -241,6 +261,12 @@ async def run_single_agent(
 
     if agent_name == "ingest" and req.source_path:
         agent.source_path = req.source_path
+    if req.publish is not None:
+        if agent_name != "publish":
+            raise HTTPException(
+                status_code=400, detail="publish input is only valid for publish"
+            )
+        agent.short_destination_request = req.publish.model_dump(mode="json")
 
     outcome = {}
     loop = asyncio.get_running_loop()
@@ -288,6 +314,28 @@ async def run_single_agent(
             },
         )
     return {"status": "completed", "agent": agent_name, "result": result}
+
+
+@router.post("/{episode_id}/publish-shorts/preview")
+async def preview_short_destinations(
+    episode_id: str, request: ShortDestinationRequest
+) -> dict:
+    """Preview exact destination, artifact, copy, and schedule identities."""
+    from agents.pipeline import load_config
+    from agents.publish import PublishAgent
+
+    episode_dir = require_episode_dir(OUTPUT_DIR, episode_id)
+    async with _pipeline_lock:
+        current = _running.get(episode_id)
+        if current is not None and current.is_alive():
+            raise HTTPException(status_code=409, detail="Pipeline already running")
+    try:
+        return await asyncio.to_thread(
+            PublishAgent(episode_dir, load_config()).preview_short_destinations,
+            request.model_dump(mode="json"),
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{episode_id}/pipeline-status")

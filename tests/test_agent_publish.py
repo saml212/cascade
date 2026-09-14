@@ -2277,3 +2277,481 @@ class TestScheduleReservation:
         ):
             _make_agent(episode_dir).execute()
         run.assert_not_called()
+
+
+def _destination_config():
+    config = _publish_config()
+    config["podcast"] = {
+        "channel_handle": "@local-pod",
+        "r2": {"public_url": "https://media.example"},
+    }
+    return config
+
+
+def _destination_request(
+    episode_dir, config, *, request_id, destinations, clip_ids=None
+):
+    from agents.qa import quality_snapshot
+
+    request = {
+        "destinations": destinations,
+        "request_id": request_id,
+        "actor": "release-operator",
+        "reason": "Publish the approved motion cut",
+        "expected_release_revision": quality_snapshot(episode_dir, config=config)[
+            "release_gate"
+        ]["revision"],
+    }
+    if clip_ids is not None:
+        request["clip_ids"] = clip_ids
+    return request
+
+
+class TestShortDestinationRequests:
+    REQUEST_A = "b8c0b129-599c-48cb-b363-60a5fe4dc46c"
+    REQUEST_B = "ecf17f34-b5a5-4a03-a62d-49fca57b85df"
+
+    @staticmethod
+    def _seed(episode_dir, config, *, clip_count=1):
+        scheduled = (
+            datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=14)
+        ).replace(hour=9, minute=0, second=0, microsecond=0)
+        clips = []
+        for index in range(clip_count):
+            clips.append(
+                {
+                    "id": f"clip_{index}",
+                    "title": "A real story",
+                    "status": "approved",
+                    "start_seconds": index * 30,
+                    "end_seconds": (index + 1) * 30,
+                    "metadata": {
+                        "youtube": {
+                            "title": "YT title",
+                            "description": "A moment.\nFull episode: link in bio",
+                        },
+                        "tiktok": {
+                            "caption": "A moment #Local\nLink in bio",
+                            "hashtags": ["local", "#LoveStory", "Love Story"],
+                        },
+                        "instagram": {"caption": "IG", "hashtags": ["local"]},
+                        "x": {"text": "X copy"},
+                    },
+                }
+            )
+        _seed_episode(
+            episode_dir,
+            config=config,
+            clips=clips,
+            schedule=[
+                {
+                    "clip_id": f"clip_{index}",
+                    "scheduled_date": (scheduled + timedelta(days=index)).isoformat(),
+                }
+                for index in range(clip_count)
+            ],
+        )
+
+    def test_preview_execute_persists_intent_before_send_and_normalizes_copy(
+        self, env, episode_dir
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        preview = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube", "tiktok"],
+            )
+        )
+
+        assert preview["requested_destinations"] == ["tiktok", "youtube"]
+        assert preview["deferred_destinations"] == ["instagram", "x"]
+        assert preview["selected_clip_ids"] == ["clip_0"]
+        copy = preview["targets"][0]["destination_copy"]
+        assert "link in bio" not in json.dumps(copy).lower()
+        assert "https://media.example/links/episodes/ep_test.html" in json.dumps(copy)
+        assert copy["tiktok"]["text"].count("#Local") == 1
+        assert copy["tiktok"]["text"].count("#LoveStory") == 1
+        assert "instagram" not in copy and "x" not in copy
+
+        def submitted(command, **_kwargs):
+            stored = json.loads((episode_dir / "publish.json").read_text())
+            assert stored["shorts"][0]["status"] == "intent_recorded"
+            assert [
+                value.removeprefix("platform[]=")
+                for value in command
+                if value.startswith("platform[]=")
+            ] == ["tiktok", "youtube"]
+            return _mock_proc(stdout=json.dumps({"request_id": "provider-job"}))
+
+        agent.short_destination_request = preview["execute"]
+        with patch("agents.publish.subprocess.run", side_effect=submitted) as run:
+            result = agent.run()
+        assert run.call_count == 1
+        receipt = result["shorts"][0]
+        assert receipt["status"] == "submitted"
+        assert receipt["destination_request_id"] == self.REQUEST_A
+        assert receipt["deferred_platforms"] == ["instagram", "x"]
+
+        with patch("agents.publish.subprocess.run") as repeated:
+            again = agent.run()
+        repeated.assert_not_called()
+        assert again["shorts"][0]["reused_receipt"] is True
+
+    def test_disjoint_wave_can_share_date_but_overlap_and_default_are_blocked(
+        self, env, episode_dir
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        first = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube", "tiktok"],
+            )
+        )
+        agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "yt-job"}))
+            agent.run()
+
+        second_request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_B,
+            destinations=["instagram"],
+        )
+        second = agent.preview_short_destinations(second_request)
+        assert second["deferred_destinations"] == ["x"]
+        assert second["deferred_destinations_by_clip"] == {"clip_0": ["x"]}
+        assert (
+            second["targets"][0]["scheduled_date"]
+            == first["targets"][0]["scheduled_date"]
+        )
+        agent.short_destination_request = second["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "tt-job"}))
+            result = agent.run()
+        assert run.call_count == 1
+        assert {tuple(receipt["platforms"]) for receipt in result["shorts"]} == {
+            ("instagram",),
+            ("tiktok", "youtube"),
+        }
+
+        overlap = {**second_request, "destinations": ["youtube"]}
+        with pytest.raises(RuntimeError, match="already has a destination request"):
+            agent.preview_short_destinations(overlap)
+
+        from agents.publish import short_receipt_history_revision
+        from agents.qa import quality_snapshot
+        from lib.short_variants import distribution_release_revision
+
+        publish = json.loads((episode_dir / "publish.json").read_text())
+        clips_path = episode_dir / "clips.json"
+        clips = json.loads(clips_path.read_text())
+        clip = clips["clips"][0]
+        version = quality_snapshot(episode_dir, config=config)["release_gate"][
+            "short_versions"
+        ]["clip_0"]
+        rerelease = {
+            "request_id": "811e01ca-6c83-4b52-9d88-3341c56560ec",
+            "actor": "release-operator",
+            "reason": "Release a new exact destination wave",
+            "variant_id": version["variant_id"],
+            "target_revision": version["revision"],
+            "render_fingerprint": version["render_fingerprint"],
+            "receipt_history_revision": short_receipt_history_revision(
+                publish, "clip_0"
+            ),
+            "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }
+        rerelease["revision"] = distribution_release_revision(
+            request_id=rerelease["request_id"],
+            actor=rerelease["actor"],
+            reason=rerelease["reason"],
+            variant_id=rerelease["variant_id"],
+            target_revision=rerelease["target_revision"],
+            render_fingerprint=rerelease["render_fingerprint"],
+            receipt_history_revision=rerelease["receipt_history_revision"],
+        )
+        clip["distribution_release"] = rerelease
+        _write_json(clips_path, clips)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode["publish_approval"] = {
+            "revision": quality_snapshot(episode_dir, config=config)["release_gate"][
+                "revision"
+            ],
+            "approved_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }
+        _write_json(episode_path, episode)
+
+        del agent.short_destination_request
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="explicit destination subset"),
+        ):
+            agent.execute()
+        run.assert_not_called()
+
+    def test_request_uuid_cannot_change_destinations_or_selected_clips(
+        self, env, episode_dir
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config, clip_count=2)
+        agent = _make_agent(episode_dir, config)
+        first = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube"],
+                clip_ids=["clip_0"],
+            )
+        )
+        agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "yt-job"}))
+            agent.run()
+
+        for changed in (
+            {"destinations": ["tiktok"], "clip_ids": ["clip_0"]},
+            {"destinations": ["youtube"], "clip_ids": None},
+        ):
+            with pytest.raises(RuntimeError, match="request_id cannot be reused"):
+                agent.preview_short_destinations(
+                    _destination_request(
+                        episode_dir,
+                        config,
+                        request_id=self.REQUEST_A,
+                        **changed,
+                    )
+                )
+
+    def test_deferred_wave_keeps_existing_future_slot(self, env, episode_dir):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        first = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube"],
+            )
+        )
+        agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "yt-job"}))
+            agent.run()
+
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        scheduled = datetime.fromisoformat(first["targets"][0]["scheduled_date"])
+        episode["publish_schedule"][0]["scheduled_date"] = (
+            scheduled + timedelta(days=1)
+        ).isoformat()
+        qa_path = episode_dir / "qa" / "qa.json"
+        qa = json.loads(qa_path.read_text())
+        qa["quality_revision"] = quality_revision(episode_dir, episode, config=config)
+        _write_json(qa_path, qa)
+        episode["publish_approval"] = {
+            "revision": release_revision(episode_dir, episode, config=config),
+            "approved_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }
+        _write_json(episode_path, episode)
+
+        with pytest.raises(RuntimeError, match="existing future schedule"):
+            agent.preview_short_destinations(
+                _destination_request(
+                    episode_dir,
+                    config,
+                    request_id=self.REQUEST_B,
+                    destinations=["tiktok"],
+                )
+            )
+
+    def test_deferred_wave_can_use_fresh_slot_after_original_passes(
+        self, env, monkeypatch, episode_dir
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        original = datetime.fromisoformat(
+            episode["publish_schedule"][0]["scheduled_date"]
+        )
+        monkeypatch.setattr(
+            PublishAgent,
+            "_schedule_reference",
+            staticmethod(lambda *_args: original - timedelta(days=1)),
+        )
+        agent = _make_agent(episode_dir, config)
+        first = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube"],
+            )
+        )
+        agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "yt-job"}))
+            agent.run()
+
+        episode = json.loads(episode_path.read_text())
+        episode["publish_schedule"][0]["scheduled_date"] = (
+            original + timedelta(days=2)
+        ).isoformat()
+        qa_path = episode_dir / "qa" / "qa.json"
+        qa = json.loads(qa_path.read_text())
+        qa["quality_revision"] = quality_revision(episode_dir, episode, config=config)
+        _write_json(qa_path, qa)
+        episode["publish_approval"] = {
+            "revision": release_revision(episode_dir, episode, config=config),
+            "approved_at": (original + timedelta(days=1)).isoformat(),
+        }
+        _write_json(episode_path, episode)
+        monkeypatch.setattr(
+            PublishAgent,
+            "_schedule_reference",
+            staticmethod(lambda *_args: original + timedelta(days=1)),
+        )
+
+        second = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_B,
+                destinations=["tiktok"],
+            )
+        )
+        assert datetime.fromisoformat(second["targets"][0]["scheduled_date"]) == (
+            original + timedelta(days=2)
+        )
+
+    @pytest.mark.parametrize(
+        ("changed_field", "changed_value"),
+        [
+            (None, None),
+            ("platforms", ["youtube", "instagram"]),
+            ("profile_username", "wrong-profile"),
+            ("source_filename", "wrong.mp4"),
+        ],
+    )
+    def test_crash_recovery_rejects_conflicting_provider_row(
+        self, env, monkeypatch, episode_dir, changed_field, changed_value
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        preview = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube"],
+            )
+        )
+        agent.short_destination_request = preview["execute"]
+        with (
+            patch.object(agent, "_submit_short", side_effect=RuntimeError("crash")),
+            pytest.raises(RuntimeError, match="crash"),
+        ):
+            agent.run()
+        target = preview["targets"][0]
+        remote = {
+            "job_id": "remote-job",
+            "external_id": target["external_id"],
+            "profile_username": "test_user",
+            "platforms": ["youtube"],
+            "source_filename": "clip_0.mp4",
+            "scheduled_date": target["scheduled_date"],
+            "fields": {"external_id": target["external_id"]},
+        }
+        if changed_field:
+            remote[changed_field] = changed_value
+        monkeypatch.setattr(PublishAgent, "_remote_schedule", lambda *_args: [remote])
+
+        with patch("agents.publish.subprocess.run") as run:
+            if changed_field:
+                with pytest.raises(RuntimeError, match="provider schedule conflicts"):
+                    agent.run()
+            else:
+                result = agent.run()
+                assert result["shorts"][0]["job_id"] == "remote-job"
+        run.assert_not_called()
+
+    def test_changed_release_revision_cannot_bypass_stable_target_overlap(
+        self, env, episode_dir
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        first = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube"],
+            )
+        )
+        agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "yt-job"}))
+            agent.run()
+
+        changed = _destination_config()
+        changed["podcast"]["channel_handle"] = "@changed"
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode["publish_approval"] = {
+            "revision": release_revision(episode_dir, episode, config=changed),
+            "approved_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }
+        _write_json(episode_path, episode)
+        changed_agent = _make_agent(episode_dir, changed)
+        with pytest.raises(RuntimeError, match="already has a destination request"):
+            changed_agent.preview_short_destinations(
+                _destination_request(
+                    episode_dir,
+                    changed,
+                    request_id=self.REQUEST_B,
+                    destinations=["youtube"],
+                )
+            )
+
+    def test_intent_survives_failure_and_malformed_intent_fails_closed(
+        self, env, episode_dir
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        preview = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube"],
+            )
+        )
+        agent.short_destination_request = preview["execute"]
+        with (
+            patch.object(agent, "_submit_short", side_effect=RuntimeError("crash")),
+            pytest.raises(RuntimeError, match="crash"),
+        ):
+            agent.run()
+        stored_path = episode_dir / "publish.json"
+        stored = json.loads(stored_path.read_text())
+        assert stored["shorts"][0]["status"] == "intent_recorded"
+
+        stored["shorts"][0]["destination_copy"]["youtube"]["title"] = "tampered"
+        _write_json(stored_path, stored)
+        with pytest.raises(RuntimeError, match="prior short publication receipts"):
+            agent.execute()
