@@ -633,6 +633,7 @@ class PublishAgent(BaseAgent):
                 previous.get("longform"),
                 revision,
                 longform_revision,
+                snapshot["quality"]["current_revision"],
                 youtube_url,
                 platforms,
                 api_key,
@@ -730,6 +731,7 @@ class PublishAgent(BaseAgent):
         previous,
         revision,
         longform_revision,
+        quality_revision,
         youtube_url,
         platforms,
         api_key,
@@ -770,16 +772,35 @@ class PublishAgent(BaseAgent):
                 "idempotency_key": identity,
                 "editorial_revision": longform_revision,
             }
+        retry_rejection = bool(
+            isinstance(previous, dict)
+            and previous.get("external_id") in {identity, legacy_identity}
+            and self._definitive_payload_rejection(previous)
+        )
         if (
             isinstance(previous, dict)
             and previous.get("external_id") in {identity, legacy_identity}
             and previous.get("status") in RECORDED_STATES
+            and not retry_rejection
         ):
             return {
                 **previous,
                 "editorial_revision": longform_revision,
                 "reused_receipt": True,
             }
+
+        transport = self._verified_longform_transport(
+            revision,
+            longform_revision,
+            quality_revision,
+        )
+        if retry_rejection and transport is None:
+            return {
+                **previous,
+                "editorial_revision": longform_revision,
+                "reused_receipt": True,
+            }
+        retry_rejection = retry_rejection and transport is not None
 
         path = self.episode_dir / "upload_video.mp4"
         if not path.exists():
@@ -788,7 +809,14 @@ class PublishAgent(BaseAgent):
             )
         title = metadata.get("title", "Podcast Episode")
         command = self._base_command(
-            path, title, ["youtube"], identity, api_key, user, 1200
+            path,
+            title,
+            ["youtube"],
+            identity,
+            api_key,
+            user,
+            1200,
+            video_url=transport["url"] if transport else None,
         )
         command += [
             "-F",
@@ -805,7 +833,95 @@ class PublishAgent(BaseAgent):
             platform="youtube",
             editorial_revision=longform_revision,
         )
+        if transport:
+            result["transport"] = transport
+        if retry_rejection:
+            attempts = previous.get("attempt_history", [])
+            if not isinstance(attempts, list):
+                attempts = []
+            result["attempt_history"] = [
+                *attempts,
+                {
+                    key: previous.get(key)
+                    for key in ("status", "error", "http_status", "external_id")
+                    if previous.get(key) is not None
+                },
+            ]
         return result
+
+    def _verified_longform_transport(
+        self,
+        release_revision: str,
+        editorial_revision: str,
+        quality_revision: str,
+    ) -> dict | None:
+        """Use a current immutable R2 object instead of a multi-GB request body."""
+        path = self.episode_dir / "video_feed.json"
+        if not path.exists():
+            return None
+        try:
+            from agents.video_feed import VIDEO_FEED_SCHEMA, VideoFeedAgent
+
+            receipt = json.loads(path.read_text())
+            video = receipt["video"]
+            remote = video["remote"]
+            agent = VideoFeedAgent(self.episode_dir, self.config)
+            current = agent._current_inputs(require_publish_approval=True)
+            live_remote = agent._head_video_object(agent._r2_client(), current)
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Published video transport proof cannot be verified"
+            ) from exc
+        if not (
+            isinstance(receipt, dict)
+            and receipt.get("schema") == VIDEO_FEED_SCHEMA
+            and receipt.get("status") == "published"
+            and receipt.get("episode_id") == self.episode_dir.name
+            and receipt.get("release_revision") == release_revision
+            and receipt.get("editorial_revision") == editorial_revision
+            and receipt.get("quality_revision") == quality_revision
+            and receipt.get("publish_approval_current") is True
+            and current["release_revision"] == release_revision
+            and current["editorial_revision"] == editorial_revision
+            and current["quality_revision"] == quality_revision
+            and current["video_url"].startswith("https://")
+            and video.get("path") == str(current["video_path"])
+            and video.get("object_key") == current["object_key"]
+            and video.get("url") == current["video_url"]
+            and video.get("sha256") == current["content_sha256"]
+            and video.get("size_bytes") == current["video_size"]
+            and video.get("render_fingerprint") == current["render_fingerprint"]
+            and isinstance(remote, dict)
+            and remote.get("status") == "ready"
+            and remote.get("sha256") == current["content_sha256"]
+            and remote.get("size_bytes") == current["video_size"]
+            and remote.get("render_fingerprint") == current["render_fingerprint"]
+            and live_remote is not None
+        ):
+            raise RuntimeError("Published video transport proof is stale")
+        return {
+            "kind": "verified_public_url",
+            "url": current["video_url"],
+            "sha256": f"sha256:{current['content_sha256']}",
+            "render_fingerprint": current["render_fingerprint"],
+            "size_bytes": current["video_size"],
+        }
+
+    @staticmethod
+    def _definitive_payload_rejection(receipt: dict) -> bool:
+        if (
+            receipt.get("status") not in {"failed", "unknown"}
+            or receipt.get("server_request_id")
+            or receipt.get("job_id")
+            or receipt.get("response")
+        ):
+            return False
+        if receipt.get("http_status") == 413:
+            return True
+        error = receipt.get("error")
+        return (
+            isinstance(error, str) and "413 request entity too large" in error.lower()
+        )
 
     def _bind_legacy_funnel_urls(
         self, episode: dict, funnel_urls: dict, longform_revision: str
@@ -1142,7 +1258,9 @@ class PublishAgent(BaseAgent):
         return result
 
     @staticmethod
-    def _base_command(path, title, platforms, identity, api_key, user, timeout):
+    def _base_command(
+        path, title, platforms, identity, api_key, user, timeout, *, video_url=None
+    ):
         command = [
             "curl",
             "-sS",
@@ -1153,7 +1271,7 @@ class PublishAgent(BaseAgent):
             "-H",
             f"Idempotency-Key: {identity}",
             "-F",
-            f"video=@{path}",
+            f"video={video_url}" if video_url else f"video=@{path}",
             "-F",
             f"user={user}",
             "-F",
@@ -1202,12 +1320,16 @@ class PublishAgent(BaseAgent):
         try:
             response = json.loads(process.stdout)
         except json.JSONDecodeError:
+            payload_rejected = "413 request entity too large" in process.stdout.lower()
             return {
                 **base,
-                "status": "unknown",
+                "status": "failed" if payload_rejected else "unknown",
                 "error": (
-                    f"non-JSON response from Upload-Post: {process.stdout[:200]}"
+                    "Upload-Post rejected the request with HTTP 413"
+                    if payload_rejected
+                    else f"non-JSON response from Upload-Post: {process.stdout[:200]}"
                 ),
+                **({"http_status": 413} if payload_rejected else {}),
             }
 
         receipt = {**base, "response": response}

@@ -36,10 +36,12 @@ from agents.qa import (
 )
 from lib.delivery_video import (
     longform_render_fingerprint,
+    read_render_manifest,
     record_longform_render,
     record_short_render,
     short_render_fingerprint,
 )
+from lib.ffprobe import file_fingerprint
 from lib.timeline import Timeline
 
 REAL_REMOTE_SCHEDULE = PublishAgent._remote_schedule
@@ -103,6 +105,8 @@ def _seed_episode(
     config = config or _publish_config()
     episode = {
         "episode_id": "ep_test",
+        "title": "Longform",
+        "description": "lf desc",
         "status": "ready_for_review",
         "crop_config": {"speakers": [{"label": "Host"}]},
         "longform_edits": [],
@@ -227,6 +231,43 @@ def _make_agent(episode_dir, config=None):
 
 def _mock_proc(stdout="", stderr="", returncode=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+
+def _write_video_feed_receipt(episode_dir, config):
+    video = episode_dir / "upload_video.mp4"
+    scan = file_fingerprint(video)
+    digest = scan["id"].removeprefix("sha256:")
+    render_fingerprint = read_render_manifest(episode_dir)["longform"]["fingerprint"]
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    public_url = config["podcast"]["r2"]["public_url"].rstrip("/")
+    object_key = f"video/{episode_dir.name}/{render_fingerprint}.mp4"
+    remote = {
+        "status": "ready",
+        "size_bytes": scan["size_bytes"],
+        "sha256": digest,
+        "render_fingerprint": render_fingerprint,
+    }
+    _write_json(
+        episode_dir / "video_feed.json",
+        {
+            "schema": "cascade.video-podcast-feed/v1",
+            "status": "published",
+            "episode_id": episode_dir.name,
+            "release_revision": episode["publish_approval"]["revision"],
+            "editorial_revision": episode["editorial_approval"]["revision"],
+            "quality_revision": quality_revision(episode_dir, episode, config=config),
+            "publish_approval_current": True,
+            "video": {
+                "path": str(video),
+                "object_key": object_key,
+                "url": f"{public_url}/{object_key}",
+                "size_bytes": scan["size_bytes"],
+                "render_fingerprint": render_fingerprint,
+                "sha256": digest,
+                "remote": remote,
+            },
+        },
+    )
 
 
 # ── safety gate ─────────────────────────────────────────────────────────────
@@ -1640,6 +1681,193 @@ class TestIdempotency:
         assert first["longform"]["status"] == "unknown"
         assert second["longform"]["status"] == "unknown"
         assert second["longform"]["reused_receipt"] is True
+
+
+class TestLongformTransport:
+    @staticmethod
+    def _config():
+        config = _publish_config()
+        config["platforms"]["video_podcast_rss"] = {"enabled": True}
+        config["podcast"] = {
+            "title": "Show",
+            "description": "Description",
+            "author": "Host",
+            "artwork_url": "https://media.example.test/art.jpg",
+            "link": "https://example.test",
+            "owner_email": "host@example.test",
+            "explicit": "false",
+            "r2": {
+                "bucket": "media",
+                "public_url": "https://media.example.test",
+            },
+        }
+        return config
+
+    @pytest.fixture
+    def remote_object(self):
+        with (
+            patch(
+                "agents.video_feed.VideoFeedAgent._r2_client",
+                return_value=object(),
+            ),
+            patch("agents.video_feed.VideoFeedAgent._head_video_object") as head,
+        ):
+            head.side_effect = lambda _client, inputs: {
+                "status": "ready",
+                "size_bytes": inputs["video_size"],
+                "sha256": inputs["content_sha256"],
+                "render_fingerprint": inputs["render_fingerprint"],
+            }
+            yield head
+
+    def test_verified_video_feed_object_is_submitted_by_url(
+        self, env, episode_dir, remote_object
+    ):
+        config = self._config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        _write_video_feed_receipt(episode_dir, config)
+        commands = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                commands.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "remote-request"}))
+            )
+            result = _make_agent(episode_dir, config).execute()
+
+        fields = TestIdempotency._values(commands[0], "-F")
+        transport = result["longform"]["transport"]
+        assert f"video={transport['url']}" in fields
+        assert not any(value.startswith("video=@") for value in fields)
+        assert transport["kind"] == "verified_public_url"
+        assert transport["sha256"].startswith("sha256:")
+
+    def test_stale_video_feed_proof_blocks_before_submission(
+        self, env, episode_dir, remote_object
+    ):
+        config = self._config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        _write_video_feed_receipt(episode_dir, config)
+        path = episode_dir / "video_feed.json"
+        receipt = json.loads(path.read_text())
+        receipt["release_revision"] = "sha256:stale"
+        _write_json(path, receipt)
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="transport proof is stale"),
+        ):
+            _make_agent(episode_dir, config).execute()
+        run.assert_not_called()
+
+    def test_missing_remote_object_blocks_before_submission(
+        self, env, episode_dir, remote_object
+    ):
+        config = self._config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        _write_video_feed_receipt(episode_dir, config)
+        remote_object.side_effect = None
+        remote_object.return_value = None
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="transport proof is stale"),
+        ):
+            _make_agent(episode_dir, config).execute()
+        run.assert_not_called()
+
+    def test_verified_url_retries_only_definitive_legacy_413(
+        self, env, episode_dir, remote_object
+    ):
+        config = self._config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        _write_video_feed_receipt(episode_dir, config)
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        identity = publication_identity(
+            episode_dir.name,
+            episode["editorial_approval"]["revision"],
+            "longform",
+        )
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "shorts": [],
+                "longform": {
+                    "external_id": identity,
+                    "idempotency_key": identity,
+                    "request_id": identity,
+                    "status": "unknown",
+                    "error": (
+                        "non-JSON response from Upload-Post: "
+                        "<h1>413 Request Entity Too Large</h1>"
+                    ),
+                },
+            },
+        )
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(
+                stdout=json.dumps({"request_id": "remote-request"})
+            )
+            result = _make_agent(episode_dir, config).execute()
+
+        assert run.call_count == 1
+        assert result["longform"]["external_id"] == identity
+        assert result["longform"]["attempt_history"][0]["status"] == "unknown"
+        assert (
+            "413 Request Entity Too Large"
+            in result["longform"]["attempt_history"][0]["error"]
+        )
+
+    def test_verified_url_does_not_retry_generic_unknown(
+        self, env, episode_dir, remote_object
+    ):
+        config = self._config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        _write_video_feed_receipt(episode_dir, config)
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        identity = publication_identity(
+            episode_dir.name,
+            episode["editorial_approval"]["revision"],
+            "longform",
+        )
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "shorts": [],
+                "longform": {
+                    "external_id": identity,
+                    "request_id": identity,
+                    "status": "unknown",
+                    "error": "connection lost after request body was sent",
+                },
+            },
+        )
+        with patch("agents.publish.subprocess.run") as run:
+            result = _make_agent(episode_dir, config).execute()
+
+        run.assert_not_called()
+        assert result["longform"]["status"] == "unknown"
+        assert result["longform"]["reused_receipt"] is True
+
+    def test_http_413_is_recorded_as_definitive_failure(self, env, episode_dir):
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(
+                stdout="<html><h1>413 Request Entity Too Large</h1></html>",
+            )
+            result = PublishAgent._submit(["curl"], 10, "identity")
+
+        assert result["status"] == "failed"
+        assert result["http_status"] == 413
+        assert "HTTP 413" in result["error"]
+
+    def test_structured_rejection_remains_definitive_failure(self):
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(
+                stdout=json.dumps({"success": False, "error": "bad metadata"})
+            )
+            result = PublishAgent._submit(["curl"], 10, "identity")
+
+        assert result["status"] == "failed"
+        assert result["error"] == "bad metadata"
 
 
 # ── schedule conversion ─────────────────────────────────────────────────────
