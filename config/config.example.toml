@@ -108,6 +108,41 @@ require_approval = true
 requires_public_url = true
 link_to_longform = true                   # "Link in bio" CTA
 
+[platforms.x]
+enabled = false
+require_approval = true
+
+# Additional short destinations are opt-in. Use the stable account username from
+# Upload-Post's profile detail API, not a display name or public handle. Cascade
+# verifies the selected account and native target again at preview and execution.
+[platforms.facebook]
+enabled = false
+require_approval = true
+account_username = ""
+page_id = ""                              # Required exact Facebook Page ID
+
+[platforms.threads]
+enabled = false
+require_approval = true
+account_username = ""
+
+[platforms.bluesky]
+enabled = false
+require_approval = true
+account_username = ""
+
+[platforms.linkedin]
+enabled = false
+require_approval = true
+account_username = ""
+page_id = ""                              # Empty publishes to the personal profile
+
+[platforms.pinterest]
+enabled = false
+require_approval = true
+account_username = ""
+board_id = ""                             # Required exact public board ID
+
 [platforms.podcast_rss]
 enabled = true
 feed_url = ""

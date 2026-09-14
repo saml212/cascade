@@ -32,7 +32,9 @@ def _inputs(tmp_episode_dir, metadata: dict | None = None):
                 "start_seconds": 10,
                 "end_seconds": 20,
                 "selection_status": "selected",
-                "metadata": metadata if metadata is not None else _platform_copy("Edit"),
+                "metadata": metadata
+                if metadata is not None
+                else _platform_copy("Edit"),
             },
             {
                 "id": "clip_02",
@@ -88,9 +90,7 @@ def test_complete_editorial_copy_is_preserved_without_generation(
     assert not result["generated"]
     assert (tmp_episode_dir / "episode.json").read_bytes() == episode_bytes
     assert (tmp_episode_dir / "clips.json").read_bytes() == clip_bytes
-    stored = json.loads(
-        (tmp_episode_dir / "metadata" / "metadata.json").read_text()
-    )
+    stored = json.loads((tmp_episode_dir / "metadata" / "metadata.json").read_text())
     assert stored["longform"]["title"] == episode["title"]
     assert stored["clips"] == [{"id": "clip_01", **clips["clips"][0]["metadata"]}]
     assert stored["generation"]["provider"] == "existing_editorial"
@@ -147,3 +147,40 @@ def test_missing_copy_rejects_non_source_clock_transcript(
 
     with pytest.raises(ValueError, match="source-clock"):
         MetadataGenAgent(tmp_episode_dir, sample_config).execute()
+
+
+def test_generation_schema_requires_only_enabled_expansion_copy(
+    tmp_episode_dir, sample_config
+):
+    sample_config["platforms"] = {
+        "facebook": {"enabled": True},
+        "threads": {"enabled": False},
+    }
+    _inputs(tmp_episode_dir)
+    generated = {
+        "longform": {
+            "title": "Editorial episode title",
+            "description": "Editorial episode description",
+            "tags": ["editorial"],
+        },
+        "clips": [
+            {
+                "id": "clip_01",
+                "facebook": {"title": "Facebook title", "description": "Body"},
+            }
+        ],
+    }
+
+    with patch(
+        "agents.metadata_gen.generate_structured",
+        return_value=(generated, {"provider": "test"}),
+    ) as generate:
+        MetadataGenAgent(tmp_episode_dir, sample_config).execute()
+
+    clip_schema = generate.call_args.kwargs["schema"]["properties"]["clips"]["items"]
+    assert clip_schema["required"] == ["id", "facebook"]
+    assert "threads" not in clip_schema["properties"]
+    stored = json.loads((tmp_episode_dir / "clips.json").read_text())
+    assert (
+        stored["clips"][0]["metadata"]["facebook"] == generated["clips"][0]["facebook"]
+    )

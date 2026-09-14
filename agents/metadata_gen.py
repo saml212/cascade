@@ -7,78 +7,35 @@ import json
 
 from agents.base import BaseAgent
 from lib.generation import generate_structured
+from lib.short_distribution import PLATFORM_METADATA_FIELDS, metadata_schema
 
-PLATFORM_FIELDS = {
-    "youtube": ("title", "description"),
-    "tiktok": ("caption", "hashtags"),
-    "instagram": ("caption", "hashtags"),
-    "x": ("text",),
-}
 
-_PLATFORM_SCHEMAS = {
-    "youtube": {
+def _metadata_generation_schema(enabled: list[str]) -> dict:
+    platform_schemas = {platform: metadata_schema(platform) for platform in enabled}
+    clip_schema = {
+        "type": "object",
+        "properties": {"id": {"type": "string"}, **platform_schemas},
+        "required": ["id", *platform_schemas],
+        "additionalProperties": False,
+    }
+    return {
         "type": "object",
         "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-        },
-        "required": ["title", "description"],
-        "additionalProperties": False,
-    },
-    "tiktok": {
-        "type": "object",
-        "properties": {
-            "caption": {"type": "string"},
-            "hashtags": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["caption", "hashtags"],
-        "additionalProperties": False,
-    },
-    "instagram": {
-        "type": "object",
-        "properties": {
-            "caption": {"type": "string"},
-            "hashtags": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["caption", "hashtags"],
-        "additionalProperties": False,
-    },
-    "x": {
-        "type": "object",
-        "properties": {"text": {"type": "string"}},
-        "required": ["text"],
-        "additionalProperties": False,
-    },
-}
-
-_CLIP_METADATA_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "id": {"type": "string"},
-        **_PLATFORM_SCHEMAS,
-    },
-    "required": ["id", *_PLATFORM_SCHEMAS],
-    "additionalProperties": False,
-}
-
-_METADATA_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "longform": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "description": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
+            "longform": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "description", "tags"],
+                "additionalProperties": False,
             },
-            "required": ["title", "description", "tags"],
-            "additionalProperties": False,
+            "clips": {"type": "array", "items": clip_schema},
         },
-        "clips": {"type": "array", "items": _CLIP_METADATA_SCHEMA},
-    },
-    "required": ["longform", "clips"],
-    "additionalProperties": False,
-}
+        "required": ["longform", "clips"],
+        "additionalProperties": False,
+    }
 
 
 def _has_fields(value: object, fields: tuple[str, ...]) -> bool:
@@ -145,14 +102,12 @@ class MetadataGenAgent(BaseAgent):
         settings = self.config.get("platforms", {})
         return [
             platform
-            for platform in PLATFORM_FIELDS
+            for platform in PLATFORM_METADATA_FIELDS
             if settings.get(platform, {}).get("enabled")
         ]
 
     @staticmethod
-    def _existing_metadata(
-        episode: dict, clips: list[dict], existing: dict
-    ) -> dict:
+    def _existing_metadata(episode: dict, clips: list[dict], existing: dict) -> dict:
         existing_longform = existing.get("longform", {})
         longform = {
             field: episode.get(field) or existing_longform.get(field)
@@ -186,13 +141,15 @@ class MetadataGenAgent(BaseAgent):
             missing.append({"scope": "longform", "fields": longform_fields})
         for clip in metadata.get("clips", []):
             for platform in enabled:
-                if not _has_fields(clip.get(platform), PLATFORM_FIELDS[platform]):
+                if not _has_fields(
+                    clip.get(platform), PLATFORM_METADATA_FIELDS[platform]
+                ):
                     missing.append(
                         {
                             "scope": "clip",
                             "clip_id": clip["id"],
                             "platform": platform,
-                            "fields": list(PLATFORM_FIELDS[platform]),
+                            "fields": list(PLATFORM_METADATA_FIELDS[platform]),
                         }
                     )
         return missing
@@ -229,15 +186,20 @@ MISSING FIELDS:
 {json.dumps(missing, indent=2)}
 
 EPISODE:
-{json.dumps({
-    "guest_name": episode.get("guest_name", ""),
-    "title": episode.get("title", ""),
-    "description": episode.get("description", ""),
-    "youtube_longform_url": episode.get("youtube_longform_url", ""),
-    "spotify_longform_url": episode.get("spotify_longform_url", ""),
-    "podcast_title": podcast.get("title", "The Local Podcast"),
-    "channel_handle": podcast.get("channel_handle", ""),
-}, indent=2)}
+{
+            json.dumps(
+                {
+                    "guest_name": episode.get("guest_name", ""),
+                    "title": episode.get("title", ""),
+                    "description": episode.get("description", ""),
+                    "youtube_longform_url": episode.get("youtube_longform_url", ""),
+                    "spotify_longform_url": episode.get("spotify_longform_url", ""),
+                    "podcast_title": podcast.get("title", "The Local Podcast"),
+                    "channel_handle": podcast.get("channel_handle", ""),
+                },
+                indent=2,
+            )
+        }
 
 CLIPS AND SOURCE-CLOCK TRANSCRIPT EVIDENCE:
 {json.dumps(summaries, indent=2)}
@@ -249,7 +211,12 @@ Return the complete schema. Existing nonempty copy is locked: reproduce it exact
 Ground every new factual claim in the supplied transcript excerpt. Do not invent a
 quotation, achievement, identity, place, or event. Do not claim a published episode,
 live URL, or link when the corresponding URL above is empty. Keep YouTube titles under
-100 characters and X text under 280 characters. Use platform-appropriate copy."""
+100 characters and X text under 280 characters. Keep Facebook titles under 255
+characters, Threads text under 500 UTF-8 bytes, Bluesky text under 300 characters,
+LinkedIn titles under 400 UTF-16 units and descriptions under 3000 characters, and
+Pinterest titles under 100 characters and descriptions under 800 characters. Reserve
+room for the deterministic full-episode CTA on Facebook, Threads, Bluesky, and
+LinkedIn. Use platform-appropriate copy."""
         generated, provenance = generate_structured(
             self.config,
             task="podcast_release_metadata",
@@ -258,7 +225,7 @@ live URL, or link when the corresponding URL above is empty. Keep YouTube titles
                 "editorial fields are authoritative. Return only schema-valid JSON."
             ),
             prompt=prompt,
-            schema=_METADATA_SCHEMA,
+            schema=_metadata_generation_schema(self._enabled_platforms()),
             max_output_tokens=16384,
         )
         provenance = {
@@ -289,7 +256,7 @@ live URL, or link when the corresponding URL above is empty. Keep YouTube titles
         }
         for clip in merged["clips"]:
             candidate = generated_by_id.get(str(clip["id"]), {})
-            for platform, fields in PLATFORM_FIELDS.items():
+            for platform, fields in PLATFORM_METADATA_FIELDS.items():
                 if not _has_fields(clip.get(platform), fields):
                     value = candidate.get(platform)
                     if value:
@@ -310,7 +277,7 @@ live URL, or link when the corresponding URL above is empty. Keep YouTube titles
             inline = clip.get("metadata")
             if not isinstance(inline, dict):
                 inline = {}
-            for platform in PLATFORM_FIELDS:
+            for platform in PLATFORM_METADATA_FIELDS:
                 if not inline.get(platform) and generated.get(platform):
                     if clip.get("metadata") is not inline:
                         clip["metadata"] = inline
@@ -333,7 +300,9 @@ live URL, or link when the corresponding URL above is empty. Keep YouTube titles
                 changed = True
         if changed:
             if self.load_json_safe("episode.json") != original:
-                raise ValueError("episode.json changed during metadata generation; retry")
+                raise ValueError(
+                    "episode.json changed during metadata generation; retry"
+                )
             self.save_json("episode.json", episode)
 
     @staticmethod
@@ -344,9 +313,7 @@ live URL, or link when the corresponding URL above is empty. Keep YouTube titles
             for word in utterance.get("words", [])
             if start <= (float(word["start"]) + float(word["end"])) / 2 < end
         ]
-        words.sort(
-            key=lambda word: (float(word["start"]), float(word["end"]))
-        )
+        words.sort(key=lambda word: (float(word["start"]), float(word["end"])))
         return " ".join(
             f"{word.get('punctuated_word') or word.get('word', '')}"
             f"{' [?]' if word.get('suspect') else ''}"

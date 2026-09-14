@@ -75,6 +75,14 @@ def _write_json(path, data):
     path.write_text(json.dumps(data))
 
 
+def _multipart_values(command):
+    return [
+        value
+        for index, value in enumerate(command)
+        if index > 0 and command[index - 1] in {"-F", "--form-string"}
+    ]
+
+
 def _publish_config() -> dict:
     return {
         "platforms": {
@@ -411,11 +419,7 @@ class TestSafetyGate:
             _make_agent(episode_dir, config).execute()
 
         longform = next(cmd for cmd in captured if "upload_video.mp4" in " ".join(cmd))
-        fields = [
-            value
-            for index, value in enumerate(longform)
-            if index > 0 and longform[index - 1] == "-F"
-        ]
+        fields = _multipart_values(longform)
         assert "youtube_title=Title saved in the episode editor" in fields
         assert "youtube_description=Description saved in the episode editor" in fields
         assert "selfDeclaredMadeForKids=true" in fields
@@ -561,9 +565,7 @@ class TestXLongTextFlag:
         # The recorded longform URL makes this a shorts-only retry.
         short_cmd = captured[0]
         # Walk -F flags looking for x_long_text_as_post
-        flags = [
-            a for i, a in enumerate(short_cmd) if i > 0 and short_cmd[i - 1] == "-F"
-        ]
+        flags = _multipart_values(short_cmd)
         assert any("x_long_text_as_post=true" in f for f in flags), (
             "publish.py must send x_long_text_as_post=true defensively, "
             "or X posts > 280 chars silently fail."
@@ -649,9 +651,7 @@ class TestYouTubeLongformFunnel:
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         # First call is the short upload
         short_cmd = captured[0]
-        flags = [
-            a for i, a in enumerate(short_cmd) if i > 0 and short_cmd[i - 1] == "-F"
-        ]
+        flags = _multipart_values(short_cmd)
         first_comment_flags = [
             f for f in flags if f.startswith("youtube_first_comment=")
         ]
@@ -671,9 +671,7 @@ class TestYouTubeLongformFunnel:
         agent = _make_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
-        flags = [
-            a for i, a in enumerate(short_cmd) if i > 0 and short_cmd[i - 1] == "-F"
-        ]
+        flags = _multipart_values(short_cmd)
         first_comment = next(f for f in flags if f.startswith("youtube_first_comment="))
         assert "spotify.com/episode/xyz" in first_comment
         assert "Listen on Spotify" in first_comment
@@ -687,9 +685,7 @@ class TestYouTubeLongformFunnel:
         agent = _make_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
-        flags = [
-            a for i, a in enumerate(short_cmd) if i > 0 and short_cmd[i - 1] == "-F"
-        ]
+        flags = _multipart_values(short_cmd)
         first_comment = next(f for f in flags if f.startswith("youtube_first_comment="))
         assert "@local-pod" in first_comment
 
@@ -1638,7 +1634,7 @@ class TestIdempotency:
 
         assert len(commands) == 1
         headers = self._values(commands[0], "-H")
-        fields = self._values(commands[0], "-F")
+        fields = _multipart_values(commands[0])
         identity = first["shorts"][0]["external_id"]
         assert f"Idempotency-Key: {identity}" in headers
         assert f"request_id={identity}" in fields
@@ -1658,7 +1654,7 @@ class TestIdempotency:
             _make_agent(episode_dir).execute()
 
         headers = self._values(captured[0], "-H")
-        fields = self._values(captured[0], "-F")
+        fields = _multipart_values(captured[0])
         assert any(
             value.startswith("Idempotency-Key: cascade-longform-") for value in headers
         )
@@ -1736,7 +1732,7 @@ class TestLongformTransport:
             )
             result = _make_agent(episode_dir, config).execute()
 
-        fields = TestIdempotency._values(commands[0], "-F")
+        fields = _multipart_values(commands[0])
         transport = result["longform"]["transport"]
         assert f"video={transport['url']}" in fields
         assert not any(value.startswith("video=@") for value in fields)
@@ -1981,11 +1977,7 @@ class TestScheduleReservation:
 
     @staticmethod
     def _scheduled_field(command):
-        fields = [
-            value
-            for index, value in enumerate(command)
-            if index > 0 and command[index - 1] == "-F"
-        ]
+        fields = _multipart_values(command)
         return next(value for value in fields if value.startswith("scheduled_date="))
 
     def test_remote_job_reserves_global_daily_slot(self, env, monkeypatch, episode_dir):
@@ -2309,12 +2301,42 @@ def _destination_request(
     return request
 
 
+def _refresh_copy_approvals(episode_dir, config):
+    """Model the exact QA/editorial refresh after reviewed copy changes."""
+    clips_path = episode_dir / "clips.json"
+    clips_document = json.loads(clips_path.read_text())
+    metadata = json.loads((episode_dir / "metadata" / "metadata.json").read_text())
+    metadata_by_id = {str(item["id"]): item for item in metadata["clips"]}
+    records = read_render_manifest(episode_dir)["shorts"]
+    for clip in clips_document["clips"]:
+        if clip.get("status") != "approved":
+            continue
+        record = records[str(clip["id"])]
+        clip["approved_render_fingerprint"] = record["fingerprint"]
+        clip["approved_revision"] = clip_review_revision(
+            clip, record, metadata_by_id.get(str(clip["id"]))
+        )
+    _write_json(clips_path, clips_document)
+
+    episode_path = episode_dir / "episode.json"
+    episode = json.loads(episode_path.read_text())
+    qa_path = episode_dir / "qa" / "qa.json"
+    qa = json.loads(qa_path.read_text())
+    qa["quality_revision"] = quality_revision(episode_dir, episode, config=config)
+    _write_json(qa_path, qa)
+    episode["publish_approval"] = {
+        "revision": release_revision(episode_dir, episode, config=config),
+        "approved_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+    }
+    _write_json(episode_path, episode)
+
+
 class TestShortDestinationRequests:
     REQUEST_A = "b8c0b129-599c-48cb-b363-60a5fe4dc46c"
     REQUEST_B = "ecf17f34-b5a5-4a03-a62d-49fca57b85df"
 
     @staticmethod
-    def _seed(episode_dir, config, *, clip_count=1):
+    def _seed(episode_dir, config, *, clip_count=1, extra_metadata=None):
         scheduled = (
             datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=14)
         ).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -2338,6 +2360,7 @@ class TestShortDestinationRequests:
                         },
                         "instagram": {"caption": "IG", "hashtags": ["local"]},
                         "x": {"text": "X copy"},
+                        **(extra_metadata or {}),
                     },
                 }
             )
@@ -2835,3 +2858,622 @@ class TestShortDestinationRequests:
         _write_json(stored_path, stored)
         with pytest.raises(RuntimeError, match="prior short publication receipts"):
             agent.execute()
+
+
+class TestExpandedShortDestinations:
+    def test_copy_only_continuation_preserves_real_rerelease_lineage(self):
+        from agents.publish import (
+            SHORT_COPY_SCHEMA,
+            SHORT_DESTINATION_SCHEMA,
+            _destination_external_id,
+            _destination_request_fields,
+            _document_revision,
+            _short_target_fields,
+            short_receipt_history_revision,
+            unresolved_receipt_obligations,
+            valid_rerelease_copy_continuation,
+        )
+        from lib.short_variants import distribution_release_revision
+
+        legacy = {
+            "clip_id": "clip_0",
+            "status": "failed",
+            "error": "Legacy transport response was not JSON",
+        }
+        before = {"shorts": [legacy]}
+        history_revision = short_receipt_history_revision(before, "clip_0")
+        obligations, allowed = unresolved_receipt_obligations(before, "clip_0")
+        assert allowed and obligations
+        acknowledgement = {
+            "receipt_history_revision": history_revision,
+            "obligations": obligations,
+        }
+        authorization = {
+            "request_id": "811e01ca-6c83-4b52-9d88-3341c56560ec",
+            "actor": "release-operator",
+            "reason": "Release the approved Motion replacement",
+            "variant_id": "background_motion_v1",
+            "target_revision": "sha256:original-copy-approval",
+            "render_fingerprint": "sha256:motion-pixels",
+            "receipt_history_revision": history_revision,
+            "unresolved_history_acknowledgement": acknowledgement,
+            "created_at": "2026-09-14T00:00:00+00:00",
+        }
+        authorization["revision"] = distribution_release_revision(
+            request_id=authorization["request_id"],
+            actor=authorization["actor"],
+            reason=authorization["reason"],
+            variant_id=authorization["variant_id"],
+            target_revision=authorization["target_revision"],
+            render_fingerprint=authorization["render_fingerprint"],
+            receipt_history_revision=history_revision,
+            unresolved_history_acknowledgement=acknowledgement,
+        )
+        clip = {"id": "clip_0", "distribution_release": authorization}
+        version = {
+            "version": "background_motion_v1",
+            "variant_id": "background_motion_v1",
+            "render_fingerprint": "sha256:motion-pixels",
+            "revision": "sha256:fresh-copy-approval",
+            "re_release_request": authorization,
+        }
+        original_version = {
+            **version,
+            "revision": authorization["target_revision"],
+        }
+        target_revision = _document_revision(
+            _short_target_fields("clip_0", original_version)
+        )
+        destinations = ["youtube"]
+        destination_request_id = "ecf17f34-b5a5-4a03-a62d-49fca57b85df"
+        external_id = _destination_external_id(
+            "ep_test",
+            destination_request_id,
+            destinations,
+            target_revision,
+            "clip_0",
+        )
+        copy = {"youtube": {"title": "Title", "description": "Body"}}
+        wave = {
+            "clip_id": "clip_0",
+            "status": "submitted",
+            "platforms": destinations,
+            "request_id": external_id,
+            "external_id": external_id,
+            "idempotency_key": external_id,
+            "scheduled": True,
+            "scheduled_date": "2026-10-01T09:00:00-07:00",
+            "timezone": "America/Los_Angeles",
+            "version": version["version"],
+            "variant_id": version["variant_id"],
+            "render_fingerprint": version["render_fingerprint"],
+            "approval_revision": authorization["target_revision"],
+            "destination_schema": SHORT_DESTINATION_SCHEMA,
+            "destination_episode_id": "ep_test",
+            "destination_profile_username": "test_user",
+            "destination_request_id": destination_request_id,
+            "destination_actor": "release-operator",
+            "destination_reason": "Publish original destination wave",
+            "deferred_platforms": ["tiktok"],
+            "target_revision": target_revision,
+            "destination_copy": copy,
+            "copy_schema": SHORT_COPY_SCHEMA,
+            "copy_revision": _document_revision(copy),
+            "rerelease_request_id": authorization["request_id"],
+            "rerelease_actor": authorization["actor"],
+            "rerelease_reason": authorization["reason"],
+            "rerelease_authorization_revision": authorization["revision"],
+            "parent_receipt_history_revision": history_revision,
+            "unresolved_history_acknowledgement": acknowledgement,
+        }
+        wave["destination_request_revision"] = _document_revision(
+            _destination_request_fields(wave)
+        )
+        publish = {"shorts": [legacy, wave]}
+        assert valid_rerelease_copy_continuation(publish, clip, version, [wave])
+
+        later_unknown = {
+            "clip_id": "clip_0",
+            "status": "unknown",
+            "error": "New unresolved provider outcome",
+        }
+        assert not valid_rerelease_copy_continuation(
+            {"shorts": [legacy, later_unknown, wave]}, clip, version, [wave]
+        )
+
+    def test_copy_only_reapproval_allows_disjoint_expansion_wave(
+        self, env, episode_dir, monkeypatch
+    ):
+        original_config = _destination_config()
+        TestShortDestinationRequests._seed(episode_dir, original_config)
+        original_agent = _make_agent(episode_dir, original_config)
+        first = original_agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                original_config,
+                request_id=TestShortDestinationRequests.REQUEST_A,
+                destinations=["youtube", "tiktok"],
+            )
+        )
+        original_agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "old-job"}))
+            original_agent.run()
+        original_receipt = json.loads((episode_dir / "publish.json").read_text())[
+            "shorts"
+        ][0]
+
+        config = _destination_config()
+        config["platforms"]["facebook"] = {
+            "enabled": True,
+            "account_username": "facebook-account-id",
+            "page_id": "facebook-page-id",
+        }
+        clips_path = episode_dir / "clips.json"
+        clips = json.loads(clips_path.read_text())
+        clips["clips"][0]["metadata"]["facebook"] = {
+            "title": "A reviewed Reel title",
+            "description": "A reviewed Reel description",
+        }
+        _write_json(clips_path, clips)
+        _refresh_copy_approvals(episode_dir, config)
+
+        agent = _make_agent(episode_dir, config)
+        binding_checks = []
+        monkeypatch.setattr(
+            agent,
+            "_verify_destination_bindings",
+            lambda *_args: binding_checks.append(True),
+        )
+        monkeypatch.setattr(
+            "agents.publish.validate_destination_media", lambda *_args: []
+        )
+        second = agent.preview_short_destinations(
+            _destination_request(
+                episode_dir,
+                config,
+                request_id=TestShortDestinationRequests.REQUEST_B,
+                destinations=["facebook"],
+            )
+        )
+        assert second["schema"] == "cascade.short-destination/v2"
+        assert second["targets"][0]["destination_bindings"] == {
+            "facebook": {
+                "account_id": "facebook-account-id",
+                "target_kind": "page",
+                "target_id": "facebook-page-id",
+            }
+        }
+        assert (
+            second["targets"][0]["scheduled_date"]
+            == first["targets"][0]["scheduled_date"]
+        )
+        copy = second["targets"][0]["destination_copy"]["facebook"]
+        assert copy["description"].endswith(
+            "Full episode: https://media.example/links/episodes/ep_test.html"
+        )
+
+        agent.short_destination_request = second["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"request_id": "new-job"}))
+            result = agent.run()
+        assert run.call_count == 1
+        command = run.call_args.args[0]
+        assert "platform[]=facebook" in command
+        assert not any("platform[]=youtube" == item for item in command)
+        assert "facebook_page_id=facebook-page-id" in command
+        assert "facebook_media_type=REELS" in command
+        assert len(binding_checks) == 2
+        stored = json.loads((episode_dir / "publish.json").read_text())["shorts"]
+        assert {**original_receipt, "historical_receipt": True} in stored
+        assert {tuple(item["platforms"]) for item in result["shorts"]} == {
+            ("facebook",),
+            ("tiktok", "youtube"),
+        }
+        tampered = {"shorts": json.loads(json.dumps(stored))}
+        tampered["shorts"][0]["destination_bindings"]["facebook"]["target_id"] = (
+            "different-page"
+        )
+        from agents.publish import validated_short_receipts
+
+        with pytest.raises(ValueError, match="cannot be verified"):
+            validated_short_receipts(tampered)
+
+    def test_provider_binding_preflight_checks_accounts_targets_and_pins(
+        self, episode_dir
+    ):
+        agent = _make_agent(episode_dir)
+        bindings = {
+            "facebook": {
+                "account_id": "fb-account",
+                "target_kind": "page",
+                "target_id": "fb-page",
+            },
+            "threads": {
+                "account_id": "threads-account",
+                "target_kind": "account",
+                "target_id": "threads-account",
+            },
+            "bluesky": {
+                "account_id": "bluesky-account",
+                "target_kind": "account",
+                "target_id": "bluesky-account",
+            },
+            "linkedin": {
+                "account_id": "li-account",
+                "target_kind": "page",
+                "target_id": "urn:li:organization:123",
+            },
+            "pinterest": {
+                "account_id": "pin-account",
+                "target_kind": "board",
+                "target_id": "pin-board",
+            },
+        }
+        profile = {
+            "success": True,
+            "profile": {
+                "username": "test_user",
+                "social_accounts": {
+                    platform: {
+                        "username": binding["account_id"],
+                        "reauth_required": False,
+                    }
+                    for platform, binding in bindings.items()
+                },
+            },
+        }
+        facebook_pages = {
+            "success": True,
+            "pages": [{"id": "fb-page", "name": "Podcast page"}],
+        }
+        facebook_pin = {**facebook_pages, "selected_page_id": "fb-page"}
+        linkedin_pages = {
+            "success": True,
+            "pages": [{"id": "urn:li:organization:123", "name": "Podcast company"}],
+        }
+        linkedin_pin = {**linkedin_pages, "selected_page_id": None}
+        pinterest = {
+            "success": True,
+            "boards": [{"id": "pin-board", "name": "Podcast board"}],
+            "pinterest_account_used": "public-pin-handle",
+        }
+        with patch.object(
+            agent,
+            "_provider_json",
+            side_effect=[
+                profile,
+                facebook_pages,
+                facebook_pin,
+                linkedin_pages,
+                linkedin_pin,
+                pinterest,
+            ],
+        ) as provider:
+            agent._verify_destination_bindings("secret", "test_user", bindings)
+        assert provider.call_count == 6
+
+        duplicate = {
+            "success": True,
+            "pages": [
+                {"id": "fb-page", "name": "One"},
+                {"id": "fb-page", "name": "Duplicate"},
+            ],
+        }
+        with (
+            patch.object(
+                agent,
+                "_provider_json",
+                side_effect=[profile, duplicate],
+            ),
+            pytest.raises(RuntimeError, match="ambiguous"),
+        ):
+            agent._verify_destination_bindings(
+                "secret", "test_user", {"facebook": bindings["facebook"]}
+            )
+
+    @pytest.mark.parametrize(
+        "account",
+        [
+            None,
+            "",
+            {},
+            [],
+            {"username": ""},
+            {"username": 123},
+            {"username": "fb-account", "reauth_required": "false"},
+            {"username": "fb-account", "reauth_required": True},
+        ],
+    )
+    def test_provider_binding_preflight_rejects_unusable_account(
+        self, episode_dir, account
+    ):
+        agent = _make_agent(episode_dir)
+        response = {
+            "success": True,
+            "profile": {
+                "username": "test_user",
+                "social_accounts": {"facebook": account},
+            },
+        }
+        binding = {
+            "facebook": {
+                "account_id": "fb-account",
+                "target_kind": "page",
+                "target_id": "fb-page",
+            }
+        }
+        with (
+            patch.object(agent, "_provider_json", return_value=response),
+            pytest.raises(RuntimeError, match="unavailable or stale"),
+        ):
+            agent._verify_destination_bindings("secret", "test_user", binding)
+
+    @pytest.mark.parametrize(
+        ("platform", "binding", "responses", "message"),
+        [
+            (
+                "facebook",
+                {"account_id": "account", "target_kind": "page", "target_id": "a"},
+                [
+                    {"success": True, "pages": [{"id": "a", "name": "A"}]},
+                    {
+                        "success": True,
+                        "pages": [{"id": "a", "name": "A"}],
+                        "selected_page_id": "b",
+                    },
+                ],
+                "Page target cannot be verified",
+            ),
+            (
+                "linkedin",
+                {
+                    "account_id": "account",
+                    "target_kind": "personal",
+                    "target_id": "account",
+                },
+                [
+                    {"success": True, "pages": [{"id": "a", "name": "A"}]},
+                    {
+                        "success": True,
+                        "pages": [{"id": "a", "name": "A"}],
+                        "selected_page_id": "a",
+                    },
+                ],
+                "pinned to a Page",
+            ),
+            (
+                "pinterest",
+                {"account_id": "account", "target_kind": "board", "target_id": "a"},
+                [
+                    {
+                        "success": True,
+                        "boards": [{"id": "b", "name": "B"}],
+                        "pinterest_account_used": "public-handle",
+                    }
+                ],
+                "board target cannot be verified",
+            ),
+        ],
+    )
+    def test_provider_binding_preflight_rejects_target_or_pin_mismatch(
+        self, episode_dir, platform, binding, responses, message
+    ):
+        agent = _make_agent(episode_dir)
+        profile = {
+            "success": True,
+            "profile": {
+                "username": "test_user",
+                "social_accounts": {
+                    platform: {
+                        "username": binding["account_id"],
+                        "reauth_required": False,
+                    }
+                },
+            },
+        }
+        with (
+            patch.object(agent, "_provider_json", side_effect=[profile, *responses]),
+            pytest.raises(RuntimeError, match=message),
+        ):
+            agent._verify_destination_bindings(
+                "secret", "test_user", {platform: binding}
+            )
+
+    @pytest.mark.parametrize("platform", ["facebook", "linkedin"])
+    def test_provider_binding_preflight_rejects_missing_pin_identity(
+        self, episode_dir, platform
+    ):
+        agent = _make_agent(episode_dir)
+        target_kind = "page" if platform == "facebook" else "personal"
+        target_id = "page-id" if platform == "facebook" else "account"
+        profile = {
+            "success": True,
+            "profile": {
+                "username": "test_user",
+                "social_accounts": {
+                    platform: {
+                        "username": "account",
+                        "reauth_required": False,
+                    }
+                },
+            },
+        }
+        page_inventory = {
+            "success": True,
+            "pages": [{"id": "page-id", "name": "Page"}],
+        }
+        malformed_pin = {
+            "success": True,
+            "pages": [{"id": "page-id", "name": "Page"}],
+        }
+        with (
+            patch.object(
+                agent,
+                "_provider_json",
+                side_effect=[profile, page_inventory, malformed_pin],
+            ),
+            pytest.raises(RuntimeError, match="pinned Page is malformed"),
+        ):
+            agent._verify_destination_bindings(
+                "secret",
+                "test_user",
+                {
+                    platform: {
+                        "account_id": "account",
+                        "target_kind": target_kind,
+                        "target_id": target_id,
+                    }
+                },
+            )
+
+    def test_provider_timeout_never_exposes_api_key(self):
+        secret = "DO-NOT-LEAK-THIS-KEY"
+        with (
+            patch(
+                "agents.publish.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(
+                    ["curl", f"Authorization: Apikey {secret}"], 35
+                ),
+            ),
+            pytest.raises(RuntimeError) as raised,
+        ):
+            PublishAgent._provider_json(secret, "https://provider.invalid")
+        assert secret not in str(raised.value)
+        assert raised.value.__cause__ is None
+
+    def test_all_expansion_fields_and_targets_reach_upload_post(self, episode_dir):
+        agent = _make_agent(episode_dir)
+        path = episode_dir / "shorts" / "clip_0.mp4"
+        path.write_bytes(b"video")
+        copy = {
+            "facebook": {"title": "FB title", "description": "FB body"},
+            "threads": {"text": "Threads post"},
+            "bluesky": {"text": "Bluesky post"},
+            "linkedin": {"title": "LI title", "description": "LI body"},
+            "pinterest": {
+                "title": "Pin title",
+                "description": "Pin body",
+                "link": "https://media.example/episode",
+            },
+        }
+        bindings = {
+            "facebook": {
+                "account_id": "fb",
+                "target_kind": "page",
+                "target_id": "fb-page",
+            },
+            "threads": {
+                "account_id": "th",
+                "target_kind": "account",
+                "target_id": "th",
+            },
+            "bluesky": {
+                "account_id": "bs",
+                "target_kind": "account",
+                "target_id": "bs",
+            },
+            "linkedin": {
+                "account_id": "li",
+                "target_kind": "page",
+                "target_id": "li-page",
+            },
+            "pinterest": {
+                "account_id": "pin",
+                "target_kind": "board",
+                "target_id": "pin-board",
+            },
+        }
+        target = {"destination_copy": copy, "destination_bindings": bindings}
+        platforms = sorted(copy)
+        with patch.object(
+            agent, "_submit", return_value={"status": "submitted"}
+        ) as submit:
+            agent._submit_short(
+                {"id": "clip_0", "title": "Clip"},
+                {},
+                platforms,
+                None,
+                "https://youtube.example/full",
+                "https://spotify.example/full",
+                {
+                    "path": "shorts/clip_0.mp4",
+                    "version": "base",
+                    "variant_id": None,
+                    "render_fingerprint": "sha256:render",
+                    "revision": "sha256:approval",
+                },
+                "cascade-short-id",
+                "secret",
+                "test_user",
+                destination_target=target,
+            )
+        command = submit.call_args.args[0]
+        for field in (
+            "facebook_title=FB title",
+            "facebook_description=FB body",
+            "facebook_media_type=REELS",
+            "facebook_page_id=fb-page",
+            "threads_title=Threads post",
+            "bluesky_title=Bluesky post",
+            "linkedin_title=LI title",
+            "linkedin_description=LI body",
+            "target_linkedin_page_id=li-page",
+            "pinterest_title=Pin title",
+            "pinterest_description=Pin body",
+            "pinterest_link=https://media.example/episode",
+            "pinterest_board_id=pin-board",
+        ):
+            assert field in command
+
+    def test_plaintext_multipart_fields_never_use_curl_file_syntax(self, episode_dir):
+        agent = _make_agent(episode_dir)
+        path = episode_dir / "shorts" / "clip_0.mp4"
+        path.write_bytes(b"video")
+        target = {
+            "destination_copy": {"threads": {"text": "</private/not-a-file"}},
+            "destination_bindings": {
+                "threads": {
+                    "account_id": "threads-account",
+                    "target_kind": "account",
+                    "target_id": "threads-account",
+                }
+            },
+        }
+        with patch.object(
+            agent, "_submit", return_value={"status": "submitted"}
+        ) as submit:
+            agent._submit_short(
+                {"id": "clip_0", "title": "@/private/not-a-file"},
+                {},
+                ["threads"],
+                None,
+                "https://youtube.example/full",
+                "https://spotify.example/full",
+                {
+                    "path": "shorts/clip_0.mp4",
+                    "version": "base",
+                    "variant_id": None,
+                    "render_fingerprint": "sha256:render",
+                    "revision": "sha256:approval",
+                },
+                "cascade-short-id",
+                "secret",
+                "test_user",
+                destination_target=target,
+            )
+
+        command = submit.call_args.args[0]
+        file_forms = [
+            value
+            for index, value in enumerate(command)
+            if index > 0 and command[index - 1] == "-F"
+        ]
+        text_forms = [
+            value
+            for index, value in enumerate(command)
+            if index > 0 and command[index - 1] == "--form-string"
+        ]
+        assert file_forms == [f"video=@{path}"]
+        assert "title=@/private/not-a-file" in text_forms
+        assert "threads_title=</private/not-a-file" in text_forms

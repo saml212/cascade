@@ -19,7 +19,6 @@ from pydantic import BaseModel, Field
 
 from agents.pipeline import load_config
 from agents.qa import (
-    PLATFORM_COPY_FIELDS,
     canonical_release_metadata,
     clip_review_revision,
     current_clip_boundary_evidence,
@@ -49,6 +48,7 @@ from lib.delivery_video import (
 from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import media_fingerprint, probe
 from lib.paths import get_episodes_dir
+from lib.short_distribution import PLATFORM_COPY_FIELDS, SHORT_PLATFORM_SPECS
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     DEFAULT_BACKGROUND_ASSET_ID,
@@ -74,12 +74,6 @@ from server.routes.clips import (
 
 router = APIRouter(prefix="/api/episodes", tags=["review"])
 
-PLATFORM_LABELS = {
-    "youtube": "YouTube Shorts",
-    "tiktok": "TikTok",
-    "instagram": "Instagram Reels",
-    "x": "X",
-}
 _CLIP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _transcript_corrections_lock = threading.Lock()
 _DERIVED_TRANSCRIPT_ARTIFACTS = (
@@ -593,7 +587,7 @@ def _enabled_destinations(config: dict) -> list[dict]:
     return [
         {
             "key": key,
-            "label": PLATFORM_LABELS.get(key, key.replace("_", " ").title()),
+            "label": SHORT_PLATFORM_SPECS[key]["label"],
             "required_fields": list(fields),
         }
         for key, fields in PLATFORM_COPY_FIELDS.items()

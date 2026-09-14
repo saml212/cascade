@@ -49,6 +49,7 @@ from lib.delivery_video import (
 from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import file_fingerprint, get_audio_stream
 from lib.ffprobe import probe as ffprobe
+from lib.short_distribution import PLATFORM_COPY_FIELDS, SHORT_PLATFORM_SPECS
 from lib.short_variants import (
     BASE_SHORT_VERSION,
     DISTRIBUTION_RELEASE_FIELD,
@@ -67,12 +68,6 @@ PUBLISH_PLAN_SCHEMA = "cascade.publish-plan/v2"
 SHORT_COPY_SCHEMA = "cascade.short-copy/v1"
 QUALITY_REPORT_PATH = Path("qa/qa.json")
 AUDIO_REPORT_PATH = Path("qa/audio-quality.json")
-PLATFORM_COPY_FIELDS = {
-    "youtube": ("title", "description"),
-    "tiktok": ("caption",),
-    "instagram": ("caption",),
-    "x": ("text",),
-}
 PODCAST_CHANNEL_FIELDS = (
     "title",
     "description",
@@ -330,6 +325,23 @@ def _upload_post_plan(
     )
     if "youtube" in destinations:
         plan["youtube"] = {"self_declared_made_for_kids": youtube_made_for_kids(config)}
+    expansion = {}
+    for destination in destinations:
+        spec = SHORT_PLATFORM_SPECS[destination]
+        account_key = spec.get("account_config")
+        target = spec.get("target")
+        if not account_key:
+            continue
+        settings = platforms.get(destination, {})
+        binding = {account_key: settings.get(account_key, "")}
+        if target:
+            config_key, _provider_key, required = target
+            target_value = settings.get(config_key, "")
+            if required or target_value:
+                binding[config_key] = target_value
+        expansion[destination] = binding
+    if expansion:
+        plan["destination_bindings"] = expansion
     return plan
 
 

@@ -15,6 +15,7 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from agents.base import BaseAgent
@@ -30,6 +31,16 @@ from agents.qa import (
 )
 from lib.atomic_write import atomic_write_json
 from lib.delivery_video import render_output_lock
+from lib.short_distribution import (
+    EXPANSION_DESTINATIONS,
+    SHORT_DESTINATIONS,
+    SHORT_PLATFORM_SPECS,
+    configured_destination_bindings,
+    upload_fields,
+    valid_destination_bindings,
+    validate_destination_copy,
+    validate_destination_media,
+)
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     DISTRIBUTION_RELEASE_FIELD,
@@ -38,9 +49,15 @@ from lib.short_variants import (
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 SCHEDULE_URL = "https://api.upload-post.com/api/uploadposts/schedule"
+PROFILE_URL = "https://api.upload-post.com/api/uploadposts/users"
+FACEBOOK_PAGES_URL = "https://api.upload-post.com/api/uploadposts/facebook/pages"
+FACEBOOK_PAGE_PIN_URL = f"{PROFILE_URL}/facebook-page"
+LINKEDIN_PAGES_URL = "https://api.upload-post.com/api/uploadposts/linkedin/pages"
+LINKEDIN_PAGE_PIN_URL = f"{PROFILE_URL}/linkedin-page"
+PINTEREST_BOARD_URL = "https://api.upload-post.com/api/uploadposts/pinterest/boards"
 SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v1"
 SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v1"
-SHORT_DESTINATIONS = ("youtube", "tiktok", "instagram", "x")
+EXPANDED_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v2"
 RECORDED_STATES = {
     "submitted",
     "published",
@@ -240,11 +257,16 @@ def _document_revision(value: object) -> str:
 
 
 def _destination_external_id(
-    episode_id, request_id, destinations, target_revision, clip_id
+    episode_id,
+    request_id,
+    destinations,
+    target_revision,
+    clip_id,
+    schema=SHORT_DESTINATION_SCHEMA,
 ):
     revision = _document_revision(
         {
-            "schema": SHORT_DESTINATION_SCHEMA,
+            "schema": schema,
             "request_id": request_id,
             "destinations": destinations,
             "target_revision": target_revision,
@@ -292,8 +314,8 @@ def _rerelease_receipt_fields(request):
 
 
 def _destination_request_fields(receipt):
-    return {
-        "schema": SHORT_DESTINATION_SCHEMA,
+    fields = {
+        "schema": receipt["destination_schema"],
         "episode_id": receipt["destination_episode_id"],
         "profile_username": receipt["destination_profile_username"],
         "request_id": receipt["destination_request_id"],
@@ -307,6 +329,9 @@ def _destination_request_fields(receipt):
         "copy_revision": receipt["copy_revision"],
         "external_id": receipt["external_id"],
     }
+    if "destination_bindings" in receipt:
+        fields["destination_bindings"] = receipt["destination_bindings"]
+    return fields
 
 
 def _destination_receipt_valid(receipt: dict) -> bool:
@@ -317,10 +342,17 @@ def _destination_receipt_valid(receipt: dict) -> bool:
         copy = receipt["destination_copy"]
         target = _short_target_fields(receipt["clip_id"], receipt)
         request = _destination_request_fields(receipt)
+        schema = receipt.get("destination_schema")
+        expanded = bool(set(platforms) & EXPANSION_DESTINATIONS)
         _parse_time(receipt["scheduled_date"])
         return bool(
             request_id == receipt["destination_request_id"]
-            and receipt.get("destination_schema") == SHORT_DESTINATION_SCHEMA
+            and schema
+            == (
+                EXPANDED_SHORT_DESTINATION_SCHEMA
+                if expanded
+                else SHORT_DESTINATION_SCHEMA
+            )
             and receipt.get("copy_schema") == SHORT_COPY_SCHEMA
             and isinstance(receipt["destination_episode_id"], str)
             and bool(receipt["destination_episode_id"])
@@ -336,6 +368,9 @@ def _destination_receipt_valid(receipt: dict) -> bool:
             and len(deferred) == len(set(deferred))
             and set(platforms) | set(deferred) <= set(SHORT_DESTINATIONS)
             and not set(platforms) & set(deferred)
+            and valid_destination_bindings(
+                receipt.get("destination_bindings"), platforms
+            )
             and isinstance(copy, dict)
             and set(copy) == set(platforms)
             and all(
@@ -353,6 +388,7 @@ def _destination_receipt_valid(receipt: dict) -> bool:
                 platforms,
                 receipt["target_revision"],
                 receipt["clip_id"],
+                schema,
             )
             and receipt["destination_request_revision"] == _document_revision(request)
         )
@@ -434,6 +470,24 @@ def short_destination_copy(
                 "Watch the full episode on The Local Podcast.",
             )
         }
+    cta = f"Full episode: {hub_url}" if hub_url else ""
+    for destination in ("facebook", "linkedin", "pinterest"):
+        if destination not in destinations:
+            continue
+        source = metadata.get(destination, {})
+        description = _clean_caption(source.get("description"))
+        if cta and destination != "pinterest":
+            description = _append_cta(description, cta)
+        result[destination] = {
+            "title": str(source.get("title") or title),
+            "description": description,
+            **({"link": hub_url} if destination == "pinterest" and hub_url else {}),
+        }
+    for destination in ("threads", "bluesky"):
+        if destination not in destinations:
+            continue
+        text = _clean_caption(metadata.get(destination, {}).get("text")) or title
+        result[destination] = {"text": _append_cta(text, cta) if cta else text}
     return result
 
 
@@ -1139,6 +1193,32 @@ def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> b
     )
 
 
+def valid_rerelease_copy_continuation(
+    publish: dict, clip: dict, version: dict, current_waves: list[dict]
+) -> bool:
+    """Preserve a proven re-release lineage across a copy-only reapproval."""
+    authorization = clip.get(DISTRIBUTION_RELEASE_FIELD)
+    if not isinstance(authorization, dict) or not current_waves:
+        return False
+    original_revision = authorization.get("target_revision")
+    if not isinstance(original_revision, str) or not original_revision:
+        return False
+    original_version = {**version, "revision": original_revision}
+    if not valid_rerelease_authorization(publish, clip, original_version):
+        return False
+    acknowledgement = authorization.get("unresolved_history_acknowledgement")
+    return any(
+        wave.get("approval_revision") == original_revision
+        and wave.get("rerelease_request_id") == authorization.get("request_id")
+        and wave.get("rerelease_authorization_revision")
+        == authorization.get("revision")
+        and wave.get("parent_receipt_history_revision")
+        == authorization.get("receipt_history_revision")
+        and wave.get("unresolved_history_acknowledgement") == acknowledgement
+        for wave in current_waves
+    )
+
+
 def _build_first_comment(youtube_url, spotify_url="", channel_handle=""):
     lines = [f"Full episode: {youtube_url}"]
     if spotify_url:
@@ -1519,8 +1599,8 @@ class PublishAgent(BaseAgent):
         platform_config = self.config.get("platforms", {})
         platforms = [
             name
-            for name in ("youtube", "tiktok", "instagram", "x")
-            if platform_config.get(name, {}).get("enabled")
+            for name in SHORT_DESTINATIONS
+            if platform_config.get(name, {}).get("enabled") is True
         ]
         if not platforms:
             raise RuntimeError("No platforms enabled in config")
@@ -1609,6 +1689,11 @@ class PublishAgent(BaseAgent):
         revision = data["gate"]["revision"]
         if value.get("expected_release_revision") != revision:
             raise RuntimeError("Destination preview does not match the current release")
+        destination_schema = (
+            EXPANDED_SHORT_DESTINATION_SCHEMA
+            if set(destinations) & EXPANSION_DESTINATIONS
+            else SHORT_DESTINATION_SCHEMA
+        )
 
         approved_ids = [str(clip.get("id", "")) for clip in data["approved"]]
         requested_ids = value.get("clip_ids")
@@ -1625,8 +1710,18 @@ class PublishAgent(BaseAgent):
         else:
             selected_ids = [item for item in approved_ids if item in requested_ids]
         hub_url = episode_hub_url(self.config, self.episode_dir.name)
-        if set(destinations) & {"youtube", "tiktok", "instagram"} and not hub_url:
+        if set(destinations) - {"x"} and not hub_url:
             raise RuntimeError("An HTTPS exact-episode hub URL is required")
+        try:
+            destination_bindings = configured_destination_bindings(
+                self.config, destinations
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if destination_bindings:
+            self._verify_destination_bindings(
+                data["api_key"], data["user"], destination_bindings
+            )
 
         schedule = data["metadata"].get("schedule", [])
         schedule_by_clip = {}
@@ -1665,6 +1760,7 @@ class PublishAgent(BaseAgent):
                 destinations,
                 target_revision,
                 clip_id,
+                destination_schema,
             )
             scheduled_at = self._schedule_to_datetime(
                 schedule_by_clip[clip_id], tz_name, reference=reference
@@ -1681,8 +1777,7 @@ class PublishAgent(BaseAgent):
             current_waves = [
                 item
                 for item in recorded
-                if item.get("target_revision") == target_revision
-                and self._receipt_matches_version(item, version)
+                if self._receipt_matches_artifact(item, version)
             ]
             covered = {
                 platform
@@ -1708,8 +1803,11 @@ class PublishAgent(BaseAgent):
                             )
                         co_schedule_ids.add(item["external_id"])
             historical = [item for item in recorded if item not in current_waves]
-            if historical and not valid_rerelease_authorization(
-                {"shorts": prior}, clip, version
+            if historical and not (
+                valid_rerelease_authorization({"shorts": prior}, clip, version)
+                or valid_rerelease_copy_continuation(
+                    {"shorts": prior}, clip, version, current_waves
+                )
             ):
                 raise RuntimeError(
                     f"A historical publication receipt exists for {clip_id}; "
@@ -1724,6 +1822,19 @@ class PublishAgent(BaseAgent):
                 spotify_url=data["funnel_urls"]["spotify"],
                 channel_handle=self.config.get("podcast", {}).get("channel_handle", ""),
             )
+            copy_issues = validate_destination_copy(copy)
+            if copy_issues:
+                raise RuntimeError(
+                    f"{clip_id} destination copy is invalid: " + "; ".join(copy_issues)
+                )
+            media_issues = validate_destination_media(
+                self.episode_dir / version["path"], destinations
+            )
+            if media_issues:
+                raise RuntimeError(
+                    f"{clip_id} destination media is invalid: "
+                    + "; ".join(media_issues)
+                )
             intent = {
                 "clip_id": clip_id,
                 "status": "intent_recorded",
@@ -1738,7 +1849,7 @@ class PublishAgent(BaseAgent):
                 "variant_id": version["variant_id"],
                 "render_fingerprint": version["render_fingerprint"],
                 "approval_revision": version["revision"],
-                "destination_schema": SHORT_DESTINATION_SCHEMA,
+                "destination_schema": destination_schema,
                 "destination_episode_id": self.episode_dir.name,
                 "destination_profile_username": data["user"],
                 "destination_request_id": request_id,
@@ -1751,6 +1862,8 @@ class PublishAgent(BaseAgent):
                 "copy_revision": _document_revision(copy),
                 **_rerelease_receipt_fields(rerelease),
             }
+            if destination_bindings:
+                intent["destination_bindings"] = destination_bindings
             intent["destination_request_revision"] = _document_revision(
                 _destination_request_fields(intent)
             )
@@ -1804,7 +1917,7 @@ class PublishAgent(BaseAgent):
             )
         preview_revision = _document_revision(
             {
-                "schema": SHORT_DESTINATION_SCHEMA,
+                "schema": destination_schema,
                 "release_revision": revision,
                 "request_id": request_id,
                 "targets": [item["destination_request_revision"] for item in targets],
@@ -1813,7 +1926,7 @@ class PublishAgent(BaseAgent):
         if value.get("preview_revision") not in (None, preview_revision):
             raise RuntimeError("Destination preview revision does not match")
         return {
-            "schema": SHORT_DESTINATION_SCHEMA,
+            "schema": destination_schema,
             "episode_id": self.episode_dir.name,
             "release_revision": revision,
             "request_id": request_id,
@@ -2158,13 +2271,13 @@ class PublishAgent(BaseAgent):
             video_url=transport["url"] if transport else None,
         )
         command += [
-            "-F",
+            "--form-string",
             f"youtube_title={title}",
-            "-F",
+            "--form-string",
             f"youtube_description={metadata.get('description', '')}",
         ]
         if metadata.get("tags"):
-            command += ["-F", f"tags={','.join(metadata['tags'])}"]
+            command += ["--form-string", f"tags={','.join(metadata['tags'])}"]
         command += ["-X", "POST", UPLOAD_POST_URL]
         self.logger.info("Uploading longform to YouTube...")
         result = self._submit(command, 1200, identity)
@@ -2377,7 +2490,7 @@ class PublishAgent(BaseAgent):
                 for target in destination_targets.values()
                 for receipt in previous
                 if receipt.get("clip_id") == target["clip_id"]
-                and receipt.get("target_revision") == target["target_revision"]
+                and self._receipt_matches_artifact(receipt, target)
                 and not set(receipt.get("platforms", [])) & set(platforms)
             }
             occupied = [
@@ -2509,6 +2622,28 @@ class PublishAgent(BaseAgent):
         return results
 
     @staticmethod
+    def _receipt_matches_artifact(receipt: dict, version: dict) -> bool:
+        """Match stable pixels and re-release lineage across fresh copy approval."""
+        request = version.get("re_release_request")
+        rerelease_id = (
+            request.get("request_id")
+            if isinstance(request, dict)
+            else version.get("rerelease_request_id")
+        )
+        rerelease_revision = (
+            request.get("revision")
+            if isinstance(request, dict)
+            else version.get("rerelease_authorization_revision")
+        )
+        return bool(
+            receipt.get("version") == version.get("version")
+            and receipt.get("variant_id") == version.get("variant_id")
+            and receipt.get("render_fingerprint") == version.get("render_fingerprint")
+            and receipt.get("rerelease_request_id") == rerelease_id
+            and receipt.get("rerelease_authorization_revision") == rerelease_revision
+        )
+
+    @staticmethod
     def _receipt_matches_version(receipt: dict, version: dict) -> bool:
         identity_fields = {
             "version",
@@ -2583,37 +2718,30 @@ class PublishAgent(BaseAgent):
                 channel_handle=self.config.get("podcast", {}).get("channel_handle", ""),
             )
         )
-        youtube = copy.get("youtube", {})
-        if "youtube" in platforms:
-            command += ["-F", f"youtube_title={youtube.get('title', title)}"]
-            command += [
-                "-F",
-                f"youtube_description={youtube.get('description', '')}",
-            ]
-        if "tiktok" in platforms:
-            command += [
-                "-F",
-                f"tiktok_title={copy.get('tiktok', {}).get('text', title)}",
-            ]
-        if "instagram" in platforms:
-            command += [
-                "-F",
-                f"instagram_title={copy.get('instagram', {}).get('text', title)}",
-            ]
-        if "x" in platforms:
-            command += ["-F", f"x_title={copy.get('x', {}).get('text', title)}"]
-            command += ["-F", "x_long_text_as_post=true"]
+        for platform in platforms:
+            for field, value in upload_fields(platform, copy.get(platform, {})).items():
+                command += ["--form-string", f"{field}={value}"]
+            binding = (
+                (destination_target or {})
+                .get("destination_bindings", {})
+                .get(platform, {})
+            )
+            target = SHORT_PLATFORM_SPECS[platform].get("target")
+            if target and binding.get("target_kind") in {"page", "board"}:
+                _config_key, provider_key, _required = target
+                command += [
+                    "--form-string",
+                    f"{provider_key}={binding['target_id']}",
+                ]
 
         tz_name = self.get_config("schedule", "timezone", default="America/Los_Angeles")
         if scheduled_at:
             command += [
-                "-F",
+                "--form-string",
                 f"scheduled_date={scheduled_at.replace(tzinfo=None).isoformat()}",
-                "-F",
+                "--form-string",
                 f"timezone={tz_name}",
             ]
-        if youtube.get("first_comment") and "youtube" in platforms:
-            command += ["-F", f"youtube_first_comment={youtube['first_comment']}"]
         command += ["-X", "POST", UPLOAD_POST_URL]
 
         result = self._submit(command, 600, identity)
@@ -2660,25 +2788,206 @@ class PublishAgent(BaseAgent):
             f"Authorization: Apikey {api_key}",
             "-H",
             f"Idempotency-Key: {identity}",
-            "-F",
-            f"video={video_url}" if video_url else f"video=@{path}",
-            "-F",
+        ]
+        if video_url:
+            command += ["--form-string", f"video={video_url}"]
+        else:
+            command += ["-F", f"video=@{path}"]
+        command += [
+            "--form-string",
             f"user={user}",
-            "-F",
+            "--form-string",
             f"title={title}",
-            "-F",
+            "--form-string",
             f"request_id={identity}",
-            "-F",
+            "--form-string",
             f"external_id={identity}",
-            "-F",
+            "--form-string",
             "async_upload=true",
         ]
         for platform in platforms:
-            command += ["-F", f"platform[]={platform}"]
+            command += ["--form-string", f"platform[]={platform}"]
         if "youtube" in platforms:
             declared = str(youtube_made_for_kids(self.config)).lower()
-            command += ["-F", f"selfDeclaredMadeForKids={declared}"]
+            command += ["--form-string", f"selfDeclaredMadeForKids={declared}"]
         return command
+
+    @staticmethod
+    def _provider_json(api_key: str, url: str, query: dict[str, str] | None = None):
+        command = [
+            "curl",
+            "-sS",
+            "--fail-with-body",
+            "--max-time",
+            "30",
+            "-H",
+            f"Authorization: Apikey {api_key}",
+        ]
+        if query:
+            command.append("--get")
+            for key, value in query.items():
+                command += ["--data-urlencode", f"{key}={value}"]
+        command.append(url)
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=35,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "Upload-Post destination account check timed out; "
+                "no shorts were submitted"
+            ) from None
+        except OSError:
+            raise RuntimeError(
+                "Upload-Post destination account check could not run; "
+                "no shorts were submitted"
+            ) from None
+        if process.returncode:
+            raise RuntimeError(
+                "Upload-Post rejected the destination account check; "
+                "no shorts were submitted"
+            )
+        try:
+            response = json.loads(process.stdout)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                "Upload-Post destination account response was not JSON; "
+                "no shorts were submitted"
+            ) from None
+        if not isinstance(response, dict) or response.get("success") is not True:
+            raise RuntimeError(
+                "Upload-Post destination account response was invalid; "
+                "no shorts were submitted"
+            )
+        return response
+
+    @staticmethod
+    def _provider_target_rows(response: dict, key: str, platform: str) -> list[dict]:
+        rows = response.get(key)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise RuntimeError(
+                f"Upload-Post {platform} target inventory is malformed; "
+                "no shorts were submitted"
+            )
+        if any(
+            not isinstance(row.get(field), str) or not row[field]
+            for row in rows
+            for field in ("id", "name")
+        ) or len({row["id"] for row in rows}) != len(rows):
+            raise RuntimeError(
+                f"Upload-Post {platform} target inventory is ambiguous; "
+                "no shorts were submitted"
+            )
+        return rows
+
+    def _verify_destination_bindings(
+        self, api_key: str, profile_username: str, bindings: dict[str, dict[str, str]]
+    ) -> None:
+        """Verify selected expansion accounts and exact native targets."""
+        response = self._provider_json(
+            api_key, f"{PROFILE_URL}/{quote(profile_username, safe='')}"
+        )
+        profile = response.get("profile")
+        accounts = profile.get("social_accounts") if isinstance(profile, dict) else None
+        if (
+            not isinstance(profile, dict)
+            or profile.get("username") != profile_username
+            or not isinstance(accounts, dict)
+        ):
+            raise RuntimeError(
+                "Upload-Post profile identity cannot be verified; no shorts were submitted"
+            )
+        for platform, binding in bindings.items():
+            account = accounts.get(platform)
+            reauth = (
+                account.get("reauth_required") if isinstance(account, dict) else None
+            )
+            if (
+                not isinstance(account, dict)
+                or account.get("username") != binding["account_id"]
+                or reauth is True
+                or (reauth is not None and not isinstance(reauth, bool))
+            ):
+                raise RuntimeError(
+                    f"Upload-Post {platform} account identity is unavailable or stale; "
+                    "no shorts were submitted"
+                )
+
+        for platform in ("facebook", "linkedin"):
+            binding = bindings.get(platform)
+            if not binding:
+                continue
+            discovery = self._provider_json(
+                api_key,
+                FACEBOOK_PAGES_URL if platform == "facebook" else LINKEDIN_PAGES_URL,
+                {"profile": profile_username},
+            )
+            pages = self._provider_target_rows(discovery, "pages", platform)
+            pinned = self._provider_json(
+                api_key,
+                (
+                    FACEBOOK_PAGE_PIN_URL
+                    if platform == "facebook"
+                    else LINKEDIN_PAGE_PIN_URL
+                ),
+                {"profile_username": profile_username},
+            )
+            pinned_pages = self._provider_target_rows(pinned, "pages", platform)
+            if "selected_page_id" not in pinned:
+                raise RuntimeError(
+                    f"Upload-Post {platform} pinned Page is malformed; "
+                    "no shorts were submitted"
+                )
+            selected = pinned["selected_page_id"]
+            if selected is not None and (not isinstance(selected, str) or not selected):
+                raise RuntimeError(
+                    f"Upload-Post {platform} pinned Page is malformed; "
+                    "no shorts were submitted"
+                )
+            if binding["target_kind"] == "personal":
+                if selected is not None:
+                    raise RuntimeError(
+                        "Upload-Post LinkedIn is pinned to a Page; no shorts were submitted"
+                    )
+                continue
+            matches = [page for page in pages if page["id"] == binding["target_id"]]
+            pinned_matches = [
+                page for page in pinned_pages if page["id"] == binding["target_id"]
+            ]
+            if (
+                len(matches) != 1
+                or len(pinned_matches) != 1
+                or selected not in (None, binding["target_id"])
+            ):
+                raise RuntimeError(
+                    f"Upload-Post {platform} Page target cannot be verified; "
+                    "no shorts were submitted"
+                )
+
+        pinterest = bindings.get("pinterest")
+        if pinterest:
+            board_response = self._provider_json(
+                api_key,
+                PINTEREST_BOARD_URL,
+                {"profile": profile_username},
+            )
+            boards = self._provider_target_rows(board_response, "boards", "pinterest")
+            matches = [
+                board for board in boards if board["id"] == pinterest["target_id"]
+            ]
+            if (
+                len(matches) != 1
+                or not isinstance(board_response.get("pinterest_account_used"), str)
+                or not board_response["pinterest_account_used"]
+            ):
+                raise RuntimeError(
+                    "Upload-Post Pinterest board target cannot be verified; "
+                    "no shorts were submitted"
+                )
 
     @staticmethod
     def _submit(command, timeout, identity):

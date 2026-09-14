@@ -15,7 +15,6 @@ from pydantic import BaseModel
 
 from agents.pipeline import load_config
 from agents.qa import (
-    PLATFORM_COPY_FIELDS,
     canonical_release_metadata,
     quality_snapshot,
     release_metadata_issues,
@@ -24,6 +23,7 @@ from lib.atomic_write import atomic_write_json
 from lib.clips import is_selected_clip
 from lib.generation import generate_text
 from lib.paths import get_episodes_dir
+from lib.short_distribution import PLATFORM_COPY_FIELDS
 from server.routes import clips as clips_api
 from server.routes import edits as edits_api
 from server.routes import episodes as episodes_api

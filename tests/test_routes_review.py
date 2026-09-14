@@ -78,6 +78,27 @@ def _clock_repair_request(guards, *, scale=1.0, offset=0.0, speaker_bindings=Non
     return request
 
 
+def test_enabled_destination_contract_ignores_disabled_expansion_copy():
+    from server.routes.review import _enabled_destinations
+
+    destinations = _enabled_destinations(
+        {
+            "platforms": {
+                "youtube": {"enabled": True},
+                "facebook": {"enabled": False},
+                "threads": {"enabled": True},
+            }
+        }
+    )
+
+    assert [item["key"] for item in destinations] == ["youtube", "threads"]
+    assert destinations[1] == {
+        "key": "threads",
+        "label": "Threads",
+        "required_fields": ["text"],
+    }
+
+
 def _transcript_clock_repair_fixture(
     test_client, monkeypatch, raw=None, episode_data=None
 ):

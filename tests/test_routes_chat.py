@@ -457,6 +457,10 @@ class TestCompleteMetadata:
                                 "tiktok": {"caption": "TikTok caption"},
                                 "instagram": {"caption": "Instagram caption"},
                                 "x": {"text": "X copy"},
+                                "linkedin": {
+                                    "title": "LinkedIn title",
+                                    "description": "LinkedIn description",
+                                },
                             },
                         },
                         {"id": "unselected", "selection_status": "unselected"},

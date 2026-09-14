@@ -80,6 +80,58 @@ def test_upload_post_destination_and_account_change_release_revision(tmp_path):
     )
 
 
+def test_disabled_expansion_destinations_do_not_change_existing_publish_plan(tmp_path):
+    config = _config()
+    episode = _episode()
+    environment = {"UPLOAD_POST_USER": "account-a"}
+    original = current_publish_plan(config, episode, environment=environment)
+    for destination in (
+        "facebook",
+        "threads",
+        "bluesky",
+        "linkedin",
+        "pinterest",
+    ):
+        config["platforms"][destination] = {
+            "enabled": False,
+            "account_username": "dormant-account",
+            "page_id": "dormant-page",
+            "board_id": "dormant-board",
+        }
+
+    assert current_publish_plan(config, episode, environment=environment) == original
+
+
+def test_enabled_expansion_account_and_target_are_release_bound(tmp_path):
+    config = _config()
+    episode = _episode()
+    environment = {"UPLOAD_POST_USER": "account-a"}
+    before = release_revision(tmp_path, episode, config=config, environment=environment)
+    config["platforms"]["facebook"] = {
+        "enabled": True,
+        "account_username": "opaque-account-id",
+        "page_id": "page-a",
+    }
+
+    plan = current_publish_plan(config, episode, environment=environment)["upload_post"]
+    assert plan["destination_bindings"] == {
+        "facebook": {
+            "account_username": "opaque-account-id",
+            "page_id": "page-a",
+        }
+    }
+    approved = release_revision(
+        tmp_path, episode, config=config, environment=environment
+    )
+    assert approved != before
+
+    config["platforms"]["facebook"]["page_id"] = "page-b"
+    assert (
+        release_revision(tmp_path, episode, config=config, environment=environment)
+        != approved
+    )
+
+
 def test_youtube_audience_declaration_is_explicit_and_approval_bound(tmp_path):
     config = _config()
     episode = _episode()
