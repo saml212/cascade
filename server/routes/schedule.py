@@ -24,6 +24,11 @@ _RECORDED_PUBLICATION_STATES = {
     "unknown",
     "cancelled",
 }
+_PENDING_SCHEDULE_CANCELLATION_STATES = {
+    "delete_started",
+    "outcome_uncertain",
+    "delete_confirmed",
+}
 
 
 def _load_config() -> dict:
@@ -42,6 +47,17 @@ def _read_json(path: Path, default):
         return json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
+
+
+def _schedule_cancellation_state(receipt: dict) -> str | None:
+    """Return the validated cancellation state, if one exists."""
+    from agents.publish import validated_schedule_cancellation
+
+    operation = validated_schedule_cancellation(receipt)
+    if not isinstance(operation, dict):
+        return None
+    state = operation.get("state")
+    return state if isinstance(state, str) else None
 
 
 def _publication_evidence(ep_dir: Path, episode: dict, config: dict) -> list[dict]:
@@ -110,32 +126,38 @@ def _publication_evidence(ep_dir: Path, episode: dict, config: dict) -> list[dic
             or short.get("status") not in _RECORDED_PUBLICATION_STATES
         ):
             continue
-        if short.get("status") == "cancelled":
-            from agents.publish import validated_schedule_cancellation
-
-            if validated_schedule_cancellation(short) is None:
-                continue
+        cancellation_state = _schedule_cancellation_state(short)
+        cancellation_pending = (
+            cancellation_state in _PENDING_SCHEDULE_CANCELLATION_STATES
+        )
+        if short.get("status") == "cancelled" and cancellation_state != "cancelled":
+            continue
         destinations = short.get("platforms")
         if not isinstance(destinations, list) or not destinations:
             destinations = ["unknown"]
-        records.append(
-            {
-                "episode_id": episode_id,
-                "name": name,
-                "content_type": "short",
-                "clip_id": str(short["clip_id"]),
-                "version": short.get("version") or "base",
-                "variant_id": short.get("variant_id"),
-                "destinations": [str(value) for value in destinations],
-                "status": short["status"],
-                "scheduled": short.get("scheduled") is True,
-                "scheduled_date": short.get("scheduled_date"),
-                "request_id": short.get("request_id"),
-                "job_id": short.get("job_id"),
-                "error": short.get("error"),
-                "evidence_source": "publish.json",
-            }
-        )
+        record = {
+            "episode_id": episode_id,
+            "name": name,
+            "content_type": "short",
+            "clip_id": str(short["clip_id"]),
+            "version": short.get("version") or "base",
+            "variant_id": short.get("variant_id"),
+            "destinations": [str(value) for value in destinations],
+            "status": (
+                "cancellation_pending" if cancellation_pending else short["status"]
+            ),
+            "scheduled": (
+                False if cancellation_pending else short.get("scheduled") is True
+            ),
+            "scheduled_date": short.get("scheduled_date"),
+            "request_id": short.get("request_id"),
+            "job_id": short.get("job_id"),
+            "error": short.get("error"),
+            "evidence_source": "publish.json",
+        }
+        if cancellation_pending:
+            record["schedule_cancellation_state"] = cancellation_state
+        records.append(record)
     return records
 
 
@@ -148,6 +170,8 @@ def _youtube_longform_recorded(records: list[dict]) -> bool:
 
 
 def _receipt_state(receipt: dict) -> str | None:
+    if _schedule_cancellation_state(receipt) in _PENDING_SCHEDULE_CANCELLATION_STATES:
+        return "cancellation_pending"
     if receipt.get("status") in {"failed", "partial_failure"}:
         return "failed"
     if receipt.get("status") == "unknown":

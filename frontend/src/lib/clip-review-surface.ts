@@ -154,6 +154,9 @@ export function publicationEvidenceStatusLabel(
   status: unknown,
   scheduled: unknown
 ): string {
+  if (status === 'cancellation_pending') {
+    return 'Cancellation pending verification';
+  }
   if (status === 'published') return 'Published URL recorded';
   if (status === 'partial_failure') return 'Some destinations failed';
   if (status === 'failed') return 'Failed';

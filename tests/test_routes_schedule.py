@@ -328,6 +328,57 @@ def test_published_receipt_is_not_labeled_scheduled():
     assert schedule._receipt_state({"status": "published"}) is None
 
 
+def test_delete_confirmed_receipt_is_pending_cancellation_not_scheduled(
+    tmp_path, monkeypatch
+):
+    _fix_now(monkeypatch)
+    episode = _episode(tmp_path, youtube_longform_url="https://youtube.example/video")
+    (episode / "publish.json").write_text(
+        json.dumps(
+            {
+                "shorts": [
+                    {
+                        "clip_id": "clip_01",
+                        "status": "submitted",
+                        "scheduled": True,
+                        "scheduled_date": "2099-07-05T09:00:00-07:00",
+                        "platforms": ["youtube", "instagram"],
+                        "job_id": "job-01",
+                        "request_id": "request-01",
+                        "schedule_cancellation": {"state": "delete_confirmed"},
+                    }
+                ]
+            }
+        )
+    )
+    from agents import publish as publish_agent
+
+    monkeypatch.setattr(
+        publish_agent,
+        "validated_schedule_cancellation",
+        lambda receipt: receipt.get("schedule_cancellation"),
+    )
+    monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
+    monkeypatch.setattr(schedule, "review_state", _review(approved=False))
+    monkeypatch.setattr(schedule, "_load_config", dict)
+
+    result = asyncio.run(schedule.get_schedule())
+    items = [item for day in result["schedule"] for item in day["items"]]
+    evidence = next(
+        record
+        for record in result["publication_evidence"]
+        if record.get("clip_id") == "clip_01"
+    )
+
+    assert len(items) == 1
+    assert items[0]["state"] == "cancellation_pending"
+    assert items[0]["scheduled_date"] == "2099-07-05T09:00:00-07:00"
+    assert items[0]["job_id"] == "job-01"
+    assert evidence["status"] == "cancellation_pending"
+    assert evidence["scheduled"] is False
+    assert evidence["schedule_cancellation_state"] == "delete_confirmed"
+
+
 @pytest.mark.parametrize(
     ("receipt_status", "expected_state"),
     [("submitted", "scheduled"), ("failed", "failed"), ("unknown", "unknown")],

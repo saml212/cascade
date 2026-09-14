@@ -379,6 +379,10 @@ test('uses neutral approval and accurate partial publication language', () => {
   });
   assert.equal(clipCardStatusOverride('pending', true), null);
   assert.equal(
+    publicationEvidenceStatusLabel('cancellation_pending', true),
+    'Cancellation pending verification'
+  );
+  assert.equal(
     publicationEvidenceStatusLabel('partial_failure', false),
     'Some destinations failed'
   );

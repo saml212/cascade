@@ -22,7 +22,13 @@ interface ScheduleItem {
   destinations?: string[];
   clip_id?: string;
   planned_date?: string;
-  state?: 'planned' | 'scheduled' | 'failed' | 'unknown' | 'suggested';
+  state?:
+    | 'planned'
+    | 'scheduled'
+    | 'cancellation_pending'
+    | 'failed'
+    | 'unknown'
+    | 'suggested';
   job_id?: string;
   request_id?: string;
   error?: string;
@@ -263,12 +269,16 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
   const destinations =
     item.destinations ?? (item.destination ? [item.destination] : []);
   const state = item.state ?? 'suggested';
+  const stateLabel =
+    state === 'cancellation_pending'
+      ? 'Cancellation pending verification'
+      : state;
   const stateClass =
     state === 'scheduled'
       ? 'text-status-success'
       : state === 'failed'
         ? 'text-status-danger'
-        : state === 'unknown'
+        : state === 'unknown' || state === 'cancellation_pending'
           ? 'text-status-warning'
           : state === 'planned'
             ? 'text-accent'
@@ -276,7 +286,11 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
   return h(
     'a',
     {
-      ...link(`/episodes/${item.episode_id}`),
+      ...link(
+        item.type === 'short' && item.clip_id
+          ? `/episodes/${encodeURIComponent(item.episode_id)}/clips/review/${encodeURIComponent(item.clip_id)}`
+          : `/episodes/${encodeURIComponent(item.episode_id)}`
+      ),
       class:
         'px-2.5 py-2 rounded bg-surface-2 border border-border-subtle flex flex-col gap-1',
     },
@@ -334,7 +348,7 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
     h(
       'div',
       { class: `text-code-sm font-mono uppercase ${stateClass}` },
-      state
+      stateLabel
     ),
     item.job_id || item.request_id
       ? h(
