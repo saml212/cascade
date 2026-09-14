@@ -33,11 +33,16 @@ import { showToast } from '../state/ui';
 
 type ReviewedClip = EpisodeReviewState['clips'][number];
 
-const DESTINATION_COLORS: Record<string, string> = {
+export const DESTINATION_COLORS: Record<string, string> = {
   youtube: '#ff3344',
   tiktok: '#69c9d0',
   instagram: '#e1306c',
   x: '#e8e8e8',
+  facebook: '#1877f2',
+  threads: '#f5f5f5',
+  bluesky: '#1684ff',
+  linkedin: '#0a66c2',
+  pinterest: '#e60023',
 };
 
 export function Publish(target: HTMLElement, episodeId: string): void {

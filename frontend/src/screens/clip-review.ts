@@ -75,7 +75,13 @@ import {
 interface PlatformSpec {
   key: string;
   label: string;
-  fields: Array<{ name: string; label: string; multiline?: boolean; hint?: string }>;
+  fields: Array<{
+    name: string;
+    label: string;
+    multiline?: boolean;
+    hint?: string;
+    maxLength?: number;
+  }>;
 }
 
 interface ClipNavigation {
@@ -85,7 +91,7 @@ interface ClipNavigation {
   nextId?: string;
 }
 
-const PLATFORMS: PlatformSpec[] = [
+export const CLIP_METADATA_PLATFORMS: PlatformSpec[] = [
   {
     key: 'youtube',
     label: 'YouTube Shorts',
@@ -116,11 +122,85 @@ const PLATFORMS: PlatformSpec[] = [
     label: 'X (Twitter)',
     fields: [{ name: 'text', label: 'Post text', multiline: true, hint: 'Max 280 chars' }],
   },
+  {
+    key: 'facebook',
+    label: 'Facebook Reels',
+    fields: [
+      { name: 'title', label: 'Title', hint: 'Max 255 chars', maxLength: 255 },
+      {
+        name: 'description',
+        label: 'Description',
+        multiline: true,
+        hint: 'Max 63,206 chars',
+        maxLength: 63_206,
+      },
+    ],
+  },
+  {
+    key: 'threads',
+    label: 'Threads',
+    fields: [
+      {
+        name: 'text',
+        label: 'Post text',
+        multiline: true,
+        hint: 'Max 500 UTF-8 bytes',
+      },
+    ],
+  },
+  {
+    key: 'bluesky',
+    label: 'Bluesky',
+    fields: [
+      {
+        name: 'text',
+        label: 'Post text',
+        multiline: true,
+        hint: 'Max 300 chars',
+        maxLength: 300,
+      },
+    ],
+  },
+  {
+    key: 'linkedin',
+    label: 'LinkedIn',
+    fields: [
+      {
+        name: 'title',
+        label: 'Title',
+        hint: 'Max 400 UTF-16 units',
+        maxLength: 400,
+      },
+      {
+        name: 'description',
+        label: 'Description',
+        multiline: true,
+        hint: 'Max 3,000 chars',
+        maxLength: 3_000,
+      },
+    ],
+  },
+  {
+    key: 'pinterest',
+    label: 'Pinterest',
+    fields: [
+      { name: 'title', label: 'Title', hint: 'Max 100 chars', maxLength: 100 },
+      {
+        name: 'description',
+        label: 'Description',
+        multiline: true,
+        hint: 'Max 800 chars',
+        maxLength: 800,
+      },
+    ],
+  },
 ];
 
 function enabledPlatforms(destinations: ReviewDestination[]): PlatformSpec[] {
   const enabled = new Set(destinations.map((destination) => destination.key));
-  return PLATFORMS.filter((platform) => enabled.has(platform.key));
+  return CLIP_METADATA_PLATFORMS.filter((platform) =>
+    enabled.has(platform.key)
+  );
 }
 
 interface ChatMessage {
@@ -1999,6 +2079,7 @@ function platformEditor(
             'focus:border-accent focus:outline-none leading-relaxed',
           ].join(' '),
           rows: '4',
+          maxlength: f.maxLength,
           value: draft[f.name],
           oninput: (e: Event) =>
             (draft[f.name] = (e.target as HTMLTextAreaElement).value),
@@ -2007,6 +2088,7 @@ function platformEditor(
           type: 'text',
           class:
             'w-full h-9 bg-surface-2 border border-border rounded-md px-3 text-body text-ink-primary focus:border-accent focus:outline-none',
+          maxlength: f.maxLength,
           value: draft[f.name],
           oninput: (e: Event) =>
             (draft[f.name] = (e.target as HTMLInputElement).value),
