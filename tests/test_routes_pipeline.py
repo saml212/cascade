@@ -606,6 +606,63 @@ class TestUploadPostReceipts:
         assert episode["youtube_longform_url_release_revision"] == "sha256:release"
         assert http_client.get.call_args.kwargs["params"] == {"request_id": "request-1"}
 
+    @pytest.mark.parametrize(
+        ("provider_status", "expected_status"),
+        (("queued", "pending"), ("processing", "pending"), ("failed", "failed")),
+    )
+    def test_longform_result_uses_terminal_provider_state(
+        self, test_client, monkeypatch, provider_status, expected_status
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        from agents.qa import editorial_revision
+
+        current_revision = editorial_revision(
+            episode_dir, json.loads((episode_dir / "episode.json").read_text())
+        )
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "longform": {
+                        "status": "submitted",
+                        "request_id": "request-1",
+                        "editorial_revision": current_revision,
+                    },
+                    "shorts": [],
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        result_item = {
+            "platform": "youtube",
+            "success": False,
+            "attempts": 0,
+        }
+        if provider_status != "processing":
+            result_item["status"] = provider_status
+        response.json.return_value = {
+            "status": provider_status,
+            "results": [result_item],
+        }
+        http_client = AsyncMock()
+        http_client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        longform = result.json()["longform"]
+        assert longform["status"] == expected_status
+        assert longform["url"] is None
+        if expected_status == "pending":
+            assert longform["upload_post_state"] == provider_status
+            assert "platform_failures" not in longform
+        else:
+            assert longform["platform_failures"]["youtube"]["status"] == "failed"
+
     @pytest.mark.parametrize("receipt_revision", [None, ["malformed"]])
     def test_unbound_or_malformed_longform_receipt_is_not_polled(
         self, test_client, monkeypatch, receipt_revision

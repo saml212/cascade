@@ -850,10 +850,34 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
         results = resp_data.get("results", [])
         if not isinstance(results, list):
             return {}
+        response_state = str(
+            resp_data.get("status") or resp_data.get("state") or ""
+        ).lower()
+
+        def still_running(item: dict) -> bool:
+            state = str(
+                item.get("status") or item.get("state") or response_state
+            ).lower()
+            return any(
+                marker in state
+                for marker in (
+                    "queue",
+                    "pending",
+                    "process",
+                    "progress",
+                    "retry",
+                    "schedule",
+                    "submit",
+                    "wait",
+                    "upload",
+                )
+            )
+
         return {
             str(item.get("platform", "unknown")): item
             for item in results
             if isinstance(item, dict)
+            and not still_running(item)
             and (
                 item.get("success") is False
                 or item.get("status") in {"failed", "skipped"}
