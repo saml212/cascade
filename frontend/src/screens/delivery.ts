@@ -126,7 +126,7 @@ function renderPage(
       h(
         'p',
         { class: 'text-body text-ink-secondary mt-3 max-w-[640px]' },
-        'Build a clean local podcast master, verify its loudness, and download the MP3 for scheduling. This does not upload or publish anything.'
+        'Build and review local podcast audio and video, verify release quality, and download the finished files. This does not upload or publish anything.'
       )
     ),
     loading
@@ -278,6 +278,7 @@ function videoDetails(
 ): HTMLElement {
   const videoState = delivery.video_status ?? 'not_prepared';
   const busy = videoState === 'preparing';
+  const progress = Math.min(99, Math.max(0, delivery.video_progress ?? 0));
   const video = delivery.video;
   return h(
     'div',
@@ -289,7 +290,7 @@ function videoDetails(
         ),
         h('div', { class: 'text-body-sm text-ink-tertiary mt-1' },
           busy
-            ? `${delivery.video_detail || 'Encoding'} · ${(delivery.video_progress ?? 0).toFixed(0)}%`
+            ? `${delivery.video_detail || 'Encoding'} · ${progress.toFixed(0)}%`
             : videoState === 'ready' && video?.render_mode === 'speaker_cut'
               ? 'Speaker-cut 1080p render with saved edits and mastered audio.'
               : videoState === 'ready'
@@ -310,7 +311,7 @@ function videoDetails(
       ? h('div', { class: 'h-2 rounded-full bg-surface-3 overflow-hidden' },
           h('div', {
             class: 'h-full bg-accent transition-all',
-            style: { width: `${Math.max(1, delivery.video_progress ?? 0)}%` },
+            style: { width: `${Math.max(1, progress)}%` },
           })
         )
       : null,
