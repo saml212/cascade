@@ -297,7 +297,13 @@ async def run_single_agent(
         await _unregister_single_agent(episode_id, worker)
 
     if "error" in outcome:
-        raise outcome["error"]
+        error = outcome["error"]
+        if agent_name == "publish":
+            from agents.publish import ShortDestinationConflict
+
+            if isinstance(error, ShortDestinationConflict):
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        raise error
     result = outcome["result"]
     if agent_name == "qa" and result.get("overall") != "pass":
         failed_checks = [

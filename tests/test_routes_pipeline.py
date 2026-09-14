@@ -1161,6 +1161,43 @@ class TestRunSingleAgent:
         assert response.status_code == 200
         assert captured == publish
 
+    def test_publish_preflight_runtime_error_is_structured_conflict(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        from agents.publish import ShortDestinationConflict
+
+        class PublishAgent:
+            def __init__(self, _episode_dir, _config):
+                pass
+
+            def run(self):
+                raise ShortDestinationConflict(
+                    "Schedule collision for clip_02; no shorts were submitted"
+                )
+
+        from agents import AGENT_REGISTRY
+
+        monkeypatch.setitem(AGENT_REGISTRY, "publish", PublishAgent)
+        publish = {
+            "destinations": ["x"],
+            "clip_ids": ["clip_02"],
+            "request_id": "e5753781-47f9-455e-9ce5-0eead48a19cd",
+            "actor": "operator",
+            "reason": "Approved motion release",
+            "expected_release_revision": "sha256:release",
+            "preview_revision": "sha256:preview",
+        }
+        response = client.post(
+            "/api/episodes/ep_001/run-agent/publish", json={"publish": publish}
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": "Schedule collision for clip_02; no shorts were submitted"
+        }
+
     def test_publish_execution_rejects_misspelled_top_level_input(
         self, test_client, monkeypatch
     ):

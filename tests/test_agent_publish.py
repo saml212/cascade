@@ -2602,6 +2602,129 @@ class TestShortDestinationRequests:
             agent.execute()
         run.assert_not_called()
 
+    def test_disjoint_sibling_waves_share_one_global_capacity_slot(
+        self, env, monkeypatch, episode_dir
+    ):
+        config = _destination_config()
+        sibling = episode_dir.parent / "ep_sibling"
+        sibling.mkdir()
+        (sibling / "shorts").mkdir()
+        self._seed(sibling, config)
+        sibling_agent = _make_agent(sibling, config)
+
+        first = sibling_agent.preview_short_destinations(
+            _destination_request(
+                sibling,
+                config,
+                request_id=self.REQUEST_A,
+                destinations=["youtube", "tiktok"],
+            )
+        )
+        sibling_agent.short_destination_request = first["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"job_id": "yt-job"}))
+            sibling_agent.run()
+
+        second = sibling_agent.preview_short_destinations(
+            _destination_request(
+                sibling,
+                config,
+                request_id=self.REQUEST_B,
+                destinations=["x"],
+            )
+        )
+        sibling_agent.short_destination_request = second["execute"]
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"job_id": "x-job"}))
+            sibling_agent.run()
+
+        receipts = [
+            receipt
+            for receipt in json.loads((sibling / "publish.json").read_text())["shorts"]
+            if receipt.get("destination_request_id")
+        ]
+        from agents.publish import _schedule_content_identity
+
+        assert (
+            _schedule_content_identity(
+                {**receipts[0], "status": "unknown"}, "test_user", sibling.name
+            )
+            is None
+        )
+        assert (
+            _schedule_content_identity(receipts[0], "test_user", "wrong_episode")
+            is None
+        )
+        remote = [
+            {
+                "job_id": receipt["job_id"],
+                "external_id": receipt["external_id"],
+                "scheduled_date": receipt["scheduled_date"],
+                "profile_username": "test_user",
+                "platforms": receipt["platforms"],
+                "source_filename": "clip_0.mp4",
+                "fields": {"external_id": receipt["external_id"]},
+            }
+            for receipt in receipts
+        ]
+        current_agent = _make_agent(episode_dir, config)
+        monkeypatch.setattr(current_agent, "_remote_schedule", lambda *_args: remote)
+
+        occupied = current_agent._occupied_schedule("key", "test_user")
+        assert len(occupied) == 2  # retain both jobs for exact recovery
+        scheduled = datetime.fromisoformat(receipts[0]["scheduled_date"])
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            current_agent._reserve(
+                list(occupied),
+                scheduled,
+                "another-exact-artifact",
+                "clip_other",
+                "America/Los_Angeles",
+                2,
+                2,
+            )
+        current_agent._reserve(
+            occupied,
+            scheduled.replace(hour=18),
+            "another-exact-artifact",
+            "clip_other",
+            "America/Los_Angeles",
+            2,
+            2,
+        )
+
+        conflicting = json.loads(json.dumps(remote))
+        conflicting[1]["source_filename"] = "different-clip.mp4"
+        monkeypatch.setattr(
+            current_agent, "_remote_schedule", lambda *_args: conflicting
+        )
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            current_agent._reserve(
+                current_agent._occupied_schedule("key", "test_user"),
+                scheduled.replace(hour=18),
+                "another-exact-artifact",
+                "clip_other",
+                "America/Los_Angeles",
+                2,
+                2,
+            )
+
+    def test_overlapping_destination_jobs_remain_distinct_capacity_slots(self):
+        from agents.publish import _schedule_capacity_count
+
+        scheduled = datetime.fromisoformat("2099-01-05T09:00:00-08:00")
+        records = [
+            {
+                "scheduled_at": scheduled,
+                "_schedule_content_identity": "sha256:exact-motion-artifact",
+                "_schedule_platforms": platforms,
+            }
+            for platforms in (["tiktok", "youtube"], ["x"], ["x"])
+        ]
+
+        assert _schedule_capacity_count(records[:2]) == 1
+        assert _schedule_capacity_count(records) == 2
+
     def test_request_uuid_cannot_change_destinations_or_selected_clips(
         self, env, episode_dir
     ):

@@ -109,6 +109,10 @@ _LEGACY_UNRESOLVED_RECEIPT_FIELDS = frozenset(
 SLOT_HOURS = {"morning": 9, "afternoon": 14, "evening": 18}
 
 
+class ShortDestinationConflict(RuntimeError):
+    """A reviewed short request conflicts with current release state."""
+
+
 @contextmanager
 def publication_lock(episodes_dir):
     """Serialize remote scheduling with receipt-bound distribution changes."""
@@ -531,6 +535,67 @@ def _matching_schedule_row(receipt: dict, remote: object, profile: str) -> bool:
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
+
+
+def _schedule_content_identity(
+    receipt: dict, profile: str, episode_id: str
+) -> str | None:
+    """Identify one exact short artifact across disjoint destination jobs."""
+    if (
+        receipt.get("status") not in {"submitted", "already_submitted"}
+        or receipt.get("destination_profile_username") != profile
+        or receipt.get("destination_episode_id") != episode_id
+        or not _destination_receipt_valid(receipt)
+    ):
+        return None
+    identity = {
+        "episode_id": receipt.get("destination_episode_id"),
+        "clip_id": receipt.get("clip_id"),
+        "version": receipt.get("version"),
+        "variant_id": receipt.get("variant_id"),
+        "render_fingerprint": receipt.get("render_fingerprint"),
+        "rerelease_request_id": receipt.get("rerelease_request_id"),
+        "rerelease_authorization_revision": receipt.get(
+            "rerelease_authorization_revision"
+        ),
+    }
+    if not all(
+        isinstance(identity[key], str) and identity[key]
+        for key in ("episode_id", "clip_id", "version", "render_fingerprint")
+    ):
+        return None
+    return _document_revision(identity)
+
+
+def _schedule_capacity_count(records: list[dict]) -> int:
+    """Count disjoint destination jobs for one exact artifact as one slot."""
+    count = 0
+    groups = {}
+    for item in records:
+        identity = item.get("_schedule_content_identity")
+        platforms = item.get("_schedule_platforms")
+        if not (
+            isinstance(identity, str)
+            and identity
+            and isinstance(platforms, (list, tuple))
+            and platforms
+            and all(isinstance(platform, str) and platform for platform in platforms)
+            and len(platforms) == len(set(platforms))
+        ):
+            count += 1
+            continue
+        platform_set = set(platforms)
+        grouped_platforms = groups.setdefault(
+            (identity, _instant(item["scheduled_at"])), []
+        )
+        for used in grouped_platforms:
+            if used.isdisjoint(platform_set):
+                used.update(platform_set)
+                break
+        else:
+            grouped_platforms.append(platform_set)
+            count += 1
+    return count
 
 
 def validated_schedule_cancellation(receipt: dict) -> dict | None:
@@ -3191,12 +3256,29 @@ class PublishAgent(BaseAgent):
                         "a scheduled short has no valid time"
                     ) from error
                 external_id = item.get("external_id")
-                if external_id and any(
-                    remote_item.get("external_id") == external_id
-                    and _instant(remote_item["scheduled_at"]) == _instant(scheduled_at)
-                    for remote_item in records
-                    if remote_item["source"] == "upload-post"
-                ):
+                matching_remote = next(
+                    (
+                        remote_item
+                        for remote_item in records
+                        if remote_item["source"] == "upload-post"
+                        and external_id
+                        and remote_item.get("external_id") == external_id
+                        and _instant(remote_item["scheduled_at"])
+                        == _instant(scheduled_at)
+                    ),
+                    None,
+                )
+                content_identity = _schedule_content_identity(
+                    item, user, path.parent.name
+                )
+                if matching_remote is not None:
+                    if content_identity and _matching_schedule_row(
+                        item, matching_remote.get("provider_record"), user
+                    ):
+                        matching_remote["_schedule_content_identity"] = content_identity
+                        matching_remote["_schedule_platforms"] = tuple(
+                            sorted(item["platforms"])
+                        )
                     continue
                 records.append(
                     {
@@ -3316,8 +3398,8 @@ class PublishAgent(BaseAgent):
             _instant(item["scheduled_at"]) == _instant(scheduled_at)
             for item in same_day
         )
-        if exact or len(same_day) >= limit:
-            raise RuntimeError(
+        if exact or _schedule_capacity_count(same_day) >= limit:
+            raise ShortDestinationConflict(
                 f"Schedule collision for {clip_id} at {local.isoformat()}; "
                 "no shorts were submitted"
             )
@@ -3360,7 +3442,7 @@ class PublishAgent(BaseAgent):
                 if limit == 2
                 else ["morning", "afternoon", "evening"]
             )
-            remaining = max(0, limit - len(same_day))
+            remaining = max(0, limit - _schedule_capacity_count(same_day))
             for slot in slots:
                 candidate = datetime.combine(
                     date, time(hour=SLOT_HOURS[slot]), tzinfo=zone
