@@ -20,6 +20,7 @@ from lib.delivery_video import (
     _audio_filter_graph,
     _short_render_fingerprint,
     aac_content_timing_proof,
+    audio_packet_signature,
     build_keep_intervals,
     build_render_segments,
     capture_transcript_render_reuse_proof,
@@ -980,6 +981,20 @@ def test_video_packet_signature_ignores_remux_timestamp_offsets():
 
     assert signature(first) == signature(shifted)
     assert signature(first)["packet_count"] == 2
+
+
+def test_audio_packet_signature_selects_stream_copy_payloads():
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout="0, 0, 0, 1024, 42, payload\n")
+
+    signature = audio_packet_signature(Path("short.mp4"), runner=runner)
+
+    assert signature["packet_count"] == 1
+    assert calls[0][calls[0].index("-map") + 1] == "0:a:0"
+    assert calls[0][calls[0].index("-c") + 1] == "copy"
 
 
 def test_mux_rejects_video_packet_change_before_replacing_output(tmp_path):

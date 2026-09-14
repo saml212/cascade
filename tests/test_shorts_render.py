@@ -1,19 +1,26 @@
 """Focused tests for source-clock shorts rendering."""
 
 import json
+import shutil
+import subprocess
 from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
 
 from agents.shorts_render import (
+    BACKGROUND_CAPTION_MARGIN_V,
     THREE_PERSON_STACK_CAPTION_MARGIN_V,
     ShortsRenderAgent,
     render_single_clip,
     repair_single_clip_audio,
 )
 from lib.ass import DEFAULT_MARGIN_V
-from lib.delivery_video import render_space_budget
+from lib.delivery_video import (
+    audio_packet_signature,
+    ffmpeg_executable,
+    render_space_budget,
+)
 from lib.encoding import get_video_encoding_policy
 from lib.timeline import Timeline
 
@@ -104,6 +111,140 @@ def test_two_person_both_span_stacks_close_crops(tmp_episode_dir, sample_config)
     assert "[stack1]crop=100:88:190:22" in video_filter
     assert video_filter.count("scale=1080:960") == 2
     assert "[top][bottom]vstack=inputs=2" in video_filter
+
+
+def test_background_overlap_panels_center_on_configured_faces(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {"center_x": 500, "center_y": 465, "zoom": 1},
+            {"center_x": 1420, "center_y": 520, "zoom": 1},
+        ]
+    }
+
+    video_filter = agent._get_background_crop_filter_no_subs(
+        "BOTH", 1920, 1080, crop_config
+    )
+
+    assert "[motion0]crop=606:358:196:286" in video_filter
+    assert "[motion1]crop=606:358:1116:340" in video_filter
+    assert video_filter.count("scale=1080:640") == 2
+    assert "pad=1080:1920:0:0:black" in video_filter
+
+
+def test_background_composition_copies_complete_base_audio(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    commands = []
+    agent._run_ffmpeg = lambda command, **_kwargs: commands.append(command)
+
+    agent._compose_background_variant(
+        tmp_episode_dir / "podcast.mp4",
+        tmp_episode_dir / "motion.mp4",
+        tmp_episode_dir / "base.mp4",
+        tmp_episode_dir / "variant.mp4",
+        "30/1",
+        [(2.0, 4.0)],
+        ["-c:v", "libx264"],
+    )
+
+    command = commands[0]
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert "-shortest" in command
+    assert "-t" not in command
+    graph = command[command.index("-filter_complex") + 1]
+    assert "tpad=stop_mode=clone:stop_duration=0.25" in graph
+    assert "enable='not(between(t,2.000000,4.000000))'" in graph
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_background_composition_keeps_trailing_aac_packet(
+    tmp_episode_dir, sample_config
+):
+    ffmpeg = ffmpeg_executable()
+    podcast = tmp_episode_dir / "podcast.mp4"
+    motion = tmp_episode_dir / "motion.mp4"
+    base = tmp_episode_dir / "base.mp4"
+    output = tmp_episode_dir / "variant.mp4"
+    for path, source in (
+        (podcast, "color=blue:size=1080x1920:rate=30:duration=1"),
+        (motion, "testsrc2=size=160x90:rate=30:duration=0.5"),
+    ):
+        subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(path),
+            ],
+            check=True,
+        )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=160x284:rate=30:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1.05",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-y",
+            str(base),
+        ],
+        check=True,
+    )
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    agent._compose_background_variant(
+        podcast,
+        motion,
+        base,
+        output,
+        "30/1",
+        [],
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            "500k",
+            "-maxrate",
+            "1M",
+            "-bufsize",
+            "2M",
+        ],
+    )
+
+    assert audio_packet_signature(output) == audio_packet_signature(base)
+
+
+def test_background_caption_margin_stays_above_motion_panel():
+    assert BACKGROUND_CAPTION_MARGIN_V == 840
 
 
 @pytest.mark.parametrize("overlap", ["BOTH", "NONE"])

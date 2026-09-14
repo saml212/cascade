@@ -2,7 +2,12 @@
 
 # ruff: noqa: F811 - imported pytest fixtures are intentionally shadowed by arguments
 
+import asyncio
 import json
+import threading
+
+import pytest
+from fastapi import HTTPException
 
 from tests.test_routes_episodes import _create_episode, test_client  # noqa: F401
 
@@ -497,3 +502,218 @@ class TestClipMutation:
         ]["clip_01"]
         assert job["audio_repaired"] is True
         assert job["video_reencoded"] is False
+
+    def test_variant_render_uses_qualified_job_and_preserves_base_approval(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        clip = dict(
+            SAMPLE_CLIPS[0],
+            status="approved",
+            selection_status="selected",
+            approved_revision="sha256:base-review",
+            approved_render_fingerprint="sha256:base-render",
+        )
+        _add_clips(episodes_dir, "ep_001", [clip])
+
+        import agents.shorts_render as render_mod
+
+        monkeypatch.setattr(
+            render_mod,
+            "render_single_clip_variant",
+            lambda episode_dir, _config, clip_id, variant_id, asset_id: {
+                "clip_id": clip_id,
+                "variant_id": variant_id,
+                "asset_id": asset_id,
+                "output_path": str(
+                    episode_dir / "short_variants" / variant_id / f"{clip_id}.mp4"
+                ),
+                "reused": False,
+                "render": {"fingerprint": "sha256:variant"},
+            },
+        )
+
+        response = client.post(
+            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/render",
+            json={"asset_id": "motion_v1"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["asset_id"] == "motion_v1"
+        assert json.loads((ep_dir / "clips.json").read_text())["clips"][0] == clip
+        job = json.loads((ep_dir / "work" / "clip_render_jobs.json").read_text())[
+            "jobs"
+        ]["clip_01@background_motion_v1"]
+        assert job["status"] == "succeeded"
+
+    def test_variant_routes_reject_unknown_id(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        response = client.post(
+            "/api/episodes/ep_001/clips/clip_01/variants/not_supported/render",
+            json={},
+        )
+
+        assert response.status_code == 404
+        assert "Unknown short variant" in response.json()["detail"]
+
+    def test_variant_approval_binds_exact_revision_without_approving_base(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        clip = dict(SAMPLE_CLIPS[0])
+        _add_clips(episodes_dir, "ep_001", [clip])
+        record = {
+            "fingerprint": "sha256:variant",
+            "output": {
+                "content_revision": "sha256:pixels",
+                "scan_identity": {"inode": 1},
+            },
+        }
+
+        from agents.qa import clip_review_revision
+        from server.routes import clips as clips_mod
+
+        revision = clip_review_revision(clip, record, None)
+        monkeypatch.setattr(clips_mod, "_current_render", lambda *_args: {})
+        monkeypatch.setattr(
+            clips_mod,
+            "background_variant_state",
+            lambda *_args, **_kwargs: (
+                record,
+                {"current": True, "playable": True},
+            ),
+        )
+        saved = []
+        monkeypatch.setattr(
+            clips_mod,
+            "save_background_variant_approval",
+            lambda *_args: saved.append(_args) or record,
+        )
+
+        stale = client.post(
+            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
+            json={"expected_revision": "sha256:stale"},
+        )
+        approved = client.post(
+            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
+            json={"expected_revision": revision},
+        )
+
+        assert stale.status_code == 409
+        assert approved.status_code == 200
+        assert approved.json()["approved_revision"] == revision
+        assert len(saved) == 1
+        assert json.loads((ep_dir / "clips.json").read_text())["clips"][0] == clip
+
+    def test_current_render_requires_provenance_current_speaker_plan(
+        self, test_client, monkeypatch
+    ):
+        _client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        audio = ep_dir / "work" / "audio_mix.wav"
+        audio.parent.mkdir(exist_ok=True)
+        audio.write_bytes(b"audio")
+
+        from agents import speaker_cut
+        from lib import audio_mix, delivery_video
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(speaker_cut, "current_speaker_segments", lambda *_: None)
+        monkeypatch.setattr(audio_mix, "selected_audio_source", lambda *_: audio)
+        called = []
+        monkeypatch.setattr(
+            delivery_video,
+            "current_short_render",
+            lambda *_: called.append(True) or {"fingerprint": "unexpected"},
+        )
+
+        assert clips_mod._current_render(ep_dir, SAMPLE_CLIPS[0]) is None
+        assert called == []
+
+    async def test_cancelled_request_keeps_clip_locked_until_worker_finishes(
+        self, test_client, monkeypatch
+    ):
+        _client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+        started = threading.Event()
+        release = threading.Event()
+
+        import agents.shorts_render as render_mod
+        from server.routes import clips as clips_mod
+
+        def render(*_args):
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test worker timed out")
+            return {
+                "reused": False,
+                "render": {"fingerprint": "sha256:variant"},
+            }
+
+        monkeypatch.setattr(render_mod, "render_single_clip_variant", render)
+        request = asyncio.create_task(
+            clips_mod._run_clip_render_operation(
+                "ep_001",
+                "clip_01",
+                variant_id="background_motion_v1",
+                asset_id="motion_v1",
+            )
+        )
+        try:
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+            with pytest.raises(HTTPException) as blocked:
+                await clips_mod._run_clip_render_operation(
+                    "ep_001", "clip_01", variant_id="background_motion_v1"
+                )
+            assert getattr(blocked.value, "status_code", None) == 409
+            assert (
+                clips_mod.render_job_state(ep_dir, "clip_01@background_motion_v1")[
+                    "status"
+                ]
+                == "rendering"
+            )
+        finally:
+            release.set()
+
+        for _ in range(100):
+            if not clips_mod._active_render_jobs:
+                break
+            await asyncio.sleep(0.01)
+        assert not clips_mod._active_render_jobs
+        assert (
+            clips_mod.render_job_state(ep_dir, "clip_01@background_motion_v1")["status"]
+            == "succeeded"
+        )
+
+    async def test_render_job_setup_failure_releases_clip_lock(
+        self, test_client, monkeypatch
+    ):
+        _client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        from server.routes import clips as clips_mod
+
+        def fail_write(*_args):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(clips_mod, "_write_render_job", fail_write)
+
+        with pytest.raises(HTTPException, match="disk unavailable") as failed:
+            await clips_mod._run_clip_render_operation("ep_001", "clip_01")
+        assert failed.value.status_code == 500
+        assert not clips_mod._active_render_jobs

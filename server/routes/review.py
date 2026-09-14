@@ -46,8 +46,16 @@ from lib.delivery_video import (
     render_artifact_state,
     short_render_fingerprint,
 )
+from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import media_fingerprint, probe
 from lib.paths import get_episodes_dir
+from lib.short_variants import (
+    BACKGROUND_VARIANT_ID,
+    DEFAULT_BACKGROUND_ASSET_ID,
+    background_variant_approval_state,
+    background_variant_state,
+    require_background_variant,
+)
 from server.media_inspection import (
     InspectionTarget,
     file_revision,
@@ -55,7 +63,7 @@ from server.media_inspection import (
     inspect_media_window,
     resolve_target,
 )
-from server.routes.clips import render_job_state
+from server.routes.clips import render_job_state, variant_render_job_id
 
 router = APIRouter(prefix="/api/episodes", tags=["review"])
 
@@ -785,6 +793,7 @@ def episode_review_state(episode_dir: Path) -> dict:
 
     reviewed_clips = []
     short_records = manifest.get("shorts", {})
+    variant_encoding = get_video_encoding_policy(config, "shorts")
     for clip in clips:
         clip_id = str(clip["id"])
         copy = metadata_by_id.get(clip_id, {"id": clip_id})
@@ -799,6 +808,22 @@ def episode_review_state(episode_dir: Path) -> dict:
             ),
             episode_id,
         )
+        variant_record, variant_render = background_variant_state(
+            episode_dir,
+            clip_id,
+            base_record=render_record if render["current"] else None,
+            encoding=variant_encoding,
+        )
+        variant_render = _with_media_url(variant_render, episode_id)
+        variant_revision = clip_review_revision(
+            clip, variant_record, approval_metadata_by_id.get(clip_id)
+        )
+        variant_asset = variant_record.get("asset")
+        variant_asset_id = (
+            variant_asset.get("asset_id") if isinstance(variant_asset, dict) else None
+        )
+        if not isinstance(variant_asset_id, str):
+            variant_asset_id = DEFAULT_BACKGROUND_ASSET_ID
         reviewed_clips.append(
             {
                 **clip,
@@ -814,6 +839,21 @@ def episode_review_state(episode_dir: Path) -> dict:
                     ),
                     "metadata": _metadata_state(copy, destinations),
                     "render_job": render_job_state(episode_dir, clip_id),
+                    "variants": {
+                        BACKGROUND_VARIANT_ID: {
+                            "id": BACKGROUND_VARIANT_ID,
+                            "label": "Motion background",
+                            "asset_id": variant_asset_id,
+                            "render": variant_render,
+                            "approval": background_variant_approval_state(
+                                variant_record, variant_render, variant_revision
+                            ),
+                            "render_job": render_job_state(
+                                episode_dir,
+                                variant_render_job_id(clip_id, BACKGROUND_VARIANT_ID),
+                            ),
+                        }
+                    },
                 },
             }
         )
@@ -864,13 +904,14 @@ def _stored_clips(episode_dir: Path) -> list[dict]:
 
 async def _inspection_target(
     episode_id: str,
-    target: Literal["source", "longform", "short"],
+    target: Literal["source", "longform", "short", "short_variant"],
     clip_id: str | None,
+    variant_id: str | None,
 ) -> tuple[Path, InspectionTarget]:
     episode_dir = _episode_dir(episode_id)
     episode = _read_json(episode_dir / "episode.json", {})
     clip = None
-    if target == "short":
+    if target in {"short", "short_variant"}:
         if not clip_id or not _CLIP_ID.fullmatch(clip_id):
             raise HTTPException(status_code=422, detail="A valid clip_id is required")
         clip = next(
@@ -879,9 +920,22 @@ async def _inspection_target(
         )
         if clip is None:
             raise HTTPException(status_code=404, detail=f"Unknown clip: {clip_id}")
-    elif clip_id is not None:
+        if target == "short_variant":
+            try:
+                require_background_variant(str(variant_id))
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404, detail=str(exc).strip("'")
+                ) from exc
+        elif variant_id is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="variant_id is only valid for a short_variant target",
+            )
+    elif clip_id is not None or variant_id is not None:
         raise HTTPException(
-            status_code=422, detail="clip_id is only valid for a short target"
+            status_code=422,
+            detail="clip_id and variant_id are only valid for short targets",
         )
     try:
         resolved = await asyncio.to_thread(
@@ -891,6 +945,7 @@ async def _inspection_target(
             load_config(),
             target,
             clip=clip,
+            variant_id=variant_id,
         )
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -899,15 +954,18 @@ async def _inspection_target(
 
 async def _create_inspection_asset(
     episode_id: str,
-    target: Literal["source", "longform", "short"],
+    target: Literal["source", "longform", "short", "short_variant"],
     clip_id: str | None,
+    variant_id: str | None,
     clock: Literal["source", "output"],
     seconds: float,
     *,
     kind: Literal["frame", "preview"],
     duration: float = 0.0,
 ) -> dict:
-    episode_dir, resolved = await _inspection_target(episode_id, target, clip_id)
+    episode_dir, resolved = await _inspection_target(
+        episode_id, target, clip_id, variant_id
+    )
     try:
         result = await asyncio.to_thread(
             inspect_media_window,
@@ -929,6 +987,7 @@ async def _create_inspection_asset(
         "episode_id": episode_id,
         "target": target,
         "clip_id": clip_id,
+        "variant_id": variant_id,
         **result.payload,
         "asset": {
             **result.payload["asset"],
@@ -940,29 +999,32 @@ async def _create_inspection_asset(
 @router.get("/{episode_id}/inspection/frame")
 async def inspection_frame(
     episode_id: str,
-    target: Literal["source", "longform", "short"] = "source",
+    target: Literal["source", "longform", "short", "short_variant"] = "source",
     clock: Literal["source", "output"] = "source",
     seconds: float = 0.0,
     clip_id: str | None = None,
+    variant_id: str | None = None,
 ) -> dict:
     return await _create_inspection_asset(
-        episode_id, target, clip_id, clock, seconds, kind="frame"
+        episode_id, target, clip_id, variant_id, clock, seconds, kind="frame"
     )
 
 
 @router.get("/{episode_id}/inspection/preview")
 async def inspection_preview(
     episode_id: str,
-    target: Literal["source", "longform", "short"] = "source",
+    target: Literal["source", "longform", "short", "short_variant"] = "source",
     clock: Literal["source", "output"] = "source",
     seconds: float = 0.0,
     duration_seconds: float = 10.0,
     clip_id: str | None = None,
+    variant_id: str | None = None,
 ) -> dict:
     return await _create_inspection_asset(
         episode_id,
         target,
         clip_id,
+        variant_id,
         clock,
         seconds,
         kind="preview",

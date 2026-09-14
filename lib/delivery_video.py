@@ -409,8 +409,10 @@ def preserve_reviewed_output(output: Path):
         backup.unlink(missing_ok=True)
 
 
-def video_packet_signature(path: Path, *, runner: Callable = subprocess.run) -> dict:
-    """Hash the ordered H.264 packet payloads without decoding or re-encoding."""
+def _packet_signature(
+    path: Path, selector: str, *, runner: Callable = subprocess.run
+) -> dict:
+    """Hash ordered packet payloads without decoding or re-encoding."""
     result = runner(
         [
             ffmpeg_executable(),
@@ -420,8 +422,8 @@ def video_packet_signature(path: Path, *, runner: Callable = subprocess.run) -> 
             "-i",
             str(path),
             "-map",
-            "0:v:0",
-            "-c:v",
+            f"0:{selector}",
+            "-c",
             "copy",
             "-f",
             "framehash",
@@ -442,17 +444,27 @@ def video_packet_signature(path: Path, *, runner: Callable = subprocess.run) -> 
         elif line and not line.startswith("#"):
             fields = [field.strip() for field in line.split(",")]
             if len(fields) < 6:
-                raise RuntimeError("ffmpeg returned an invalid video packet signature")
-            records.append("packet:" + ":".join(fields[-2:]))
+                raise RuntimeError("ffmpeg returned an invalid packet signature")
+            records.append("packet:" + ":".join(fields[4:6]))
             packet_count += 1
     if packet_count == 0:
-        raise RuntimeError("Rendered media contains no video packets")
+        raise RuntimeError("Rendered media contains no selected packets")
     canonical = "\n".join(records).encode()
     return {
         "method": "ffmpeg-framehash-packet-payload-sha256/v1",
         "sha256": hashlib.sha256(canonical).hexdigest(),
         "packet_count": packet_count,
     }
+
+
+def video_packet_signature(path: Path, *, runner: Callable = subprocess.run) -> dict:
+    """Hash ordered H.264 packet payloads without decoding or re-encoding."""
+    return _packet_signature(path, "v:0", runner=runner)
+
+
+def audio_packet_signature(path: Path, *, runner: Callable = subprocess.run) -> dict:
+    """Hash ordered audio packet payloads without decoding or re-encoding."""
+    return _packet_signature(path, "a:0", runner=runner)
 
 
 def mux_timeline_audio(

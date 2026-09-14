@@ -323,6 +323,64 @@ def test_review_distinguishes_missing_short_from_stale(test_client):
     }
 
 
+def test_review_exposes_background_variant_as_separate_media(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 30}
+    _write_clips(episode_dir, [clip])
+    variant_path = (
+        episode_dir / "short_variants" / "background_motion_v1" / "clip_01.mp4"
+    )
+    variant_path.parent.mkdir(parents=True)
+    variant_path.write_bytes(b"background pixels")
+    stat = variant_path.stat()
+    variant_record = {
+        "fingerprint": "sha256:variant",
+        "asset": {"asset_id": "original_block_parkour_v1"},
+        "output": {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns},
+    }
+
+    from server.routes import review
+
+    monkeypatch.setattr(
+        review,
+        "background_variant_state",
+        lambda *_args, **_kwargs: (
+            variant_record,
+            {
+                "status": "current",
+                "current": True,
+                "playable": True,
+                "path": "short_variants/background_motion_v1/clip_01.mp4",
+                "reason_code": None,
+                "detail": "current",
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            },
+        ),
+    )
+
+    response = client.get("/api/episodes/ep_001/review")
+
+    assert response.status_code == 200
+    variant = response.json()["clips"][0]["review"]["variants"]["background_motion_v1"]
+    assert variant["asset_id"] == "original_block_parkour_v1"
+    assert variant["render"]["current"] is True
+    assert (
+        "/short_variants/background_motion_v1/clip_01.mp4?v="
+        in variant["render"]["url"]
+    )
+    assert variant["approval"]["current"] is False
+    assert variant["approval"]["revision"].startswith("sha256:")
+
+    variant_record["asset"]["asset_id"] = []
+    fallback = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"]
+    assert (
+        fallback["variants"]["background_motion_v1"]["asset_id"]
+        == "original_block_parkour_v1"
+    )
+
+
 def test_inspection_reports_revision_bound_clip_boundary_evidence(
     test_client, monkeypatch
 ):
@@ -523,6 +581,27 @@ def test_inspection_rejects_a_stale_render_input(test_client, monkeypatch):
 
     assert response.status_code == 409
     assert response.json()["detail"] == "Selected audio is stale"
+
+
+def test_inspection_rejects_unknown_short_variant(test_client):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    _write_clips(
+        episode_dir,
+        [{"id": "clip_01", "start_seconds": 1.0, "end_seconds": 3.0}],
+    )
+
+    response = client.get(
+        "/api/episodes/ep_001/inspection/frame",
+        params={
+            "target": "short_variant",
+            "clip_id": "clip_01",
+            "variant_id": "unknown",
+        },
+    )
+
+    assert response.status_code == 404
+    assert "Unknown short variant" in response.json()["detail"]
 
 
 def test_audio_inspection_names_camera_channel_and_uncertainty(

@@ -121,11 +121,12 @@ export interface InspectionRequest {
   method: 'GET';
   endpoint: string;
   query: {
-    target: 'source' | 'longform' | 'short';
+    target: 'source' | 'longform' | 'short' | 'short_variant';
     clock: 'source' | 'output';
     seconds: number;
     duration_seconds: number;
     clip_id?: string;
+    variant_id?: string;
   };
 }
 
@@ -214,8 +215,9 @@ export interface OutputContinuityReport extends UnknownRecord {
 }
 
 export interface MediaInspection extends UnknownRecord {
-  target: 'source' | 'longform' | 'short';
+  target: 'source' | 'longform' | 'short' | 'short_variant';
   clip_id?: string | null;
+  variant_id?: string | null;
   artifact: { current: true; fingerprint: string; duration_seconds: number };
   asset: {
     url: string;
@@ -328,6 +330,16 @@ export interface ClipReviewState extends UnknownRecord {
     completed_at?: string;
     error?: string;
   };
+  variants?: Record<string, ShortVariantReview>;
+}
+
+export interface ShortVariantReview extends UnknownRecord {
+  id: string;
+  label: string;
+  asset_id: string;
+  render: ReviewArtifact;
+  approval: { status: string; current: boolean; revision: string };
+  render_job: ClipReviewState['render_job'];
 }
 
 export interface EpisodeReviewState extends UnknownRecord {
@@ -572,6 +584,28 @@ export const api = {
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/select`),
   renderClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/render`),
+  renderClipVariant: (
+    id: string,
+    clipId: string,
+    variantId: string,
+    assetId?: string
+  ) =>
+    request<UnknownRecord>(
+      'POST',
+      `/api/episodes/${id}/clips/${clipId}/variants/${variantId}/render`,
+      assetId ? { asset_id: assetId } : {}
+    ),
+  approveClipVariant: (
+    id: string,
+    clipId: string,
+    variantId: string,
+    expectedRevision: string
+  ) =>
+    request<UnknownRecord>(
+      'POST',
+      `/api/episodes/${id}/clips/${clipId}/variants/${variantId}/approve`,
+      { expected_revision: expectedRevision }
+    ),
   approveClips: (id: string, clipIds: string[]) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/approve`, {
       clip_ids: clipIds,

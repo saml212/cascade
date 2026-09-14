@@ -145,6 +145,29 @@ def _file_identity(stat: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def scan_identity(path: str | Path) -> dict | None:
+    """Return stable path and stat identity, or None if the file changes."""
+    requested = Path(path)
+    try:
+        resolved = requested.resolve(strict=True)
+        before = resolved.stat()
+        if requested.resolve(strict=True) != resolved:
+            return None
+        after = resolved.stat()
+    except (OSError, RuntimeError):
+        return None
+    if _file_identity(before) != _file_identity(after):
+        return None
+    return {
+        "resolved_path": str(resolved),
+        "size_bytes": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
+        "device": after.st_dev,
+        "inode": after.st_ino,
+    }
+
+
 def _hash_open_file(handle) -> str:
     digest = hashlib.sha256()
     while chunk := handle.read(1024 * 1024):

@@ -24,6 +24,13 @@ from lib.clips import (
 )
 from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
+from lib.short_variants import (
+    DEFAULT_BACKGROUND_ASSET_ID,
+    background_variant_output,
+    background_variant_state,
+    require_background_variant,
+    save_background_variant_approval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +39,14 @@ router = APIRouter(prefix="/api/episodes/{episode_id}/clips", tags=["clips"])
 EPISODES_DIR = get_episodes_dir()
 _render_jobs_lock = threading.Lock()
 _active_render_jobs: set[str] = set()
+_render_completion_tasks: set[asyncio.Task] = set()
 _RENDER_JOBS_PATH = Path("work/clip_render_jobs.json")
+
+
+def _release_render_task(task: asyncio.Task) -> None:
+    _render_completion_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 class ManualClipRequest(BaseModel):
@@ -57,6 +71,14 @@ class BulkClipRequest(BaseModel):
     clip_ids: list[str] | None = None
     min_score: float | None = None
     max_score: float | None = None
+
+
+class VariantRenderRequest(BaseModel):
+    asset_id: str = DEFAULT_BACKGROUND_ASSET_ID
+
+
+class VariantApprovalRequest(BaseModel):
+    expected_revision: str
 
 
 def _finite_number(name: str, value: float) -> float:
@@ -92,12 +114,20 @@ def _render_job_key(ep_dir: Path, clip_id: str) -> str:
     return f"{ep_dir.resolve()}:{clip_id}"
 
 
+def variant_render_job_id(clip_id: str, variant_id: str) -> str:
+    return f"{clip_id}@{variant_id}"
+
+
 def _read_render_jobs(ep_dir: Path) -> dict:
     try:
         data = json.loads((ep_dir / _RENDER_JOBS_PATH).read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"version": 1, "jobs": {}}
-    if data.get("version") != 1 or not isinstance(data.get("jobs"), dict):
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(data.get("jobs"), dict)
+    ):
         return {"version": 1, "jobs": {}}
     return data
 
@@ -253,26 +283,30 @@ def _metadata_entry(ep_dir: Path, clip_id: str) -> dict | None:
 def _current_render(ep_dir: Path, clip: dict) -> dict | None:
     """Return the current validated render record for one clip."""
     from agents.pipeline import load_config
+    from agents.speaker_cut import current_speaker_segments
     from lib.audio_mix import selected_audio_source
     from lib.delivery_video import current_short_render
 
     try:
         episode = json.loads((ep_dir / "episode.json").read_text())
-        segments = json.loads((ep_dir / "segments.json").read_text()).get(
-            "segments", []
-        )
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
-    config = load_config()
-    try:
+        config = load_config()
+        plan = current_speaker_segments(ep_dir, episode, config)
         audio = selected_audio_source(ep_dir, episode, config) or (
             ep_dir / "work" / "audio_mix.wav"
         )
-    except ValueError:
+        segments = plan.get("segments", []) if isinstance(plan, dict) else []
+        if not audio.exists() or not segments:
+            return None
+        return current_short_render(ep_dir, episode, config, audio, segments, clip)
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
         return None
-    if not audio.exists() or not segments:
-        return None
-    return current_short_render(ep_dir, episode, config, audio, segments, clip)
 
 
 def _approve_current_render(
@@ -575,77 +609,192 @@ async def delete_clip(episode_id: str, clip_id: str) -> dict:
 
 
 async def _run_clip_render_operation(
-    episode_id: str, clip_id: str, *, repair_audio: bool
+    episode_id: str,
+    clip_id: str,
+    *,
+    repair_audio: bool = False,
+    variant_id: str | None = None,
+    asset_id: str | None = None,
 ) -> dict:
     """Run one serialized clip media operation and persist its review state."""
+    from agents.pipeline import load_config
+    from agents.shorts_render import (
+        render_single_clip,
+        render_single_clip_variant,
+        repair_single_clip_audio,
+    )
+
     clips, _ = load_clips(episode_id)
     find_clip(clips, clip_id)
     ep_dir = EPISODES_DIR / episode_id
-    job_key = _render_job_key(ep_dir, clip_id)
+    job_id = variant_render_job_id(clip_id, variant_id) if variant_id else clip_id
+    job_keys = {
+        _render_job_key(ep_dir, clip_id),
+        _render_job_key(ep_dir, job_id),
+    }
     with _render_jobs_lock:
-        if job_key in _active_render_jobs:
+        if any(key in _active_render_jobs for key in job_keys):
             raise HTTPException(
                 status_code=409, detail=f"Clip {clip_id} is already rendering"
             )
-        _active_render_jobs.add(job_key)
+        _active_render_jobs.update(job_keys)
     started_at = datetime.now(timezone.utc).isoformat()
-    _write_render_job(
-        ep_dir,
-        clip_id,
-        {
-            "status": "rendering",
-            "operation": "repair_audio" if repair_audio else "render",
-            "started_at": started_at,
-        },
-    )
 
-    from agents.pipeline import load_config
-    from agents.shorts_render import render_single_clip, repair_single_clip_audio
-
-    operation = repair_single_clip_audio if repair_audio else render_single_clip
-
-    try:
+    async def complete() -> dict:
+        job_started = False
         try:
-            result = await asyncio.to_thread(operation, ep_dir, load_config(), clip_id)
-        except KeyError as error:
-            raise HTTPException(
-                status_code=404, detail=f"Clip {clip_id} not found"
-            ) from error
-        except (FileNotFoundError, ValueError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        except (OSError, RuntimeError) as error:
-            logger.exception("single clip media operation failed for %s", clip_id)
-            raise HTTPException(status_code=500, detail=str(error)) from error
+            try:
+                _write_render_job(
+                    ep_dir,
+                    job_id,
+                    {
+                        "status": "rendering",
+                        "operation": (
+                            "render_variant"
+                            if variant_id
+                            else "repair_audio"
+                            if repair_audio
+                            else "render"
+                        ),
+                        "started_at": started_at,
+                    },
+                )
+                job_started = True
+                if variant_id:
+                    operation = render_single_clip_variant
+                    arguments = (
+                        ep_dir,
+                        load_config(),
+                        clip_id,
+                        variant_id,
+                        asset_id or DEFAULT_BACKGROUND_ASSET_ID,
+                    )
+                else:
+                    operation = (
+                        repair_single_clip_audio if repair_audio else render_single_clip
+                    )
+                    arguments = (ep_dir, load_config(), clip_id)
+                result = await asyncio.to_thread(operation, *arguments)
+            except KeyError as error:
+                detail = (
+                    str(error).strip("'") if variant_id else f"Clip {clip_id} not found"
+                )
+                raise HTTPException(status_code=404, detail=detail) from error
+            except (FileNotFoundError, ValueError) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            except (OSError, RuntimeError) as error:
+                logger.exception("single clip media operation failed for %s", clip_id)
+                raise HTTPException(status_code=500, detail=str(error)) from error
 
-        # New pixels or repaired audio need review. A byte-identical current reuse
-        # keeps its prior approval; a remaster deliberately clears it.
-        clips, clips_file = load_clips(episode_id)
-        clip, index = find_clip(clips, clip_id)
-        fingerprint = result.get("render", {}).get("fingerprint")
-        if clip.get("status") == "approved" and (
-            result.get("audio_repaired")
-            or clip.get("approved_render_fingerprint") != fingerprint
-        ):
-            _clear_final_approval(clip)
-            clips[index] = clip
-            save_clips(clips, clips_file)
-        _finish_render_job(ep_dir, clip_id, started_at, result=result)
-        return result
-    except Exception as error:
-        _finish_render_job(ep_dir, clip_id, started_at, error=error)
-        raise
-    finally:
-        with _render_jobs_lock:
-            _active_render_jobs.discard(job_key)
+            # A variant never mutates or approves its canonical base clip.
+            if not variant_id:
+                current_clips, clips_file = load_clips(episode_id)
+                clip, index = find_clip(current_clips, clip_id)
+                fingerprint = result.get("render", {}).get("fingerprint")
+                if clip.get("status") == "approved" and (
+                    result.get("audio_repaired")
+                    or clip.get("approved_render_fingerprint") != fingerprint
+                ):
+                    _clear_final_approval(clip)
+                    current_clips[index] = clip
+                    save_clips(current_clips, clips_file)
+            _finish_render_job(ep_dir, job_id, started_at, result=result)
+            return result
+        except Exception as error:
+            if job_started:
+                _finish_render_job(ep_dir, job_id, started_at, error=error)
+            raise
+        finally:
+            with _render_jobs_lock:
+                _active_render_jobs.difference_update(job_keys)
+
+    completion = asyncio.create_task(complete())
+    _render_completion_tasks.add(completion)
+    completion.add_done_callback(_release_render_task)
+    return await asyncio.shield(completion)
 
 
 @router.post("/{clip_id}/render")
 async def render_clip(episode_id: str, clip_id: str) -> dict:
     """Render one exact clip through the public shorts-render adapter."""
-    return await _run_clip_render_operation(episode_id, clip_id, repair_audio=False)
+    return await _run_clip_render_operation(episode_id, clip_id)
 
 
 @router.post("/{clip_id}/repair-audio")
 async def repair_clip_audio(episode_id: str, clip_id: str) -> dict:
     """Normalize one current short while copying its reviewed video packets."""
     return await _run_clip_render_operation(episode_id, clip_id, repair_audio=True)
+
+
+@router.post("/{clip_id}/variants/{variant_id}/render")
+async def render_clip_variant(
+    episode_id: str,
+    clip_id: str,
+    variant_id: str,
+    req: VariantRenderRequest | None = None,
+) -> dict:
+    """Render one optional review variant without changing the canonical short."""
+    try:
+        require_background_variant(variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    return await _run_clip_render_operation(
+        episode_id,
+        clip_id,
+        variant_id=variant_id,
+        asset_id=req.asset_id if req else DEFAULT_BACKGROUND_ASSET_ID,
+    )
+
+
+@router.post("/{clip_id}/variants/{variant_id}/approve")
+async def approve_clip_variant(
+    episode_id: str, clip_id: str, variant_id: str, req: VariantApprovalRequest
+) -> dict:
+    """Approve the exact current variant pixels and current clip copy."""
+    try:
+        require_background_variant(variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    clips, _ = load_clips(episode_id)
+    clip, _ = find_clip(clips, clip_id)
+    ep_dir = EPISODES_DIR / episode_id
+
+    from agents.pipeline import load_config
+    from agents.qa import clip_review_revision
+    from lib.delivery_video import render_config_for_episode, render_output_lock
+    from lib.encoding import get_video_encoding_policy
+
+    with render_output_lock(background_variant_output(ep_dir, clip_id)):
+        base_record = _current_render(ep_dir, clip)
+        try:
+            episode = json.loads((ep_dir / "episode.json").read_text())
+            encoding = get_video_encoding_policy(
+                render_config_for_episode(episode, load_config()), "shorts"
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record, render = background_variant_state(
+            ep_dir, clip_id, base_record=base_record, encoding=encoding
+        )
+        revision = clip_review_revision(clip, record, _metadata_entry(ep_dir, clip_id))
+        if req.expected_revision != revision:
+            raise HTTPException(
+                status_code=409,
+                detail="The variant or its copy changed; refresh before approving.",
+            )
+        if not render["current"]:
+            raise HTTPException(
+                status_code=409,
+                detail="This variant needs a current render before approval.",
+            )
+        if save_background_variant_approval(ep_dir, clip_id, record, revision) is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The variant changed while approval was being saved.",
+            )
+    return {
+        "status": "approved",
+        "clip_id": clip_id,
+        "variant_id": variant_id,
+        "approved_revision": revision,
+    }

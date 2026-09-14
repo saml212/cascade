@@ -21,6 +21,7 @@ import {
   type EpisodeReviewState,
   type ReviewArtifact,
   type ReviewDestination,
+  type ShortVariantReview,
   type UnknownRecord,
 } from '../lib/api';
 import {
@@ -156,7 +157,13 @@ export function ClipReview(
 
   const hasActiveRender = (state: EpisodeReviewState | null): boolean =>
     Boolean(
-      state?.clips.some((clip) => clip.review.render_job.status === 'rendering')
+      state?.clips.some(
+        (clip) =>
+          clip.review.render_job.status === 'rendering' ||
+          Object.values(clip.review.variants ?? {}).some(
+            (variant) => variant.render_job.status === 'rendering'
+          )
+      )
     );
 
   function schedulePoll(state: EpisodeReviewState | null): void {
@@ -910,6 +917,12 @@ function clipExpanded(
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
+  const background = review.variants?.background_motion_v1;
+  const surface = signal<'base' | 'background'>('base');
+  const rendering = signal(
+    review.render_job.status === 'rendering' ||
+      background?.render_job.status === 'rendering'
+  );
   return h(
     'div',
     {
@@ -917,12 +930,22 @@ function clipExpanded(
       class: 'border-t border-border-subtle',
       tabindex: '-1',
     },
-    renderReviewPlayer(clipId, review.render, navigation, setExpanded),
-    renderActions(
+    renderReviewChoice(
+      clipId,
+      review.render,
+      background,
+      surface,
+      navigation,
+      setExpanded
+    ),
+    renderChoiceActions(
       episodeId,
       clipId,
       clip,
       review,
+      background,
+      surface,
+      rendering,
       approvalFeedback,
       reload
     ),
@@ -938,11 +961,59 @@ function clipExpanded(
   );
 }
 
+function renderReviewChoice(
+  clipId: string,
+  base: ReviewArtifact,
+  background: ShortVariantReview | undefined,
+  surface: Signal<'base' | 'background'>,
+  navigation: ClipNavigation | undefined,
+  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
+): HTMLElement {
+  if (!background) {
+    return renderReviewPlayer(clipId, base, navigation, setExpanded);
+  }
+  const controls = h('div', {
+    class: 'px-5 pt-4 flex items-center justify-center gap-2 bg-surface-inset/50',
+    role: 'group',
+    'aria-label': 'Video version',
+  });
+  const player = h('div');
+  effect(() => {
+    const selected = surface();
+    controls.replaceChildren(
+      Button({
+        variant: selected === 'base' ? 'primary' : 'secondary',
+        size: 'sm',
+        label: 'Base',
+        onClick: () => surface.set('base'),
+      }),
+      Button({
+        variant: selected === 'background' ? 'primary' : 'secondary',
+        size: 'sm',
+        label: 'Background',
+        onClick: () => surface.set('background'),
+      })
+    );
+    player.querySelector('video')?.pause();
+    player.replaceChildren(
+      renderReviewPlayer(
+        clipId,
+        selected === 'background' ? background.render : base,
+        navigation,
+        setExpanded,
+        selected === 'background' ? 'background variant' : 'base render'
+      )
+    );
+  });
+  return h('div', null, controls, player);
+}
+
 function renderReviewPlayer(
   clipId: string,
   render: ReviewArtifact,
   navigation: ClipNavigation | undefined,
-  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
+  setExpanded: (clipId: string | null, focusPlayer?: boolean) => void,
+  versionLabel = 'base render'
 ): HTMLElement {
   if (!render.playable || !render.url) {
     return h(
@@ -952,11 +1023,17 @@ function renderReviewPlayer(
           'px-5 py-8 bg-surface-inset/50 text-center border-b border-border-subtle',
         'aria-label': 'Clip video review',
       },
-      h('p', { class: 'text-body text-ink-secondary' }, 'No current video to review.'),
+      h(
+        'p',
+        { class: 'text-body text-ink-secondary' },
+        `No current ${versionLabel} to review.`
+      ),
       h(
         'p',
         { class: 'text-body-sm text-ink-tertiary mt-1' },
-        'Render this candidate to inspect framing, captions, audio, and timing.'
+        versionLabel === 'background variant'
+          ? 'Render the motion version to inspect framing, captions, audio, and timing.'
+          : 'Render this candidate to inspect framing, captions, audio, and timing.'
       )
     );
   }
@@ -999,7 +1076,7 @@ function renderReviewPlayer(
         preload: 'metadata',
         class:
           'block w-full aspect-[9/16] object-contain bg-black rounded-lg border border-border-strong shadow-lift-lg',
-        'aria-label': `Review video for ${clipId}`,
+        'aria-label': `Review ${versionLabel} for ${clipId}`,
       }),
       h(
         'div',
@@ -1007,13 +1084,16 @@ function renderReviewPlayer(
         h(
           'span',
           { class: 'text-body-sm text-ink-tertiary' },
-          render.current ? 'Current rendered file' : 'Previous rendered file'
+          render.current ? `Current ${versionLabel}` : `Previous ${versionLabel}`
         ),
         h(
           'a',
           {
             href: url,
-            download: `${clipId}.mp4`,
+            download:
+              versionLabel === 'base render'
+                ? `${clipId}.mp4`
+                : `${clipId}-background.mp4`,
             class:
               'text-body-sm text-ink-secondary hover:text-ink-primary underline underline-offset-4',
           },
@@ -1059,15 +1139,128 @@ function renderPlaybackNavigation(
   );
 }
 
+function renderChoiceActions(
+  episodeId: string,
+  clipId: string,
+  clip: UnknownRecord,
+  review: ClipReviewState,
+  background: ShortVariantReview | undefined,
+  surface: Signal<'base' | 'background'>,
+  rendering: Signal<boolean>,
+  approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
+  reload: () => Promise<void>
+): HTMLElement {
+  const base = renderActions(
+    episodeId,
+    clipId,
+    clip,
+    review,
+    rendering,
+    approvalFeedback,
+    reload
+  );
+  if (!background) return base;
+  const variant = renderVariantActions(
+    episodeId,
+    clipId,
+    background,
+    review.render.current,
+    rendering,
+    reload
+  );
+  effect(() => {
+    base.classList.toggle('hidden', surface() !== 'base');
+    variant.classList.toggle('hidden', surface() !== 'background');
+  });
+  return h('div', null, base, variant);
+}
+
+function renderVariantActions(
+  episodeId: string,
+  clipId: string,
+  background: ShortVariantReview,
+  baseCurrent: boolean,
+  rendering: Signal<boolean>,
+  reload: () => Promise<void>
+): HTMLElement {
+  const action = h('span');
+  effect(() => {
+    const active = rendering();
+    action.replaceChildren(
+      Button({
+        variant: 'primary',
+        size: 'sm',
+        label: !baseCurrent
+          ? 'Render base first'
+          : background.approval.current
+          ? 'Background approved'
+          : background.render.current
+            ? 'Approve background'
+            : active
+              ? 'Rendering background…'
+              : background.render.playable
+                ? 'Re-render background'
+                : 'Render background',
+        disabled: !baseCurrent || background.approval.current || active,
+        loading: active,
+        onClick: async () => {
+          try {
+            if (background.render.current) {
+              await api.approveClipVariant(
+                episodeId,
+                clipId,
+                background.id,
+                background.approval.revision
+              );
+              showToast(
+                'Background version approved for this render and copy.',
+                'success'
+              );
+            } else {
+              rendering.set(true);
+              showToast('Rendering the background version locally…');
+              await api.renderClipVariant(
+                episodeId,
+                clipId,
+                background.id,
+                background.asset_id
+              );
+              showToast(
+                'Background version rendered. Review it before approval.',
+                'success'
+              );
+            }
+            await reload();
+          } catch (error) {
+            showToast((error as Error).message, 'error');
+          } finally {
+            rendering.set(false);
+          }
+        },
+      })
+    );
+  });
+  return h(
+    'div',
+    { class: 'flex items-center gap-3 px-5 py-4 flex-wrap' },
+    action,
+    h(
+      'span',
+      { class: 'text-body-sm text-ink-tertiary' },
+      `Uses ${background.asset_id.replaceAll('_', ' ')}. Base approval and delivery stay separate.`
+    )
+  );
+}
+
 function renderActions(
   episodeId: string,
   clipId: string,
   clip: UnknownRecord,
   review: ClipReviewState,
+  rendering: Signal<boolean>,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   reload: () => Promise<void>
 ): HTMLElement {
-  const rendering = signal(review.render_job.status === 'rendering');
   const primary = h('span');
   const feedbackHost = h('p', {
     class: 'basis-full text-body-sm min-h-5',

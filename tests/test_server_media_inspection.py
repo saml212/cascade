@@ -120,6 +120,68 @@ def test_resolve_render_rejects_stale_selected_audio(tmp_path, monkeypatch):
         resolve_target(tmp_path, {}, {}, "longform")
 
 
+def test_resolve_short_variant_requires_current_fixed_artifact(tmp_path, monkeypatch):
+    source = tmp_path / "source_merged.mp4"
+    selected = tmp_path / "work" / "audio_mix.wav"
+    variant = tmp_path / "short_variants" / "background_motion_v1" / "clip_01.mp4"
+    for path in (source, selected, variant):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(path.name.encode())
+    episode = {"longform_edits": []}
+    clip = {"id": "clip_01", "start_seconds": 2, "end_seconds": 5}
+    segments = [{"start": 0, "end": 10, "speaker": "speaker_0"}]
+
+    import server.media_inspection as inspection
+
+    monkeypatch.setattr(inspection, "_video", lambda *_args: (10.0, "30/1"))
+    monkeypatch.setattr(inspection, "selected_audio_source", lambda *_args: selected)
+    monkeypatch.setattr(
+        inspection, "current_speaker_segments", lambda *_args: {"segments": segments}
+    )
+    monkeypatch.setattr(
+        inspection, "current_diarized_transcript", lambda *_args: {"utterances": []}
+    )
+    monkeypatch.setattr(
+        inspection,
+        "current_short_render",
+        lambda *_args: {"fingerprint": "sha256:base"},
+    )
+    monkeypatch.setattr(
+        inspection,
+        "background_variant_state",
+        lambda *_args, **_kwargs: (
+            {"fingerprint": "sha256:variant"},
+            {
+                "current": True,
+                "path": "short_variants/background_motion_v1/clip_01.mp4",
+            },
+        ),
+    )
+
+    target = resolve_target(
+        tmp_path,
+        episode,
+        {},
+        "short_variant",
+        clip=clip,
+        variant_id="background_motion_v1",
+    )
+
+    assert target.path == variant
+    assert target.timeline.keep_intervals == ((2.0, 5.0),)
+    assert target.fingerprint == "sha256:variant"
+
+    with pytest.raises(KeyError, match="Unknown short variant"):
+        resolve_target(
+            tmp_path,
+            episode,
+            {},
+            "short_variant",
+            clip=clip,
+            variant_id="unknown",
+        )
+
+
 @pytest.mark.skipif(
     not shutil.which("ffmpeg"),
     reason="ffmpeg is required",

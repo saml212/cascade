@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 
 from agents.base import BaseAgent, timed_ffmpeg
@@ -14,9 +15,11 @@ from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
 from lib.delivery_video import (
+    audio_packet_signature,
     build_render_segments,
     concat_video_segments,
     current_short_render,
+    ffmpeg_executable,
     mux_timeline_audio,
     preserve_reviewed_output,
     record_short_render,
@@ -28,8 +31,11 @@ from lib.delivery_video import (
     require_render_space,
     short_render_fingerprint,
     source_fps,
+    staged_render_output,
+    validate_av_output,
 )
 from lib.encoding import (
+    get_color_metadata_args,
     get_lut_filter,
     get_scale_filter,
     get_video_encoder_args,
@@ -37,11 +43,29 @@ from lib.encoding import (
     get_video_polish_filters,
 )
 from lib.ffprobe import probe as ffprobe
-from lib.loudness import delivery_loudness_policy, loudness_status
+from lib.ffprobe import scan_identity
+from lib.loudness import (
+    delivery_loudness_policy,
+    loudness_status,
+    measure_loudness,
+    require_delivery_loudness,
+)
+from lib.short_variants import (
+    BACKGROUND_VARIANT_ID,
+    DEFAULT_BACKGROUND_ASSET_ID,
+    background_variant_fingerprint,
+    background_variant_output,
+    background_variant_state,
+    file_content_identity,
+    load_background_asset,
+    record_background_variant,
+    require_background_variant,
+)
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
 
 THREE_PERSON_STACK_CAPTION_MARGIN_V = 600
+BACKGROUND_CAPTION_MARGIN_V = 840
 
 
 class ShortsRenderAgent(BaseAgent):
@@ -78,6 +102,270 @@ class ShortsRenderAgent(BaseAgent):
         output = self.episode_dir / "shorts" / f"{clip_id}.mp4"
         with render_output_lock(output):
             return self._repair_clip_audio_locked(clip_id, output)
+
+    def render_background_variant(
+        self, clip_id: str, asset_id: str = DEFAULT_BACKGROUND_ASSET_ID
+    ) -> dict:
+        """Compose one optional motion variant from a current canonical short."""
+        clips = self.load_json("clips.json").get("clips", [])
+        clip = next((item for item in clips if item.get("id") == clip_id), None)
+        if clip is None:
+            raise KeyError(f"Unknown clip: {clip_id}")
+        output = background_variant_output(self.episode_dir, clip_id)
+        with render_output_lock(output):
+            return self._render_background_variant_locked(clip, asset_id, output)
+
+    def _render_background_variant_locked(
+        self, clip: dict, asset_id: str, output: Path
+    ) -> dict:
+        episode = self.load_json("episode.json")
+        self.config = render_config_for_episode(episode, self.config)
+        segment_document = current_speaker_segments(
+            self.episode_dir, episode, self.config
+        )
+        segments = segment_document.get("segments", []) if segment_document else []
+        if not segments:
+            raise ValueError(
+                "Current speaker segments are required for a short variant"
+            )
+        source = self.episode_dir / "source_merged.mp4"
+        source_probe = ffprobe(source)
+        video_stream = next(
+            stream
+            for stream in source_probe["streams"]
+            if stream["codec_type"] == "video"
+        )
+        src_w = int(video_stream["width"])
+        src_h = int(video_stream["height"])
+        fps = source_fps(video_stream, episode)
+        timeline = (
+            Timeline.from_edits(
+                float(source_probe["format"]["duration"]),
+                episode.get("longform_edits", []),
+            )
+            .slice(float(clip["start_seconds"]), float(clip["end_seconds"]))
+            .quantize(fps)
+        )
+        if timeline.duration < 0.1:
+            raise ValueError("Clip contains no retained source material")
+
+        from lib.audio_mix import selected_audio_source
+
+        audio = selected_audio_source(self.episode_dir, episode, self.config) or (
+            self.episode_dir / "work" / "audio_mix.wav"
+        )
+        if not audio.is_file():
+            raise RuntimeError("Canonical audio source is required")
+        base_record = current_short_render(
+            self.episode_dir, episode, self.config, audio, segments, clip
+        )
+        if base_record is None:
+            raise ValueError(
+                "A current canonical short is required for a background variant"
+            )
+
+        base_path = self.episode_dir / "shorts" / f"{clip['id']}.mp4"
+        base_duration = float(ffprobe(base_path)["format"]["duration"])
+        base_identity = scan_identity(base_path)
+        if base_identity is None:
+            raise OSError("Canonical short changed while its identity was read")
+        asset = load_background_asset(asset_id, verify_content=True)
+        asset_probe = ffprobe(asset["path"])
+        if not any(
+            item.get("codec_type") == "video" for item in asset_probe["streams"]
+        ):
+            raise ValueError("Background asset has no video stream")
+        if any(item.get("codec_type") == "audio" for item in asset_probe["streams"]):
+            raise ValueError("Background assets must be silent")
+
+        encoding = get_video_encoding_policy(self.config, "shorts")
+        fingerprint = background_variant_fingerprint(
+            base_record,
+            base_identity,
+            asset,
+            encoding,
+        )
+        current_record, current_state = background_variant_state(
+            self.episode_dir,
+            str(clip["id"]),
+            base_record=base_record,
+            encoding=encoding,
+        )
+        if (
+            current_state["current"]
+            and current_record.get("fingerprint") == fingerprint
+            and current_record.get("asset", {}).get("asset_id") == asset_id
+        ):
+            return self._variant_result(output, current_record, reused=True)
+
+        encoder_args = get_video_encoder_args(self.config, "shorts")
+        lut_filter = get_lut_filter(self.config)
+        diarized = current_diarized_transcript(self.episode_dir, episode, self.config)
+        if not diarized:
+            raise ValueError("Current transcript is required for variant captions")
+        had_output = output.is_file()
+        protection = preserve_reviewed_output(output) if had_output else nullcontext()
+        try:
+            with protection:
+                record = self._render_short_unlocked(
+                    source,
+                    output,
+                    self.episode_dir
+                    / "subtitles"
+                    / "short_variants"
+                    / BACKGROUND_VARIANT_ID
+                    / f"{clip['id']}.ass",
+                    float(clip["start_seconds"]),
+                    float(clip["end_seconds"]),
+                    segments,
+                    src_w,
+                    src_h,
+                    encoding["audio_bitrate"],
+                    episode.get("crop_config", {}),
+                    encoder_args,
+                    lut_filter,
+                    audio,
+                    fps,
+                    timeline=timeline,
+                    diarized=diarized,
+                    fingerprint=fingerprint,
+                    episode=episode,
+                    clip=clip,
+                    encoding=encoding,
+                    background={
+                        "asset": asset,
+                        "base_path": base_path,
+                        "base_duration": base_duration,
+                        "base_record": base_record,
+                        "base_identity": base_identity,
+                    },
+                )
+        except BaseException:
+            if not had_output:
+                output.unlink(missing_ok=True)
+            raise
+        return self._variant_result(output, record, reused=False)
+
+    def _compose_background_variant(
+        self,
+        podcast_video: Path,
+        asset: Path,
+        base_short: Path,
+        output: Path,
+        fps: str,
+        suppress_motion: list[tuple[float, float]],
+        encoder_args: list[str],
+    ) -> None:
+        disabled = "+".join(
+            f"between(t,{start:.6f},{end:.6f})" for start, end in suppress_motion
+        )
+        enable = f":enable='not({disabled})'" if disabled else ""
+        graph = (
+            "[0:v]setpts=PTS-STARTPTS[podcast];"
+            "[1:v]scale=1080:640:force_original_aspect_ratio=increase,"
+            f"crop=1080:640,fps={fps},setpts=PTS-STARTPTS[motion];"
+            f"[podcast][motion]overlay=0:1280{enable},"
+            "drawbox=x=0:y=1276:w=1080:h=8:color=black@0.85:t=fill,"
+            "tpad=stop_mode=clone:stop_duration=0.25,format=yuv420p[variant]"
+        )
+        self._run_ffmpeg(
+            [
+                ffmpeg_executable(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(podcast_video),
+                "-stream_loop",
+                "-1",
+                "-i",
+                str(asset),
+                "-i",
+                str(base_short),
+                "-filter_complex",
+                graph,
+                "-map",
+                "[variant]",
+                "-map",
+                "2:a:0",
+                *encoder_args,
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-shortest",
+                *get_color_metadata_args(),
+                "-use_editlist",
+                "0",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def _finish_background_variant(
+        self,
+        podcast_video: Path,
+        output: Path,
+        fps: str,
+        suppress_motion: list[tuple[float, float]],
+        encoder_args: list[str],
+        background: dict,
+    ) -> dict:
+        base_path = background["base_path"]
+        asset = background["asset"]
+        base_signature = audio_packet_signature(base_path, runner=self._run_ffmpeg)
+        with staged_render_output(output) as staged:
+            self._compose_background_variant(
+                podcast_video,
+                asset["path"],
+                base_path,
+                staged,
+                fps,
+                suppress_motion,
+                encoder_args,
+            )
+            media = validate_av_output(staged, background["base_duration"])
+            if (media["width"], media["height"]) != (1080, 1920):
+                raise RuntimeError("Background variant must be 1080x1920")
+            media["audio_loudness"] = require_delivery_loudness(
+                measure_loudness(staged, ffmpeg_bin=ffmpeg_executable()),
+                delivery_loudness_policy(self.config, "shorts"),
+            )
+            output_signature = audio_packet_signature(staged, runner=self._run_ffmpeg)
+            if output_signature != base_signature:
+                raise RuntimeError("Background variant changed canonical audio packets")
+            media["audio_copy_verification"] = {
+                "status": "pass",
+                "input": base_signature,
+                "output": output_signature,
+            }
+            if scan_identity(base_path) != background["base_identity"]:
+                raise RuntimeError("Canonical short changed during variant render")
+            if (
+                file_content_identity(asset["path"], asset["content_revision"])[
+                    "scan_identity"
+                ]
+                != asset["scan_identity"]
+            ):
+                raise RuntimeError("Background asset changed during variant render")
+        return media
+
+    @staticmethod
+    def _variant_result(output: Path, record: dict, *, reused: bool) -> dict:
+        return {
+            "clip_id": output.stem,
+            "variant_id": BACKGROUND_VARIANT_ID,
+            "asset_id": record.get("asset", {}).get("asset_id"),
+            "output_path": str(output),
+            "reused": reused,
+            "render": record,
+        }
 
     def _repair_clip_audio_locked(self, clip_id: str, output: Path) -> dict:
         clips = self.load_json("clips.json").get("clips", [])
@@ -368,6 +656,7 @@ class ShortsRenderAgent(BaseAgent):
         episode=None,
         clip=None,
         encoding=None,
+        background=None,
     ) -> dict:
         """Render one clip; positional arguments remain compatible with chat actions."""
         episode = episode or self.load_json("episode.json")
@@ -394,7 +683,11 @@ class ShortsRenderAgent(BaseAgent):
         render_segments = build_render_segments(timeline, segments, frame_rate=fps)
         render_segments = self._apply_overlap_policy(render_segments)
         captions = rebase_diarized(diarized, timeline)
-        style = CaptionStyle()
+        style = (
+            CaptionStyle(margin_v=BACKGROUND_CAPTION_MARGIN_V)
+            if background
+            else CaptionStyle()
+        )
         three_person_stack_enabled = bool(
             episode.get("shorts_three_person_stack", False)
         )
@@ -414,8 +707,21 @@ class ShortsRenderAgent(BaseAgent):
                 segment_timeline = Timeline(
                     timeline.duration, [(segment["start"], segment["end"])]
                 )
-                segment_style = self._short_caption_style(
+                three_person = self._uses_three_person_stack(
                     segment["speaker"], crop_config, three_person_stack_enabled
+                )
+                segment_style = (
+                    CaptionStyle(
+                        margin_v=(
+                            THREE_PERSON_STACK_CAPTION_MARGIN_V
+                            if three_person
+                            else BACKGROUND_CAPTION_MARGIN_V
+                        )
+                    )
+                    if background
+                    else self._short_caption_style(
+                        segment["speaker"], crop_config, three_person_stack_enabled
+                    )
                 )
                 generate_ass_from_diarized(
                     rebase_diarized(captions, segment_timeline),
@@ -427,17 +733,24 @@ class ShortsRenderAgent(BaseAgent):
                 filters = []
                 if lut_filter:
                     filters.append(lut_filter)
-                filters.extend(
-                    [
-                        self._get_short_crop_filter_no_subs(
-                            segment["speaker"],
-                            src_w,
-                            src_h,
-                            crop_config,
-                            three_person_stack=three_person_stack_enabled,
-                        ),
-                    ]
+                crop_filter = (
+                    self._get_background_crop_filter_no_subs(
+                        segment["speaker"],
+                        src_w,
+                        src_h,
+                        crop_config,
+                        three_person_stack=three_person,
+                    )
+                    if background
+                    else self._get_short_crop_filter_no_subs(
+                        segment["speaker"],
+                        src_w,
+                        src_h,
+                        crop_config,
+                        three_person_stack=three_person_stack_enabled,
+                    )
                 )
+                filters.append(crop_filter)
                 if "Dialogue:" in segment_ass.read_text():
                     filters.append(f"subtitles='{escape_srt_path(segment_ass)}'")
                 segment_path = scratch / f"segment_{index:03d}.mp4"
@@ -454,14 +767,33 @@ class ShortsRenderAgent(BaseAgent):
                 paths.append(segment_path)
             video_only = scratch / "short_video.mp4"
             concat_video_segments(paths, video_only, runner=self._run_ffmpeg)
-            media = mux_timeline_audio(
-                video_only,
-                Path(audio_mix_path),
-                Path(output),
-                timeline,
-                audio_bitrate=audio_bitrate,
-                loudness_policy=delivery_loudness_policy(self.config, "shorts"),
-                runner=self._run_ffmpeg,
+            media = (
+                self._finish_background_variant(
+                    video_only,
+                    Path(output),
+                    fps,
+                    [
+                        (float(segment["start"]), float(segment["end"]))
+                        for segment in render_segments
+                        if self._uses_three_person_stack(
+                            segment["speaker"],
+                            crop_config,
+                            three_person_stack_enabled,
+                        )
+                    ],
+                    encoder_args,
+                    background,
+                )
+                if background
+                else mux_timeline_audio(
+                    video_only,
+                    Path(audio_mix_path),
+                    Path(output),
+                    timeline,
+                    audio_bitrate=audio_bitrate,
+                    loudness_policy=delivery_loudness_policy(self.config, "shorts"),
+                    runner=self._run_ffmpeg,
+                )
             )
             if "audio_loudness" not in media:
                 raise RuntimeError("Rendered short has no verified audio loudness")
@@ -479,6 +811,23 @@ class ShortsRenderAgent(BaseAgent):
             segments,
             clip,
         )
+        if background:
+            return record_background_variant(
+                self.episode_dir,
+                str(clip["id"]),
+                fingerprint=fingerprint,
+                timeline=timeline,
+                media=media,
+                base_record=background["base_record"],
+                base_identity=background["base_identity"],
+                asset=background["asset"],
+                encoding=encoding,
+                captions={
+                    "path": str(caption_path.relative_to(self.episode_dir)),
+                    "format": "ass",
+                    "burned_in": True,
+                },
+            )
         return record_short_render(
             self.episode_dir,
             clip["id"],
@@ -578,6 +927,85 @@ class ShortsRenderAgent(BaseAgent):
         ):
             return CaptionStyle(margin_v=THREE_PERSON_STACK_CAPTION_MARGIN_V)
         return CaptionStyle()
+
+    def _get_background_crop_filter_no_subs(
+        self,
+        speaker,
+        src_w,
+        src_h,
+        crop_config,
+        *,
+        three_person_stack=False,
+    ):
+        if three_person_stack:
+            return self._get_short_crop_filter_no_subs(
+                speaker,
+                src_w,
+                src_h,
+                crop_config,
+                three_person_stack=True,
+            )
+        if speaker == "BOTH" and len(crop_config.get("speakers", [])) == 2:
+            panels = []
+            for index, label in enumerate(("top", "bottom")):
+                center_x, center_y, _, _ = resolve_speaker(
+                    f"speaker_{index}",
+                    src_w,
+                    src_h,
+                    crop_config,
+                    for_shorts=True,
+                )
+                crop_w, _, _, _ = self._get_short_crop_region(
+                    f"speaker_{index}", src_w, src_h, crop_config
+                )
+                panel_w = min(src_w, crop_w)
+                panel_h = panel_w * 16 / 27
+                if panel_h > src_h:
+                    panel_h = src_h
+                    panel_w = panel_h * 27 / 16
+                panel_w = max(2, int(panel_w) // 2 * 2)
+                panel_h = max(2, int(panel_h) // 2 * 2)
+                x = max(0, min(round(center_x - panel_w / 2), src_w - panel_w))
+                y = max(0, min(round(center_y - panel_h / 2), src_h - panel_h))
+                panels.append(
+                    f"[motion{index}]crop={panel_w}:{panel_h}:{x // 2 * 2}:{y // 2 * 2},"
+                    f"{get_scale_filter(1080, 640)},format=yuv420p[{label}]"
+                )
+            chain = (
+                "split=2[motion0][motion1];"
+                f"{panels[0]};{panels[1]};"
+                "[top][bottom]vstack=inputs=2,"
+                "drawbox=x=0:y=637:w=1080:h=6:color=black@0.8:t=fill,"
+                "pad=1080:1920:0:0:black,format=yuv420p"
+            )
+        elif speaker in {"BOTH", "NONE"}:
+            chain = (
+                "scale=1080:1280:force_original_aspect_ratio=decrease:"
+                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
+                "pad=1080:1280:(ow-iw)/2:(oh-ih)/2:black,"
+                "pad=1080:1920:0:0:black,format=yuv420p"
+            )
+        else:
+            _, crop_h, _, _ = self._get_short_crop_region(
+                speaker, src_w, src_h, crop_config
+            )
+            center_x, center_y, _, _ = resolve_speaker(
+                speaker, src_w, src_h, crop_config, for_shorts=True
+            )
+            viewport_w = min(src_w, crop_h * 27 / 32)
+            viewport_h = min(src_h, viewport_w * 32 / 27)
+            viewport_w = min(src_w, viewport_h * 27 / 32)
+            viewport_w = max(2, int(viewport_w) // 2 * 2)
+            viewport_h = max(2, int(viewport_h) // 2 * 2)
+            x = max(0, min(round(center_x - viewport_w / 2), src_w - viewport_w))
+            y = max(0, min(round(center_y - viewport_h / 2), src_h - viewport_h))
+            chain = (
+                f"crop={viewport_w}:{viewport_h}:{x // 2 * 2}:{y // 2 * 2},"
+                f"{get_scale_filter(1080, 1280)},"
+                "pad=1080:1920:0:0:black,format=yuv420p"
+            )
+        polish = get_video_polish_filters(self.config)
+        return f"{chain},{polish}" if polish else chain
 
     def _get_short_crop_filter_no_subs(
         self,
@@ -685,6 +1113,20 @@ class ShortsRenderAgent(BaseAgent):
 def render_single_clip(episode_dir: Path, config: dict, clip_id: str) -> dict:
     """Public API adapter for an atomic, manifest-backed single-clip render."""
     return ShortsRenderAgent(episode_dir, config).render_clip(clip_id)
+
+
+def render_single_clip_variant(
+    episode_dir: Path,
+    config: dict,
+    clip_id: str,
+    variant_id: str,
+    asset_id: str = DEFAULT_BACKGROUND_ASSET_ID,
+) -> dict:
+    """Render one supported optional short without changing the canonical short."""
+    require_background_variant(variant_id)
+    return ShortsRenderAgent(episode_dir, config).render_background_variant(
+        clip_id, asset_id
+    )
 
 
 def repair_single_clip_audio(episode_dir: Path, config: dict, clip_id: str) -> dict:

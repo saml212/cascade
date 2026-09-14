@@ -30,6 +30,7 @@ from lib.delivery_video import (
 )
 from lib.ffprobe import file_fingerprint, get_audio_stream, media_fingerprint
 from lib.ffprobe import probe as ffprobe
+from lib.ffprobe import scan_identity as _scan_identity
 
 REPORT_SCHEMA = "cascade.audio-quality/v1"
 OUTPUT_CONTINUITY_SCHEMA = "cascade.output-audio-continuity/v1"
@@ -626,39 +627,6 @@ def analyze_output_continuity(
     }
     report["fingerprint"] = output_continuity_report_fingerprint(report)
     return report
-
-
-def _scan_identity(path: Path) -> dict | None:
-    try:
-        resolved = path.resolve(strict=True)
-        before = resolved.stat()
-        if path.resolve(strict=True) != resolved:
-            return None
-        after = resolved.stat()
-    except (OSError, RuntimeError):
-        return None
-    if (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    ) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    ):
-        return None
-    return {
-        "resolved_path": str(resolved),
-        "size_bytes": after.st_size,
-        "mtime_ns": after.st_mtime_ns,
-        "ctime_ns": after.st_ctime_ns,
-        "device": after.st_dev,
-        "inode": after.st_ino,
-    }
 
 
 def _verified_content_offset_seconds(target: dict, timeline: Any) -> float:

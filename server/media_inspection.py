@@ -23,7 +23,12 @@ from lib.delivery_video import (
     ffmpeg_executable,
     source_fps,
 )
+from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import file_fingerprint, probe
+from lib.short_variants import (
+    background_variant_state,
+    require_background_variant,
+)
 from lib.timeline import Timeline
 
 INSPECTION_VERSION = "source-clock/v1"
@@ -98,11 +103,14 @@ def resolve_target(
     episode_dir: Path,
     episode: dict,
     config: dict,
-    target: Literal["source", "longform", "short"],
+    target: Literal["source", "longform", "short", "short_variant"],
     *,
     clip: dict | None = None,
+    variant_id: str | None = None,
 ) -> InspectionTarget:
     """Resolve a source or revision-current render without mutating artifacts."""
+    if target != "short_variant" and variant_id is not None:
+        raise ValueError("variant_id is only valid for a short_variant target")
     source = episode_dir / "source_merged.mp4"
     source_duration, fps = _video(source, episode)
     source_timeline = Timeline.from_edits(source_duration).quantize(fps)
@@ -138,16 +146,31 @@ def resolve_target(
         record = current_longform_render(episode_dir, episode, config, audio, segments)
         path = episode_dir / "upload_video.mp4"
         timeline = episode_timeline
-    elif target == "short":
+    elif target in {"short", "short_variant"}:
         if not isinstance(clip, dict) or not clip.get("id"):
             raise ValueError("A stored clip is required for a short target")
-        record = current_short_render(
+        base_record = current_short_render(
             episode_dir, episode, config, audio, segments, clip
         )
-        path = episode_dir / "shorts" / f"{clip['id']}.mp4"
         timeline = episode_timeline.slice(
             float(clip["start_seconds"]), float(clip["end_seconds"])
         ).quantize(fps)
+        if target == "short_variant":
+            require_background_variant(str(variant_id))
+            record, state = background_variant_state(
+                episode_dir,
+                str(clip["id"]),
+                base_record=base_record,
+                encoding=get_video_encoding_policy(config, "shorts"),
+            )
+            if not state["current"]:
+                raise ValueError("Current short_variant render is unavailable")
+            path = episode_dir / state["path"]
+        else:
+            if variant_id is not None:
+                raise ValueError("variant_id is only valid for a short_variant target")
+            record = base_record
+            path = episode_dir / "shorts" / f"{clip['id']}.mp4"
     else:
         raise ValueError(f"Unsupported inspection target: {target}")
     if record is None:
