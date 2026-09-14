@@ -866,11 +866,16 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
                     "process",
                     "progress",
                     "retry",
+                    "inbox",
                     "schedule",
                     "submit",
+                    "unknown",
                     "wait",
                     "upload",
                 )
+            ) or any(
+                item.get(field) is True
+                for field in ("fallback_to_inbox", "retryable", "is_retryable")
             )
 
         return {

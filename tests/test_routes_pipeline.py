@@ -607,11 +607,23 @@ class TestUploadPostReceipts:
         assert http_client.get.call_args.kwargs["params"] == {"request_id": "request-1"}
 
     @pytest.mark.parametrize(
-        ("provider_status", "expected_status"),
-        (("queued", "pending"), ("processing", "pending"), ("failed", "failed")),
+        ("provider_status", "unresolved_flag", "expected_status"),
+        (
+            ("queued", None, "pending"),
+            ("processing", None, "pending"),
+            ("inbox", None, "pending"),
+            ("unknown", None, "pending"),
+            ("failed", "fallback_to_inbox", "pending"),
+            ("failed", None, "failed"),
+        ),
     )
     def test_longform_result_uses_terminal_provider_state(
-        self, test_client, monkeypatch, provider_status, expected_status
+        self,
+        test_client,
+        monkeypatch,
+        provider_status,
+        unresolved_flag,
+        expected_status,
     ):
         client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
@@ -642,6 +654,8 @@ class TestUploadPostReceipts:
         }
         if provider_status != "processing":
             result_item["status"] = provider_status
+        if unresolved_flag:
+            result_item[unresolved_flag] = True
         response.json.return_value = {
             "status": provider_status,
             "results": [result_item],
