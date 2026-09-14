@@ -76,6 +76,27 @@ test('passed quality still requires explicit publish approval', () => {
   );
 });
 
+test('passed technical QA labels pending editorial decisions as approval work', () => {
+  const status = describeEpisodeStatus({
+    delivery: { status: 'ready', video_status: 'ready' },
+    quality: {
+      quality: { status: 'passed' },
+      release_gate: {
+        status: 'blocked',
+        blockers: [
+          { code: 'clips_pending_review' },
+          { code: 'editorial_approval_missing_or_stale' },
+          { code: 'publish_approval_missing_or_stale' },
+        ],
+      },
+    },
+  });
+
+  assert.equal(status.key, 'approval_required');
+  assert.equal(status.label, 'Approval needed');
+  assert.match(status.hint, /Technical QA passed/);
+});
+
 test('audio-only delivery never claims the video is ready', () => {
   assert.equal(
     describeEpisodeStatus({

@@ -127,6 +127,7 @@ export type StatusKey =
   | 'delivery_ready'
   | 'quality_review_required'
   | 'quality_blocked'
+  | 'approval_required'
   | 'processing'
   | 'awaiting_crop'
   | 'awaiting_longform_review'
@@ -188,6 +189,11 @@ const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
     label: 'Release blocked',
     hint: 'Review the current QA findings before release.',
   },
+  approval_required: {
+    tone: 'waiting',
+    label: 'Approval needed',
+    hint: 'Technical QA passed. Review and approve the remaining release items.',
+  },
   processing: {
     tone: 'working',
     label: 'Processing',
@@ -235,6 +241,13 @@ const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
   },
   queued: { tone: 'neutral', label: 'Queued', hint: 'Waiting to start.' },
 };
+
+const APPROVAL_BLOCKER_CODES = new Set([
+  'clips_pending_review',
+  'clip_approval_missing_or_stale',
+  'editorial_approval_missing_or_stale',
+  'publish_approval_missing_or_stale',
+]);
 
 /** Raw backend strings that map onto each canonical StatusKey. */
 const STATUS_ALIASES: Record<string, StatusKey> = {
@@ -338,6 +351,25 @@ export function describeEpisodeStatus(
     }
     if (report?.status === 'blocked') {
       return { key: 'quality_blocked', ...STATUS.quality_blocked };
+    }
+    const blockers = gate?.blockers;
+    const onlyApprovalBlockers =
+      Array.isArray(blockers) &&
+      blockers.length > 0 &&
+      blockers.every(
+        (blocker) =>
+          typeof blocker === 'object' &&
+          blocker !== null &&
+          APPROVAL_BLOCKER_CODES.has(
+            String((blocker as Record<string, unknown>).code ?? '')
+          )
+      );
+    if (
+      report?.status === 'passed' &&
+      gate?.status === 'blocked' &&
+      onlyApprovalBlockers
+    ) {
+      return { key: 'approval_required', ...STATUS.approval_required };
     }
     return {
       key: 'quality_review_required',
