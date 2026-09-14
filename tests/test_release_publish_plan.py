@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agents.qa import current_funnel_urls, current_publish_plan, release_revision
 
 
@@ -76,6 +78,29 @@ def test_upload_post_destination_and_account_change_release_revision(tmp_path):
         )
         != approved
     )
+
+
+def test_youtube_audience_declaration_is_explicit_and_approval_bound(tmp_path):
+    config = _config()
+    episode = _episode()
+    environment = {"UPLOAD_POST_USER": "account-a"}
+
+    initial = release_revision(
+        tmp_path, episode, config=config, environment=environment
+    )
+    assert current_publish_plan(config, episode, environment=environment)[
+        "upload_post"
+    ]["youtube"] == {"self_declared_made_for_kids": False}
+
+    config["platforms"]["youtube"]["self_declared_made_for_kids"] = True
+    assert (
+        release_revision(tmp_path, episode, config=config, environment=environment)
+        != initial
+    )
+
+    config["platforms"]["youtube"]["self_declared_made_for_kids"] = "false"
+    with pytest.raises(TypeError, match="must be true or false"):
+        current_publish_plan(config, episode, environment=environment)
 
 
 def test_upload_post_receipt_does_not_invalidate_approved_batch(tmp_path):

@@ -86,6 +86,20 @@ PODCAST_CHANNEL_FIELDS = (
 )
 
 
+def youtube_made_for_kids(config: dict) -> bool:
+    """Return the explicit YouTube COPPA declaration for every upload."""
+    value = (
+        config.get("platforms", {})
+        .get("youtube", {})
+        .get("self_declared_made_for_kids", False)
+    )
+    if not isinstance(value, bool):
+        raise TypeError(
+            "platforms.youtube.self_declared_made_for_kids must be true or false"
+        )
+    return value
+
+
 def normalize_podcast_explicit(value: object) -> str | None:
     """Return Apple's canonical explicit value without truthy-string coercion."""
     if isinstance(value, bool):
@@ -314,6 +328,8 @@ def _upload_post_plan(
             ),
         },
     )
+    if "youtube" in destinations:
+        plan["youtube"] = {"self_declared_made_for_kids": youtube_made_for_kids(config)}
     return plan
 
 

@@ -26,6 +26,7 @@ from agents.qa import (
     publication_identity,
     quality_snapshot,
     release_metadata_issues,
+    youtube_made_for_kids,
 )
 from lib.atomic_write import atomic_write_json
 from lib.delivery_video import render_output_lock
@@ -2638,9 +2639,17 @@ class PublishAgent(BaseAgent):
             )
         return result
 
-    @staticmethod
     def _base_command(
-        path, title, platforms, identity, api_key, user, timeout, *, video_url=None
+        self,
+        path,
+        title,
+        platforms,
+        identity,
+        api_key,
+        user,
+        timeout,
+        *,
+        video_url=None,
     ):
         command = [
             "curl",
@@ -2666,6 +2675,9 @@ class PublishAgent(BaseAgent):
         ]
         for platform in platforms:
             command += ["-F", f"platform[]={platform}"]
+        if "youtube" in platforms:
+            declared = str(youtube_made_for_kids(self.config)).lower()
+            command += ["-F", f"selfDeclaredMadeForKids={declared}"]
         return command
 
     @staticmethod

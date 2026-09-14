@@ -385,6 +385,7 @@ class TestSafetyGate:
 
     def test_episode_editor_copy_is_the_publisher_payload(self, env, episode_dir):
         config = _publish_config()
+        config["platforms"]["youtube"]["self_declared_made_for_kids"] = True
         _seed_episode(episode_dir, config=config, youtube_url=None)
         episode_path = episode_dir / "episode.json"
         episode = json.loads(episode_path.read_text())
@@ -417,6 +418,7 @@ class TestSafetyGate:
         ]
         assert "youtube_title=Title saved in the episode editor" in fields
         assert "youtube_description=Description saved in the episode editor" in fields
+        assert "selfDeclaredMadeForKids=true" in fields
 
 
 class TestApiKeyGate:
@@ -2462,6 +2464,7 @@ class TestShortDestinationRequests:
                 for value in command
                 if value.startswith("platform[]=")
             ] == ["tiktok", "youtube"]
+            assert "selfDeclaredMadeForKids=false" in command
             return _mock_proc(stdout=json.dumps({"request_id": "provider-job"}))
 
         agent.short_destination_request = preview["execute"]

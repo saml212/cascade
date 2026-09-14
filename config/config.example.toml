@@ -94,6 +94,7 @@ enabled = true
 require_approval = true
 include_shorts_hashtag = true
 link_to_longform = true                   # Include longform link in Shorts description
+self_declared_made_for_kids = false       # Explicit YouTube COPPA audience declaration
 
 [platforms.tiktok]
 enabled = true
