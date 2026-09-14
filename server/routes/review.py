@@ -55,6 +55,7 @@ from lib.short_variants import (
     background_variant_approval_state,
     background_variant_state,
     require_background_variant,
+    selected_short_variant_id,
 )
 from server.media_inspection import (
     InspectionTarget,
@@ -64,7 +65,11 @@ from server.media_inspection import (
     resolve_target,
 )
 from server.routes import require_episode_dir
-from server.routes.clips import render_job_state, variant_render_job_id
+from server.routes.clips import (
+    publication_change_lock,
+    render_job_state,
+    variant_render_job_id,
+)
 
 router = APIRouter(prefix="/api/episodes", tags=["review"])
 
@@ -817,6 +822,42 @@ def episode_review_state(episode_dir: Path) -> dict:
         )
         if not isinstance(variant_asset_id, str):
             variant_asset_id = DEFAULT_BACKGROUND_ASSET_ID
+        base_approval = _approval_state(
+            clip,
+            render,
+            render_record,
+            approval_metadata_by_id.get(clip_id),
+        )
+        variant_approval = background_variant_approval_state(
+            variant_record, variant_render, variant_revision
+        )
+        change_lock = publication_change_lock(episode_dir, clip_id)
+        try:
+            selected_variant_id = selected_short_variant_id(clip)
+        except KeyError:
+            distribution = {
+                "version": "invalid",
+                "variant_id": None,
+                "label": "Invalid selection",
+                "current": False,
+                "approval_current": False,
+                "revision": base_approval["revision"],
+                **change_lock,
+            }
+        else:
+            selected_render = variant_render if selected_variant_id else render
+            selected_approval = (
+                variant_approval if selected_variant_id else base_approval
+            )
+            distribution = {
+                "version": selected_variant_id or "base",
+                "variant_id": selected_variant_id,
+                "label": "Motion background" if selected_variant_id else "Base",
+                "current": selected_render["current"],
+                "approval_current": selected_approval["current"],
+                "revision": selected_approval["revision"],
+                **change_lock,
+            }
         reviewed_clips.append(
             {
                 **clip,
@@ -824,12 +865,8 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "review": {
                     "selection": {"status": clip_selection_status(clip)},
                     "render": render,
-                    "approval": _approval_state(
-                        clip,
-                        render,
-                        render_record,
-                        approval_metadata_by_id.get(clip_id),
-                    ),
+                    "approval": base_approval,
+                    "distribution": distribution,
                     "metadata": _metadata_state(copy, destinations),
                     "render_job": render_job_state(episode_dir, clip_id),
                     "variants": {
@@ -838,9 +875,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                             "label": "Motion background",
                             "asset_id": variant_asset_id,
                             "render": variant_render,
-                            "approval": background_variant_approval_state(
-                                variant_record, variant_render, variant_revision
-                            ),
+                            "approval": variant_approval,
                             "render_job": render_job_state(
                                 episode_dir,
                                 variant_render_job_id(clip_id, BACKGROUND_VARIANT_ID),

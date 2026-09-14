@@ -2,7 +2,7 @@
 
 import json
 
-from agents.qa import current_publish_plan, release_revision
+from agents.qa import current_funnel_urls, current_publish_plan, release_revision
 
 
 def _config() -> dict:
@@ -100,6 +100,129 @@ def test_upload_post_receipt_does_not_invalidate_approved_batch(tmp_path):
         release_revision(tmp_path, episode, config=config, environment=environment)
         != approved
     )
+
+
+def test_selected_variant_identity_changes_release_but_default_base_does_not(
+    tmp_path,
+):
+    config = _config()
+    episode = _episode()
+    clips_path = tmp_path / "clips.json"
+    clip = {"id": "clip_01", "status": "approved"}
+    clips_path.write_text(json.dumps({"clips": [clip]}))
+    base = release_revision(tmp_path, episode, config=config, environment={})
+
+    clip["distribution_variant_id"] = None
+    clips_path.write_text(json.dumps({"clips": [clip]}))
+    assert release_revision(tmp_path, episode, config=config, environment={}) == base
+
+    clip["distribution_variant_id"] = "background_motion_v1"
+    clips_path.write_text(json.dumps({"clips": [clip]}))
+    record_path = tmp_path / "short_variants" / "background_motion_v1" / "clip_01.json"
+    record_path.parent.mkdir(parents=True)
+    record = {
+        "fingerprint": "sha256:variant-render",
+        "output": {
+            "content_revision": "sha256:variant-pixels",
+            "scan_identity": {"size_bytes": 10, "mtime_ns": 20},
+        },
+        "asset": {
+            "asset_id": "motion",
+            "content_revision": "sha256:motion-pixels",
+            "manifest_revision": "sha256:motion-manifest",
+        },
+        "approval": {"revision": "sha256:variant-review"},
+    }
+    record_path.write_text(json.dumps(record))
+
+    selected = release_revision(tmp_path, episode, config=config, environment={})
+    assert selected != base
+    record["output"]["content_revision"] = "sha256:replacement-pixels"
+    record_path.write_text(json.dumps(record))
+    assert (
+        release_revision(tmp_path, episode, config=config, environment={}) != selected
+    )
+
+
+def test_supplied_funnel_url_is_bound_to_longform_revision(tmp_path):
+    episode = {
+        "youtube_longform_url": "https://youtube.invalid/current",
+        "youtube_longform_url_source": "supplied",
+        "youtube_longform_url_editorial_revision": "sha256:longform-a",
+    }
+
+    current = current_funnel_urls(
+        episode,
+        episode_dir=tmp_path,
+        editorial_revision_value="sha256:longform-a",
+        quality_revision_value="sha256:quality-a",
+    )
+    remastered = current_funnel_urls(
+        episode,
+        episode_dir=tmp_path,
+        editorial_revision_value="sha256:longform-b",
+        quality_revision_value="sha256:quality-b",
+    )
+
+    assert current["youtube"] == "https://youtube.invalid/current"
+    assert remastered["youtube"] == ""
+
+
+def test_source_less_old_urls_are_not_reused_for_rebuilt_release(tmp_path):
+    episode = {
+        "youtube_longform_url": "https://youtube.invalid/old",
+        "spotify_longform_url": "https://spotify.invalid/old",
+    }
+
+    assert current_funnel_urls(
+        episode,
+        episode_dir=tmp_path,
+        editorial_revision_value="sha256:rebuilt-longform",
+        quality_revision_value="sha256:rebuilt-quality",
+    ) == {"youtube": "", "spotify": ""}
+
+
+def test_current_legacy_supplied_urls_migrate_only_with_matching_release_proof(
+    tmp_path,
+):
+    episode = {
+        "youtube_longform_url": "https://youtube.invalid/current",
+        "youtube_longform_url_source": "supplied",
+        "spotify_longform_url": "https://spotify.invalid/current",
+        "publish_approval": {"revision": "sha256:published-release"},
+    }
+    (tmp_path / "qa").mkdir()
+    (tmp_path / "qa" / "qa.json").write_text(
+        json.dumps(
+            {
+                "quality_revision": "sha256:current-quality",
+                "release_revision": "sha256:published-release",
+                "editorial_revision": "sha256:current-longform",
+            }
+        )
+    )
+    (tmp_path / "publish.json").write_text(
+        json.dumps({"release_revision": "sha256:published-release"})
+    )
+
+    migrated = current_funnel_urls(
+        episode,
+        episode_dir=tmp_path,
+        editorial_revision_value="sha256:current-longform",
+        quality_revision_value="sha256:current-quality",
+    )
+    stale = current_funnel_urls(
+        episode,
+        episode_dir=tmp_path,
+        editorial_revision_value="sha256:remastered-longform",
+        quality_revision_value="sha256:remastered-quality",
+    )
+
+    assert migrated == {
+        "youtube": "https://youtube.invalid/current",
+        "spotify": "https://spotify.invalid/current",
+    }
+    assert stale == {"youtube": "", "spotify": ""}
 
 
 def test_credentials_are_not_stored_or_bound_to_release_revision(tmp_path):

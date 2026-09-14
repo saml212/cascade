@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agents.qa import canonical_release_metadata, quality_revision
+from agents.qa import canonical_release_metadata, editorial_revision, quality_revision
 
 
 @pytest.fixture
@@ -534,9 +534,44 @@ class TestUpdateEpisode:
         assert response.status_code == 200
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert episode["youtube_longform_url_source"] == "supplied"
+        assert episode["youtube_longform_url_editorial_revision"] == editorial_revision(
+            episode_dir, episode
+        )
         assert "youtube_longform_url_captured_at" not in episode
         assert "youtube_longform_url_external_id" not in episode
         assert "youtube_longform_url_release_revision" not in episode
+
+    def test_supplied_urls_are_revision_bound_and_clear_removes_provenance(
+        self, test_client
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+
+        supplied = client.patch(
+            "/api/episodes/ep_001",
+            json={
+                "youtube_longform_url": "https://youtu.be/current",
+                "spotify_longform_url": "https://spotify.invalid/current",
+            },
+        )
+
+        assert supplied.status_code == 200
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        revision = editorial_revision(episode_dir, episode)
+        assert episode["youtube_longform_url_editorial_revision"] == revision
+        assert episode["spotify_longform_url_editorial_revision"] == revision
+        assert episode["spotify_longform_url_source"] == "supplied"
+
+        cleared = client.patch(
+            "/api/episodes/ep_001",
+            json={"youtube_longform_url": "", "spotify_longform_url": ""},
+        )
+        assert cleared.status_code == 200
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        assert "youtube_longform_url_source" not in episode
+        assert "youtube_longform_url_editorial_revision" not in episode
+        assert "spotify_longform_url_source" not in episode
+        assert "spotify_longform_url_editorial_revision" not in episode
 
     def test_publish_schedule_is_canonical_and_approval_bound(self, test_client):
         client, episodes_dir = test_client

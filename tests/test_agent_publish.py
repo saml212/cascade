@@ -30,6 +30,7 @@ from agents.publish import PublishAgent
 from agents.qa import (
     clip_review_revision,
     editorial_revision,
+    publication_identity,
     quality_revision,
     release_revision,
 )
@@ -196,10 +197,13 @@ def _seed_episode(
             clip, record, metadata_by_id.get(clip_id)
         )
     _write_json(episode_dir / "clips.json", {"clips": clips})
+    current_editorial_revision = editorial_revision(episode_dir, episode)
     episode["editorial_approval"] = {
-        "revision": editorial_revision(episode_dir, episode),
+        "revision": current_editorial_revision,
         "approved_at": "2026-01-01T00:00:00+00:00",
     }
+    if episode.get("youtube_longform_url_source") == "supplied":
+        episode["youtube_longform_url_editorial_revision"] = current_editorial_revision
     _write_json(episode_dir / "episode.json", episode)
     episode["publish_approval"] = {
         "revision": release_revision(episode_dir, episode, config=config),
@@ -565,8 +569,15 @@ class TestYouTubeLongformFunnel:
         if youtube_url is not None:
             ep["youtube_longform_url"] = youtube_url
             ep["youtube_longform_url_source"] = "supplied"
+            ep["youtube_longform_url_editorial_revision"] = editorial_revision(
+                episode_dir, ep
+            )
         if spotify_url is not None:
             ep["spotify_longform_url"] = spotify_url
+            ep["spotify_longform_url_source"] = "supplied"
+            ep["spotify_longform_url_editorial_revision"] = editorial_revision(
+                episode_dir, ep
+            )
         ep["publish_approval"] = {
             "revision": release_revision(episode_dir, ep, config=config),
             "approved_at": "2026-01-01T00:02:00+00:00",
@@ -784,6 +795,328 @@ class TestRejectedClips:
         # Make sure clip_1.mp4 doesn't appear in any upload command
         for cmd in upload_calls:
             assert "clip_1.mp4" not in " ".join(cmd)
+
+
+class TestVersionedShorts:
+    @staticmethod
+    def _variant_snapshot(episode_dir, config):
+        from agents.qa import quality_snapshot
+
+        snapshot = quality_snapshot(episode_dir, config=config)
+        snapshot["release_gate"]["revision"] = "sha256:release-with-variant"
+        snapshot["release_gate"]["short_versions"]["clip_0"] = {
+            "version": "background_motion_v1",
+            "variant_id": "background_motion_v1",
+            "current": True,
+            "approval_current": True,
+            "revision": "sha256:variant-review",
+            "path": ("short_variants/background_motion_v1/clip_0.mp4"),
+            "render_fingerprint": "sha256:variant-render",
+        }
+        return snapshot
+
+    def test_selected_variant_path_and_identity_are_persisted_and_reused(
+        self, env, episode_dir
+    ):
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        variant = episode_dir / "short_variants" / "background_motion_v1" / "clip_0.mp4"
+        variant.parent.mkdir(parents=True)
+        variant.write_bytes(b"approved variant")
+        snapshot = self._variant_snapshot(episode_dir, config)
+        commands = []
+        with (
+            patch("agents.publish.quality_snapshot", return_value=snapshot),
+            patch("agents.publish.subprocess.run") as run,
+        ):
+            run.side_effect = lambda command, **_kwargs: (
+                commands.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "variant-job"}))
+            )
+            agent = _make_agent(episode_dir, config)
+            first = agent.run()
+            second = agent.execute()
+
+        assert len(commands) == 1
+        assert f"video=@{variant}" in commands[0]
+        receipt = first["shorts"][0]
+        assert receipt["version"] == "background_motion_v1"
+        assert receipt["variant_id"] == "background_motion_v1"
+        assert receipt["render_fingerprint"] == "sha256:variant-render"
+        assert receipt["approval_revision"] == "sha256:variant-review"
+        assert second["shorts"][0]["reused_receipt"] is True
+        editorial_revision_value = snapshot["approvals"]["editorial"]["revision"]
+        assert first["longform"]["external_id"] == agent._identity(
+            editorial_revision_value, "longform"
+        )
+        assert first["longform"]["external_id"] != agent._identity(
+            snapshot["release_gate"]["revision"], "longform"
+        )
+
+    @pytest.mark.parametrize("legacy_receipt", [False, True])
+    def test_short_release_change_reuses_current_longform_receipt(
+        self, env, episode_dir, legacy_receipt
+    ):
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        variant = episode_dir / "short_variants" / "background_motion_v1" / "clip_0.mp4"
+        variant.parent.mkdir(parents=True)
+        variant.write_bytes(b"approved variant")
+        snapshot = self._variant_snapshot(episode_dir, config)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        longform_revision = snapshot["approvals"]["editorial"]["revision"]
+        prior_release = "sha256:prior-base-release"
+        longform_identity = publication_identity(
+            episode_dir.name,
+            prior_release if legacy_receipt else longform_revision,
+            "longform",
+        )
+        episode.update(
+            youtube_longform_url="https://youtube.com/watch?v=current-longform",
+            youtube_longform_url_source="upload_post_receipt",
+            youtube_longform_url_external_id=longform_identity,
+            youtube_longform_url_release_revision=prior_release,
+            publish_approval={
+                "revision": snapshot["release_gate"]["revision"],
+                "approved_at": "2026-01-01T00:03:00+00:00",
+            },
+        )
+        if not legacy_receipt:
+            episode["youtube_longform_url_editorial_revision"] = longform_revision
+        _write_json(episode_path, episode)
+        if legacy_receipt:
+            qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+            qa_report.update(
+                editorial_revision=longform_revision,
+                release_revision=prior_release,
+            )
+            _write_json(episode_dir / "qa" / "qa.json", qa_report)
+        longform_receipt = {
+            "status": "submitted",
+            "external_id": longform_identity,
+        }
+        if not legacy_receipt:
+            longform_receipt["editorial_revision"] = longform_revision
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "release_revision": prior_release,
+                "longform": longform_receipt,
+                "shorts": [],
+            },
+        )
+        commands = []
+        with (
+            patch("agents.publish.quality_snapshot", return_value=snapshot),
+            patch("agents.publish.subprocess.run") as run,
+        ):
+            run.side_effect = lambda command, **_kwargs: (
+                commands.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "variant-job"}))
+            )
+            result = _make_agent(episode_dir, config).execute()
+
+        assert len(commands) == 1
+        assert f"video=@{variant}" in commands[0]
+        assert "upload_video.mp4" not in " ".join(commands[0])
+        assert result["longform"]["status"] == "already_submitted"
+        assert (
+            result["longform"]["youtube_longform_url"]
+            == "https://youtube.com/watch?v=current-longform"
+        )
+        stored = json.loads(episode_path.read_text())
+        assert stored["youtube_longform_url_editorial_revision"] == longform_revision
+
+    @pytest.mark.parametrize(
+        "receipt_identity",
+        (
+            {"version": "base"},
+            {
+                "version": "background_motion_v1",
+                "variant_id": "background_motion_v1",
+                "render_fingerprint": "sha256:replaced-render",
+                "approval_revision": "sha256:variant-review",
+            },
+        ),
+    )
+    def test_partial_or_mismatched_version_receipt_fails_closed(
+        self, env, episode_dir, receipt_identity
+    ):
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        variant = episode_dir / "short_variants" / "background_motion_v1" / "clip_0.mp4"
+        variant.parent.mkdir(parents=True)
+        variant.write_bytes(b"approved variant")
+        snapshot = self._variant_snapshot(episode_dir, config)
+        revision = snapshot["release_gate"]["revision"]
+        identity = _make_agent(episode_dir, config)._identity(
+            revision, "short", "clip_0"
+        )
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "release_revision": revision,
+                "shorts": [
+                    {
+                        "clip_id": "clip_0",
+                        "status": "submitted",
+                        "external_id": identity,
+                        **receipt_identity,
+                    }
+                ],
+            },
+        )
+
+        with (
+            patch("agents.publish.quality_snapshot", return_value=snapshot),
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="does not match its selected version"),
+        ):
+            _make_agent(episode_dir, config).execute()
+        run.assert_not_called()
+
+    def test_fieldless_legacy_receipt_is_accepted_only_for_base(self, episode_dir):
+        agent = _make_agent(episode_dir)
+        legacy_receipt = {"clip_id": "clip_0", "status": "submitted"}
+        base = {
+            "version": "base",
+            "variant_id": None,
+            "render_fingerprint": "sha256:base-render",
+            "revision": "sha256:base-review",
+        }
+        variant = {
+            **base,
+            "version": "background_motion_v1",
+            "variant_id": "background_motion_v1",
+        }
+
+        assert agent._receipt_matches_version(legacy_receipt, base) is True
+        assert agent._receipt_matches_version(legacy_receipt, variant) is False
+
+    def test_deferred_longform_run_preserves_prior_short_receipts(
+        self, env, episode_dir
+    ):
+        _seed_episode(episode_dir, youtube_url=None)
+        prior = {
+            "clip_id": "clip_0",
+            "status": "submitted",
+            "external_id": "cascade-short-prior-release",
+            "scheduled": True,
+        }
+        _write_json(
+            episode_dir / "publish.json",
+            {"release_revision": "sha256:prior-release", "shorts": [prior]},
+        )
+
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(
+                stdout=json.dumps({"request_id": "new-longform"})
+            )
+            result = _make_agent(episode_dir).run()
+
+        assert result["shorts_deferred"] is True
+        stored = json.loads((episode_dir / "publish.json").read_text())
+        assert stored["shorts"] == [{**prior, "historical_receipt": True}]
+
+    def test_old_release_receipt_blocks_same_base_from_being_submitted_again(
+        self, env, episode_dir
+    ):
+        _seed_episode(episode_dir)
+        _write_json(
+            episode_dir / "publish.json",
+            {
+                "release_revision": "sha256:prior-release",
+                "shorts": [
+                    {
+                        "clip_id": "clip_0",
+                        "status": "submitted",
+                        "external_id": "cascade-short-prior-release",
+                    }
+                ],
+            },
+        )
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="explicit re-release identity"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "invalid_receipts",
+        (
+            "not-a-list",
+            [{"status": "submitted", "external_id": "unattributed"}],
+        ),
+    )
+    def test_uninspectable_receipt_history_blocks_before_external_requests(
+        self, env, episode_dir, invalid_receipts
+    ):
+        _seed_episode(episode_dir)
+        _write_json(episode_dir / "publish.json", {"shorts": invalid_receipts})
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="Cannot inspect prior short"),
+        ):
+            _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_media_replacement_after_initial_gate_snapshot_blocks_submission(
+        self, env, episode_dir
+    ):
+        from agents.qa import quality_snapshot
+
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        initial = quality_snapshot(episode_dir, config=config)
+        short = episode_dir / "shorts" / "clip_0.mp4"
+        calls = 0
+
+        def snapshot(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return initial
+            short.write_bytes(b"replacement render")
+            return quality_snapshot(episode_dir, config=config)
+
+        with (
+            patch("agents.publish.quality_snapshot", side_effect=snapshot),
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="Release media"),
+        ):
+            _make_agent(episode_dir, config).execute()
+        run.assert_not_called()
+
+    def test_longform_replacement_after_initial_gate_blocks_all_submission(
+        self, env, episode_dir
+    ):
+        from agents.qa import quality_snapshot
+
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        initial = quality_snapshot(episode_dir, config=config)
+        longform = episode_dir / "upload_video.mp4"
+        calls = 0
+
+        def snapshot(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return initial
+            longform.write_bytes(b"replacement longform render")
+            return quality_snapshot(episode_dir, config=config)
+
+        with (
+            patch("agents.publish.quality_snapshot", side_effect=snapshot),
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="Release media"),
+        ):
+            _make_agent(episode_dir, config).execute()
+        run.assert_not_called()
 
 
 class TestIdempotency:

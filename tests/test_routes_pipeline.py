@@ -444,11 +444,110 @@ class TestPublishApproval:
 
 
 class TestUploadPostReceipts:
+    def test_current_bound_supplied_url_skips_remote_poll(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        from agents.qa import editorial_revision
+
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode.update(
+            youtube_longform_url="https://youtu.be/current",
+            youtube_longform_url_source="supplied",
+            youtube_longform_url_editorial_revision=editorial_revision(
+                episode_dir, episode
+            ),
+        )
+        episode_path.write_text(json.dumps(episode))
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "longform": {
+                        "status": "submitted",
+                        "request_id": "request-1",
+                    },
+                    "shorts": [],
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+
+        with patch("httpx.AsyncClient") as client_class:
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert result.json()["longform"] == {
+            "status": "live",
+            "url": "https://youtu.be/current",
+        }
+        client_class.assert_not_called()
+
+    def test_stale_bound_supplied_url_polls_current_receipt_and_replaces_it(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        from agents.qa import editorial_revision, publication_identity
+
+        current_editorial_revision = editorial_revision(episode_dir, episode)
+        longform_identity = publication_identity(
+            "ep_001", current_editorial_revision, "longform"
+        )
+        episode.update(
+            youtube_longform_url="https://youtu.be/old",
+            youtube_longform_url_source="supplied",
+            youtube_longform_url_editorial_revision="sha256:old-longform",
+            publish_approval={"revision": "sha256:current-release"},
+        )
+        episode_path.write_text(json.dumps(episode))
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "release_revision": "sha256:current-release",
+                    "longform": {
+                        "status": "submitted",
+                        "request_id": "request-2",
+                        "external_id": longform_identity,
+                        "editorial_revision": current_editorial_revision,
+                    },
+                    "shorts": [],
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"youtube_url": "https://youtu.be/rebuilt"}
+        http_client = AsyncMock()
+        http_client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert http_client.get.call_args.kwargs["params"] == {"request_id": "request-2"}
+        updated = json.loads(episode_path.read_text())
+        assert updated["youtube_longform_url"] == "https://youtu.be/rebuilt"
+        assert updated["youtube_longform_url_source"] == "upload_post_receipt"
+        assert (
+            updated["youtube_longform_url_release_revision"] == "sha256:current-release"
+        )
+
     def test_captured_youtube_url_records_receipt_provenance(
         self, test_client, monkeypatch
     ):
         client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
+        from agents.qa import editorial_revision
+
+        current_editorial_revision = editorial_revision(
+            episode_dir, json.loads((episode_dir / "episode.json").read_text())
+        )
         (episode_dir / "publish.json").write_text(
             json.dumps(
                 {
@@ -457,6 +556,7 @@ class TestUploadPostReceipts:
                         "status": "unknown",
                         "request_id": "request-1",
                         "external_id": "cascade-longform-current",
+                        "editorial_revision": current_editorial_revision,
                     },
                     "shorts": [],
                 }
@@ -489,6 +589,39 @@ class TestUploadPostReceipts:
         assert episode["youtube_longform_url_external_id"] == "cascade-longform-current"
         assert episode["youtube_longform_url_release_revision"] == "sha256:release"
         assert http_client.get.call_args.kwargs["params"] == {"request_id": "request-1"}
+
+    @pytest.mark.parametrize("receipt_revision", [None, ["malformed"]])
+    def test_unbound_or_malformed_longform_receipt_is_not_polled(
+        self, test_client, monkeypatch, receipt_revision
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        receipt = {
+            "status": "submitted",
+            "request_id": "old-request",
+            "external_id": "cascade-longform-old",
+        }
+        if receipt_revision is not None:
+            receipt["editorial_revision"] = receipt_revision
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "release_revision": "sha256:old-release",
+                    "longform": receipt,
+                    "shorts": [],
+                }
+            )
+        )
+        before = (episode_dir / "episode.json").read_bytes()
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+
+        with patch("httpx.AsyncClient") as client_class:
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert result.json()["longform"]["status"] == "stale"
+        assert (episode_dir / "episode.json").read_bytes() == before
+        client_class.assert_not_called()
 
     @pytest.mark.parametrize(
         ("receipt", "expected_params"),

@@ -26,10 +26,12 @@ from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
     DEFAULT_BACKGROUND_ASSET_ID,
+    DISTRIBUTION_VARIANT_FIELD,
     background_variant_output,
     background_variant_state,
     require_background_variant,
     save_background_variant_approval,
+    selected_short_variant_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,11 @@ class VariantRenderRequest(BaseModel):
 
 
 class VariantApprovalRequest(BaseModel):
+    expected_revision: str
+
+
+class DistributionSelectionRequest(BaseModel):
+    variant_id: str | None = None
     expected_revision: str
 
 
@@ -280,6 +287,94 @@ def _metadata_entry(ep_dir: Path, clip_id: str) -> dict | None:
     return None
 
 
+def publication_change_lock(ep_dir: Path, clip_id: str) -> dict:
+    """Return whether prior remote work locks this clip's selected version."""
+    unverifiable = {
+        "change_locked": True,
+        "change_lock_reason": (
+            "Publication receipt history cannot be verified. Repair it before "
+            "changing this clip's distribution version."
+        ),
+    }
+    try:
+        publish = json.loads((ep_dir / "publish.json").read_text())
+    except FileNotFoundError:
+        return {"change_locked": False, "change_lock_reason": None}
+    except (json.JSONDecodeError, OSError):
+        return unverifiable
+    if not isinstance(publish, dict) or not isinstance(publish.get("shorts", []), list):
+        return unverifiable
+    receipts = publish.get("shorts", [])
+    if any(not isinstance(receipt, dict) for receipt in receipts):
+        return unverifiable
+    recorded_states = {
+        "submitted",
+        "published",
+        "already_submitted",
+        "partial_failure",
+        "unknown",
+    }
+    for receipt in receipts:
+        receipt_clip_id = receipt.get("clip_id")
+        if not isinstance(receipt_clip_id, str) or not receipt_clip_id:
+            return unverifiable
+        if receipt_clip_id != clip_id:
+            continue
+        status = receipt.get("status")
+        if not isinstance(status, str):
+            return unverifiable
+        if status in recorded_states:
+            return {
+                "change_locked": True,
+                "change_lock_reason": (
+                    "A historical or current publication receipt exists for this "
+                    "clip. Create an explicit re-release identity before changing "
+                    "its distribution version."
+                ),
+            }
+        if status != "failed":
+            return unverifiable
+    return {"change_locked": False, "change_lock_reason": None}
+
+
+def _distribution_state(ep_dir: Path, clip: dict) -> dict:
+    from agents.pipeline import load_config
+    from agents.qa import short_distribution_state
+
+    try:
+        episode = json.loads((ep_dir / "episode.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(
+            status_code=409, detail="Episode state is unavailable."
+        ) from exc
+    return short_distribution_state(
+        ep_dir,
+        episode,
+        load_config(),
+        clip,
+        _current_render(ep_dir, clip),
+        _metadata_entry(ep_dir, str(clip["id"])),
+    )
+
+
+def _public_distribution(state: dict, change_lock: dict | None = None) -> dict:
+    change_lock = change_lock or {
+        "change_locked": False,
+        "change_lock_reason": None,
+    }
+    return {
+        key: state[key]
+        for key in (
+            "version",
+            "variant_id",
+            "label",
+            "current",
+            "approval_current",
+            "revision",
+        )
+    } | change_lock
+
+
 def _current_render(ep_dir: Path, clip: dict) -> dict | None:
     """Return the current validated render record for one clip."""
     from agents.pipeline import load_config
@@ -445,6 +540,77 @@ async def select_clip(episode_id: str, clip_id: str) -> dict:
         "selection_status": "selected",
         "clip_id": clip_id,
     }
+
+
+def _select_clip_distribution_locked(
+    episode_id: str, clip_id: str, req: DistributionSelectionRequest
+) -> dict:
+    from agents.publish import publication_lock
+
+    with publication_lock(EPISODES_DIR):
+        return _select_clip_distribution_unlocked(episode_id, clip_id, req)
+
+
+def _select_clip_distribution_unlocked(
+    episode_id: str, clip_id: str, req: DistributionSelectionRequest
+) -> dict:
+    clips, clips_file = load_clips(episode_id)
+    clip, index = find_clip(clips, clip_id)
+    try:
+        current_variant_id = selected_short_variant_id(clip)
+    except KeyError:
+        current_variant_id = clip.get(DISTRIBUTION_VARIANT_FIELD)
+    change_lock = publication_change_lock(clips_file.parent, clip_id)
+    if current_variant_id != req.variant_id and change_lock["change_locked"]:
+        raise HTTPException(
+            status_code=409,
+            detail=change_lock["change_lock_reason"],
+        )
+
+    candidate = dict(clip)
+    if req.variant_id is None:
+        candidate.pop(DISTRIBUTION_VARIANT_FIELD, None)
+    else:
+        candidate[DISTRIBUTION_VARIANT_FIELD] = req.variant_id
+    state = _distribution_state(clips_file.parent, candidate)
+    if req.expected_revision != state["revision"]:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected render or its copy changed; refresh before selecting it.",
+        )
+    if state["current"] is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected distribution version needs a current render.",
+        )
+    if state["approval_current"] is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="Approve this exact distribution version and copy before selecting it.",
+        )
+
+    clips[index] = candidate
+    save_clips(clips, clips_file)
+    return {
+        "status": "selected",
+        "clip_id": clip_id,
+        "distribution": _public_distribution(state, change_lock),
+    }
+
+
+@router.put("/{clip_id}/distribution")
+async def select_clip_distribution(
+    episode_id: str, clip_id: str, req: DistributionSelectionRequest
+) -> dict:
+    """Select one independently approved short version for distribution."""
+    if req.variant_id is not None:
+        try:
+            require_background_variant(req.variant_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    return await asyncio.to_thread(
+        _select_clip_distribution_locked, episode_id, clip_id, req
+    )
 
 
 @router.post("/{clip_id}/reject")

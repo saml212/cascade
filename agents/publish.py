@@ -6,20 +6,23 @@ receipts; the calendar lock serializes Cascade publishers on this filesystem.
 """
 
 import fcntl
-import hashlib
 import json
 import os
 import subprocess
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agents.base import BaseAgent
 from agents.qa import (
     canonical_release_metadata,
+    current_funnel_urls,
+    publication_identity,
     quality_snapshot,
     release_metadata_issues,
 )
+from lib.delivery_video import render_output_lock
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 SCHEDULE_URL = "https://api.upload-post.com/api/uploadposts/schedule"
@@ -31,6 +34,17 @@ RECORDED_STATES = {
     "unknown",
 }
 SLOT_HOURS = {"morning": 9, "afternoon": 14, "evening": 18}
+
+
+@contextmanager
+def publication_lock(episodes_dir):
+    """Serialize remote scheduling with receipt-bound distribution changes."""
+    with (Path(episodes_dir) / ".publish-schedule.lock").open("a+") as file:
+        fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
 
 def _build_first_comment(youtube_url, spotify_url="", channel_handle=""):
@@ -64,9 +78,19 @@ def _instant(value: datetime) -> datetime:
 class PublishAgent(BaseAgent):
     name = "publish"
 
+    def run(self) -> dict:
+        """Keep distribution selection locked until publish.json is durable."""
+        with publication_lock(self.episode_dir.parent):
+            self._publication_lock_held = True
+            try:
+                return super().run()
+            finally:
+                self._publication_lock_held = False
+
     def execute(self) -> dict:
         episode = self.load_json_safe("episode.json")
-        gate = quality_snapshot(self.episode_dir, config=self.config)["release_gate"]
+        snapshot = quality_snapshot(self.episode_dir, config=self.config)
+        gate = snapshot["release_gate"]
         if not gate["safe"]:
             reasons = "; ".join(item["message"] for item in gate["blockers"])
             raise RuntimeError(f"release gate blocked — {reasons}")
@@ -113,91 +137,181 @@ class PublishAgent(BaseAgent):
             raise TypeError(
                 "Cannot inspect the current publish receipt; nothing was submitted"
             )
-        youtube_url = episode.get("youtube_longform_url", "")
-        longform = self._publish_longform(
+        previous_shorts = self._validated_previous_shorts(previous)
+        funnel_urls = current_funnel_urls(
             episode,
-            metadata.get("longform", {}),
-            previous.get("longform"),
-            revision,
-            platforms,
-            api_key,
-            user,
+            episode_dir=self.episode_dir,
+            editorial_revision_value=snapshot["approvals"]["editorial"]["revision"],
+            quality_revision_value=snapshot["quality"]["current_revision"],
         )
-        if "youtube" in platforms and not youtube_url:
-            state = longform.get("status") if isinstance(longform, dict) else "failed"
-            if state in {"submitted", "unknown", "published", "already_submitted"}:
-                publish_status = "waiting_for_longform_publication"
-                reason = (
-                    "The YouTube longform submission is awaiting a public URL."
-                    if state != "unknown"
-                    else "The YouTube longform submission outcome is unknown."
-                )
-                next_action = (
-                    f"Poll POST /api/episodes/{self.episode_dir.name}/"
-                    "check-upload-urls, then rerun publish after it records the "
-                    "current public URL."
-                )
-            else:
-                publish_status = "longform_failed"
-                reason = "The YouTube longform submission failed."
-                next_action = (
-                    "Resolve the reported longform error and rerun the current "
-                    "approved publish job."
-                )
-            result = self._result(
-                [],
-                longform,
-                platforms,
-                revision,
-                user,
-                reason,
-            )
-            result.update(
-                publish_status=publish_status,
-                action_required=True,
-                next_action=next_action,
-            )
-            return result
-
+        longform_revision = snapshot["approvals"]["editorial"]["revision"]
+        self._bind_legacy_funnel_urls(episode, funnel_urls, longform_revision)
+        youtube_url = funnel_urls["youtube"]
         short_metadata = {
             str(item["id"]): item
             for item in metadata.get("clips", [])
             if isinstance(item, dict) and item.get("id")
         }
-        shorts = self._publish_shorts(
-            approved,
-            short_metadata,
-            metadata.get("schedule", []),
-            previous.get("shorts", []),
-            episode,
+        short_versions = gate.get("short_versions")
+        if not isinstance(short_versions, dict) or any(
+            not isinstance(short_versions.get(str(clip.get("id", ""))), dict)
+            or short_versions[str(clip.get("id", ""))].get("current") is not True
+            or short_versions[str(clip.get("id", ""))].get("approval_current")
+            is not True
+            for clip in approved
+        ):
+            raise RuntimeError(
+                "The selected short versions are unavailable or unapproved"
+            )
+        with self._publication_output_locks(approved, short_versions):
+            live_snapshot = quality_snapshot(self.episode_dir, config=self.config)
+            live_gate = live_snapshot["release_gate"]
+            if (
+                live_gate.get("safe") is not True
+                or live_gate.get("revision") != revision
+                or live_snapshot.get("approvals", {})
+                .get("editorial", {})
+                .get("revision")
+                != longform_revision
+            ):
+                raise RuntimeError(
+                    "Release media, copy, or approvals changed after publication "
+                    "started; nothing was submitted"
+                )
+            longform = self._publish_longform(
+                episode,
+                metadata.get("longform", {}),
+                previous.get("longform"),
+                revision,
+                longform_revision,
+                youtube_url,
+                platforms,
+                api_key,
+                user,
+            )
+            if "youtube" in platforms and not youtube_url:
+                state = (
+                    longform.get("status") if isinstance(longform, dict) else "failed"
+                )
+                if state in {
+                    "submitted",
+                    "unknown",
+                    "published",
+                    "already_submitted",
+                }:
+                    publish_status = "waiting_for_longform_publication"
+                    reason = (
+                        "The YouTube longform submission is awaiting a public URL."
+                        if state != "unknown"
+                        else "The YouTube longform submission outcome is unknown."
+                    )
+                    next_action = (
+                        f"Poll POST /api/episodes/{self.episode_dir.name}/"
+                        "check-upload-urls, then rerun publish after it records the "
+                        "current public URL."
+                    )
+                else:
+                    publish_status = "longform_failed"
+                    reason = "The YouTube longform submission failed."
+                    next_action = (
+                        "Resolve the reported longform error and rerun the current "
+                        "approved publish job."
+                    )
+                result = self._result(
+                    [],
+                    longform,
+                    platforms,
+                    revision,
+                    user,
+                    reason,
+                    previous_shorts,
+                )
+                result.update(
+                    publish_status=publish_status,
+                    action_required=True,
+                    next_action=next_action,
+                )
+                return result
+            shorts = self._publish_shorts(
+                approved,
+                short_versions,
+                short_metadata,
+                metadata.get("schedule", []),
+                previous_shorts,
+                episode,
+                platforms,
+                youtube_url,
+                funnel_urls["spotify"],
+                revision,
+                api_key,
+                user,
+            )
+        return self._result(
+            shorts,
+            longform,
             platforms,
-            youtube_url,
-            episode.get("spotify_longform_url", ""),
             revision,
-            api_key,
             user,
+            previous_shorts=previous_shorts,
         )
-        return self._result(shorts, longform, platforms, revision, user)
+
+    @contextmanager
+    def _publication_output_locks(self, clips, short_versions):
+        paths = {self.episode_dir / "upload_video.mp4"}
+        for clip in clips:
+            clip_id = str(clip.get("id", ""))
+            paths.add(self.episode_dir / "shorts" / f"{clip_id}.mp4")
+            version = short_versions.get(clip_id, {})
+            if version.get("variant_id") is not None:
+                relative_path = version.get("path")
+                if not isinstance(relative_path, str):
+                    raise RuntimeError(
+                        f"The selected short version for {clip_id} has no media path"
+                    )
+                paths.add(self.episode_dir / relative_path)
+        with ExitStack() as stack:
+            for path in sorted(paths):
+                stack.enter_context(render_output_lock(path))
+            yield
 
     def _publish_longform(
-        self, episode, metadata, previous, revision, platforms, api_key, user
+        self,
+        episode,
+        metadata,
+        previous,
+        revision,
+        longform_revision,
+        youtube_url,
+        platforms,
+        api_key,
+        user,
     ):
         if "youtube" not in platforms:
             return None
-        identity = self._identity(revision, "longform")
-        youtube_url = episode.get("youtube_longform_url", "")
+        identity = self._identity(longform_revision, "longform")
+        legacy_identity = self._identity(revision, "longform")
+        raw_url = episode.get("youtube_longform_url")
         if (
-            youtube_url
+            raw_url
             and episode.get("youtube_longform_url_source") == "upload_post_receipt"
-            and (
-                episode.get("youtube_longform_url_external_id") != identity
-                or episode.get("youtube_longform_url_release_revision") != revision
-            )
         ):
-            raise RuntimeError(
-                "The captured YouTube URL does not belong to the current "
-                "approved release"
+            recorded_revision = episode.get("youtube_longform_url_release_revision")
+            recorded_editorial_revision = episode.get(
+                "youtube_longform_url_editorial_revision"
             )
+            recorded_identity = episode.get("youtube_longform_url_external_id")
+            valid_identities = {
+                publication_identity(self.episode_dir.name, bound_revision, "longform")
+                for bound_revision in (
+                    recorded_revision,
+                    recorded_editorial_revision,
+                )
+                if isinstance(bound_revision, str) and bound_revision
+            }
+            if recorded_identity not in valid_identities:
+                raise RuntimeError(
+                    "The captured YouTube URL does not belong to a valid release identity"
+                )
         if youtube_url:
             return {
                 "status": "already_submitted",
@@ -205,13 +319,18 @@ class PublishAgent(BaseAgent):
                 "youtube_longform_url": youtube_url,
                 "external_id": identity,
                 "idempotency_key": identity,
+                "editorial_revision": longform_revision,
             }
         if (
             isinstance(previous, dict)
-            and previous.get("external_id") == identity
+            and previous.get("external_id") in {identity, legacy_identity}
             and previous.get("status") in RECORDED_STATES
         ):
-            return {**previous, "reused_receipt": True}
+            return {
+                **previous,
+                "editorial_revision": longform_revision,
+                "reused_receipt": True,
+            }
 
         path = self.episode_dir / "upload_video.mp4"
         if not path.exists():
@@ -233,12 +352,38 @@ class PublishAgent(BaseAgent):
         command += ["-X", "POST", UPLOAD_POST_URL]
         self.logger.info("Uploading longform to YouTube...")
         result = self._submit(command, 1200, identity)
-        result["platform"] = "youtube"
+        result.update(
+            platform="youtube",
+            editorial_revision=longform_revision,
+        )
         return result
+
+    def _bind_legacy_funnel_urls(
+        self, episode: dict, funnel_urls: dict, longform_revision: str
+    ) -> None:
+        changed = False
+        if (
+            funnel_urls["youtube"]
+            and episode.get("youtube_longform_url_source")
+            in {"supplied", "upload_post_receipt"}
+            and episode.get("youtube_longform_url_editorial_revision") is None
+        ):
+            episode["youtube_longform_url_editorial_revision"] = longform_revision
+            changed = True
+        if (
+            funnel_urls["spotify"]
+            and episode.get("spotify_longform_url_editorial_revision") is None
+        ):
+            episode["spotify_longform_url_source"] = "supplied"
+            episode["spotify_longform_url_editorial_revision"] = longform_revision
+            changed = True
+        if changed:
+            self.save_json("episode.json", episode)
 
     def _publish_shorts(
         self,
         clips,
+        short_versions,
         metadata,
         schedule,
         previous,
@@ -255,21 +400,37 @@ class PublishAgent(BaseAgent):
         pending = []
         for clip in clips:
             clip_id = str(clip.get("id", ""))
+            version = short_versions[clip_id]
             identity = self._identity(revision, "short", clip_id)
+            recorded_for_clip = [
+                item
+                for item in previous
+                if isinstance(item, dict)
+                and str(item.get("clip_id", "")) == clip_id
+                and item.get("status") in RECORDED_STATES
+            ]
             receipt = next(
                 (
                     item
-                    for item in previous
-                    if isinstance(item, dict)
-                    and item.get("external_id") == identity
-                    and item.get("status") in RECORDED_STATES
+                    for item in recorded_for_clip
+                    if item.get("external_id") == identity
                 ),
                 None,
             )
+            if receipt is None and recorded_for_clip:
+                raise RuntimeError(
+                    f"A historical publication receipt exists for {clip_id}; "
+                    "create an explicit re-release identity before submitting it again"
+                )
+            if receipt and not self._receipt_matches_version(receipt, version):
+                raise RuntimeError(
+                    f"The recorded receipt for {clip_id} does not match its "
+                    "selected version; nothing was submitted"
+                )
             if receipt and receipt.get("status") != "unknown":
                 results.append({**receipt, "reused_receipt": True})
             else:
-                pending.append((clip, identity, receipt))
+                pending.append((clip, version, identity, receipt))
         if not pending:
             return results
 
@@ -287,7 +448,7 @@ class PublishAgent(BaseAgent):
         with self._schedule_lock():
             occupied = self._occupied_schedule(api_key, user)
             remaining = []
-            for clip, identity, uncertain in pending:
+            for clip, version, identity, uncertain in pending:
                 matches = [
                     item for item in occupied if item.get("external_id") == identity
                 ]
@@ -298,17 +459,22 @@ class PublishAgent(BaseAgent):
                 if existing:
                     results.append(
                         self._scheduled_receipt(
-                            clip, identity, existing, platforms, tz_name
+                            clip,
+                            version,
+                            identity,
+                            existing,
+                            platforms,
+                            tz_name,
                         )
                     )
                 elif uncertain:
                     results.append({**uncertain, "reused_receipt": True})
                 else:
-                    remaining.append((clip, identity))
+                    remaining.append((clip, version, identity))
 
             if not schedule:
                 schedule = self._generate_schedule(
-                    [clip for clip, _ in remaining],
+                    [clip for clip, _, _ in remaining],
                     weekday_limit,
                     weekend_limit,
                     tz_name=tz_name,
@@ -328,7 +494,7 @@ class PublishAgent(BaseAgent):
                     schedule_by_clip[clip_id] = entry
             unscheduled = [
                 str(clip.get("id", ""))
-                for clip, _ in remaining
+                for clip, _, _ in remaining
                 if str(clip.get("id", "")) not in schedule_by_clip
             ]
             if unscheduled:
@@ -339,7 +505,7 @@ class PublishAgent(BaseAgent):
 
             plans = []
             reservations = list(occupied)
-            for clip, identity in remaining:
+            for clip, version, identity in remaining:
                 clip_id = str(clip.get("id", ""))
                 entry = schedule_by_clip.get(clip_id)
                 scheduled_at = (
@@ -369,9 +535,9 @@ class PublishAgent(BaseAgent):
                         weekday_limit,
                         weekend_limit,
                     )
-                plans.append((clip, identity, scheduled_at))
+                plans.append((clip, version, identity, scheduled_at))
 
-            for index, (clip, identity, scheduled_at) in enumerate(plans, 1):
+            for index, (clip, version, identity, scheduled_at) in enumerate(plans, 1):
                 clip_id = str(clip.get("id", ""))
                 self.report_progress(index, len(plans), f"Uploading {clip_id}")
                 result = self._submit_short(
@@ -381,6 +547,7 @@ class PublishAgent(BaseAgent):
                     scheduled_at,
                     youtube_url,
                     spotify_url,
+                    version,
                     identity,
                     api_key,
                     user,
@@ -388,6 +555,44 @@ class PublishAgent(BaseAgent):
                 if result:
                     results.append(result)
         return results
+
+    @staticmethod
+    def _receipt_matches_version(receipt: dict, version: dict) -> bool:
+        identity_fields = {
+            "version",
+            "variant_id",
+            "render_fingerprint",
+            "approval_revision",
+        }
+        present = identity_fields.intersection(receipt)
+        if not present:
+            return (
+                version.get("version") == "base" and version.get("variant_id") is None
+            )
+        if present != identity_fields:
+            return False
+        expected = {
+            "version": version.get("version"),
+            "variant_id": version.get("variant_id"),
+            "render_fingerprint": version.get("render_fingerprint"),
+            "approval_revision": version.get("revision"),
+        }
+        return all(receipt.get(key) == value for key, value in expected.items())
+
+    @staticmethod
+    def _validated_previous_shorts(previous: dict) -> list[dict]:
+        receipts = previous.get("shorts", [])
+        if not isinstance(receipts, list) or any(
+            not isinstance(receipt, dict)
+            or not isinstance(receipt.get("clip_id"), str)
+            or not receipt["clip_id"]
+            or receipt.get("status") not in RECORDED_STATES | {"failed"}
+            for receipt in receipts
+        ):
+            raise RuntimeError(
+                "Cannot inspect prior short publication receipts; nothing was submitted"
+            )
+        return receipts
 
     def _submit_short(
         self,
@@ -397,12 +602,13 @@ class PublishAgent(BaseAgent):
         scheduled_at,
         youtube_url,
         spotify_url,
+        version,
         identity,
         api_key,
         user,
     ):
         clip_id = str(clip.get("id", ""))
-        path = self.episode_dir / "shorts" / f"{clip_id}.mp4"
+        path = self.episode_dir / version["path"]
         if not path.exists():
             self.logger.warning("Short not found: %s", clip_id)
             return None
@@ -461,6 +667,10 @@ class PublishAgent(BaseAgent):
             clip_id=clip_id,
             platforms=platforms,
             scheduled=scheduled_at is not None,
+            version=version["version"],
+            variant_id=version["variant_id"],
+            render_fingerprint=version["render_fingerprint"],
+            approval_revision=version["revision"],
         )
         if scheduled_at:
             result.update(
@@ -719,12 +929,11 @@ class PublishAgent(BaseAgent):
 
     @contextmanager
     def _schedule_lock(self):
-        with (self.episode_dir.parent / ".publish-schedule.lock").open("a+") as file:
-            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        if getattr(self, "_publication_lock_held", False):
+            yield
+            return
+        with publication_lock(self.episode_dir.parent):
+            yield
 
     @staticmethod
     def _schedule_reference(episode, tz_name):
@@ -742,21 +951,10 @@ class PublishAgent(BaseAgent):
             ) from error
 
     def _identity(self, revision, kind, clip_id=""):
-        value = json.dumps(
-            {
-                "episode_id": self.episode_dir.name,
-                "revision": revision,
-                "kind": kind,
-                "clip_id": clip_id,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        digest = hashlib.sha256(value.encode()).hexdigest()[:32]
-        return f"cascade-{kind}-{digest}"
+        return publication_identity(self.episode_dir.name, revision, kind, clip_id)
 
     @staticmethod
-    def _scheduled_receipt(clip, identity, existing, platforms, tz_name):
+    def _scheduled_receipt(clip, version, identity, existing, platforms, tz_name):
         scheduled_at = existing["scheduled_at"].astimezone(ZoneInfo(tz_name))
         receipt = {
             "clip_id": str(clip.get("id", "")),
@@ -768,6 +966,10 @@ class PublishAgent(BaseAgent):
             "scheduled": True,
             "scheduled_date": scheduled_at.isoformat(),
             "timezone": tz_name,
+            "version": version["version"],
+            "variant_id": version["variant_id"],
+            "render_fingerprint": version["render_fingerprint"],
+            "approval_revision": version["revision"],
             "reused_receipt": True,
             "receipt_source": existing["source"],
         }
@@ -902,22 +1104,62 @@ class PublishAgent(BaseAgent):
         return datetime.combine(date, time(hour=hour), tzinfo=zone)
 
     @staticmethod
-    def _result(shorts, longform, platforms, revision, user, deferred_reason=None):
+    def _receipt_key(receipt):
+        for field in ("external_id", "idempotency_key", "request_id", "job_id"):
+            value = receipt.get(field) if isinstance(receipt, dict) else None
+            if isinstance(value, str) and value:
+                return field, value
+        return None
+
+    @classmethod
+    def _merge_short_receipts(cls, current, previous):
+        current = [item for item in current if isinstance(item, dict)]
+        previous = previous if isinstance(previous, list) else []
+        current_keys = {
+            key for item in current if (key := cls._receipt_key(item)) is not None
+        }
+        history = []
+        for item in previous:
+            if not isinstance(item, dict):
+                continue
+            key = cls._receipt_key(item)
+            if key is not None and key in current_keys:
+                continue
+            history.append({**item, "historical_receipt": True})
+        return current + history
+
+    @classmethod
+    def _result(
+        cls,
+        shorts,
+        longform,
+        platforms,
+        revision,
+        user,
+        deferred_reason=None,
+        previous_shorts=None,
+    ):
+        active_shorts = shorts
         result = {
-            "shorts": shorts,
+            "shorts": cls._merge_short_receipts(shorts, previous_shorts),
             "longform": longform,
             "shorts_submitted": sum(
                 item.get("status") == "submitted" and not item.get("reused_receipt")
-                for item in shorts
+                for item in active_shorts
             ),
-            "shorts_reused": sum(bool(item.get("reused_receipt")) for item in shorts),
+            "shorts_reused": sum(
+                bool(item.get("reused_receipt")) for item in active_shorts
+            ),
             "shorts_published": sum(
-                item.get("status") == "published" for item in shorts
+                item.get("status") == "published" for item in active_shorts
             ),
             "shorts_failed": sum(
-                item.get("status") in {"failed", "partial_failure"} for item in shorts
+                item.get("status") in {"failed", "partial_failure"}
+                for item in active_shorts
             ),
-            "shorts_unknown": sum(item.get("status") == "unknown" for item in shorts),
+            "shorts_unknown": sum(
+                item.get("status") == "unknown" for item in active_shorts
+            ),
             "platforms": platforms,
             "release_revision": revision,
             "profile_username": user,
@@ -944,9 +1186,11 @@ class PublishAgent(BaseAgent):
                     "attempting another submission."
                 ),
             )
-        elif shorts and all(item.get("reused_receipt") for item in shorts):
+        elif active_shorts and all(
+            item.get("reused_receipt") for item in active_shorts
+        ):
             result["publish_status"] = "already_submitted"
-        elif shorts and result["shorts_published"] == len(shorts):
+        elif active_shorts and result["shorts_published"] == len(active_shorts):
             result["publish_status"] = "published"
         else:
             result["publish_status"] = "submitted"

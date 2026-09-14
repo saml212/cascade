@@ -5,6 +5,7 @@
 import asyncio
 import json
 import threading
+from contextlib import contextmanager
 
 import pytest
 from fastapi import HTTPException
@@ -206,6 +207,304 @@ class TestApproveReject:
             "clips"
         ]
         assert [clip["status"] for clip in stored] == ["approved", "rejected"]
+
+
+class TestDistributionSelection:
+    @staticmethod
+    def _state(candidate, *, current=True, approval_current=True):
+        variant_id = candidate.get("distribution_variant_id")
+        return {
+            "version": variant_id or "base",
+            "variant_id": variant_id,
+            "label": "Motion background" if variant_id else "Base",
+            "current": current,
+            "approval_current": approval_current,
+            "revision": "sha256:selected-review",
+        }
+
+    def test_selects_exact_approved_variant_and_can_restore_base(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        clip = dict(SAMPLE_CLIPS[0], status="approved")
+        _add_clips(episodes_dir, "ep_001", [clip])
+
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "publication_change_lock",
+            lambda *_: {"change_locked": False, "change_lock_reason": None},
+        )
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+
+        selected = client.put(
+            "/api/episodes/ep_001/clips/clip_01/distribution",
+            json={
+                "variant_id": "background_motion_v1",
+                "expected_revision": "sha256:selected-review",
+            },
+        )
+        restored = client.put(
+            "/api/episodes/ep_001/clips/clip_01/distribution",
+            json={
+                "variant_id": None,
+                "expected_revision": "sha256:selected-review",
+            },
+        )
+
+        assert selected.status_code == 200
+        assert selected.json()["distribution"] == {
+            "version": "background_motion_v1",
+            "variant_id": "background_motion_v1",
+            "label": "Motion background",
+            "current": True,
+            "approval_current": True,
+            "revision": "sha256:selected-review",
+            "change_locked": False,
+            "change_lock_reason": None,
+        }
+        assert restored.status_code == 200
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert "distribution_variant_id" not in stored
+
+    @pytest.mark.parametrize(
+        ("current", "approval_current", "revision", "detail"),
+        (
+            (True, True, "sha256:changed", "changed; refresh"),
+            (False, True, "sha256:selected-review", "current render"),
+            (True, False, "sha256:selected-review", "Approve this exact"),
+        ),
+    )
+    def test_selection_fails_closed_for_stale_missing_or_unapproved_version(
+        self,
+        test_client,
+        monkeypatch,
+        current,
+        approval_current,
+        revision,
+        detail,
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "publication_change_lock",
+            lambda *_: {"change_locked": False, "change_lock_reason": None},
+        )
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: (
+                self._state(
+                    candidate,
+                    current=current,
+                    approval_current=approval_current,
+                )
+                | {"revision": revision}
+            ),
+        )
+
+        response = client.put(
+            "/api/episodes/ep_001/clips/clip_01/distribution",
+            json={
+                "variant_id": "background_motion_v1",
+                "expected_revision": "sha256:selected-review",
+            },
+        )
+
+        assert response.status_code == 409
+        assert detail in response.json()["detail"]
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert "distribution_variant_id" not in stored
+
+    def test_unknown_variant_is_rejected_without_persisting(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        response = client.put(
+            "/api/episodes/ep_001/clips/clip_01/distribution",
+            json={"variant_id": "unknown", "expected_revision": "sha256:any"},
+        )
+
+        assert response.status_code == 404
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert "distribution_variant_id" not in stored
+
+    def test_any_recorded_receipt_locks_legacy_base_selection(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "release_revision": "sha256:older-release",
+                    "shorts": [
+                        {
+                            "clip_id": "clip_01",
+                            "status": "submitted",
+                            "request_id": "legacy-job",
+                        }
+                    ],
+                }
+            )
+        )
+
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+        response = client.put(
+            "/api/episodes/ep_001/clips/clip_01/distribution",
+            json={
+                "variant_id": "background_motion_v1",
+                "expected_revision": "sha256:selected-review",
+            },
+        )
+
+        assert response.status_code == 409
+        assert "historical or current publication receipt" in response.json()["detail"]
+        assert "explicit re-release identity" in response.json()["detail"]
+
+    def test_pre_schema_receipt_without_release_or_version_still_locks_base(
+        self, test_client
+    ):
+        _client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "shorts": [
+                        {"clip_id": "clip_01", "status": "unknown"},
+                    ]
+                }
+            )
+        )
+
+        from server.routes import clips as clips_mod
+
+        state = clips_mod.publication_change_lock(episode_dir, "clip_01")
+        assert state["change_locked"] is True
+        assert "explicit re-release identity" in state["change_lock_reason"]
+
+    def test_failed_receipt_does_not_lock_and_malformed_state_fails_closed(
+        self, test_client
+    ):
+        _client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        receipt_path = episode_dir / "publish.json"
+        receipt_path.write_text(
+            json.dumps({"shorts": [{"clip_id": "clip_01", "status": "failed"}]})
+        )
+
+        from server.routes import clips as clips_mod
+
+        assert clips_mod.publication_change_lock(episode_dir, "clip_01") == {
+            "change_locked": False,
+            "change_lock_reason": None,
+        }
+        receipt_path.write_text(json.dumps({"shorts": ["not-a-receipt"]}))
+        malformed = clips_mod.publication_change_lock(episode_dir, "clip_01")
+        assert malformed["change_locked"] is True
+        assert "cannot be verified" in malformed["change_lock_reason"]
+        receipt_path.write_text(json.dumps({"shorts": [{"status": "submitted"}]}))
+        unattributed = clips_mod.publication_change_lock(episode_dir, "clip_01")
+        assert unattributed["change_locked"] is True
+        assert "cannot be verified" in unattributed["change_lock_reason"]
+
+    def test_selection_waits_until_inflight_publish_receipt_is_saved(
+        self, test_client, monkeypatch
+    ):
+        _client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        from agents import publish as publish_mod
+        from server.routes import clips as clips_mod
+
+        shared_lock = threading.Lock()
+
+        @contextmanager
+        def guarded_publication(_episodes_dir):
+            with shared_lock:
+                yield
+
+        monkeypatch.setattr(publish_mod, "publication_lock", guarded_publication)
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+        remote_submission_finished = threading.Event()
+        allow_receipt_write = threading.Event()
+        agent = publish_mod.PublishAgent(episode_dir, {})
+
+        def execute():
+            remote_submission_finished.set()
+            assert allow_receipt_write.wait(timeout=2)
+            return {
+                "release_revision": "sha256:old-release",
+                "shorts": [
+                    {
+                        "clip_id": "clip_01",
+                        "status": "submitted",
+                        "external_id": "legacy-base-job",
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(agent, "execute", execute)
+        publish_thread = threading.Thread(target=agent.run)
+        publish_thread.start()
+        assert remote_submission_finished.wait(timeout=2)
+
+        outcome = {}
+
+        def select():
+            try:
+                outcome["result"] = clips_mod._select_clip_distribution_locked(
+                    "ep_001",
+                    "clip_01",
+                    clips_mod.DistributionSelectionRequest(
+                        variant_id="background_motion_v1",
+                        expected_revision="sha256:selected-review",
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - asserted below
+                outcome["error"] = exc
+
+        selection_thread = threading.Thread(target=select)
+        selection_thread.start()
+        selection_thread.join(timeout=0.05)
+        assert selection_thread.is_alive()
+
+        allow_receipt_write.set()
+        publish_thread.join(timeout=2)
+        selection_thread.join(timeout=2)
+
+        assert not publish_thread.is_alive()
+        assert not selection_thread.is_alive()
+        assert isinstance(outcome.get("error"), HTTPException)
+        assert outcome["error"].status_code == 409
+        assert "explicit re-release identity" in outcome["error"].detail
+        assert (episode_dir / "publish.json").is_file()
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        assert "distribution_variant_id" not in stored
 
 
 class TestManualClip:

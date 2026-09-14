@@ -219,6 +219,33 @@ The three expected revisions bind the decision to the report, finding, and
 rendered output. This review does not approve the episode or authorize
 publication.
 
+## Select a short version for distribution
+
+Preview and approve **Base** and **Motion background** independently. Approval
+does not select a version, and selection does not approve it. A clip with no
+saved selection uses Base.
+
+Read `review.distribution` from
+`GET /api/episodes/{episode_id}/review`, then select with:
+
+```text
+PUT /api/episodes/{episode_id}/clips/{clip_id}/distribution
+{"variant_id":null,"expected_revision":"sha256:..."}
+PUT /api/episodes/{episode_id}/clips/{clip_id}/distribution
+{"variant_id":"background_motion_v1","expected_revision":"sha256:..."}
+```
+
+The selected file must be current and separately approved. Its exact media,
+copy, and approval revision become part of the release identity and receipt.
+A `409` means the selection or approval is stale; reread the review response
+instead of forcing the write.
+
+After any recorded submission, `change_locked` prevents switching that clip's
+version. Existing Base receipts remain Base and are never treated as Motion
+approval. Releasing an old episode again, including the same Base version,
+requires a future explicit re-release operation with a new audited identity;
+do not delete or rewrite historical receipts to bypass this lock.
+
 ## Verification
 
 Run the Python suite and frontend checks before handing a recovery back for

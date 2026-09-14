@@ -12,7 +12,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from agents.qa import editorial_revision, quality_snapshot
+from agents.qa import (
+    current_funnel_urls_for_episode,
+    editorial_revision,
+    quality_snapshot,
+)
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import selected_audio_source
 from lib.paths import get_episodes_dir
@@ -780,10 +784,42 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
     longform_res = publish_data.get("longform") or {}
     longform_status = longform_res.get("status")
     longform_query = _status_query(longform_res)
-    existing_url = episode.get("youtube_longform_url", "")
+    current_longform_revision = editorial_revision(ep_dir, episode)
+    from agents.pipeline import load_config
+
+    existing_url = current_funnel_urls_for_episode(ep_dir, episode, load_config())[
+        "youtube"
+    ]
+    submitted_longform_revision = longform_res.get("editorial_revision")
+    legacy_longform_current = False
+    if submitted_longform_revision is None:
+        qa_file = ep_dir / "qa" / "qa.json"
+        try:
+            with open(qa_file) as file:
+                qa_report = json.load(file)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            qa_report = {}
+        legacy_longform_current = bool(
+            isinstance(qa_report, dict)
+            and isinstance(publish_data.get("release_revision"), str)
+            and qa_report.get("release_revision")
+            == publish_data.get("release_revision")
+            and qa_report.get("editorial_revision") == current_longform_revision
+        )
+    submitted_longform_current = (
+        submitted_longform_revision == current_longform_revision
+        if isinstance(submitted_longform_revision, str)
+        else legacy_longform_current
+    )
 
     if existing_url:
         result.longform = {"status": "live", "url": existing_url}
+    elif longform_status in {"submitted", "unknown"} and not submitted_longform_current:
+        result.longform = {
+            "status": "stale",
+            "url": None,
+            "error": "The submitted longform belongs to an older editorial revision.",
+        }
     elif longform_status in {"submitted", "unknown"} and longform_query:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -818,6 +854,9 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
                 )
                 episode["youtube_longform_url_release_revision"] = publish_data.get(
                     "release_revision"
+                )
+                episode["youtube_longform_url_editorial_revision"] = (
+                    submitted_longform_revision or current_longform_revision
                 )
                 episode["youtube_longform_url_captured_at"] = datetime.now(
                     timezone.utc

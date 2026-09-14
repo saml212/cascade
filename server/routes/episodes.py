@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agents.pipeline import load_config
 from agents.podcast_feed import current_podcast_audio
-from agents.qa import quality_snapshot
+from agents.qa import editorial_revision, quality_snapshot
 from agents.speaker_cut import current_speaker_segments, rebind_visual_crop_segments
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import (
@@ -384,12 +384,27 @@ async def update_episode(episode_id: str, req: EpisodeUpdateRequest) -> dict:
         ep["video_explicit"] = req.video_explicit
     if req.youtube_longform_url is not None:
         ep["youtube_longform_url"] = req.youtube_longform_url
-        ep["youtube_longform_url_source"] = "supplied"
         ep.pop("youtube_longform_url_captured_at", None)
         ep.pop("youtube_longform_url_external_id", None)
         ep.pop("youtube_longform_url_release_revision", None)
+        if req.youtube_longform_url:
+            ep["youtube_longform_url_source"] = "supplied"
+            ep["youtube_longform_url_editorial_revision"] = editorial_revision(
+                EPISODES_DIR / episode_id, ep
+            )
+        else:
+            ep.pop("youtube_longform_url_source", None)
+            ep.pop("youtube_longform_url_editorial_revision", None)
     if req.spotify_longform_url is not None:
         ep["spotify_longform_url"] = req.spotify_longform_url
+        if req.spotify_longform_url:
+            ep["spotify_longform_url_source"] = "supplied"
+            ep["spotify_longform_url_editorial_revision"] = editorial_revision(
+                EPISODES_DIR / episode_id, ep
+            )
+        else:
+            ep.pop("spotify_longform_url_source", None)
+            ep.pop("spotify_longform_url_editorial_revision", None)
     if req.link_tree_url is not None:
         ep["link_tree_url"] = req.link_tree_url
     if req.publish_schedule is not None:

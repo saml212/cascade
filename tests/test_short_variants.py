@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from agents.qa import clip_review_revision, short_distribution_state
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     background_variant_fingerprint,
@@ -207,3 +208,75 @@ def test_recorded_variant_path_cannot_redirect_review(tmp_path, monkeypatch):
 
     assert state["current"] is False
     assert state["reason_code"] == "variant_path_changed"
+
+
+def test_missing_distribution_selection_defaults_to_exact_base_approval(tmp_path):
+    clip = {"id": "clip_01", "status": "approved"}
+    base_record = {
+        "fingerprint": "sha256:base",
+        "output": {"content_revision": "sha256:base-pixels"},
+    }
+    revision = clip_review_revision(clip, base_record)
+    clip.update(
+        approved_render_fingerprint=base_record["fingerprint"],
+        approved_revision=revision,
+    )
+
+    state = short_distribution_state(
+        tmp_path,
+        {},
+        {},
+        clip,
+        base_record,
+    )
+
+    assert state["version"] == "base"
+    assert state["variant_id"] is None
+    assert state["current"] is True
+    assert state["approval_current"] is True
+    assert state["revision"] == revision
+    assert state["path"] == "shorts/clip_01.mp4"
+
+
+def test_selected_variant_requires_its_own_current_pixels_and_approval(
+    tmp_path, monkeypatch
+):
+    episode_dir, base_record, encoding, record, output = _record(tmp_path, monkeypatch)
+    clip = {
+        "id": "clip_01",
+        "status": "pending",
+        "distribution_variant_id": BACKGROUND_VARIANT_ID,
+    }
+    revision = clip_review_revision(clip, record)
+    assert save_background_variant_approval(episode_dir, "clip_01", record, revision)
+
+    from agents import qa
+
+    monkeypatch.setattr(qa, "render_config_for_episode", lambda *_args: {})
+    monkeypatch.setattr(qa, "get_video_encoding_policy", lambda *_args: encoding)
+    selected = short_distribution_state(
+        episode_dir,
+        {},
+        {},
+        clip,
+        base_record,
+    )
+
+    assert selected["version"] == BACKGROUND_VARIANT_ID
+    assert selected["current"] is True
+    assert selected["approval_current"] is True
+    assert selected["revision"] == revision
+    assert selected["path"].endswith(f"/{BACKGROUND_VARIANT_ID}/clip_01.mp4")
+
+    stat = output.stat()
+    output.write_bytes(b"X" * stat.st_size)
+    os.utime(output, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    replaced = short_distribution_state(
+        episode_dir,
+        {},
+        {},
+        clip,
+        base_record,
+    )
+    assert replaced["current"] is False
+    assert replaced["approval_current"] is False

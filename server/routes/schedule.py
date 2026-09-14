@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import tomllib
 from fastapi import APIRouter, HTTPException
 
-from agents.qa import quality_snapshot
+from agents.qa import current_funnel_urls_for_episode, quality_snapshot
 from lib.paths import get_episodes_dir
 from server.routes.review import review_state
 
@@ -43,7 +43,7 @@ def _read_json(path: Path, default):
         return default
 
 
-def _publication_evidence(ep_dir: Path, episode: dict) -> list[dict]:
+def _publication_evidence(ep_dir: Path, episode: dict, config: dict) -> list[dict]:
     """Return recorded external actions without upgrading submissions to publishes."""
     episode_id = str(episode.get("episode_id", ep_dir.name))
     name = episode.get("name") or episode.get("guest_name") or episode_id
@@ -66,7 +66,7 @@ def _publication_evidence(ep_dir: Path, episode: dict) -> list[dict]:
             }
         )
 
-    youtube_url = episode.get("youtube_longform_url")
+    youtube_url = current_funnel_urls_for_episode(ep_dir, episode, config)["youtube"]
     if isinstance(youtube_url, str) and youtube_url.strip():
         records.append(
             {
@@ -118,6 +118,8 @@ def _publication_evidence(ep_dir: Path, episode: dict) -> list[dict]:
                 "name": name,
                 "content_type": "short",
                 "clip_id": str(short["clip_id"]),
+                "version": short.get("version") or "base",
+                "variant_id": short.get("variant_id"),
                 "destinations": [str(value) for value in destinations],
                 "status": short["status"],
                 "scheduled": short.get("scheduled") is True,
@@ -165,7 +167,12 @@ def _release_gate(ep_dir: Path, config: dict) -> dict:
 
 
 def _short_item(
-    episode_id: str, name: str, clip_id: str, clip: dict, destinations: list[str]
+    episode_id: str,
+    name: str,
+    clip_id: str,
+    clip: dict,
+    destinations: list[str],
+    distribution: dict | None = None,
 ) -> dict:
     metadata = clip.get("metadata", {})
     youtube = metadata.get("youtube", {}) if isinstance(metadata, dict) else {}
@@ -174,6 +181,8 @@ def _short_item(
         or clip.get("title")
         or f"Clip {clip_id}"
     )
+    distribution = distribution if isinstance(distribution, dict) else {}
+    variant_id = distribution.get("variant_id")
     return {
         "type": "short",
         "episode_id": episode_id,
@@ -181,6 +190,8 @@ def _short_item(
         "name": name,
         "title": title,
         "destinations": destinations,
+        "version": distribution.get("version") or variant_id or "base",
+        "variant_id": variant_id if isinstance(variant_id, str) else None,
     }
 
 
@@ -200,7 +211,7 @@ async def _get_approved_items(
             continue
         episode_id = str(episode.get("episode_id", ep_dir.name))
         name = episode.get("name") or episode.get("guest_name") or episode_id
-        evidence = _publication_evidence(ep_dir, episode)
+        evidence = _publication_evidence(ep_dir, episode, config)
         publication_evidence.extend(evidence)
         gate = _release_gate(ep_dir, config)
         publish = _read_json(ep_dir / "publish.json", {})
@@ -267,6 +278,7 @@ async def _get_approved_items(
                 clip_id,
                 clip,
                 receipt.get("platforms") or ["unknown"],
+                receipt,
             )
             item.update(
                 state=receipt_state,
@@ -305,16 +317,30 @@ async def _get_approved_items(
                 continue
             clip_id = str(clip["id"])
             clip_review = clip.get("review", {})
+            distribution = clip_review.get("distribution")
+            distribution_ready = (
+                distribution.get("current") is True
+                and distribution.get("approval_current") is True
+                if isinstance(distribution, dict)
+                else clip_review.get("render", {}).get("current") is True
+                and clip_review.get("approval", {}).get("current") is True
+            )
             if (
                 not enabled_destinations
                 or clip_review.get("selection", {}).get("status") != "selected"
-                or clip_review.get("render", {}).get("current") is not True
-                or clip_review.get("approval", {}).get("current") is not True
+                or not distribution_ready
             ):
                 continue
             if clip_id in receipt_ids:
                 continue
-            item = _short_item(episode_id, name, clip_id, clip, enabled_destinations)
+            item = _short_item(
+                episode_id,
+                name,
+                clip_id,
+                clip,
+                enabled_destinations,
+                distribution,
+            )
             plan = planned.get(clip_id)
             if plan:
                 item.update(state="planned", scheduled_date=plan["scheduled_date"])

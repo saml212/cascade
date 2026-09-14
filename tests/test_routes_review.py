@@ -275,7 +275,11 @@ def test_review_exposes_untracked_longform_despite_episode_status(test_client):
 def test_review_media_urls_change_when_atomic_outputs_are_replaced(test_client):
     client, episodes_dir = test_client
     episode_dir = _create_episode(episodes_dir, "ep_001")
-    clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 30}
+    clip = {
+        "id": "clip_01",
+        "start_seconds": 10,
+        "end_seconds": 30,
+    }
     _write_clips(episode_dir, [clip])
     longform = episode_dir / "upload_video.mp4"
     short = episode_dir / "shorts" / "clip_01.mp4"
@@ -326,7 +330,12 @@ def test_review_distinguishes_missing_short_from_stale(test_client):
 def test_review_exposes_background_variant_as_separate_media(test_client, monkeypatch):
     client, episodes_dir = test_client
     episode_dir = _create_episode(episodes_dir, "ep_001")
-    clip = {"id": "clip_01", "start_seconds": 10, "end_seconds": 30}
+    clip = {
+        "id": "clip_01",
+        "start_seconds": 10,
+        "end_seconds": 30,
+        "distribution_variant_id": "background_motion_v1",
+    }
     _write_clips(episode_dir, [clip])
     variant_path = (
         episode_dir / "short_variants" / "background_motion_v1" / "clip_01.mp4"
@@ -372,6 +381,26 @@ def test_review_exposes_background_variant_as_separate_media(test_client, monkey
     )
     assert variant["approval"]["current"] is False
     assert variant["approval"]["revision"].startswith("sha256:")
+    distribution = response.json()["clips"][0]["review"]["distribution"]
+    assert distribution == {
+        "version": "background_motion_v1",
+        "variant_id": "background_motion_v1",
+        "label": "Motion background",
+        "current": True,
+        "approval_current": False,
+        "revision": variant["approval"]["revision"],
+        "change_locked": False,
+        "change_lock_reason": None,
+    }
+
+    (episode_dir / "publish.json").write_text(
+        json.dumps({"shorts": [{"clip_id": "clip_01", "status": "submitted"}]})
+    )
+    locked = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"][
+        "distribution"
+    ]
+    assert locked["change_locked"] is True
+    assert "explicit re-release identity" in locked["change_lock_reason"]
 
     variant_record["asset"]["asset_id"] = []
     fallback = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"]

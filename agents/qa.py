@@ -43,9 +43,20 @@ from lib.delivery_video import (
     current_episode_longform_render,
     current_short_render,
     read_render_manifest,
+    render_config_for_episode,
 )
+from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import file_fingerprint, get_audio_stream
 from lib.ffprobe import probe as ffprobe
+from lib.short_variants import (
+    BASE_SHORT_VERSION,
+    DISTRIBUTION_VARIANT_FIELD,
+    background_variant_approval_state,
+    background_variant_output,
+    background_variant_state,
+    selected_short_variant_id,
+    variant_record,
+)
 from lib.timeline import Timeline
 from lib.transcript_search import clip_boundary_evidence
 
@@ -122,8 +133,126 @@ def _private_identity(scope: str, value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def publication_identity(
+    episode_id: str, revision: str, kind: str, clip_id: str = ""
+) -> str:
+    value = json.dumps(
+        {
+            "episode_id": episode_id,
+            "revision": revision,
+            "kind": kind,
+            "clip_id": clip_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(value.encode()).hexdigest()[:32]
+    return f"cascade-{kind}-{digest}"
+
+
+def current_funnel_urls(
+    episode: dict,
+    *,
+    episode_dir: str | Path | None = None,
+    editorial_revision_value: str | None = None,
+    quality_revision_value: str | None = None,
+) -> dict[str, str]:
+    """Return external episode URLs bound to the current longform revision."""
+    youtube_source = episode.get("youtube_longform_url_source")
+    legacy_supplied_current = episode_dir is None
+    if episode_dir is not None:
+        episode_dir = Path(episode_dir)
+        qa = _load_json(episode_dir / QUALITY_REPORT_PATH)
+        publish = _load_json(episode_dir / "publish.json")
+        published_revision = publish.get("release_revision")
+        legacy_supplied_current = bool(
+            (not qa and not publish)
+            or isinstance(published_revision, str)
+            and qa.get("release_revision") == published_revision
+            and qa.get("editorial_revision") == editorial_revision_value
+        )
+    receipt_revision = episode.get("youtube_longform_url_release_revision")
+    receipt_external_id = episode.get("youtube_longform_url_external_id")
+    episode_id = str(
+        episode.get("episode_id")
+        or (Path(episode_dir).name if episode_dir is not None else "")
+    )
+    receipt_editorial_revision = episode.get("youtube_longform_url_editorial_revision")
+    if receipt_editorial_revision is not None:
+        receipt_identities = {
+            publication_identity(episode_id, bound_revision, "longform")
+            for bound_revision in (
+                receipt_editorial_revision,
+                receipt_revision,
+            )
+            if isinstance(bound_revision, str) and bound_revision
+        }
+        receipt_youtube_current = bool(
+            receipt_editorial_revision == editorial_revision_value
+            and receipt_external_id in receipt_identities
+        )
+    else:
+        receipt_youtube_current = bool(
+            isinstance(receipt_revision, str)
+            and receipt_revision
+            and (
+                legacy_supplied_current
+                or (episode.get("publish_approval") or {}).get("revision")
+                == receipt_revision
+            )
+            and receipt_external_id
+            == publication_identity(episode_id, receipt_revision, "longform")
+        )
+    supplied_youtube_current = (
+        episode.get("youtube_longform_url_editorial_revision")
+        == editorial_revision_value
+        if episode.get("youtube_longform_url_editorial_revision") is not None
+        else legacy_supplied_current
+    )
+    youtube = (
+        str(episode.get("youtube_longform_url", ""))
+        if youtube_source == "upload_post_receipt"
+        and receipt_youtube_current
+        or youtube_source == "supplied"
+        and supplied_youtube_current
+        else ""
+    )
+    spotify_source = episode.get("spotify_longform_url_source")
+    supplied_spotify_current = (
+        episode.get("spotify_longform_url_editorial_revision")
+        == editorial_revision_value
+        if episode.get("spotify_longform_url_editorial_revision") is not None
+        else legacy_supplied_current
+    )
+    spotify = (
+        str(episode.get("spotify_longform_url", ""))
+        if spotify_source == "supplied"
+        and supplied_spotify_current
+        or spotify_source is None
+        and youtube_source == "supplied"
+        and supplied_youtube_current
+        else ""
+    )
+    return {"youtube": youtube, "spotify": spotify}
+
+
+def current_funnel_urls_for_episode(
+    episode_dir: str | Path, episode: dict, config: dict
+) -> dict[str, str]:
+    episode_dir = Path(episode_dir)
+    return current_funnel_urls(
+        episode,
+        episode_dir=episode_dir,
+        editorial_revision_value=editorial_revision(episode_dir, episode),
+        quality_revision_value=quality_revision(episode_dir, episode, config=config),
+    )
+
+
 def _upload_post_plan(
-    config: dict, episode: dict, environment: Mapping[str, str]
+    config: dict,
+    episode: dict,
+    environment: Mapping[str, str],
+    funnel_urls: dict[str, str],
 ) -> dict:
     platforms = config.get("platforms", {})
     destinations = sorted(
@@ -136,7 +265,7 @@ def _upload_post_plan(
         return plan
 
     user = environment.get("UPLOAD_POST_USER", "")
-    youtube_url = episode.get("youtube_longform_url", "")
+    youtube_url = funnel_urls["youtube"]
     if episode.get("youtube_longform_url_source") == "upload_post_receipt" or (
         not youtube_url and "youtube" in destinations
     ):
@@ -162,7 +291,7 @@ def _upload_post_plan(
             "upload-post-funnel",
             {
                 "youtube": youtube_funnel,
-                "spotify": episode.get("spotify_longform_url", ""),
+                "spotify": funnel_urls["spotify"],
                 "channel_handle": config.get("podcast", {}).get("channel_handle", ""),
             },
         ),
@@ -302,12 +431,21 @@ def current_publish_plan(
     episode: dict,
     *,
     environment: Mapping[str, str] | None = None,
+    episode_dir: str | Path | None = None,
+    editorial_revision_value: str | None = None,
+    quality_revision_value: str | None = None,
 ) -> dict:
     """Return the normalized external destinations covered by publish approval."""
     environment = os.environ if environment is None else environment
+    funnel_urls = current_funnel_urls(
+        episode,
+        episode_dir=episode_dir,
+        editorial_revision_value=editorial_revision_value,
+        quality_revision_value=quality_revision_value,
+    )
     return {
         "schema": PUBLISH_PLAN_SCHEMA,
-        "upload_post": _upload_post_plan(config, episode, environment),
+        "upload_post": _upload_post_plan(config, episode, environment, funnel_urls),
         "podcast_rss": _podcast_rss_plan(config, episode, environment),
         "video_podcast_rss": _video_podcast_rss_plan(config, episode, environment),
     }
@@ -460,6 +598,7 @@ def quality_revision(
         "approved_at",
         "approved_revision",
         "approved_render_fingerprint",
+        DISTRIBUTION_VARIANT_FIELD,
     }
     quality_clips = [
         {key: value for key, value in clip.items() if key not in decision_fields}
@@ -519,14 +658,26 @@ def release_revision(
         for clip in clips
         if isinstance(clip, dict) and clip.get("id")
     }
+    current_quality_revision = quality_revision(episode_dir, episode, config=config)
+    current_editorial_revision = editorial_revision(episode_dir, episode)
     payload = {
-        "quality_revision": quality_revision(episode_dir, episode, config=config),
+        "quality_revision": current_quality_revision,
         "clip_decisions": decisions,
         "audio_finding_reviews": _file_content_fingerprint(
             episode_dir / AUDIO_FINDING_REVIEWS_PATH
         ),
-        "publish_plan": current_publish_plan(config, episode, environment=environment),
+        "publish_plan": current_publish_plan(
+            config,
+            episode,
+            environment=environment,
+            episode_dir=episode_dir,
+            editorial_revision_value=current_editorial_revision,
+            quality_revision_value=current_quality_revision,
+        ),
     }
+    short_versions = _selected_short_version_inputs(episode_dir, clips)
+    if short_versions:
+        payload["short_versions"] = short_versions
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -545,6 +696,7 @@ def clip_review_revision(
         "approved_at",
         "approved_revision",
         "approved_render_fingerprint",
+        DISTRIBUTION_VARIANT_FIELD,
     }
     copy = {}
     if isinstance(metadata_entry, dict):
@@ -569,6 +721,121 @@ def clip_review_revision(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _selected_short_version_inputs(
+    episode_dir: Path, clips: list[dict]
+) -> dict[str, dict]:
+    """Bind non-default distribution choices into the release revision."""
+    selected = {}
+    for clip in clips:
+        if not isinstance(clip, dict) or not clip.get("id"):
+            continue
+        raw_variant_id = clip.get(DISTRIBUTION_VARIANT_FIELD)
+        if raw_variant_id is None:
+            continue
+        clip_id = str(clip["id"])
+        try:
+            variant_id = selected_short_variant_id(clip)
+        except KeyError:
+            selected[clip_id] = {
+                "variant_id": raw_variant_id,
+                "status": "invalid",
+            }
+            continue
+        record = variant_record(episode_dir, clip_id)
+        asset = record.get("asset") if isinstance(record.get("asset"), dict) else {}
+        output = record.get("output") if isinstance(record.get("output"), dict) else {}
+        approval = (
+            record.get("approval") if isinstance(record.get("approval"), dict) else {}
+        )
+        selected[clip_id] = {
+            "variant_id": variant_id,
+            "render_fingerprint": record.get("fingerprint"),
+            "output_content_revision": output.get("content_revision"),
+            "output_scan_identity": output.get("scan_identity"),
+            "asset_id": asset.get("asset_id"),
+            "asset_content_revision": asset.get("content_revision"),
+            "asset_manifest_revision": asset.get("manifest_revision"),
+            "approval_revision": approval.get("revision"),
+        }
+    return selected
+
+
+def short_distribution_state(
+    episode_dir: str | Path,
+    episode: dict,
+    config: dict,
+    clip: dict,
+    base_record: dict | None,
+    metadata_entry: dict | None = None,
+) -> dict:
+    """Resolve the selected short version and its independent approval."""
+    episode_dir = Path(episode_dir)
+    base_record = base_record if isinstance(base_record, dict) else {}
+    base_revision = clip_review_revision(clip, base_record, metadata_entry)
+    try:
+        variant_id = selected_short_variant_id(clip)
+    except KeyError as exc:
+        return {
+            "version": "invalid",
+            "variant_id": None,
+            "label": "Invalid selection",
+            "current": False,
+            "approval_current": False,
+            "revision": base_revision,
+            "path": None,
+            "render_fingerprint": None,
+            "detail": str(exc).strip("'"),
+        }
+
+    if variant_id is None:
+        current = bool(base_record)
+        return {
+            "version": BASE_SHORT_VERSION,
+            "variant_id": None,
+            "label": "Base",
+            "current": current,
+            "approval_current": bool(
+                current
+                and clip.get("status") == "approved"
+                and clip.get("approved_render_fingerprint")
+                == base_record.get("fingerprint")
+                and clip.get("approved_revision") == base_revision
+            ),
+            "revision": base_revision,
+            "path": f"shorts/{clip.get('id')}.mp4",
+            "render_fingerprint": base_record.get("fingerprint"),
+        }
+
+    encoding = get_video_encoding_policy(
+        render_config_for_episode(episode, config), "shorts"
+    )
+    record, render = background_variant_state(
+        episode_dir,
+        str(clip["id"]),
+        base_record=base_record or None,
+        encoding=encoding,
+    )
+    revision = clip_review_revision(clip, record, metadata_entry)
+    approval = background_variant_approval_state(record, render, revision)
+    asset = record.get("asset") if isinstance(record.get("asset"), dict) else {}
+    return {
+        "version": variant_id,
+        "variant_id": variant_id,
+        "label": "Motion background",
+        "current": render.get("current") is True,
+        "approval_current": approval.get("current") is True,
+        "revision": revision,
+        "path": str(
+            background_variant_output(episode_dir, str(clip["id"])).relative_to(
+                episode_dir
+            )
+        ),
+        "render_fingerprint": record.get("fingerprint"),
+        "asset_id": asset.get("asset_id"),
+        "detail": render.get("detail"),
+    }
 
 
 def current_clip_boundary_evidence(
@@ -1285,7 +1552,14 @@ def quality_snapshot(
     )
     current_editorial_revision = editorial_revision(episode_dir, episode)
     current_quality_revision = quality_revision(episode_dir, episode, config=config)
-    publish_plan = current_publish_plan(config, episode, environment=environment)
+    publish_plan = current_publish_plan(
+        config,
+        episode,
+        environment=environment,
+        episode_dir=episode_dir,
+        editorial_revision_value=current_editorial_revision,
+        quality_revision_value=current_quality_revision,
+    )
     current_release_revision = release_revision(
         episode_dir,
         episode,
@@ -1423,6 +1697,18 @@ def quality_snapshot(
         for item in approval_metadata.get("clips", [])
         if isinstance(item, dict) and item.get("id")
     }
+    short_versions = {
+        str(clip["id"]): short_distribution_state(
+            episode_dir,
+            episode,
+            config,
+            clip,
+            current_shorts.get(str(clip["id"])),
+            approval_metadata_by_id.get(clip["id"]),
+        )
+        for clip in clips
+        if isinstance(clip, dict) and clip.get("id")
+    }
     approved = []
     pending = []
     for clip in clips:
@@ -1451,7 +1737,9 @@ def quality_snapshot(
             }
         )
     missing_shorts = [
-        str(clip["id"]) for clip in approved if str(clip["id"]) not in current_shorts
+        str(clip["id"])
+        for clip in approved
+        if short_versions[str(clip["id"])]["current"] is not True
     ]
     if missing_shorts:
         blockers.append(
@@ -1465,17 +1753,8 @@ def quality_snapshot(
     stale_clip_approvals = [
         str(clip["id"])
         for clip in approved
-        if str(clip["id"]) in current_shorts
-        and (
-            clip.get("approved_render_fingerprint")
-            != current_shorts[str(clip["id"])].get("fingerprint")
-            or clip.get("approved_revision")
-            != clip_review_revision(
-                clip,
-                current_shorts[str(clip["id"])],
-                approval_metadata_by_id.get(clip["id"]),
-            )
-        )
+        if short_versions[str(clip["id"])]["current"] is True
+        and short_versions[str(clip["id"])]["approval_current"] is not True
     ]
     if stale_clip_approvals:
         blockers.append(
@@ -1651,6 +1930,7 @@ def quality_snapshot(
             "can_approve_publish": not prerequisites,
             "revision": current_release_revision,
             "publish_plan": publish_plan,
+            "short_versions": short_versions,
             "blockers": blockers,
         },
         "approvals": {

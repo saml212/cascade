@@ -18,6 +18,8 @@ BACKGROUND_VARIANT_ID = "background_motion_v1"
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
+BASE_SHORT_VERSION = "base"
+DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 
 _ASSET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -39,6 +41,17 @@ def background_assets_dir() -> Path:
 def require_background_variant(variant_id: str) -> None:
     if variant_id != BACKGROUND_VARIANT_ID:
         raise KeyError(f"Unknown short variant: {variant_id}")
+
+
+def selected_short_variant_id(clip: dict) -> str | None:
+    """Return the explicit distribution variant; missing means canonical base."""
+    variant_id = clip.get(DISTRIBUTION_VARIANT_FIELD)
+    if variant_id is None:
+        return None
+    if not isinstance(variant_id, str):
+        raise KeyError(f"Unknown short variant: {variant_id}")
+    require_background_variant(variant_id)
+    return variant_id
 
 
 def background_variant_output(episode_dir: Path, clip_id: str) -> Path:

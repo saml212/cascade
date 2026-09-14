@@ -12,13 +12,17 @@ from server.routes import schedule
 def _episode(root, episode_id="example", **episode):
     path = root / episode_id
     path.mkdir()
+    if episode.get("youtube_longform_url") and not episode.get(
+        "youtube_longform_url_source"
+    ):
+        episode["youtube_longform_url_source"] = "supplied"
     (path / "episode.json").write_text(
         json.dumps({"episode_id": episode_id, "guest_name": "Guest", **episode})
     )
     return path
 
 
-def _review(*, approved=True):
+def _review(*, approved=True, distribution=None):
     state = {
         "enabled_destinations": [{"key": "youtube"}, {"key": "instagram"}],
         "longform": {
@@ -38,6 +42,8 @@ def _review(*, approved=True):
             }
         ],
     }
+    if distribution is not None:
+        state["clips"][0]["review"]["distribution"] = distribution
 
     async def load(_episode_id):
         return state
@@ -100,6 +106,37 @@ def test_calendar_proposes_only_current_revision_bound_approvals(tmp_path, monke
     assert items[0]["destination"] == "youtube"
     assert items[1]["type"] == "short"
     assert items[1]["destinations"] == ["youtube", "instagram"]
+    assert items[1]["version"] == "base"
+    assert items[1]["variant_id"] is None
+
+
+def test_calendar_proposal_exposes_selected_variant_identity(tmp_path, monkeypatch):
+    _episode(tmp_path, title="A current episode")
+    monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        schedule,
+        "review_state",
+        _review(
+            distribution={
+                "version": "background_motion_v1",
+                "variant_id": "background_motion_v1",
+                "current": True,
+                "approval_current": True,
+            }
+        ),
+    )
+    monkeypatch.setattr(schedule, "_load_config", dict)
+
+    result = asyncio.run(schedule.get_schedule())
+    short = next(
+        item
+        for day in result["schedule"]
+        for item in day["items"]
+        if item["type"] == "short"
+    )
+
+    assert short["version"] == "background_motion_v1"
+    assert short["variant_id"] == "background_motion_v1"
 
 
 def test_calendar_surfaces_rss_without_claiming_youtube_publication(
@@ -135,6 +172,32 @@ def test_calendar_surfaces_rss_without_claiming_youtube_publication(
     ]
 
 
+def test_stale_bound_youtube_url_is_not_current_publication_evidence(
+    tmp_path, monkeypatch
+):
+    _episode(
+        tmp_path,
+        youtube_longform_url="https://youtube.example/old",
+        youtube_longform_url_source="supplied",
+        youtube_longform_url_editorial_revision="sha256:old-longform",
+    )
+    monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
+    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_load_config", dict)
+
+    result = asyncio.run(schedule.get_schedule())
+
+    assert all(
+        item.get("content_type") != "longform"
+        for item in result["publication_evidence"]
+    )
+    assert any(
+        item["type"] == "longform"
+        for day in result["schedule"]
+        for item in day["items"]
+    )
+
+
 def test_recorded_submissions_block_ambiguous_duplicate_proposals(
     tmp_path, monkeypatch
 ):
@@ -166,6 +229,8 @@ def test_recorded_submissions_block_ambiguous_duplicate_proposals(
         "submitted",
     ]
     assert result["publication_evidence"][0]["destination"] == "unknown"
+    assert result["publication_evidence"][1]["version"] == "base"
+    assert result["publication_evidence"][1]["variant_id"] is None
 
 
 def test_calendar_day_uses_configured_timezone(tmp_path, monkeypatch):
