@@ -2302,6 +2302,14 @@ class QAAgent(BaseAgent):
                 review_document,
                 output_revision=output_revision,
             )
+            output_check = {
+                "name": "selected_master_output_continuity",
+                "status": effective_output_continuity.get("status", "unknown"),
+                "pass": effective_output_continuity.get("safe") is True,
+                "detail": effective_output_continuity.get(
+                    "detail", "Release audio continuity is unavailable."
+                ),
+            }
             audio_report = apply_selected_master_continuity_proof(
                 audio_report, effective_output_continuity
             )

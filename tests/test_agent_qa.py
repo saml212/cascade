@@ -20,6 +20,10 @@ def current_output_continuity(monkeypatch):
             "findings": [],
         },
     )
+    monkeypatch.setattr(
+        "agents.qa.apply_output_finding_reviews",
+        lambda report, *_args, **_kwargs: report,
+    )
 
 
 class TestQAAgent:
@@ -484,3 +488,63 @@ class TestQAAgent:
         assert check["status"] == "failed"
         assert result["overall"] == "fail"
         assert result["selected_master_output_continuity"] == continuity
+
+    def test_reviewed_output_continuity_controls_result_without_rewriting_evidence(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+        raw_continuity = {
+            "status": "failed",
+            "safe": False,
+            "detail": "1 semantic finding requires review.",
+            "artifacts": [{"role": "selected_audio_master", "status": "failed"}],
+            "findings": [{"id": "oc_reviewed"}],
+        }
+        reviewed_continuity = {
+            **raw_continuity,
+            "status": "pass",
+            "safe": True,
+            "detail": "The current output finding was explicitly reviewed.",
+        }
+
+        agent = QAAgent(tmp_episode_dir, sample_config)
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+            patch(
+                "agents.qa.analyze_release_audio_continuity",
+                return_value=raw_continuity,
+            ),
+            patch(
+                "agents.qa.apply_output_finding_reviews",
+                return_value=reviewed_continuity,
+            ),
+        ):
+            result = agent.execute()
+
+        check = next(
+            item
+            for item in result["checks"]
+            if item["name"] == "selected_master_output_continuity"
+        )
+        assert check == {
+            "name": "selected_master_output_continuity",
+            "status": "pass",
+            "pass": True,
+            "detail": "The current output finding was explicitly reviewed.",
+        }
+        assert result["overall"] == "pass"
+        assert result["selected_master_output_continuity"] == raw_continuity
+        saved = json.loads((tmp_episode_dir / "qa" / "qa.json").read_text())
+        assert saved["selected_master_output_continuity"] == raw_continuity
