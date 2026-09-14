@@ -67,6 +67,7 @@ from lib.timeline import Timeline, rebase_diarized
 
 THREE_PERSON_STACK_CAPTION_MARGIN_V = 600
 BACKGROUND_CAPTION_MARGIN_V = 840
+BACKGROUND_PANEL_HEADROOM_FRACTION = 1 / 12
 
 
 class ShortsRenderAgent(BaseAgent):
@@ -1013,7 +1014,10 @@ class ShortsRenderAgent(BaseAgent):
         panel_w = max(2, int(panel_w) // 2 * 2)
         panel_h = max(2, int(panel_h) // 2 * 2)
         x = max(0, min(round(center_x - panel_w / 2), src_w - panel_w))
-        y = max(0, min(round(center_y - panel_h / 2), src_h - panel_h))
+        panel_top = (
+            center_y - panel_h / 2 - panel_h * BACKGROUND_PANEL_HEADROOM_FRACTION
+        )
+        y = max(0, min(round(panel_top), src_h - panel_h))
         return center_x, panel_w, panel_h, x // 2 * 2, y // 2 * 2
 
     def _three_person_stack_filter(

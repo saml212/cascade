@@ -171,7 +171,12 @@ def test_malformed_nested_variant_identity_is_never_current(
 
 
 @pytest.mark.parametrize(
-    "layout_version", ("portrait-over-motion/v1", "portrait-over-motion/v2")
+    "layout_version",
+    (
+        "portrait-over-motion/v1",
+        "portrait-over-motion/v2",
+        "portrait-over-motion/v3",
+    ),
 )
 def test_previous_layout_has_specific_stale_reason(
     tmp_path, monkeypatch, layout_version

@@ -142,8 +142,8 @@ def test_background_overlap_panels_use_landscape_crop_settings(
         "BOTH", 1920, 1080, crop_config
     )
 
-    assert "[motion0]crop=960:568:40:116" in video_filter
-    assert "[motion1]crop=960:568:920:176" in video_filter
+    assert "[motion0]crop=960:568:40:68" in video_filter
+    assert "[motion1]crop=960:568:920:128" in video_filter
     assert video_filter.count("scale=1080:640") == 2
     assert "pad=1080:1920:0:0:black" in video_filter
 
@@ -320,7 +320,7 @@ def test_background_three_person_stack_uses_valid_crops_without_base_opt_in(
             "BOTH", 320, 180, crop_config, three_person_stack=True
         )
     )
-    assert "[stack1]crop=160:94:80:42" in (
+    assert "[stack1]crop=160:94:80:34" in (
         agent._get_background_crop_filter_no_subs(
             "BOTH", 320, 180, crop_config, three_person_stack=True
         )
@@ -329,6 +329,69 @@ def test_background_three_person_stack_uses_valid_crops_without_base_opt_in(
     del crop_config["speakers"][1]["center_x"]
     assert not agent._three_person_stack_enabled(
         {}, crop_config, 320, 180, for_background=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_size", "speaker", "expected"),
+    (
+        (
+            (1920, 1080),
+            {
+                "longform_center_x": 565,
+                "longform_center_y": 570,
+                "longform_zoom": 2,
+            },
+            (565, 480, 284, 324, 404),
+        ),
+        (
+            (3840, 2160),
+            {
+                "longform_center_x": 2390,
+                "longform_center_y": 1157,
+                "longform_zoom": 1.2,
+            },
+            (2390, 1600, 948, 1590, 604),
+        ),
+        (
+            (1920, 1080),
+            {
+                "longform_center_x": 948,
+                "longform_center_y": 330,
+                "longform_zoom": 1.4,
+            },
+            (948, 684, 404, 606, 94),
+        ),
+    ),
+)
+def test_background_panel_headroom_preserves_real_pilot_face_regions(
+    tmp_episode_dir, sample_config, source_size, speaker, expected
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    width, height = source_size
+
+    assert (
+        agent._get_background_panel_region(
+            "speaker_0", width, height, {"speakers": [speaker]}
+        )
+        == expected
+    )
+
+
+def test_background_panel_headroom_clamps_at_source_top(tmp_episode_dir, sample_config):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {
+                "longform_center_x": 160,
+                "longform_center_y": 20,
+                "longform_zoom": 1,
+            }
+        ]
+    }
+
+    assert (
+        agent._get_background_panel_region("speaker_0", 320, 180, crop_config)[-1] == 0
     )
 
 
