@@ -182,6 +182,30 @@ This produces `links/index.html` — a single-file, dark-themed page with your p
 
 Supported platforms: Spotify, Apple Podcasts, YouTube, Instagram, X, TikTok, iHeartRadio, GitHub. Empty URLs are automatically excluded.
 
+To prepare revision-bound landing pages for each episode, write a reviewable site to
+a separate directory. An optional Apple catalog supplies exact Apple episode URLs;
+otherwise the page labels the configured Apple show URL as a show-level fallback.
+
+```bash
+.venv/bin/python -m links.episode_hub prepare \
+  --episodes-root /path/to/cascade/episodes \
+  --output-dir /tmp/cascade-watch-site \
+  --apple-catalog /path/to/apple-current-video-catalog.json
+```
+
+The prepared manifest binds every HTML file by size and SHA-256. After review, upload
+those exact bytes to the configured R2 bucket; episode pages are uploaded before the
+branded `links/index.html` entry point.
+
+```bash
+.venv/bin/python -m links.episode_hub upload \
+  --site-dir /tmp/cascade-watch-site
+```
+
+The API exposes the same current link resolution at
+`GET /api/episodes/{episode_id}/watch-links` and an HTML preview at
+`GET /api/episodes/{episode_id}/watch-page`.
+
 ## API Costs per Episode
 
 | Service | Cost |
