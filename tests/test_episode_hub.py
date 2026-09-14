@@ -105,8 +105,12 @@ def test_prepare_builds_branded_index_and_exact_apple_page(tmp_path, monkeypatch
     assert manifest["episode_count"] == 1
     assert manifest["episodes"][0]["episode_id"] == "ep_001"
     assert manifest["episodes"][0]["destinations"][-1]["scope"] == "episode"
+    legacy = (output / "index.html").read_text()
     index = (output / "links" / "index.html").read_text()
     page = (output / "links" / "episodes" / "ep_001.html").read_text()
+    assert 'rel="canonical" href="https://public.example/links/index.html"' in legacy
+    assert 'content="0; url=https://public.example/links/index.html"' in legacy
+    assert "Open the full episode hub" in legacy
     assert "Local" in index
     assert "First &lt;Episode&gt;" in index
     assert "ep_002" not in index
@@ -121,13 +125,15 @@ def test_prepare_builds_branded_index_and_exact_apple_page(tmp_path, monkeypatch
         assert item["sha256"] == hashlib.sha256(content).hexdigest()
 
 
-def test_upload_verifies_every_file_then_replaces_index_last(tmp_path, monkeypatch):
+def test_upload_verifies_every_file_then_replaces_indexes_last(tmp_path, monkeypatch):
     site = tmp_path / "site"
     episode_path = site / "links" / "episodes" / "ep_001.html"
     index_path = site / "links" / "index.html"
+    legacy_path = site / "index.html"
     episode_path.parent.mkdir(parents=True)
     episode_path.write_bytes(b"episode")
     index_path.write_bytes(b"index")
+    legacy_path.write_bytes(b"legacy")
 
     def entry(path: Path) -> dict:
         content = path.read_bytes()
@@ -141,7 +147,7 @@ def test_upload_verifies_every_file_then_replaces_index_last(tmp_path, monkeypat
         json.dumps(
             {
                 "schema": episode_hub.SITE_MANIFEST_SCHEMA,
-                "files": [entry(index_path), entry(episode_path)],
+                "files": [entry(legacy_path), entry(index_path), entry(episode_path)],
             }
         )
     )
@@ -155,13 +161,20 @@ def test_upload_verifies_every_file_then_replaces_index_last(tmp_path, monkeypat
     assert uploaded == [
         "https://public.example/links/episodes/ep_001.html",
         "https://public.example/links/index.html",
+        "https://public.example/index.html",
     ]
-    assert put.call_count == 2
+    assert put.call_count == 3
     assert put.call_args_list[0].kwargs["content"] == b"episode"
     assert put.call_args_list[1].kwargs["content"] == b"index"
+    assert put.call_args_list[2].kwargs["content"] == b"legacy"
+    assert all(
+        call.kwargs["headers"]["Cache-Control"]
+        == "no-cache, max-age=0, must-revalidate"
+        for call in put.call_args_list
+    )
 
 
-@pytest.mark.parametrize("damage", ["bytes", "duplicate", "escape"])
+@pytest.mark.parametrize("damage", ["bytes", "duplicate", "escape", "missing_legacy"])
 def test_upload_rejects_unreviewed_or_unsafe_manifest_without_network(
     tmp_path, monkeypatch, damage
 ):
@@ -171,8 +184,10 @@ def test_upload_rejects_unreviewed_or_unsafe_manifest_without_network(
     pages.mkdir(parents=True)
     index = links / "index.html"
     page = pages / "ep.html"
+    legacy = site / "index.html"
     index.write_bytes(b"index")
     page.write_bytes(b"episode")
+    legacy.write_bytes(b"legacy")
 
     def entry(relative: str, content: bytes) -> dict:
         return {
@@ -182,6 +197,7 @@ def test_upload_rejects_unreviewed_or_unsafe_manifest_without_network(
         }
 
     files = [
+        entry("index.html", b"legacy"),
         entry("links/index.html", b"index"),
         entry("links/episodes/ep.html", b"episode"),
     ]
@@ -189,11 +205,13 @@ def test_upload_rejects_unreviewed_or_unsafe_manifest_without_network(
         page.write_bytes(b"changed")
     elif damage == "duplicate":
         files.append(files[-1].copy())
-    else:
+    elif damage == "escape":
         outside = tmp_path / "outside.html"
         outside.write_bytes(b"outside")
         page.unlink()
         page.symlink_to(outside)
+    else:
+        files.pop(0)
     (site / "manifest.json").write_text(
         json.dumps({"schema": episode_hub.SITE_MANIFEST_SCHEMA, "files": files})
     )

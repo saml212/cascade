@@ -251,6 +251,18 @@ def render_index(
     )
 
 
+def render_legacy_root_redirect(config: dict) -> str:
+    """Keep legacy /index.html links useful after the hub moved under /links."""
+    identity = _site_identity(config)
+    target = f"{identity['public_url']}/links/index.html"
+    escaped_target = html.escape(target, quote=True)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="0; url={escaped_target}"><meta name="robots" content="noindex">
+<link rel="canonical" href="{escaped_target}"><title>{html.escape(identity["name"])} — full episodes</title></head>
+<body><p><a href="{escaped_target}">Open the full episode hub</a></p></body></html>"""
+
+
 def prepare_site(
     episodes_root: Path,
     config: dict,
@@ -273,6 +285,7 @@ def prepare_site(
         raise ValueError("No current exact episode destinations are available")
 
     files: dict[str, bytes] = {
+        "index.html": render_legacy_root_redirect(config).encode(),
         "links/index.html": render_index(
             documents, config, apple_catalog=apple_catalog
         ).encode(),
@@ -330,13 +343,18 @@ def upload_prepared_site(site_dir: Path, config: dict) -> list[str]:
     seen: set[str] = set()
     for item in manifest_files:
         relative = item.get("path") if isinstance(item, dict) else None
-        if not isinstance(relative, str) or not relative.startswith("links/"):
+        if not isinstance(relative, str) or not (
+            relative == "index.html" or relative.startswith("links/")
+        ):
             raise ValueError("Prepared watch-site path is invalid")
         if relative in seen:
             raise ValueError(f"Prepared watch-site path is duplicated: {relative}")
         seen.add(relative)
         path = (site_dir / relative).resolve()
-        if links_root not in path.parents:
+        if relative == "index.html":
+            if path.parent != site_dir:
+                raise ValueError("Prepared watch-site path escapes its directory")
+        elif links_root not in path.parents:
             raise ValueError("Prepared watch-site path escapes its directory")
         content = path.read_bytes()
         if len(content) != item.get("size_bytes") or hashlib.sha256(
@@ -344,11 +362,17 @@ def upload_prepared_site(site_dir: Path, config: dict) -> list[str]:
         ).hexdigest() != item.get("sha256"):
             raise ValueError(f"Prepared watch-site file changed: {relative}")
         prepared.append((relative, content))
-    if "links/index.html" not in seen or not any(
-        value.startswith("links/episodes/") for value in seen
+    if (
+        "index.html" not in seen
+        or "links/index.html" not in seen
+        or not any(value.startswith("links/episodes/") for value in seen)
     ):
         raise ValueError("Prepared watch-site manifest is incomplete")
-    prepared.sort(key=lambda item: item[0] == "links/index.html")
+    prepared.sort(
+        key=lambda item: (
+            2 if item[0] == "index.html" else 1 if item[0] == "links/index.html" else 0
+        )
+    )
     uploaded = []
     for key, content in prepared:
         url = (
@@ -361,6 +385,7 @@ def upload_prepared_site(site_dir: Path, config: dict) -> list[str]:
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-cache, max-age=0, must-revalidate",
             },
             timeout=60.0,
         )
