@@ -23,7 +23,7 @@ from lib.editor import (
     add_trim_start,
     clear_edits,
     find_and_propose_cut,
-    list_edits,
+    load_edits,
     remove_edit,
     total_time_removed,
 )
@@ -97,7 +97,7 @@ def _prepare_terminal_trim_reuse(ep_dir: Path) -> bool:
 async def list_episode_edits(episode_id: str):
     """List the current edit list for an episode."""
     ep_dir = _ep_dir(episode_id)
-    edits = list_edits(ep_dir)
+    edits = load_edits(ep_dir)
     return {
         "episode_id": episode_id,
         "edits": edits,
@@ -133,7 +133,7 @@ async def add_edit(episode_id: str, req: AddEditRequest):
 
     return {
         "edit": edit,
-        "edits": list_edits(ep_dir),
+        "edits": load_edits(ep_dir),
         "longform_trim_reuse_prepared": trim_reuse_prepared,
     }
 
@@ -145,7 +145,7 @@ async def delete_edit(episode_id: str, index: int):
     removed = remove_edit(ep_dir, index)
     if removed is None:
         raise HTTPException(404, f"No edit at index {index}")
-    return {"removed": removed, "edits": list_edits(ep_dir)}
+    return {"removed": removed, "edits": load_edits(ep_dir)}
 
 
 @router.delete("")

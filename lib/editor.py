@@ -125,11 +125,6 @@ def clear_edits(episode_dir: Path) -> int:
     return n
 
 
-def list_edits(episode_dir: Path) -> list[dict]:
-    """Return the current edit list (alias for load_edits for clarity)."""
-    return load_edits(episode_dir)
-
-
 def total_time_removed(edits: list[dict]) -> float:
     """Sum of all cut durations (excluding trim_start/trim_end)."""
     return sum(
@@ -173,9 +168,9 @@ def find_and_propose_cut(
     User picks one and passes to add_cut() to commit.
     """
     from lib.transcript_search import (
+        expand_to_sentence,
         flatten_transcript,
         hybrid_search,
-        expand_to_sentence,
     )
 
     diarized = load_diarized(episode_dir)
