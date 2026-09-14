@@ -636,6 +636,19 @@ def mux_timeline_audio(
         return media
 
 
+def audio_remaster_provenance(current: dict, media: dict, policy: dict) -> dict:
+    """Build shared provenance for a packet-verified audio remaster."""
+    provenance = copy.deepcopy(current.get("provenance", {}))
+    provenance["audio_remaster"] = {
+        "method": "copy-video-remux-canonical-audio/v1",
+        "source_render_fingerprint": current["fingerprint"],
+        "video_reencoded": False,
+        "video_copy_verification": copy.deepcopy(media["video_copy_verification"]),
+        "policy": policy,
+    }
+    return provenance
+
+
 def validate_av_output(path: Path, expected_duration: float) -> dict:
     """Validate that a render has playable H.264 video and AAC audio in sync."""
     if not path.exists() or path.stat().st_size == 0:

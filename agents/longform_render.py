@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +14,7 @@ from lib.ass import CaptionStyle, generate_ass_from_diarized
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
 from lib.delivery_video import (
+    audio_remaster_provenance,
     build_render_segments,
     concat_video_segments,
     current_longform_render,
@@ -154,7 +154,6 @@ class LongformRenderAgent(BaseAgent):
             return self._remaster_current_audio(
                 episode,
                 audio,
-                segments,
                 timeline,
                 fingerprint,
                 caption_path,
@@ -284,7 +283,6 @@ class LongformRenderAgent(BaseAgent):
         self,
         episode: dict,
         audio: Path,
-        segments: list[dict],
         timeline: Timeline,
         fingerprint: str,
         caption_path: Path,
@@ -326,16 +324,7 @@ class LongformRenderAgent(BaseAgent):
                     segment_count=len(render_segments),
                     expected_duration_seconds=round(timeline.duration, 3),
                 )
-            provenance = copy.deepcopy(current.get("provenance", {}))
-            provenance["audio_remaster"] = {
-                "method": "copy-video-remux-canonical-audio/v1",
-                "source_render_fingerprint": current["fingerprint"],
-                "video_reencoded": False,
-                "video_copy_verification": copy.deepcopy(
-                    media["video_copy_verification"]
-                ),
-                "policy": policy,
-            }
+            provenance = audio_remaster_provenance(current, media, policy)
             self.report_progress(1, 2, "Recording verified audio repair")
             record = record_longform_render(
                 self.episode_dir,

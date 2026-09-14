@@ -16,6 +16,7 @@ from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
 from lib.delivery_video import (
     audio_packet_signature,
+    audio_remaster_provenance,
     build_render_segments,
     concat_video_segments,
     current_short_render,
@@ -442,16 +443,7 @@ class ShortsRenderAgent(BaseAgent):
             )
             if "audio_loudness" not in media:
                 raise RuntimeError("Repaired short has no verified audio loudness")
-            provenance = copy.deepcopy(current.get("provenance", {}))
-            provenance["audio_remaster"] = {
-                "method": "copy-video-remux-canonical-audio/v1",
-                "source_render_fingerprint": current["fingerprint"],
-                "video_reencoded": False,
-                "video_copy_verification": copy.deepcopy(
-                    media["video_copy_verification"]
-                ),
-                "policy": policy,
-            }
+            provenance = audio_remaster_provenance(current, media, policy)
             record = record_short_render(
                 self.episode_dir,
                 clip_id,
