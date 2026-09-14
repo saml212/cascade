@@ -6,6 +6,7 @@ receipts; the calendar lock serializes Cascade publishers on this filesystem.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -23,6 +24,10 @@ from agents.qa import (
     release_metadata_issues,
 )
 from lib.delivery_video import render_output_lock
+from lib.short_variants import (
+    DISTRIBUTION_RELEASE_FIELD,
+    distribution_release_revision,
+)
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 SCHEDULE_URL = "https://api.upload-post.com/api/uploadposts/schedule"
@@ -33,6 +38,20 @@ RECORDED_STATES = {
     "partial_failure",
     "unknown",
 }
+TERMINAL_DESTINATION_STATES = {"published", "failed", "cancelled"}
+_UNRESOLVED_PROVIDER_STATE_MARKERS = (
+    "queue",
+    "pending",
+    "process",
+    "progress",
+    "retry",
+    "inbox",
+    "schedule",
+    "submit",
+    "unknown",
+    "wait",
+    "upload",
+)
 SLOT_HOURS = {"morning": 9, "afternoon": 14, "evening": 18}
 
 
@@ -45,6 +64,436 @@ def publication_lock(episodes_dir):
             yield
         finally:
             fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+
+
+def receipt_key(receipt: dict) -> tuple[str, str] | None:
+    for field in ("external_id", "idempotency_key", "request_id", "job_id"):
+        value = receipt.get(field) if isinstance(receipt, dict) else None
+        if isinstance(value, str) and value:
+            return field, value
+    return None
+
+
+def validated_short_receipts(publish: dict) -> list[dict]:
+    receipts = publish.get("shorts", [])
+    if not isinstance(receipts, list) or any(
+        not isinstance(receipt, dict)
+        or not isinstance(receipt.get("clip_id"), str)
+        or not receipt["clip_id"]
+        or receipt.get("status") not in RECORDED_STATES | {"failed"}
+        for receipt in receipts
+    ):
+        raise ValueError("Publication receipt history cannot be verified")
+    return receipts
+
+
+def _provider_identity(receipt: dict) -> dict[str, str]:
+    values = {
+        "job_id": receipt.get("job_id"),
+        "request_id": receipt.get("server_request_id") or receipt.get("request_id"),
+        "external_id": receipt.get("external_id"),
+    }
+    return {
+        field: value
+        for field, value in values.items()
+        if isinstance(value, str) and value
+    }
+
+
+def _identity_evidence(expected: dict[str, str], observed: object) -> tuple[bool, bool]:
+    """Return (matched, conflicting) for same-field provider identifiers."""
+    if not isinstance(observed, dict):
+        return False, False
+    matched = False
+    conflicting = False
+    for field, expected_value in expected.items():
+        observed_value = observed.get(field)
+        if not isinstance(observed_value, str) or not observed_value:
+            continue
+        if observed_value == expected_value:
+            matched = True
+        else:
+            conflicting = True
+    return matched, conflicting
+
+
+def status_identity_conflicts(
+    receipt: dict,
+    response: object,
+    *,
+    profile_username: str | None = None,
+) -> bool:
+    """Reject contradictory IDs from a receipt-specific status response."""
+    identity = _provider_identity(receipt)
+    if not identity or not isinstance(response, dict):
+        return False
+    values = response.get("results")
+    items = list(values.values()) if isinstance(values, dict) else values
+    observed = [response]
+    if isinstance(items, list):
+        observed.extend(item for item in items if isinstance(item, dict))
+    top_matches, _ = _identity_evidence(identity, response)
+    for index, item in enumerate(observed):
+        matches, conflicting = _identity_evidence(identity, item)
+        if conflicting:
+            return True
+        if not profile_username or not (matches or (index > 0 and top_matches)):
+            continue
+        observed_profile = item.get("profile_username")
+        if (index > 0 or observed_profile is not None) and (
+            observed_profile != profile_username
+        ):
+            return True
+    return False
+
+
+def validated_terminal_destinations(
+    platforms: object, destinations: object
+) -> dict[str, dict] | None:
+    """Validate the one canonical saved terminal-destination shape."""
+    if (
+        not isinstance(platforms, list)
+        or not platforms
+        or any(not isinstance(platform, str) or not platform for platform in platforms)
+        or len(set(platforms)) != len(platforms)
+        or not isinstance(destinations, dict)
+        or set(destinations) != set(platforms)
+    ):
+        return None
+    for value in destinations.values():
+        if not isinstance(value, dict):
+            return None
+        state = value.get("state")
+        url = value.get("url")
+        if state == "published":
+            if not (isinstance(url, str) and url.startswith(("http://", "https://"))):
+                return None
+        elif state in TERMINAL_DESTINATION_STATES - {"published"}:
+            if url not in (None, ""):
+                return None
+        else:
+            return None
+    return destinations
+
+
+def _provider_result_has_unresolved_work(value: dict) -> bool:
+    provider_state = str(value.get("status") or value.get("state") or "").lower()
+    return (
+        any(marker in provider_state for marker in _UNRESOLVED_PROVIDER_STATE_MARKERS)
+        or value.get("fallback_to_inbox") is True
+        or value.get("retryable") is True
+        or value.get("is_retryable") is True
+    )
+
+
+def status_response_has_unresolved_work(response: object) -> bool:
+    """Deny history fallback while exact provider status remains uncertain."""
+    if not isinstance(response, dict) or not response:
+        return True
+    results = response.get("results")
+    items = list(results.values()) if isinstance(results, dict) else results
+    evidence = [response]
+    if isinstance(items, list):
+        evidence.extend(item for item in items if isinstance(item, dict))
+    return any(_provider_result_has_unresolved_work(item) for item in evidence)
+
+
+def receipt_terminal_destinations(
+    receipt: dict, *, profile_username: str | None = None
+) -> dict[str, dict] | None:
+    """Return per-destination terminal proof from a saved provider result."""
+    platforms = receipt.get("platforms")
+    recorded = receipt.get("terminal_destinations")
+    if recorded is not None:
+        recorded = validated_terminal_destinations(platforms, recorded)
+        if recorded is None:
+            return None
+        history = receipt.get("status_history")
+        if (
+            isinstance(history, list)
+            and history
+            and isinstance(history[-1], dict)
+            and history[-1].get("terminal_destinations") == recorded
+            and (
+                not profile_username
+                or history[-1].get("profile_username") == profile_username
+            )
+            and history[-1].get("evidence_source") in {"status", "history"}
+        ):
+            return recorded
+        return None
+
+    response = receipt.get("response")
+    return terminal_destinations_from_status(
+        receipt, response, profile_username=profile_username
+    )
+
+
+def terminal_destinations_from_status(
+    receipt: dict,
+    response: object,
+    *,
+    profile_username: str | None = None,
+) -> dict[str, dict] | None:
+    """Accept only exact, public-or-failed results for every destination."""
+    platforms = receipt.get("platforms")
+    if (
+        not isinstance(platforms, list)
+        or not platforms
+        or any(not isinstance(platform, str) or not platform for platform in platforms)
+        or len(set(platforms)) != len(platforms)
+    ):
+        return None
+    expected = set(platforms)
+    if not isinstance(response, dict):
+        return None
+    if status_response_has_unresolved_work(response):
+        return None
+    identity = _provider_identity(receipt)
+    results = response.get("results")
+    items: list[tuple[str, dict]] = []
+    if isinstance(results, dict):
+        if any(not isinstance(value, dict) for value in results.values()):
+            return None
+        items = [
+            (str(platform), value)
+            for platform, value in results.items()
+            if isinstance(value, dict)
+        ]
+    elif isinstance(results, list) and response.get("status") in {
+        "completed",
+        "failed",
+        "cancelled",
+    }:
+        if any(not isinstance(value, dict) for value in results):
+            return None
+        total = response.get("total")
+        completed = response.get("completed")
+        if total is not None and (not isinstance(total, int) or total != len(expected)):
+            return None
+        if completed is not None and (
+            not isinstance(completed, int) or completed != total
+        ):
+            return None
+        items = [
+            (str(value.get("platform", "")), value)
+            for value in results
+            if isinstance(value, dict)
+        ]
+    response_matches, response_conflicts = _identity_evidence(identity, response)
+    if not identity or response_conflicts:
+        return None
+    evidence = {}
+    for platform, value in items:
+        item_matches, item_conflicts = _identity_evidence(identity, value)
+        if (
+            not platform
+            or platform in evidence
+            or not isinstance(value.get("success"), bool)
+            or (profile_username and value.get("profile_username") != profile_username)
+            or item_conflicts
+            or (not response_matches and not item_matches)
+        ):
+            return None
+        provider_state = str(value.get("status") or value.get("state") or "").lower()
+        post_url = next(
+            (
+                value.get(field)
+                for field in ("post_url", "video_url", "url")
+                if isinstance(value.get(field), str) and value[field]
+            ),
+            None,
+        )
+        if value["success"] is True and not (
+            isinstance(post_url, str) and post_url.startswith(("http://", "https://"))
+        ):
+            return None
+        if (
+            value["success"] is True
+            and any(
+                marker in provider_state
+                for marker in ("fail", "cancel", "error", "skip")
+            )
+        ) or (
+            value["success"] is False
+            and (
+                post_url is not None
+                or any(
+                    marker in provider_state
+                    for marker in ("publish", "success", "live", "complete")
+                )
+            )
+        ):
+            return None
+        evidence[platform] = {
+            "state": (
+                "published"
+                if value["success"]
+                else "cancelled"
+                if "cancel" in provider_state
+                else "failed"
+            ),
+            **({"url": post_url} if isinstance(post_url, str) and post_url else {}),
+        }
+    return validated_terminal_destinations(platforms, evidence)
+
+
+def terminal_destinations_from_history(
+    receipt: dict,
+    response: object,
+    *,
+    profile_username: str | None = None,
+) -> dict[str, dict] | None:
+    """Extract exact receipt results from Upload-Post's broader history response."""
+    if not isinstance(response, dict):
+        return None
+    identity = _provider_identity(receipt)
+    if not identity:
+        return None
+
+    in_progress = response.get("in_progress", [])
+    if not isinstance(in_progress, list) or any(
+        not isinstance(item, dict) for item in in_progress
+    ):
+        return None
+    if any(_identity_evidence(identity, item)[0] for item in in_progress):
+        return None
+    history = response.get("history", [])
+    if not isinstance(history, list) or any(
+        not isinstance(item, dict) for item in history
+    ):
+        return None
+    identity_states = [
+        (_identity_evidence(identity, item), item) for item in [*in_progress, *history]
+    ]
+    if any(
+        (matched and conflicting)
+        or (
+            matched
+            and profile_username
+            and item.get("profile_username") != profile_username
+        )
+        for (matched, conflicting), item in identity_states
+    ):
+        return None
+    matched = [
+        item for item in history if _identity_evidence(identity, item) == (True, False)
+    ]
+    return terminal_destinations_from_status(
+        receipt,
+        {"status": "completed", "results": matched},
+        profile_username=profile_username,
+    )
+
+
+def short_receipt_history_revision(
+    publish: dict, clip_id: str, *, exclude_request_id: str | None = None
+) -> str:
+    receipts = [
+        {
+            key: value
+            for key, value in receipt.items()
+            if key not in {"historical_receipt", "reused_receipt"}
+        }
+        for receipt in validated_short_receipts(publish)
+        if receipt["clip_id"] == clip_id
+        and (
+            exclude_request_id is None
+            or receipt.get("rerelease_request_id") != exclude_request_id
+        )
+    ]
+    encoded = json.dumps(receipts, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def short_rerelease_state(
+    publish: dict, clip_id: str, *, profile_username: str | None = None
+) -> dict:
+    """Describe whether immutable receipt history permits a new release."""
+    try:
+        receipts = [
+            receipt
+            for receipt in validated_short_receipts(publish)
+            if receipt["clip_id"] == clip_id
+        ]
+    except ValueError as exc:
+        return {"allowed": False, "reason": str(exc), "history_revision": None}
+    if not receipts:
+        return {
+            "allowed": False,
+            "reason": "No prior remote submission requires a re-release.",
+            "history_revision": short_receipt_history_revision(publish, clip_id),
+        }
+    for receipt in receipts:
+        evidence = receipt_terminal_destinations(
+            receipt, profile_username=profile_username
+        )
+        if evidence is None:
+            key = receipt_key(receipt)
+            label = key[1] if key else receipt.get("status", "unknown")
+            return {
+                "allowed": False,
+                "reason": (
+                    f"Receipt {label} has unresolved remote destinations. "
+                    "Refresh Upload-Post status before preparing a re-release."
+                ),
+                "history_revision": short_receipt_history_revision(publish, clip_id),
+            }
+    return {
+        "allowed": True,
+        "reason": None,
+        "history_revision": short_receipt_history_revision(publish, clip_id),
+        "receipt_count": len(receipts),
+    }
+
+
+def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> bool:
+    authorization = clip.get(DISTRIBUTION_RELEASE_FIELD)
+    if not isinstance(authorization, dict):
+        return False
+    required = (
+        "request_id",
+        "actor",
+        "reason",
+        "target_revision",
+        "render_fingerprint",
+        "receipt_history_revision",
+        "revision",
+        "created_at",
+    )
+    if any(
+        not isinstance(authorization.get(field), str) or not authorization[field]
+        for field in required
+    ):
+        return False
+    if (
+        "variant_id" not in authorization
+        or authorization.get("variant_id") != version.get("variant_id")
+        or authorization["target_revision"] != version.get("revision")
+        or authorization["render_fingerprint"] != version.get("render_fingerprint")
+    ):
+        return False
+    try:
+        history_revision = short_receipt_history_revision(
+            publish,
+            str(clip.get("id", "")),
+            exclude_request_id=authorization["request_id"],
+        )
+    except ValueError:
+        return False
+    expected = distribution_release_revision(
+        request_id=authorization["request_id"],
+        actor=authorization["actor"],
+        reason=authorization["reason"],
+        variant_id=authorization.get("variant_id"),
+        target_revision=authorization["target_revision"],
+        render_fingerprint=authorization["render_fingerprint"],
+        receipt_history_revision=history_revision,
+    )
+    return (
+        authorization["receipt_history_revision"] == history_revision
+        and authorization["revision"] == expected
+    )
 
 
 def _build_first_comment(youtube_url, spotify_url="", channel_handle=""):
@@ -405,9 +854,7 @@ class PublishAgent(BaseAgent):
             recorded_for_clip = [
                 item
                 for item in previous
-                if isinstance(item, dict)
-                and str(item.get("clip_id", "")) == clip_id
-                and item.get("status") in RECORDED_STATES
+                if isinstance(item, dict) and str(item.get("clip_id", "")) == clip_id
             ]
             receipt = next(
                 (
@@ -417,10 +864,17 @@ class PublishAgent(BaseAgent):
                 ),
                 None,
             )
-            if receipt is None and recorded_for_clip:
+            if (
+                receipt is None
+                and recorded_for_clip
+                and not valid_rerelease_authorization(
+                    {"shorts": previous}, clip, version
+                )
+            ):
                 raise RuntimeError(
                     f"A historical publication receipt exists for {clip_id}; "
-                    "create an explicit re-release identity before submitting it again"
+                    "prepare an explicit re-release identity before submitting "
+                    "it again"
                 )
             if receipt and not self._receipt_matches_version(receipt, version):
                 raise RuntimeError(
@@ -577,22 +1031,21 @@ class PublishAgent(BaseAgent):
             "render_fingerprint": version.get("render_fingerprint"),
             "approval_revision": version.get("revision"),
         }
-        return all(receipt.get(key) == value for key, value in expected.items())
+        if not all(receipt.get(key) == value for key, value in expected.items()):
+            return False
+        request = version.get("re_release_request")
+        if isinstance(request, dict):
+            return receipt.get("rerelease_request_id") == request.get("request_id")
+        return receipt.get("rerelease_request_id") is None
 
     @staticmethod
     def _validated_previous_shorts(previous: dict) -> list[dict]:
-        receipts = previous.get("shorts", [])
-        if not isinstance(receipts, list) or any(
-            not isinstance(receipt, dict)
-            or not isinstance(receipt.get("clip_id"), str)
-            or not receipt["clip_id"]
-            or receipt.get("status") not in RECORDED_STATES | {"failed"}
-            for receipt in receipts
-        ):
+        try:
+            return validated_short_receipts(previous)
+        except ValueError as exc:
             raise RuntimeError(
                 "Cannot inspect prior short publication receipts; nothing was submitted"
-            )
-        return receipts
+            ) from exc
 
     def _submit_short(
         self,
@@ -672,6 +1125,15 @@ class PublishAgent(BaseAgent):
             render_fingerprint=version["render_fingerprint"],
             approval_revision=version["revision"],
         )
+        request = version.get("re_release_request")
+        if isinstance(request, dict):
+            result.update(
+                rerelease_request_id=request.get("request_id"),
+                rerelease_actor=request.get("actor"),
+                rerelease_reason=request.get("reason"),
+                rerelease_authorization_revision=request.get("revision"),
+                parent_receipt_history_revision=request.get("receipt_history_revision"),
+            )
         if scheduled_at:
             result.update(
                 scheduled_date=scheduled_at.isoformat(),
@@ -973,6 +1435,15 @@ class PublishAgent(BaseAgent):
             "reused_receipt": True,
             "receipt_source": existing["source"],
         }
+        request = version.get("re_release_request")
+        if isinstance(request, dict):
+            receipt.update(
+                rerelease_request_id=request.get("request_id"),
+                rerelease_actor=request.get("actor"),
+                rerelease_reason=request.get("reason"),
+                rerelease_authorization_revision=request.get("revision"),
+                parent_receipt_history_revision=request.get("receipt_history_revision"),
+            )
         if existing.get("job_id"):
             receipt["job_id"] = existing["job_id"]
         return receipt
@@ -1105,11 +1576,7 @@ class PublishAgent(BaseAgent):
 
     @staticmethod
     def _receipt_key(receipt):
-        for field in ("external_id", "idempotency_key", "request_id", "job_id"):
-            value = receipt.get(field) if isinstance(receipt, dict) else None
-            if isinstance(value, str) and value:
-                return field, value
-        return None
+        return receipt_key(receipt)
 
     @classmethod
     def _merge_short_receipts(cls, current, previous):

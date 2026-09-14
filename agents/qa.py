@@ -50,6 +50,7 @@ from lib.ffprobe import file_fingerprint, get_audio_stream
 from lib.ffprobe import probe as ffprobe
 from lib.short_variants import (
     BASE_SHORT_VERSION,
+    DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
     background_variant_approval_state,
     background_variant_output,
@@ -598,6 +599,7 @@ def quality_revision(
         "approved_at",
         "approved_revision",
         "approved_render_fingerprint",
+        DISTRIBUTION_RELEASE_FIELD,
         DISTRIBUTION_VARIANT_FIELD,
     }
     quality_clips = [
@@ -678,6 +680,15 @@ def release_revision(
     short_versions = _selected_short_version_inputs(episode_dir, clips)
     if short_versions:
         payload["short_versions"] = short_versions
+    distribution_releases = {
+        str(clip.get("id")): clip.get(DISTRIBUTION_RELEASE_FIELD)
+        for clip in clips
+        if isinstance(clip, dict)
+        and clip.get("id")
+        and clip.get(DISTRIBUTION_RELEASE_FIELD) is not None
+    }
+    if distribution_releases:
+        payload["distribution_releases"] = distribution_releases
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -696,6 +707,7 @@ def clip_review_revision(
         "approved_at",
         "approved_revision",
         "approved_render_fingerprint",
+        DISTRIBUTION_RELEASE_FIELD,
         DISTRIBUTION_VARIANT_FIELD,
     }
     copy = {}
@@ -773,6 +785,9 @@ def short_distribution_state(
     """Resolve the selected short version and its independent approval."""
     episode_dir = Path(episode_dir)
     base_record = base_record if isinstance(base_record, dict) else {}
+    release_request = clip.get(DISTRIBUTION_RELEASE_FIELD)
+    if not isinstance(release_request, dict):
+        release_request = None
     base_revision = clip_review_revision(clip, base_record, metadata_entry)
     try:
         variant_id = selected_short_variant_id(clip)
@@ -786,6 +801,7 @@ def short_distribution_state(
             "revision": base_revision,
             "path": None,
             "render_fingerprint": None,
+            "re_release_request": release_request,
             "detail": str(exc).strip("'"),
         }
 
@@ -806,6 +822,7 @@ def short_distribution_state(
             "revision": base_revision,
             "path": f"shorts/{clip.get('id')}.mp4",
             "render_fingerprint": base_record.get("fingerprint"),
+            "re_release_request": release_request,
         }
 
     encoding = get_video_encoding_policy(
@@ -834,6 +851,7 @@ def short_distribution_state(
         ),
         "render_fingerprint": record.get("fingerprint"),
         "asset_id": asset.get("asset_id"),
+        "re_release_request": release_request,
         "detail": render.get("detail"),
     }
 

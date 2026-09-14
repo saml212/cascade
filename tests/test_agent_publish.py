@@ -797,6 +797,287 @@ class TestRejectedClips:
             assert "clip_1.mp4" not in " ".join(cmd)
 
 
+class TestReceiptTerminalEvidence:
+    @staticmethod
+    def _receipt():
+        return {
+            "clip_id": "clip_0",
+            "status": "submitted",
+            "job_id": "job-1",
+            "platforms": ["youtube", "x"],
+        }
+
+    @staticmethod
+    def _response():
+        return {
+            "status": "completed",
+            "job_id": "job-1",
+            "results": [
+                {
+                    "platform": "youtube",
+                    "success": True,
+                    "post_url": "https://youtu.be/current",
+                    "job_id": "job-1",
+                    "profile_username": "account-a",
+                },
+                {
+                    "platform": "x",
+                    "success": False,
+                    "job_id": "job-1",
+                    "profile_username": "account-a",
+                },
+            ],
+        }
+
+    def test_status_requires_exact_identity_profile_and_all_destinations(self):
+        from agents.publish import (
+            status_identity_conflicts,
+            terminal_destinations_from_status,
+        )
+
+        evidence = terminal_destinations_from_status(
+            self._receipt(), self._response(), profile_username="account-a"
+        )
+
+        assert evidence == {
+            "youtube": {
+                "state": "published",
+                "url": "https://youtu.be/current",
+            },
+            "x": {"state": "failed"},
+        }
+        wrong_identity = self._response()
+        wrong_identity.pop("job_id")
+        for item in wrong_identity["results"]:
+            item["job_id"] = "other-job"
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), wrong_identity, profile_username="account-a"
+            )
+            is None
+        )
+        wrong_profile = self._response()
+        wrong_profile["results"][1]["profile_username"] = "account-b"
+        assert status_identity_conflicts(
+            self._receipt(), wrong_profile, profile_username="account-a"
+        )
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), wrong_profile, profile_username="account-a"
+            )
+            is None
+        )
+        assert not status_identity_conflicts(
+            self._receipt(),
+            {"status": "processing", "job_id": "job-1"},
+            profile_username="account-a",
+        )
+        incomplete = self._response()
+        incomplete["results"].pop()
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), incomplete, profile_username="account-a"
+            )
+            is None
+        )
+        mixed_identity_receipt = {
+            **self._receipt(),
+            "request_id": "request-1",
+        }
+        mixed_identity = self._response()
+        mixed_identity["request_id"] = "request-1"
+        mixed_identity["job_id"] = "wrong-job"
+        for item in mixed_identity["results"]:
+            item["request_id"] = "request-1"
+            item["job_id"] = "wrong-job"
+        assert (
+            terminal_destinations_from_status(
+                mixed_identity_receipt,
+                mixed_identity,
+                profile_username="account-a",
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "change",
+        (
+            {"post_url": None},
+            {"status": "Queued"},
+            {"fallback_to_inbox": True},
+            {"status": "failed"},
+        ),
+    )
+    def test_nonpublic_success_is_not_terminal(self, change):
+        from agents.publish import terminal_destinations_from_status
+
+        response = self._response()
+        response["results"][0].update(change)
+
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), response, profile_username="account-a"
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("state", ("scheduled", "submitted", "unknown", "waiting"))
+    def test_unresolved_failure_state_is_not_definitive(self, state):
+        from agents.publish import terminal_destinations_from_status
+
+        response = self._response()
+        response["results"][1]["status"] = state
+
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), response, profile_username="account-a"
+            )
+            is None
+        )
+
+    def test_failure_with_public_url_is_not_definitive(self):
+        from agents.publish import terminal_destinations_from_status
+
+        response = self._response()
+        response["results"][1]["post_url"] = "https://x.com/account/status/1"
+
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), response, profile_username="account-a"
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "destinations",
+        (
+            {"youtube": {"state": "published"}},
+            {
+                "youtube": {
+                    "state": "failed",
+                    "url": "https://youtu.be/contradiction",
+                }
+            },
+        ),
+    )
+    def test_persisted_terminal_proof_uses_same_url_invariants(self, destinations):
+        from agents.publish import receipt_terminal_destinations
+
+        receipt = {
+            "clip_id": "clip_0",
+            "status": "published",
+            "request_id": "request-1",
+            "platforms": ["youtube"],
+            "terminal_destinations": destinations,
+            "status_history": [
+                {
+                    "profile_username": "account-a",
+                    "evidence_source": "status",
+                    "terminal_destinations": destinations,
+                }
+            ],
+        }
+
+        assert (
+            receipt_terminal_destinations(receipt, profile_username="account-a") is None
+        )
+
+    def test_history_filters_locally_and_exact_in_progress_blocks(self):
+        from agents.publish import terminal_destinations_from_history
+
+        exact = self._response()["results"]
+        unrelated = {
+            **exact[0],
+            "platform": "instagram",
+            "job_id": "other-job",
+        }
+        history = {"history": [unrelated, *exact], "in_progress": []}
+
+        assert (
+            terminal_destinations_from_history(
+                self._receipt(), history, profile_username="account-a"
+            )
+            is not None
+        )
+        history["in_progress"] = [
+            {
+                "job_id": "job-1",
+                "profile_username": "account-a",
+            }
+        ]
+        assert (
+            terminal_destinations_from_history(
+                self._receipt(), history, profile_username="account-a"
+            )
+            is None
+        )
+        for unverified_profile in (None, "account-b"):
+            history["in_progress"] = [
+                {
+                    "job_id": "job-1",
+                    **(
+                        {"profile_username": unverified_profile}
+                        if unverified_profile is not None
+                        else {}
+                    ),
+                }
+            ]
+            assert (
+                terminal_destinations_from_history(
+                    self._receipt(), history, profile_username="account-a"
+                )
+                is None
+            )
+
+        history["in_progress"] = []
+        history["history"][1].pop("profile_username")
+        assert (
+            terminal_destinations_from_history(
+                self._receipt(), history, profile_username="account-a"
+            )
+            is None
+        )
+
+    def test_authorization_requires_explicit_base_variant_identity(self):
+        from agents.publish import (
+            short_receipt_history_revision,
+            valid_rerelease_authorization,
+        )
+        from lib.short_variants import distribution_release_revision
+
+        publish = {"shorts": []}
+        authorization = {
+            "request_id": "323e4567-e89b-12d3-a456-426614174000",
+            "actor": "Sam",
+            "reason": "Re-release rebuilt Base clip",
+            "target_revision": "sha256:target",
+            "render_fingerprint": "sha256:render",
+            "receipt_history_revision": short_receipt_history_revision(
+                publish, "clip_0"
+            ),
+            "created_at": "2026-09-13T20:00:00+00:00",
+        }
+        authorization["revision"] = distribution_release_revision(
+            request_id=authorization["request_id"],
+            actor=authorization["actor"],
+            reason=authorization["reason"],
+            variant_id=None,
+            target_revision=authorization["target_revision"],
+            render_fingerprint=authorization["render_fingerprint"],
+            receipt_history_revision=authorization["receipt_history_revision"],
+        )
+
+        assert not valid_rerelease_authorization(
+            publish,
+            {"id": "clip_0", "distribution_release": authorization},
+            {
+                "variant_id": None,
+                "revision": "sha256:target",
+                "render_fingerprint": "sha256:render",
+            },
+        )
+
+
 class TestVersionedShorts:
     @staticmethod
     def _variant_snapshot(episode_dir, config):
@@ -1042,6 +1323,178 @@ class TestVersionedShorts:
             pytest.raises(RuntimeError, match="explicit re-release identity"),
         ):
             _make_agent(episode_dir).execute()
+        run.assert_not_called()
+
+    def test_explicit_rerelease_uses_new_identity_and_preserves_history(
+        self, env, episode_dir
+    ):
+        from agents.publish import short_receipt_history_revision
+        from agents.qa import quality_snapshot
+        from lib.short_variants import distribution_release_revision
+
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        old_receipt = {
+            "clip_id": "clip_0",
+            "status": "published",
+            "request_id": "old-request",
+            "platforms": ["youtube"],
+            "response": {
+                "status": "completed",
+                "request_id": "old-request",
+                "results": [
+                    {
+                        "platform": "youtube",
+                        "success": True,
+                        "post_url": "https://youtu.be/old-short",
+                        "request_id": "old-request",
+                    }
+                ],
+            },
+        }
+        publish = {"release_revision": "sha256:old-release", "shorts": [old_receipt]}
+        _write_json(episode_dir / "publish.json", publish)
+        clips_path = episode_dir / "clips.json"
+        clips = json.loads(clips_path.read_text())
+        clip = clips["clips"][0]
+        version = quality_snapshot(episode_dir, config=config)["release_gate"][
+            "short_versions"
+        ]["clip_0"]
+        request = {
+            "request_id": "47db1913-4d32-4acf-bcfe-31763c50e9c2",
+            "actor": "release-operator",
+            "reason": "Rebuilt episode with current media",
+            "variant_id": None,
+            "target_revision": version["revision"],
+            "render_fingerprint": version["render_fingerprint"],
+            "receipt_history_revision": short_receipt_history_revision(
+                publish, "clip_0"
+            ),
+            "created_at": "2026-01-01T00:02:00+00:00",
+        }
+        request["revision"] = distribution_release_revision(
+            request_id=request["request_id"],
+            actor=request["actor"],
+            reason=request["reason"],
+            variant_id=None,
+            target_revision=request["target_revision"],
+            render_fingerprint=request["render_fingerprint"],
+            receipt_history_revision=request["receipt_history_revision"],
+        )
+        clip["distribution_release"] = request
+        _write_json(clips_path, clips)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        current = quality_snapshot(episode_dir, config=config)["release_gate"]
+        episode["publish_approval"] = {
+            "revision": current["revision"],
+            "approved_at": "2026-01-01T00:03:00+00:00",
+        }
+        _write_json(episode_path, episode)
+        commands = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                commands.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "new-request"}))
+            )
+            agent = _make_agent(episode_dir, config)
+            first = agent.run()
+            second = agent.execute()
+
+        assert len(commands) == 1
+        current_receipt = next(
+            receipt
+            for receipt in first["shorts"]
+            if not receipt.get("historical_receipt")
+        )
+        assert current_receipt["rerelease_request_id"] == request["request_id"]
+        assert current_receipt["rerelease_actor"] == request["actor"]
+        assert current_receipt["rerelease_reason"] == request["reason"]
+        assert (
+            current_receipt["rerelease_authorization_revision"] == request["revision"]
+        )
+        assert current_receipt["external_id"] != old_receipt["request_id"]
+        assert any(
+            receipt.get("request_id") == "old-request"
+            and receipt.get("historical_receipt") is True
+            for receipt in first["shorts"]
+        )
+        assert second["shorts"][0]["reused_receipt"] is True
+
+    def test_changed_receipt_history_invalidates_prepared_rerelease(
+        self, env, episode_dir
+    ):
+        from agents.publish import short_receipt_history_revision
+        from agents.qa import quality_snapshot
+        from lib.short_variants import distribution_release_revision
+
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        publish = {
+            "shorts": [
+                {
+                    "clip_id": "clip_0",
+                    "status": "published",
+                    "request_id": "old-request",
+                    "platforms": ["youtube"],
+                    "response": {
+                        "status": "completed",
+                        "request_id": "old-request",
+                        "results": [
+                            {
+                                "platform": "youtube",
+                                "success": True,
+                                "post_url": "https://youtu.be/old",
+                                "request_id": "old-request",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        _write_json(episode_dir / "publish.json", publish)
+        clips_path = episode_dir / "clips.json"
+        clips = json.loads(clips_path.read_text())
+        version = quality_snapshot(episode_dir, config=config)["release_gate"][
+            "short_versions"
+        ]["clip_0"]
+        authorization = {
+            "request_id": "8e05ec16-3b85-4929-96ef-24d8e609576c",
+            "actor": "release-operator",
+            "reason": "Rebuilt episode with current media",
+            "variant_id": None,
+            "target_revision": version["revision"],
+            "render_fingerprint": version["render_fingerprint"],
+            "receipt_history_revision": short_receipt_history_revision(
+                publish, "clip_0"
+            ),
+            "created_at": "2026-01-01T00:02:00+00:00",
+        }
+        authorization["revision"] = distribution_release_revision(
+            **{
+                key: value
+                for key, value in authorization.items()
+                if key != "created_at"
+            }
+        )
+        clips["clips"][0]["distribution_release"] = authorization
+        _write_json(clips_path, clips)
+        publish["shorts"][0]["status_history"] = [{"status": "published"}]
+        _write_json(episode_dir / "publish.json", publish)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        gate = quality_snapshot(episode_dir, config=config)["release_gate"]
+        episode["publish_approval"] = {
+            "revision": gate["revision"],
+            "approved_at": "2026-01-01T00:03:00+00:00",
+        }
+        _write_json(episode_path, episode)
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="explicit re-release identity"),
+        ):
+            _make_agent(episode_dir, config).execute()
         run.assert_not_called()
 
     @pytest.mark.parametrize(

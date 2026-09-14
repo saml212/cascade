@@ -14,6 +14,20 @@ def _write_clips(episode_dir, clips):
     (episode_dir / "clips.json").write_text(json.dumps({"clips": clips}))
 
 
+def _release_request():
+    return {
+        "request_id": "47db1913-4d32-4acf-bcfe-31763c50e9c2",
+        "actor": "release-operator",
+        "reason": "Rebuilt episode with current media",
+        "variant_id": "background_motion_v1",
+        "target_revision": "sha256:target",
+        "render_fingerprint": "sha256:render",
+        "receipt_history_revision": "sha256:history",
+        "revision": "sha256:authorization",
+        "created_at": "2026-09-13T20:00:00+00:00",
+    }
+
+
 def _record(path, fingerprint, mode):
     stat = path.stat()
     return {
@@ -389,8 +403,12 @@ def test_review_exposes_background_variant_as_separate_media(test_client, monkey
         "current": True,
         "approval_current": False,
         "revision": variant["approval"]["revision"],
+        "re_release_request": None,
         "change_locked": False,
         "change_lock_reason": None,
+        "re_release_allowed": False,
+        "re_release_reason": "No prior remote submission requires a re-release.",
+        "re_release_request_consumed": None,
     }
 
     (episode_dir / "publish.json").write_text(
@@ -401,6 +419,26 @@ def test_review_exposes_background_variant_as_separate_media(test_client, monkey
     ]
     assert locked["change_locked"] is True
     assert "explicit re-release identity" in locked["change_lock_reason"]
+
+    clip["distribution_release"] = None
+    _write_clips(episode_dir, [clip])
+    malformed = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"][
+        "distribution"
+    ]
+    assert malformed["re_release_request"] is None
+    assert malformed["re_release_allowed"] is False
+    assert "cannot be verified" in malformed["change_lock_reason"]
+
+    (episode_dir / "publish.json").unlink()
+    clip["distribution_release"] = _release_request()
+    _write_clips(episode_dir, [clip])
+    missing_history = client.get("/api/episodes/ep_001/review").json()["clips"][0][
+        "review"
+    ]["distribution"]
+    assert missing_history["re_release_request"] == clip["distribution_release"]
+    assert missing_history["change_locked"] is True
+    assert missing_history["re_release_allowed"] is False
+    assert "cannot be verified" in missing_history["change_lock_reason"]
 
     variant_record["asset"]["asset_id"] = []
     fallback = client.get("/api/episodes/ep_001/review").json()["clips"][0]["review"]

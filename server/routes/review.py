@@ -52,6 +52,7 @@ from lib.paths import get_episodes_dir
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     DEFAULT_BACKGROUND_ASSET_ID,
+    DISTRIBUTION_RELEASE_FIELD,
     background_variant_approval_state,
     background_variant_state,
     require_background_variant,
@@ -831,7 +832,15 @@ def episode_review_state(episode_dir: Path) -> dict:
         variant_approval = background_variant_approval_state(
             variant_record, variant_render, variant_revision
         )
-        change_lock = publication_change_lock(episode_dir, clip_id)
+        raw_release_request = clip.get(DISTRIBUTION_RELEASE_FIELD)
+        release_request = (
+            raw_release_request if isinstance(raw_release_request, dict) else None
+        )
+        change_lock = (
+            publication_change_lock(episode_dir, clip_id, raw_release_request)
+            if DISTRIBUTION_RELEASE_FIELD in clip
+            else publication_change_lock(episode_dir, clip_id)
+        )
         try:
             selected_variant_id = selected_short_variant_id(clip)
         except KeyError:
@@ -842,6 +851,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "current": False,
                 "approval_current": False,
                 "revision": base_approval["revision"],
+                "re_release_request": release_request,
                 **change_lock,
             }
         else:
@@ -856,6 +866,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "current": selected_render["current"],
                 "approval_current": selected_approval["current"],
                 "revision": selected_approval["revision"],
+                "re_release_request": release_request,
                 **change_lock,
             }
         reviewed_clips.append(

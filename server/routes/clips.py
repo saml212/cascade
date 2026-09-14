@@ -4,13 +4,15 @@ import asyncio
 import json
 import logging
 import math
+import os
 import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from lib.atomic_write import atomic_write_json
 from lib.clips import (
@@ -25,10 +27,13 @@ from lib.clips import (
 from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
+    BACKGROUND_VARIANT_ID,
     DEFAULT_BACKGROUND_ASSET_ID,
+    DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
     background_variant_output,
     background_variant_state,
+    distribution_release_revision,
     require_background_variant,
     save_background_variant_approval,
     selected_short_variant_id,
@@ -86,6 +91,12 @@ class VariantApprovalRequest(BaseModel):
 class DistributionSelectionRequest(BaseModel):
     variant_id: str | None = None
     expected_revision: str
+
+
+class ReReleaseRequest(DistributionSelectionRequest):
+    request_id: UUID
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=3, max_length=500)
 
 
 def _finite_number(name: str, value: float) -> float:
@@ -287,54 +298,111 @@ def _metadata_entry(ep_dir: Path, clip_id: str) -> dict | None:
     return None
 
 
-def publication_change_lock(ep_dir: Path, clip_id: str) -> dict:
+_RELEASE_REQUEST_STRING_FIELDS = (
+    "request_id",
+    "actor",
+    "reason",
+    "target_revision",
+    "render_fingerprint",
+    "receipt_history_revision",
+    "revision",
+    "created_at",
+)
+
+
+def _valid_release_request(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and all(
+            isinstance(value.get(field), str) and bool(value[field])
+            for field in _RELEASE_REQUEST_STRING_FIELDS
+        )
+        and "variant_id" in value
+        and value["variant_id"] in {None, BACKGROUND_VARIANT_ID}
+    )
+
+
+def publication_change_lock(
+    ep_dir: Path,
+    clip_id: str,
+    release_request: object = Ellipsis,
+) -> dict:
     """Return whether prior remote work locks this clip's selected version."""
+    from agents.publish import short_rerelease_state, validated_short_receipts
+
     unverifiable = {
         "change_locked": True,
         "change_lock_reason": (
             "Publication receipt history cannot be verified. Repair it before "
             "changing this clip's distribution version."
         ),
+        "re_release_allowed": False,
+        "re_release_reason": "Publication receipt history cannot be verified.",
+        "re_release_request_consumed": None,
     }
+    has_release_request = release_request is not Ellipsis
+    if has_release_request and not _valid_release_request(release_request):
+        return unverifiable
+    request_id = release_request["request_id"] if has_release_request else None
     try:
         publish = json.loads((ep_dir / "publish.json").read_text())
     except FileNotFoundError:
-        return {"change_locked": False, "change_lock_reason": None}
+        if has_release_request:
+            return unverifiable
+        return {
+            "change_locked": False,
+            "change_lock_reason": None,
+            "re_release_allowed": False,
+            "re_release_reason": "No prior remote submission requires a re-release.",
+            "re_release_request_consumed": None,
+        }
     except (json.JSONDecodeError, OSError):
         return unverifiable
-    if not isinstance(publish, dict) or not isinstance(publish.get("shorts", []), list):
+    if not isinstance(publish, dict):
         return unverifiable
-    receipts = publish.get("shorts", [])
-    if any(not isinstance(receipt, dict) for receipt in receipts):
+    try:
+        receipts = validated_short_receipts(publish)
+    except ValueError:
         return unverifiable
-    recorded_states = {
-        "submitted",
-        "published",
-        "already_submitted",
-        "partial_failure",
-        "unknown",
+    profile_username = publish.get("profile_username") or os.getenv(
+        "UPLOAD_POST_USER", ""
+    )
+    rerelease = short_rerelease_state(
+        publish,
+        clip_id,
+        profile_username=profile_username
+        if isinstance(profile_username, str)
+        else None,
+    )
+    locked = any(receipt["clip_id"] == clip_id for receipt in receipts)
+    if has_release_request and not locked:
+        return unverifiable
+    request_consumed = (
+        any(
+            receipt["clip_id"] == clip_id
+            and receipt.get("rerelease_request_id") == request_id
+            for receipt in receipts
+        )
+        if request_id
+        else None
+    )
+    return {
+        "change_locked": locked,
+        "change_lock_reason": (
+            "A historical or current publication receipt exists for this clip. "
+            "Prepare an explicit re-release identity before changing its "
+            "distribution version."
+            if locked
+            else None
+        ),
+        "re_release_allowed": rerelease["allowed"] if locked else False,
+        "re_release_reason": (
+            rerelease["reason"]
+            if locked
+            else "No prior remote submission requires a re-release."
+        ),
+        "re_release_request_consumed": request_consumed,
     }
-    for receipt in receipts:
-        receipt_clip_id = receipt.get("clip_id")
-        if not isinstance(receipt_clip_id, str) or not receipt_clip_id:
-            return unverifiable
-        if receipt_clip_id != clip_id:
-            continue
-        status = receipt.get("status")
-        if not isinstance(status, str):
-            return unverifiable
-        if status in recorded_states:
-            return {
-                "change_locked": True,
-                "change_lock_reason": (
-                    "A historical or current publication receipt exists for this "
-                    "clip. Create an explicit re-release identity before changing "
-                    "its distribution version."
-                ),
-            }
-        if status != "failed":
-            return unverifiable
-    return {"change_locked": False, "change_lock_reason": None}
 
 
 def _distribution_state(ep_dir: Path, clip: dict) -> dict:
@@ -361,6 +429,9 @@ def _public_distribution(state: dict, change_lock: dict | None = None) -> dict:
     change_lock = change_lock or {
         "change_locked": False,
         "change_lock_reason": None,
+        "re_release_allowed": False,
+        "re_release_reason": "No prior remote submission requires a re-release.",
+        "re_release_request_consumed": None,
     }
     return {
         key: state[key]
@@ -372,7 +443,10 @@ def _public_distribution(state: dict, change_lock: dict | None = None) -> dict:
             "approval_current",
             "revision",
         )
-    } | change_lock
+    } | {
+        "re_release_request": state.get("re_release_request"),
+        **change_lock,
+    }
 
 
 def _current_render(ep_dir: Path, clip: dict) -> dict | None:
@@ -560,7 +634,13 @@ def _select_clip_distribution_unlocked(
         current_variant_id = selected_short_variant_id(clip)
     except KeyError:
         current_variant_id = clip.get(DISTRIBUTION_VARIANT_FIELD)
-    change_lock = publication_change_lock(clips_file.parent, clip_id)
+    change_lock = (
+        publication_change_lock(
+            clips_file.parent, clip_id, clip[DISTRIBUTION_RELEASE_FIELD]
+        )
+        if DISTRIBUTION_RELEASE_FIELD in clip
+        else publication_change_lock(clips_file.parent, clip_id)
+    )
     if current_variant_id != req.variant_id and change_lock["change_locked"]:
         raise HTTPException(
             status_code=409,
@@ -610,6 +690,177 @@ async def select_clip_distribution(
             raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     return await asyncio.to_thread(
         _select_clip_distribution_locked, episode_id, clip_id, req
+    )
+
+
+def _prepare_clip_rerelease_locked(
+    episode_id: str, clip_id: str, req: ReReleaseRequest
+) -> dict:
+    from agents.publish import (
+        publication_lock,
+        short_receipt_history_revision,
+        short_rerelease_state,
+        validated_short_receipts,
+    )
+
+    with publication_lock(EPISODES_DIR):
+        clips, clips_file = load_clips(episode_id)
+        clip, index = find_clip(clips, clip_id)
+        try:
+            publish = json.loads((clips_file.parent / "publish.json").read_text())
+            if not isinstance(publish, dict):
+                raise TypeError
+            receipts = validated_short_receipts(publish)
+        except (
+            FileNotFoundError,
+            json.JSONDecodeError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Publication receipt history cannot be verified.",
+            ) from exc
+
+        candidate = dict(clip)
+        if req.variant_id is None:
+            candidate.pop(DISTRIBUTION_VARIANT_FIELD, None)
+        else:
+            try:
+                require_background_variant(req.variant_id)
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404, detail=str(exc).strip("'")
+                ) from exc
+            candidate[DISTRIBUTION_VARIANT_FIELD] = req.variant_id
+        state = _distribution_state(clips_file.parent, candidate)
+        if req.expected_revision != state["revision"]:
+            raise HTTPException(
+                status_code=409,
+                detail="The target render or its copy changed; refresh before re-releasing it.",
+            )
+        if state["current"] is not True or state["approval_current"] is not True:
+            raise HTTPException(
+                status_code=409,
+                detail="The target version must be current and separately approved.",
+            )
+        if (
+            not isinstance(state.get("render_fingerprint"), str)
+            or not state["render_fingerprint"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The target version has no verifiable render fingerprint.",
+            )
+
+        request_id = str(req.request_id)
+        actor = req.actor.strip()
+        reason = req.reason.strip()
+        if not actor or len(reason) < 3:
+            raise HTTPException(
+                status_code=422, detail="Actor and reason are required."
+            )
+        existing = clip.get(DISTRIBUTION_RELEASE_FIELD)
+        if DISTRIBUTION_RELEASE_FIELD in clip and not _valid_release_request(existing):
+            raise HTTPException(
+                status_code=409,
+                detail="The existing re-release identity cannot be verified.",
+            )
+        if isinstance(existing, dict) and existing.get("request_id") == request_id:
+            parent_revision = short_receipt_history_revision(
+                publish, clip_id, exclude_request_id=request_id
+            )
+            expected_inputs = {
+                "request_id": request_id,
+                "actor": actor,
+                "reason": reason,
+                "variant_id": req.variant_id,
+                "target_revision": state["revision"],
+                "render_fingerprint": state["render_fingerprint"],
+                "receipt_history_revision": parent_revision,
+            }
+            expected = distribution_release_revision(
+                **expected_inputs,
+            )
+            if existing.get("revision") != expected or any(
+                existing.get(field) != value for field, value in expected_inputs.items()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This re-release request ID is already bound to different inputs.",
+                )
+            return {
+                "status": "already_prepared",
+                "clip_id": clip_id,
+                "requires_publish_approval": True,
+                "distribution": _public_distribution(
+                    {**state, "re_release_request": existing},
+                    publication_change_lock(clips_file.parent, clip_id, existing),
+                ),
+            }
+        if isinstance(existing, dict) and not any(
+            receipt.get("clip_id") == clip_id
+            and receipt.get("rerelease_request_id") == existing.get("request_id")
+            for receipt in receipts
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="A different re-release is already prepared and not yet recorded.",
+            )
+
+        profile_username = publish.get("profile_username") or os.getenv(
+            "UPLOAD_POST_USER", ""
+        )
+        eligibility = short_rerelease_state(
+            publish,
+            clip_id,
+            profile_username=(
+                profile_username if isinstance(profile_username, str) else None
+            ),
+        )
+        if eligibility["allowed"] is not True:
+            raise HTTPException(status_code=409, detail=eligibility["reason"])
+        authorization = {
+            "request_id": request_id,
+            "actor": actor,
+            "reason": reason,
+            "variant_id": req.variant_id,
+            "target_revision": state["revision"],
+            "render_fingerprint": state["render_fingerprint"],
+            "receipt_history_revision": eligibility["history_revision"],
+        }
+        authorization["revision"] = distribution_release_revision(
+            request_id=request_id,
+            actor=actor,
+            reason=reason,
+            variant_id=req.variant_id,
+            target_revision=state["revision"],
+            render_fingerprint=state["render_fingerprint"],
+            receipt_history_revision=eligibility["history_revision"],
+        )
+        authorization["created_at"] = datetime.now(timezone.utc).isoformat()
+        candidate[DISTRIBUTION_RELEASE_FIELD] = authorization
+        clips[index] = candidate
+        save_clips(clips, clips_file)
+        return {
+            "status": "prepared",
+            "clip_id": clip_id,
+            "requires_publish_approval": True,
+            "distribution": _public_distribution(
+                {**state, "re_release_request": authorization},
+                publication_change_lock(clips_file.parent, clip_id, authorization),
+            ),
+        }
+
+
+@router.post("/{clip_id}/re-release")
+async def prepare_clip_rerelease(
+    episode_id: str, clip_id: str, req: ReReleaseRequest
+) -> dict:
+    """Prepare a new receipt-bound release without rewriting prior receipts."""
+    return await asyncio.to_thread(
+        _prepare_clip_rerelease_locked, episode_id, clip_id, req
     )
 
 

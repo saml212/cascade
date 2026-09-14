@@ -19,6 +19,20 @@ def _add_clips(episodes_dir, episode_id, clips):
         json.dump({"clips": clips}, f)
 
 
+def _release_request(request_id="47db1913-4d32-4acf-bcfe-31763c50e9c2"):
+    return {
+        "request_id": request_id,
+        "actor": "release-operator",
+        "reason": "Rebuilt episode with current media",
+        "variant_id": None,
+        "target_revision": "sha256:target",
+        "render_fingerprint": "sha256:render",
+        "receipt_history_revision": "sha256:history",
+        "revision": "sha256:authorization",
+        "created_at": "2026-09-13T20:00:00+00:00",
+    }
+
+
 SAMPLE_CLIPS = [
     {
         "id": "clip_01",
@@ -220,6 +234,8 @@ class TestDistributionSelection:
             "current": current,
             "approval_current": approval_current,
             "revision": "sha256:selected-review",
+            "render_fingerprint": "sha256:selected-render",
+            "re_release_request": None,
         }
 
     def test_selects_exact_approved_variant_and_can_restore_base(
@@ -266,6 +282,7 @@ class TestDistributionSelection:
             "current": True,
             "approval_current": True,
             "revision": "sha256:selected-review",
+            "re_release_request": None,
             "change_locked": False,
             "change_lock_reason": None,
         }
@@ -402,9 +419,7 @@ class TestDistributionSelection:
         assert state["change_locked"] is True
         assert "explicit re-release identity" in state["change_lock_reason"]
 
-    def test_failed_receipt_does_not_lock_and_malformed_state_fails_closed(
-        self, test_client
-    ):
+    def test_failed_or_malformed_receipt_history_fails_closed(self, test_client):
         _client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
         receipt_path = episode_dir / "publish.json"
@@ -414,10 +429,10 @@ class TestDistributionSelection:
 
         from server.routes import clips as clips_mod
 
-        assert clips_mod.publication_change_lock(episode_dir, "clip_01") == {
-            "change_locked": False,
-            "change_lock_reason": None,
-        }
+        failed = clips_mod.publication_change_lock(episode_dir, "clip_01")
+        assert failed["change_locked"] is True
+        assert failed["re_release_allowed"] is False
+        assert "unresolved remote destinations" in failed["re_release_reason"]
         receipt_path.write_text(json.dumps({"shorts": ["not-a-receipt"]}))
         malformed = clips_mod.publication_change_lock(episode_dir, "clip_01")
         assert malformed["change_locked"] is True
@@ -426,6 +441,45 @@ class TestDistributionSelection:
         unattributed = clips_mod.publication_change_lock(episode_dir, "clip_01")
         assert unattributed["change_locked"] is True
         assert "cannot be verified" in unattributed["change_lock_reason"]
+
+        malformed_request = clips_mod.publication_change_lock(
+            episode_dir, "clip_01", None
+        )
+        assert malformed_request["change_locked"] is True
+        assert malformed_request["re_release_allowed"] is False
+        assert "cannot be verified" in malformed_request["change_lock_reason"]
+
+    @pytest.mark.parametrize("publish_state", (None, {"shorts": []}))
+    def test_stored_rerelease_without_its_receipt_history_blocks_selection(
+        self, test_client, monkeypatch, publish_state
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        clip = {
+            **SAMPLE_CLIPS[0],
+            "distribution_release": _release_request(),
+        }
+        _add_clips(episodes_dir, "ep_001", [clip])
+        if publish_state is not None:
+            (episode_dir / "publish.json").write_text(json.dumps(publish_state))
+
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+        response = client.put(
+            "/api/episodes/ep_001/clips/clip_01/distribution",
+            json={
+                "variant_id": "background_motion_v1",
+                "expected_revision": "sha256:selected-review",
+            },
+        )
+
+        assert response.status_code == 409
+        assert "cannot be verified" in response.json()["detail"]
 
     def test_selection_waits_until_inflight_publish_receipt_is_saved(
         self, test_client, monkeypatch
@@ -505,6 +559,230 @@ class TestDistributionSelection:
         assert (episode_dir / "publish.json").is_file()
         stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
         assert "distribution_variant_id" not in stored
+
+    def test_prepares_idempotent_rerelease_without_rewriting_receipts(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        receipt = {
+            "clip_id": "clip_01",
+            "status": "published",
+            "request_id": "old-request",
+            "platforms": ["youtube"],
+            "response": {
+                "status": "completed",
+                "request_id": "old-request",
+                "results": [
+                    {
+                        "platform": "youtube",
+                        "success": True,
+                        "post_url": "https://youtu.be/old",
+                        "request_id": "old-request",
+                        "profile_username": "up",
+                    }
+                ],
+            },
+        }
+        publish_path = episode_dir / "publish.json"
+        publish_path.write_text(json.dumps({"shorts": [receipt]}))
+        publish_before = publish_path.read_bytes()
+
+        from agents.qa import quality_revision, release_revision
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        quality_before = quality_revision(episode_dir, episode, config={})
+        release_before = release_revision(
+            episode_dir, episode, config={}, environment={}
+        )
+        body = {
+            "variant_id": None,
+            "expected_revision": "sha256:selected-review",
+            "request_id": "47db1913-4d32-4acf-bcfe-31763c50e9c2",
+            "actor": "release-operator",
+            "reason": "Rebuilt episode with current media",
+        }
+
+        prepared = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release", json=body
+        )
+        stored_after_first = (episode_dir / "clips.json").read_bytes()
+        repeated = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release", json=body
+        )
+        conflicting = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                **body,
+                "request_id": "87c7c0fe-ad21-44e0-a468-5a70609f6fbc",
+            },
+        )
+
+        assert prepared.status_code == 200
+        assert prepared.json()["status"] == "prepared"
+        assert prepared.json()["requires_publish_approval"] is True
+        assert prepared.json()["distribution"]["re_release_request_consumed"] is False
+        assert repeated.status_code == 200
+        assert repeated.json()["status"] == "already_prepared"
+        assert conflicting.status_code == 409
+        assert "already prepared" in conflicting.json()["detail"]
+        assert (episode_dir / "clips.json").read_bytes() == stored_after_first
+        assert publish_path.read_bytes() == publish_before
+        stored_clip = json.loads(stored_after_first)["clips"][0]
+        request = stored_clip["distribution_release"]
+        assert request["request_id"] == body["request_id"]
+        assert request["target_revision"] == "sha256:selected-review"
+        assert quality_revision(episode_dir, episode, config={}) == quality_before
+        assert (
+            release_revision(episode_dir, episode, config={}, environment={})
+            != release_before
+        )
+
+        publish = json.loads(publish_path.read_text())
+        publish["shorts"].append(
+            {
+                "clip_id": "clip_02",
+                "status": "failed",
+                "rerelease_request_id": body["request_id"],
+            }
+        )
+        publish_path.write_text(json.dumps(publish))
+        cross_clip_receipt = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                **body,
+                "request_id": "233e53ba-341d-47f7-a659-b48e8b3846dd",
+            },
+        )
+        assert cross_clip_receipt.status_code == 409
+        assert "already prepared" in cross_clip_receipt.json()["detail"]
+        assert (episode_dir / "clips.json").read_bytes() == stored_after_first
+
+        publish["shorts"].append(
+            {
+                "clip_id": "clip_01",
+                "status": "submitted",
+                "rerelease_request_id": body["request_id"],
+            }
+        )
+        publish_path.write_text(json.dumps(publish))
+        consumed = clips_mod.publication_change_lock(episode_dir, "clip_01", request)
+        assert consumed["re_release_request_consumed"] is True
+        assert consumed["re_release_allowed"] is False
+
+    @pytest.mark.parametrize("status", ["submitted", "unknown", "failed"])
+    def test_rerelease_rejects_unresolved_remote_receipt(
+        self, test_client, monkeypatch, status
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        clips_before = (episode_dir / "clips.json").read_bytes()
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "shorts": [
+                        {
+                            "clip_id": "clip_01",
+                            "status": status,
+                            "request_id": "unresolved-request",
+                            "platforms": ["youtube", "instagram"],
+                        }
+                    ]
+                }
+            )
+        )
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+
+        response = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                "variant_id": None,
+                "expected_revision": "sha256:selected-review",
+                "request_id": "793321a8-a45d-41d5-99b6-b4310bd6de90",
+                "actor": "release-operator",
+                "reason": "Rebuilt episode with current media",
+            },
+        )
+
+        assert response.status_code == 409
+        assert "unresolved remote destinations" in response.json()["detail"]
+        assert (episode_dir / "clips.json").read_bytes() == clips_before
+
+    def test_rerelease_rejects_malformed_existing_identity(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        clip = dict(
+            SAMPLE_CLIPS[0],
+            status="approved",
+            distribution_release={"request_id": "incomplete"},
+        )
+        _add_clips(episodes_dir, "ep_001", [clip])
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "shorts": [
+                        {
+                            "clip_id": "clip_01",
+                            "status": "published",
+                            "request_id": "old-request",
+                            "platforms": ["youtube"],
+                            "response": {
+                                "status": "completed",
+                                "request_id": "old-request",
+                                "results": [
+                                    {
+                                        "platform": "youtube",
+                                        "success": True,
+                                        "post_url": "https://youtu.be/old",
+                                        "request_id": "old-request",
+                                        "profile_username": "up",
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        clips_before = (episode_dir / "clips.json").read_bytes()
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+
+        response = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                "variant_id": None,
+                "expected_revision": "sha256:selected-review",
+                "request_id": "4530a444-c85a-49d7-af59-5a237fb4c22d",
+                "actor": "release-operator",
+                "reason": "Rebuilt episode with current media",
+            },
+        )
+
+        assert response.status_code == 409
+        assert "identity cannot be verified" in response.json()["detail"]
+        assert (episode_dir / "clips.json").read_bytes() == clips_before
 
 
 class TestManualClip:

@@ -242,9 +242,32 @@ instead of forcing the write.
 
 After any recorded submission, `change_locked` prevents switching that clip's
 version. Existing Base receipts remain Base and are never treated as Motion
-approval. Releasing an old episode again, including the same Base version,
-requires a future explicit re-release operation with a new audited identity;
-do not delete or rewrite historical receipts to bypass this lock.
+approval. A clip with prior receipts can be prepared for an explicit re-release
+only after every requested destination is proven published, definitively failed,
+or cancelled. First call
+`POST /api/episodes/{episode_id}/check-upload-urls`. Cascade checks the exact
+saved request or job ID against Upload-Post status and history and persists
+terminal per-destination evidence. Submitted, scheduled, pending, queued,
+inbox-only, unknown, incomplete, or identity-less records remain blocked; they
+need provider reconciliation before a re-release can be prepared.
+
+When `review.distribution.re_release_allowed` is true, prepare the exact approved
+target with:
+
+```text
+POST /api/episodes/{episode_id}/clips/{clip_id}/re-release
+{"variant_id":"background_motion_v1","expected_revision":"sha256:...","request_id":"<new UUID>","actor":"...","reason":"..."}
+```
+
+Use `variant_id: null` to release Base again. Keep the same request ID when
+retrying the same operation. The request binds the actor, reason, selected media
+and copy revision, render fingerprint, and prior receipt-history fingerprint.
+It creates a new release identity and invalidates publish approval, so review and
+approve the new release plan before running publication. Prior receipts stay in
+`publish.json`; the new receipt records its parent history and request ID.
+Unknown or stale targets, changed receipt history, malformed state, and a second
+unconsumed request fail with `409`. Never delete or rewrite receipt history to
+bypass these checks.
 
 ## Verification
 

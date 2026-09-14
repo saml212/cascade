@@ -697,6 +697,76 @@ class CheckUploadUrlsResponse(BaseModel):
     shorts: list[dict] = []  # per-clip {"clip_id": ..., "status": ..., "url": ...}
 
 
+def _persist_short_terminal_evidence(
+    ep_dir: Path,
+    expected_receipt: dict,
+    destinations: dict[str, dict],
+    provider_status: str | None,
+    profile_username: str | None,
+    evidence_source: str,
+) -> dict | None:
+    """Append terminal proof without deleting the receipt's prior state."""
+    from agents.publish import (
+        publication_lock,
+        validated_short_receipts,
+        validated_terminal_destinations,
+    )
+
+    with publication_lock(ep_dir.parent):
+        path = ep_dir / "publish.json"
+        try:
+            publish = json.loads(path.read_text())
+            if not isinstance(publish, dict):
+                return None
+            receipts = validated_short_receipts(publish)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            return None
+        matches = [
+            index
+            for index, receipt in enumerate(receipts)
+            if receipt == expected_receipt
+        ]
+        if len(matches) != 1:
+            return None
+        current = receipts[matches[0]]
+        platforms = current.get("platforms")
+        destinations = validated_terminal_destinations(platforms, destinations)
+        if destinations is None or evidence_source not in {"status", "history"}:
+            return None
+        states = {value["state"] for value in destinations.values()}
+        status = (
+            "published"
+            if states == {"published"}
+            else "failed"
+            if states <= {"failed", "cancelled"}
+            else "partial_failure"
+        )
+        history = current.get("status_history", [])
+        if not isinstance(history, list):
+            return None
+        event = {
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "previous_status": current["status"],
+            "status": status,
+            "provider_status": provider_status
+            if isinstance(provider_status, str)
+            else None,
+            "profile_username": profile_username,
+            "evidence_source": evidence_source,
+            "terminal_destinations": destinations,
+        }
+        updated = {
+            **current,
+            "status": status,
+            "terminal_destinations": destinations,
+            "status_history": [*history, event],
+        }
+        receipts[matches[0]] = updated
+        publish["shorts"] = receipts
+        atomic_write_json(path, publish)
+        return updated
+
+
 @router.post("/{episode_id}/check-upload-urls")
 async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
     """Poll Upload-Post for pending request or scheduled-job IDs and
@@ -726,10 +796,28 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
             status_code=500, detail="UPLOAD_POST_API_KEY not set in environment"
         )
 
-    with open(publish_file) as f:
-        publish_data = json.load(f)
-    with open(episode_file) as f:
-        episode = json.load(f)
+    try:
+        with open(publish_file) as f:
+            publish_data = json.load(f)
+        with open(episode_file) as f:
+            episode = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(
+            status_code=409, detail="Publication state cannot be verified."
+        ) from exc
+
+    from agents.publish import validated_short_receipts
+
+    if not isinstance(publish_data, dict):
+        raise HTTPException(
+            status_code=409, detail="Publication receipt history cannot be verified."
+        )
+    try:
+        short_receipts = validated_short_receipts(publish_data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409, detail="Publication receipt history cannot be verified."
+        ) from exc
 
     result = CheckUploadUrlsResponse()
     status_url = "https://api.upload-post.com/api/uploadposts/status"
@@ -777,8 +865,13 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
         if receipt.get("scheduled") is True:
             job_id = receipt.get("job_id") or receipt.get("request_id")
             return {"job_id": str(job_id)} if job_id else None
-        request_id = receipt.get("request_id")
-        return {"request_id": str(request_id)} if request_id else None
+        if receipt.get("job_id"):
+            return {"job_id": str(receipt["job_id"])}
+        request_id = receipt.get("server_request_id") or receipt.get("request_id")
+        if request_id:
+            return {"request_id": str(request_id)}
+        external_id = receipt.get("external_id")
+        return {"external_id": str(external_id)} if external_id else None
 
     # Longform check
     longform_res = publish_data.get("longform") or {}
@@ -873,15 +966,46 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
         result.longform = {"status": longform_status or "not_submitted", "url": None}
 
     # Per-clip checks (best-effort; failures don't error the endpoint)
-    for clip_result in publish_data.get("shorts", []):
+    from agents.publish import (
+        receipt_terminal_destinations,
+        status_identity_conflicts,
+        status_response_has_unresolved_work,
+        terminal_destinations_from_history,
+        terminal_destinations_from_status,
+    )
+
+    history_url = "https://api.upload-post.com/api/uploadposts/history"
+    profile_username = os.getenv("UPLOAD_POST_USER", "")
+    for clip_result in short_receipts:
         clip_id = clip_result.get("clip_id", "")
         clip_query = _status_query(clip_result)
-        if clip_result.get("status") not in {"submitted", "unknown"} or not clip_query:
+        terminal = receipt_terminal_destinations(
+            clip_result, profile_username=profile_username or None
+        )
+        if terminal is not None:
+            url = next(
+                (
+                    value.get("url")
+                    for platform, value in terminal.items()
+                    if platform == "youtube" and value.get("state") == "published"
+                ),
+                None,
+            )
             result.shorts.append(
                 {
                     "clip_id": clip_id,
-                    "status": clip_result.get("status", "unknown"),
+                    "status": clip_result.get("status", "published"),
+                    "url": url,
+                }
+            )
+            continue
+        if not clip_query:
+            result.shorts.append(
+                {
+                    "clip_id": clip_id,
+                    "status": "unresolved",
                     "url": None,
+                    "error": "This receipt has no exact provider identity to reconcile.",
                 }
             )
             continue
@@ -892,27 +1016,115 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
                     params=clip_query,
                     headers={"Authorization": f"Apikey {api_key}"},
                 )
-                resp.raise_for_status()
-                data = resp.json()
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code != 404:
+                        raise
+                    status_not_found = True
+                    data = {}
+                else:
+                    status_not_found = False
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        raise TypeError("Upload-Post status response is malformed.")
+                if status_identity_conflicts(
+                    clip_result,
+                    data,
+                    profile_username=profile_username or None,
+                ):
+                    result.shorts.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "unresolved",
+                            "url": None,
+                            "error": (
+                                "Upload-Post status returned conflicting provider "
+                                "identifiers; history was not accepted."
+                            ),
+                        }
+                    )
+                    continue
+                destinations = terminal_destinations_from_status(
+                    clip_result,
+                    data,
+                    profile_username=profile_username or None,
+                )
+                evidence_source = "status"
+                status_unresolved = (
+                    not status_not_found and status_response_has_unresolved_work(data)
+                )
+                if destinations is None and not status_unresolved:
+                    history_resp = await client.get(
+                        history_url,
+                        params={
+                            **clip_query,
+                            **(
+                                {"profile_username": profile_username}
+                                if profile_username
+                                else {}
+                            ),
+                            "limit": 100,
+                            "page": 1,
+                        },
+                        headers={"Authorization": f"Apikey {api_key}"},
+                    )
+                    history_resp.raise_for_status()
+                    history_data = history_resp.json()
+                    destinations = terminal_destinations_from_history(
+                        clip_result,
+                        history_data,
+                        profile_username=profile_username or None,
+                    )
+                    evidence_source = "history"
+            if destinations is not None:
+                reconciled = await asyncio.to_thread(
+                    _persist_short_terminal_evidence,
+                    ep_dir,
+                    clip_result,
+                    destinations,
+                    data.get("status") if isinstance(data, dict) else None,
+                    profile_username or None,
+                    evidence_source,
+                )
+                if reconciled is None:
+                    result.shorts.append(
+                        {
+                            "clip_id": clip_id,
+                            "status": "stale",
+                            "url": None,
+                            "error": "The receipt changed while status was reconciled.",
+                        }
+                    )
+                    continue
+                url = next(
+                    (
+                        value.get("url")
+                        for platform, value in destinations.items()
+                        if platform == "youtube" and value.get("state") == "published"
+                    ),
+                    None,
+                )
+                result.shorts.append(
+                    {
+                        "clip_id": clip_id,
+                        "status": reconciled["status"],
+                        "url": url,
+                        "terminal_destinations": destinations,
+                    }
+                )
+                continue
             url = _extract_youtube_url(data)
             failures = _platform_failures(data)
             result.shorts.append(
                 {
                     "clip_id": clip_id,
-                    "status": (
-                        "partial_failure"
-                        if url and failures
-                        else "failed"
-                        if failures
-                        else "live"
-                        if url
-                        else "pending"
-                    ),
+                    "status": "pending",
                     "url": url,
                     **({"platform_failures": failures} if failures else {}),
                 }
             )
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, TypeError, ValueError) as e:
             result.shorts.append(
                 {"clip_id": clip_id, "status": "pending", "url": None, "error": str(e)}
             )

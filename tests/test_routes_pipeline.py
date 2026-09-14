@@ -5,6 +5,7 @@ import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from tests.test_routes_episodes import _create_episode
@@ -444,6 +445,21 @@ class TestPublishApproval:
 
 
 class TestUploadPostReceipts:
+    def test_malformed_short_receipts_fail_closed_before_provider_poll(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(json.dumps({"shorts": "invalid"}))
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+
+        with patch("httpx.AsyncClient") as client_class:
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 409
+        assert "cannot be verified" in result.json()["detail"]
+        client_class.assert_not_called()
+
     def test_current_bound_supplied_url_skips_remote_poll(
         self, test_client, monkeypatch
     ):
@@ -670,7 +686,8 @@ class TestUploadPostReceipts:
             result = client.post("/api/episodes/ep_001/check-upload-urls")
 
         assert result.status_code == 200
-        assert http_client.get.call_args.kwargs["params"] == expected_params
+        assert http_client.get.call_args_list[0].kwargs["params"] == expected_params
+        assert http_client.get.await_count == 1
         assert result.json()["shorts"] == [
             {"clip_id": "clip-1", "status": "pending", "url": None}
         ]
@@ -690,6 +707,7 @@ class TestUploadPostReceipts:
                             "status": "submitted",
                             "scheduled": True,
                             "job_id": "job-1",
+                            "platforms": ["youtube", "x"],
                         }
                     ],
                 }
@@ -705,12 +723,16 @@ class TestUploadPostReceipts:
                     "platform": "youtube",
                     "success": True,
                     "post_url": "https://youtu.be/clip",
+                    "job_id": "job-1",
+                    "profile_username": "up",
                 },
                 {
                     "platform": "x",
                     "success": False,
                     "status": "failed",
                     "error": "No access token",
+                    "job_id": "job-1",
+                    "profile_username": "up",
                 },
             ],
         }
@@ -724,7 +746,273 @@ class TestUploadPostReceipts:
         short = result.json()["shorts"][0]
         assert short["status"] == "partial_failure"
         assert short["url"] == "https://youtu.be/clip"
-        assert short["platform_failures"]["x"]["error"] == "No access token"
+        stored = json.loads((episode_dir / "publish.json").read_text())["shorts"][0]
+        assert stored["terminal_destinations"]["youtube"]["state"] == "published"
+        assert stored["terminal_destinations"]["x"]["state"] == "failed"
+        assert stored["status_history"][0]["previous_status"] == "submitted"
+
+    def test_short_history_reconciliation_is_exact_and_persists_terminal_proof(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        receipt = {
+            "clip_id": "clip-1",
+            "status": "submitted",
+            "request_id": "request-1",
+            "platforms": ["youtube", "instagram"],
+        }
+        (episode_dir / "publish.json").write_text(
+            json.dumps({"longform": None, "shorts": [receipt]})
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        status_response = MagicMock()
+        status_response.raise_for_status.return_value = None
+        status_response.json.return_value = {
+            "status": "completed",
+            "request_id": "request-1",
+        }
+        history_response = MagicMock()
+        history_response.raise_for_status.return_value = None
+        history_response.json.return_value = {
+            "history": [
+                {
+                    "platform": "youtube",
+                    "success": True,
+                    "post_url": "https://youtu.be/clip",
+                    "request_id": "request-1",
+                    "profile_username": "up",
+                },
+                {
+                    "platform": "instagram",
+                    "success": True,
+                    "post_url": "https://instagram.com/reel/clip",
+                    "request_id": "request-1",
+                    "profile_username": "up",
+                },
+                {
+                    "platform": "x",
+                    "success": True,
+                    "post_url": "https://x.com/other/status/1",
+                    "request_id": "other-request",
+                    "profile_username": "up",
+                },
+            ],
+            "in_progress": [],
+        }
+        http_client = AsyncMock()
+        http_client.get.side_effect = [status_response, history_response]
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            first = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert first.status_code == 200
+        assert first.json()["shorts"][0]["status"] == "published"
+        stored = json.loads((episode_dir / "publish.json").read_text())["shorts"][0]
+        assert stored["status_history"][-1]["evidence_source"] == "history"
+        assert stored["status_history"][-1]["profile_username"] == "up"
+        assert set(stored["terminal_destinations"]) == {"youtube", "instagram"}
+
+        with patch("httpx.AsyncClient") as client_class:
+            repeated = client.post("/api/episodes/ep_001/check-upload-urls")
+        assert repeated.status_code == 200
+        assert repeated.json()["shorts"][0]["status"] == "published"
+        client_class.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            "processing",
+            "queued",
+            "pending",
+            "retrying",
+            "fallback_to_inbox",
+            "scheduled",
+            "submitted",
+            "unknown",
+            "waiting",
+        ],
+    )
+    def test_exact_unresolved_status_does_not_accept_stale_terminal_history(
+        self, test_client, monkeypatch, status
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        receipt = {
+            "clip_id": "clip-1",
+            "status": "submitted",
+            "request_id": "request-1",
+            "platforms": ["youtube"],
+        }
+        publish_path = episode_dir / "publish.json"
+        publish_path.write_text(json.dumps({"shorts": [receipt]}))
+        before = publish_path.read_bytes()
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        status_response = MagicMock()
+        status_response.raise_for_status.return_value = None
+        status_response.json.return_value = {
+            "status": status,
+            "request_id": "request-1",
+        }
+        history_response = MagicMock()
+        history_response.raise_for_status.return_value = None
+        history_response.json.return_value = {
+            "history": [
+                {
+                    "platform": "youtube",
+                    "success": True,
+                    "post_url": "https://youtu.be/stale",
+                    "request_id": "request-1",
+                    "profile_username": "up",
+                }
+            ],
+            "in_progress": [],
+        }
+        http_client = AsyncMock()
+        http_client.get.side_effect = [status_response, history_response]
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert result.json()["shorts"] == [
+            {"clip_id": "clip-1", "status": "pending", "url": None}
+        ]
+        assert http_client.get.await_count == 1
+        assert publish_path.read_bytes() == before
+
+    def test_retired_status_id_falls_back_to_exact_history(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "shorts": [
+                        {
+                            "clip_id": "clip-1",
+                            "status": "submitted",
+                            "request_id": "request-1",
+                            "platforms": ["youtube"],
+                        }
+                    ]
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        status_response = httpx.Response(
+            404,
+            request=httpx.Request("GET", "https://example.test/status"),
+        )
+        history_response = httpx.Response(
+            200,
+            request=httpx.Request("GET", "https://example.test/history"),
+            json={
+                "history": [
+                    {
+                        "platform": "youtube",
+                        "success": True,
+                        "post_url": "https://youtu.be/clip",
+                        "request_id": "request-1",
+                        "profile_username": "up",
+                    }
+                ],
+                "in_progress": [],
+            },
+        )
+        http_client = AsyncMock()
+        http_client.get.side_effect = [status_response, history_response]
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert result.json()["shorts"][0]["status"] == "published"
+        assert http_client.get.await_count == 2
+
+    def test_status_auth_error_does_not_fall_back_to_history(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        (episode_dir / "publish.json").write_text(
+            json.dumps(
+                {
+                    "shorts": [
+                        {
+                            "clip_id": "clip-1",
+                            "status": "submitted",
+                            "request_id": "request-1",
+                            "platforms": ["youtube"],
+                        }
+                    ]
+                }
+            )
+        )
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        forbidden = httpx.Response(
+            403,
+            request=httpx.Request("GET", "https://example.test/status"),
+        )
+        http_client = AsyncMock()
+        http_client.get.return_value = forbidden
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert result.json()["shorts"][0]["status"] == "pending"
+        assert http_client.get.await_count == 1
+
+    def test_conflicting_status_identity_does_not_fall_back_to_history(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        receipt = {
+            "clip_id": "clip-1",
+            "status": "submitted",
+            "job_id": "expected-job",
+            "request_id": "request-1",
+            "platforms": ["youtube"],
+        }
+        (episode_dir / "publish.json").write_text(json.dumps({"shorts": [receipt]}))
+        publish_before = (episode_dir / "publish.json").read_bytes()
+        monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-key")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "completed",
+            "job_id": "wrong-job",
+            "request_id": "request-1",
+            "results": [
+                {
+                    "platform": "youtube",
+                    "success": True,
+                    "post_url": "https://youtu.be/wrong",
+                    "job_id": "wrong-job",
+                    "request_id": "request-1",
+                    "profile_username": "up",
+                }
+            ],
+        }
+        http_client = AsyncMock()
+        http_client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value = http_client
+            result = client.post("/api/episodes/ep_001/check-upload-urls")
+
+        assert result.status_code == 200
+        assert result.json()["shorts"][0]["status"] == "unresolved"
+        assert "conflicting provider identifiers" in result.json()["shorts"][0]["error"]
+        assert http_client.get.await_count == 1
+        assert (episode_dir / "publish.json").read_bytes() == publish_before
 
 
 class TestRunSingleAgent:
