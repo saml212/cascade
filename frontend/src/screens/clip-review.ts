@@ -941,8 +941,9 @@ function clipExpanded(
 ): HTMLElement {
   const background = review.variants?.background_motion_v1;
   const hasBackground = Boolean(background);
+  const selectedSurface = selectedDistributionVersion(review)?.surface ?? 'base';
   const surface = signal<ClipReviewSurface>(
-    reviewSurfaces.get(clipId, hasBackground)
+    reviewSurfaces.get(clipId, hasBackground, selectedSurface)
   );
   const selectSurface = (next: ClipReviewSurface): void => {
     reviewSurfaces.select(clipId, next);

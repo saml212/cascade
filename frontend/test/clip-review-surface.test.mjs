@@ -67,22 +67,32 @@ function reviewState({ distributionVersion = 'base', backgroundApproved = false 
 test('preserves the chosen preview surface through next and previous navigation', () => {
   const memory = new ClipReviewSurfaceMemory();
 
-  assert.equal(memory.get('clip_11', true), 'base');
+  assert.equal(memory.get('clip_11', true, 'base'), 'base');
   memory.select('clip_11', 'background');
-  assert.equal(memory.get('clip_11', true), 'background');
-  assert.equal(memory.get('clip_12', true), 'background');
-  assert.equal(memory.get('clip_11', true), 'background');
+  assert.equal(memory.get('clip_11', true, 'base'), 'background');
+  assert.equal(memory.get('clip_12', true, 'base'), 'background');
+  assert.equal(memory.get('clip_11', true, 'base'), 'background');
 
   memory.select('clip_12', 'base');
-  assert.equal(memory.get('clip_11', true), 'base');
+  assert.equal(memory.get('clip_11', true, 'background'), 'base');
 });
 
 test('temporarily falls back to base without losing background preference', () => {
   const memory = new ClipReviewSurfaceMemory();
 
   memory.select('clip_11', 'background');
-  assert.equal(memory.get('clip_12', false), 'base');
-  assert.equal(memory.get('clip_13', true), 'background');
+  assert.equal(memory.get('clip_12', false, 'base'), 'base');
+  assert.equal(memory.get('clip_13', true, 'base'), 'background');
+});
+
+test('defaults each clip preview to its selected distribution until the user chooses', () => {
+  const memory = new ClipReviewSurfaceMemory();
+
+  assert.equal(memory.get('clip_01', true, 'background'), 'background');
+  assert.equal(memory.get('clip_02', true, 'base'), 'base');
+
+  memory.select('clip_02', 'base');
+  assert.equal(memory.get('clip_03', true, 'background'), 'base');
 });
 
 test('uses the persisted exact version as the distribution identity', () => {

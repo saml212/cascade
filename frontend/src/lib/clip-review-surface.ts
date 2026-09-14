@@ -371,10 +371,15 @@ export class ClipReReleaseDraftStore {
 }
 
 export class ClipReviewSurfaceMemory {
-  private preferred: ClipReviewSurface = 'base';
+  private preferred: ClipReviewSurface | null = null;
 
-  get(_clipId: string, hasBackground: boolean): ClipReviewSurface {
-    return this.preferred === 'background' && hasBackground
+  get(
+    _clipId: string,
+    hasBackground: boolean,
+    selected: ClipReviewSurface
+  ): ClipReviewSurface {
+    const surface = this.preferred ?? selected;
+    return surface === 'background' && hasBackground
       ? 'background'
       : 'base';
   }
