@@ -3,7 +3,11 @@ import test from 'node:test';
 
 import { importTs } from './load-ts.mjs';
 
-const { describeEpisodeStatus, episodeDisplayDuration } = await importTs(
+const {
+  describeEpisodeStatus,
+  episodeDisplayDuration,
+  formatDeliveryNote,
+} = await importTs(
   new URL('../src/lib/format.ts', import.meta.url)
 );
 
@@ -106,5 +110,18 @@ test('display duration uses a ready delivery and otherwise falls back to source'
       delivery: { status: 'preparing', duration_seconds: 5267.7 },
     }),
     5400
+  );
+});
+
+test('delivery preparation note does not claim global publication state', () => {
+  assert.equal(
+    formatDeliveryNote(
+      'Local file only; nothing has been uploaded or published.'
+    ),
+    'This preparation step creates local files.'
+  );
+  assert.equal(
+    formatDeliveryNote('Measured against the current edit.'),
+    'Measured against the current edit.'
   );
 });

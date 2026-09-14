@@ -2,7 +2,7 @@ import { Button } from '../components/Button';
 import { Icon } from '../components/icons';
 import { h, mount } from '../lib/dom';
 import { api, type DeliveryStatus, type UnknownRecord } from '../lib/api';
-import { pluralize } from '../lib/format';
+import { formatDeliveryNote, pluralize } from '../lib/format';
 import { link } from '../lib/router';
 import { effect, onCleanup, signal } from '../lib/signals';
 import { showToast } from '../state/ui';
@@ -387,7 +387,9 @@ function readyDetails(
       'Download metadata'
     )),
     h('div', { class: 'text-body-sm text-ink-tertiary' },
-      ...(delivery.notes ?? []).map((note) => h('div', null, `• ${note}`))
+      ...(delivery.notes ?? []).map((note) =>
+        h('div', null, `• ${formatDeliveryNote(note)}`)
+      )
     )
   );
 }

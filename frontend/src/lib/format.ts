@@ -109,6 +109,13 @@ export function formatRelative(iso: string | null | undefined): string {
   });
 }
 
+/** Avoid presenting a local preparation note as global publication state. */
+export function formatDeliveryNote(note: string): string {
+  return note === 'Local file only; nothing has been uploaded or published.'
+    ? 'This preparation step creates local files.'
+    : note;
+}
+
 /* ---------------------- Status → plain-English mapping --------------------- */
 
 export type StatusKey =

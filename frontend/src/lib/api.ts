@@ -352,6 +352,37 @@ export interface ClipDistributionState extends UnknownRecord {
   revision: string;
   change_locked: boolean;
   change_lock_reason: string | null;
+  re_release_allowed: boolean;
+  re_release_reason: string | null;
+  re_release_request: ClipReReleaseRequestState | null;
+  re_release_request_consumed: boolean | null;
+}
+
+export interface ClipReReleaseRequestState extends UnknownRecord {
+  request_id: string;
+  actor: string;
+  reason: string;
+  variant_id: null | 'background_motion_v1';
+  target_revision: string;
+  render_fingerprint: string;
+  receipt_history_revision: string;
+  revision: string;
+  created_at: string;
+}
+
+export interface PrepareClipReReleaseRequest {
+  variant_id: null | 'background_motion_v1';
+  expected_revision: string;
+  request_id: string;
+  actor: string;
+  reason: string;
+}
+
+export interface PrepareClipReReleaseResponse extends UnknownRecord {
+  status: 'prepared' | 'already_prepared';
+  clip_id: string;
+  requires_publish_approval: true;
+  distribution: ClipDistributionState;
 }
 
 export interface EpisodeReviewState extends UnknownRecord {
@@ -628,6 +659,16 @@ export const api = {
       'PUT',
       `/api/episodes/${id}/clips/${clipId}/distribution`,
       { variant_id: variantId, expected_revision: expectedRevision }
+    ),
+  prepareClipReRelease: (
+    id: string,
+    clipId: string,
+    body: PrepareClipReReleaseRequest
+  ) =>
+    request<PrepareClipReReleaseResponse>(
+      'POST',
+      `/api/episodes/${id}/clips/${clipId}/re-release`,
+      body
     ),
   approveClips: (id: string, clipIds: string[]) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/approve`, {

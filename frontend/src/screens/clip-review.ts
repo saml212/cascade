@@ -58,11 +58,16 @@ import {
   isRejectedClipId,
 } from '../lib/clip-review-list';
 import {
+  clipCardStatusOverride,
   clipDistributionLabel,
   clipDistributionSelectable,
+  clipReReleaseViewState,
   clipVersionState,
+  confirmsClipReRelease,
+  ClipReReleaseDraftStore,
   ClipReviewSurfaceMemory,
   distributionChangeLockReason,
+  distributionVersionLabel,
   selectedDistributionVersion,
   type ClipReviewSurface,
 } from '../lib/clip-review-surface';
@@ -668,7 +673,10 @@ function clipCard(
   const end = (clip.end_seconds as number) ?? 0;
   const score = (clip.virality_score as number) ?? null;
   const rank = (clip.rank as number) ?? null;
-  const status = describeStatus((clip.status as string) ?? 'pending');
+  const rawStatus = (clip.status as string) ?? 'pending';
+  const status =
+    clipCardStatusOverride(rawStatus, review.distribution.change_locked) ??
+    describeStatus(rawStatus);
   const metadata = (clip.metadata as Record<string, UnknownRecord>) ?? {};
 
   const card = h('article', {
@@ -1330,11 +1338,22 @@ function renderDistributionAction(
     class: 'hidden text-body-sm text-status-warning max-w-md',
     'aria-live': 'polite',
   });
+  const reReleaseState = clipReReleaseViewState(review);
+  const reReleaseControl = renderReReleaseControl(
+    episodeId,
+    clipId,
+    review,
+    surface,
+    reload
+  );
   effect(() => {
     const version = clipVersionState(review, surface);
     const selected = selectedDistributionVersion(review)?.surface === surface;
     const active = selecting();
-    const lockReason = distributionChangeLockReason(review);
+    const lockReason =
+      reReleaseState.kind === 'blocked'
+        ? reReleaseState.reason
+        : distributionChangeLockReason(review);
     const current = version?.render.current === true;
     const approved = version?.approval.current === true;
     const selectable = clipDistributionSelectable(review, surface);
@@ -1381,11 +1400,235 @@ function renderDistributionAction(
     lockMessage.textContent = lockReason ?? '';
   });
   return h(
-    'span',
+    'div',
     { class: 'inline-flex flex-col items-start gap-1' },
     host,
-    lockMessage
+    lockMessage,
+    reReleaseControl
   );
+}
+
+function renderReReleaseControl(
+  episodeId: string,
+  clipId: string,
+  review: ClipReviewState,
+  surface: ClipReviewSurface,
+  reload: () => Promise<void>
+): HTMLElement | null {
+  const state = clipReReleaseViewState(review);
+  if (state.kind === 'unneeded' || state.kind === 'blocked') return null;
+  if (state.kind === 'prepared') {
+    const targetLabel = distributionVersionLabel(
+      state.request.variant_id ?? 'base',
+      state.request.variant_id
+    );
+    return h(
+      'div',
+      {
+        class:
+          'mt-2 max-w-xl rounded-md border border-accent/30 bg-accent/10 px-3 py-2 text-body-sm text-ink-secondary',
+        role: 'status',
+      },
+      h('strong', { class: 'text-ink-primary' }, `Re-release prepared for ${targetLabel}. `),
+      `Prepared by ${state.request.actor}: ${state.request.reason}. Prior receipts remain intact; new publish approval is required. `,
+      h('code', { class: 'text-code-sm break-all' }, state.request.request_id)
+    );
+  }
+
+  const version = clipVersionState(review, surface);
+  if (!version) return null;
+  const target = {
+    episodeId,
+    clipId,
+    variantId: version.variantId,
+    expectedRevision: version.approval.revision,
+    previousRequestId: state.previousRequest?.request_id ?? null,
+  };
+  const canPrepare =
+    version.render.current === true &&
+    version.approval.current === true &&
+    typeof version.approval.revision === 'string' &&
+    Boolean(version.approval.revision.trim());
+  if (!canPrepare) {
+    return Button({
+      variant: 'secondary',
+      size: 'sm',
+      label: 'Prepare re-release',
+      disabled: true,
+      title: `The ${version.label} version must be current and separately approved first`,
+    });
+  }
+
+  let store: ClipReReleaseDraftStore | null = null;
+  let draft: ReturnType<ClipReReleaseDraftStore['getOrCreate']> | null = null;
+  const actor = h('input', {
+    type: 'text',
+    maxlength: '120',
+    autocomplete: 'name',
+    required: true,
+    class:
+      'w-full mt-1 rounded-md border border-border bg-surface-1 px-3 py-2 text-body text-ink-primary',
+  });
+  const reason = h('textarea', {
+    rows: '3',
+    maxlength: '500',
+    minlength: '3',
+    required: true,
+    class:
+      'w-full mt-1 rounded-md border border-border bg-surface-1 px-3 py-2 text-body text-ink-primary resize-y',
+  });
+  const formError = h('p', {
+    class: 'hidden text-body-sm text-status-danger',
+    role: 'alert',
+  });
+  const retryNote = h(
+    'p',
+    { class: 'hidden text-body-sm text-ink-tertiary' },
+    'Retrying will reuse this exact saved request.'
+  );
+  const lockDraft = (): void => {
+    actor.readOnly = true;
+    reason.readOnly = true;
+    retryNote.classList.remove('hidden');
+  };
+  const submit = Button({
+    variant: 'primary',
+    size: 'sm',
+    type: 'submit',
+    label: 'Prepare re-release',
+  });
+  const form = h('form', {
+    class: 'mt-2 max-w-xl border-t border-border pt-3 flex flex-col gap-3',
+  });
+  const field = (label: string, control: HTMLElement): HTMLElement =>
+    h(
+      'label',
+      { class: 'text-body-sm font-medium text-ink-secondary' },
+      label,
+      control
+    );
+  const previousEvidence = state.previousRequest
+    ? [
+        h(
+          'p',
+          { class: 'text-body-sm text-ink-tertiary' },
+          `Previous re-release ${state.previousRequest.request_id} by ${state.previousRequest.actor} has a recorded receipt and remains in publication history.`
+        ),
+      ]
+    : [];
+  form.append(
+    ...previousEvidence,
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-secondary' },
+      `Target: ${version.label}. Prior publication receipts stay intact, and a new publish approval is required before anything can publish.`
+    ),
+    field('Actor', actor),
+    field('Reason', reason),
+    retryNote,
+    formError,
+    submit
+  );
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!store || !draft) {
+      formError.textContent =
+        'This request cannot be prepared until its retry identity is saved.';
+      formError.classList.remove('hidden');
+      return;
+    }
+    const actorValue = actor.value.trim();
+    const reasonValue = reason.value.trim();
+    if (!actorValue || reasonValue.length < 3) {
+      formError.textContent =
+        'Actor and a reason of at least 3 characters are required.';
+      formError.classList.remove('hidden');
+      return;
+    }
+    const body = {
+      ...draft,
+      actor: actorValue,
+      reason: reasonValue,
+    };
+    try {
+      store.save(body);
+      draft = body;
+      lockDraft();
+    } catch (error) {
+      formError.textContent = `This request cannot be retried safely: ${(error as Error).message}`;
+      formError.classList.remove('hidden');
+      return;
+    }
+
+    submit.disabled = true;
+    submit.textContent = 'Preparing\u2026';
+    formError.classList.add('hidden');
+    formError.textContent = '';
+    let prepared = false;
+    try {
+      const result = await api.prepareClipReRelease(episodeId, clipId, body);
+      if (!confirmsClipReRelease(result, clipId, body)) {
+        throw new Error('The server returned an invalid re-release response.');
+      }
+      prepared = true;
+      try {
+        store.clear();
+      } catch {
+        // The confirmed request remains safe to retry under the same stored ID.
+      }
+      showToast(
+        result.status === 'already_prepared'
+          ? 'This re-release was already prepared. New publish approval is still required.'
+          : 'Re-release prepared. New publish approval is required before publication.',
+        'success'
+      );
+    } catch (error) {
+      formError.textContent = (error as Error).message;
+      formError.classList.remove('hidden');
+      showToast((error as Error).message, 'error');
+    } finally {
+      submit.disabled = false;
+      submit.textContent = 'Prepare re-release';
+    }
+    if (prepared) {
+      await reload();
+    }
+  });
+
+  const disclosure = h(
+    'details',
+    {
+      class:
+        'mt-1 w-full max-w-xl rounded-md border border-border bg-surface-2 p-3',
+    },
+    h(
+      'summary',
+      {
+        class:
+          'cursor-pointer text-body-sm font-medium text-ink-primary select-none',
+      },
+      'Prepare re-release'
+    ),
+    form
+  );
+  disclosure.addEventListener('toggle', () => {
+    if (!disclosure.open || draft) return;
+    try {
+      store = new ClipReReleaseDraftStore(window.localStorage, target);
+      draft = store.getOrCreate();
+      actor.value = draft.actor;
+      reason.value = draft.reason;
+      if (draft.actor.trim() && draft.reason.trim()) lockDraft();
+      (actor.value.trim() ? reason : actor).focus();
+    } catch (error) {
+      disclosure.open = false;
+      showToast(
+        `Re-release preparation is unavailable: ${(error as Error).message}`,
+        'error'
+      );
+    }
+  });
+  return disclosure;
 }
 
 function renderActions(

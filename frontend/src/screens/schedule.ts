@@ -7,7 +7,10 @@ import { signal, effect } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
 import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
-import { distributionVersionLabel } from '../lib/clip-review-surface';
+import {
+  distributionVersionLabel,
+  publicationEvidenceStatusLabel,
+} from '../lib/clip-review-surface';
 
 interface ScheduleItem {
   type: 'longform' | 'short' | string;
@@ -470,20 +473,10 @@ function renderPublicationRecord(record: PublicationEvidence): HTMLElement {
   const destinationLabel = destinations
     .map((value) => value.replaceAll('_', ' '))
     .join(', ');
-  const status =
-    record.status === 'published'
-      ? 'Published URL recorded'
-      : record.status === 'failed' || record.status === 'partial_failure'
-      ? 'Failed'
-      : record.status === 'unknown'
-      ? 'Unknown outcome'
-      : record.scheduled
-      ? 'Scheduled'
-      : record.status === 'submitted'
-      ? 'Submission recorded'
-      : record.status === 'already_submitted'
-      ? 'Prior submission recorded'
-      : 'Publication record';
+  const status = publicationEvidenceStatusLabel(
+    record.status,
+    record.scheduled
+  );
   const safeUrl =
     record.url?.startsWith('https://') || record.url?.startsWith('http://')
       ? record.url

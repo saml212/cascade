@@ -1,4 +1,11 @@
-import type { ClipReviewState, ReviewArtifact } from './api';
+import type {
+  ClipReReleaseRequestState,
+  ClipReviewState,
+  PrepareClipReReleaseRequest,
+  PrepareClipReReleaseResponse,
+  ReviewArtifact,
+} from './api';
+import type { StatusDescriptor } from './format';
 
 export type ClipReviewSurface = 'base' | 'background';
 
@@ -76,6 +83,16 @@ export function distributionChangeLockReason(
   review: ClipReviewState
 ): string | null {
   if (review.distribution.change_locked === false) return null;
+  if (review.distribution.change_locked === true) {
+    const reReleaseReason = review.distribution.re_release_reason;
+    if (
+      review.distribution.re_release_allowed === false &&
+      typeof reReleaseReason === 'string' &&
+      reReleaseReason.trim()
+    ) {
+      return reReleaseReason.trim();
+    }
+  }
   const reason = review.distribution.change_lock_reason;
   if (typeof reason === 'string' && reason.trim()) return reason.trim();
   return review.distribution.change_locked === true
@@ -92,6 +109,7 @@ export function clipDistributionSelectable(
     version &&
       selectedDistributionVersion(review)?.surface !== surface &&
       review.distribution.change_locked === false &&
+      review.distribution.re_release_request === null &&
       version.render.current &&
       version.approval.current
   );
@@ -111,15 +129,257 @@ export function distributionVersionLabel(
   return 'Unknown version';
 }
 
-export class ClipReviewSurfaceMemory {
-  private readonly selections = new Map<string, ClipReviewSurface>();
+export function clipCardStatusOverride(
+  rawStatus: unknown,
+  changeLocked: unknown
+): StatusDescriptor | null {
+  if (
+    typeof rawStatus !== 'string' ||
+    rawStatus.toLowerCase() !== 'approved'
+  ) {
+    return null;
+  }
+  return {
+    key: 'queued',
+    tone: 'neutral',
+    label: 'Approved',
+    hint:
+      changeLocked === true
+        ? 'This clip is approved. Publication-history checks lock distribution changes; review its distribution details before a re-release.'
+        : 'This clip\u2019s current render is approved.',
+  };
+}
 
-  get(clipId: string, hasBackground: boolean): ClipReviewSurface {
-    const remembered = this.selections.get(clipId);
-    return remembered === 'background' && hasBackground ? remembered : 'base';
+export function publicationEvidenceStatusLabel(
+  status: unknown,
+  scheduled: unknown
+): string {
+  if (status === 'published') return 'Published URL recorded';
+  if (status === 'partial_failure') return 'Some destinations failed';
+  if (status === 'failed') return 'Failed';
+  if (status === 'unknown') return 'Unknown outcome';
+  if (scheduled === true) return 'Scheduled';
+  if (status === 'submitted') return 'Submission recorded';
+  if (status === 'already_submitted') return 'Prior submission recorded';
+  return 'Publication record';
+}
+
+export type ClipReReleaseViewState =
+  | { kind: 'unneeded' }
+  | {
+      kind: 'available';
+      previousRequest: ClipReReleaseRequestState | null;
+    }
+  | { kind: 'prepared'; request: ClipReReleaseRequestState }
+  | { kind: 'blocked'; reason: string };
+
+function nonemptyString(value: unknown): value is string {
+  return typeof value === 'string' && Boolean(value.trim());
+}
+
+function validReReleaseRequest(
+  value: unknown
+): ClipReReleaseRequestState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const request = value as Record<string, unknown>;
+  const requiredStrings = [
+    'request_id',
+    'actor',
+    'reason',
+    'target_revision',
+    'render_fingerprint',
+    'receipt_history_revision',
+    'revision',
+    'created_at',
+  ];
+  if (
+    (request.variant_id !== null &&
+      request.variant_id !== 'background_motion_v1') ||
+    requiredStrings.some((field) => !nonemptyString(request[field]))
+  ) {
+    return null;
+  }
+  return request as unknown as ClipReReleaseRequestState;
+}
+
+export function confirmsClipReRelease(
+  response: PrepareClipReReleaseResponse,
+  clipId: string,
+  request: PrepareClipReReleaseRequest
+): boolean {
+  const prepared = validReReleaseRequest(
+    response.distribution?.re_release_request
+  );
+  return Boolean(
+    (response.status === 'prepared' || response.status === 'already_prepared') &&
+      response.requires_publish_approval === true &&
+      response.clip_id === clipId &&
+      (response.distribution?.re_release_request_consumed === false ||
+        (response.status === 'already_prepared' &&
+          response.distribution?.re_release_request_consumed === true)) &&
+      response.distribution?.variant_id === request.variant_id &&
+      response.distribution?.revision === request.expected_revision &&
+      prepared?.request_id === request.request_id &&
+      prepared.actor === request.actor &&
+      prepared.reason === request.reason &&
+      prepared.variant_id === request.variant_id &&
+      prepared.target_revision === request.expected_revision
+  );
+}
+
+export function clipReReleaseViewState(
+  review: ClipReviewState
+): ClipReReleaseViewState {
+  const distribution = review.distribution;
+  const rawRequest = distribution.re_release_request;
+  const consumed = distribution.re_release_request_consumed;
+  const backendReason =
+    typeof distribution.re_release_reason === 'string' &&
+    distribution.re_release_reason.trim()
+      ? distribution.re_release_reason.trim()
+      : null;
+  if (rawRequest === null) {
+    if (consumed !== null) {
+      return {
+        kind: 'blocked',
+        reason:
+          backendReason ??
+          'Re-release request state is unavailable. Refresh before preparing another re-release.',
+      };
+    }
+    if (distribution.change_locked !== true) return { kind: 'unneeded' };
+    if (distribution.re_release_allowed === true) {
+      return { kind: 'available', previousRequest: null };
+    }
+  } else {
+    const request = validReReleaseRequest(rawRequest);
+    if (!request || (consumed !== false && consumed !== true)) {
+      return {
+        kind: 'blocked',
+        reason:
+          backendReason ??
+          'Re-release request state is unavailable. Refresh before preparing another re-release.',
+      };
+    }
+    if (consumed === false) {
+      if (
+        request.variant_id !== distribution.variant_id ||
+        request.target_revision !== distribution.revision
+      ) {
+        return {
+          kind: 'blocked',
+          reason:
+            'The prepared re-release no longer matches the selected render and copy. Refresh before continuing.',
+        };
+      }
+      return { kind: 'prepared', request };
+    }
+    if (distribution.re_release_allowed === true) {
+      return { kind: 'available', previousRequest: request };
+    }
+  }
+  return {
+    kind: 'blocked',
+    reason:
+      backendReason ??
+      'Re-release eligibility is unavailable. Refresh before preparing another re-release.',
+  };
+}
+
+export interface ClipReReleaseDraftTarget {
+  episodeId: string;
+  clipId: string;
+  variantId: null | 'background_motion_v1';
+  expectedRevision: string;
+  previousRequestId: string | null;
+}
+
+interface KeyValueStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+export class ClipReReleaseDraftStore {
+  private readonly key: string;
+
+  constructor(
+    private readonly storage: KeyValueStorage,
+    private readonly target: ClipReReleaseDraftTarget,
+    private readonly createRequestId: () => string = () =>
+      crypto.randomUUID()
+  ) {
+    this.key = `cascade.clip-rerelease.v1:${JSON.stringify([
+      target.episodeId,
+      target.clipId,
+      target.variantId,
+      target.expectedRevision,
+      target.previousRequestId,
+    ])}`;
   }
 
-  select(clipId: string, surface: ClipReviewSurface): void {
-    this.selections.set(clipId, surface);
+  getOrCreate(): PrepareClipReReleaseRequest {
+    const stored = this.read();
+    if (stored) return stored;
+    const created: PrepareClipReReleaseRequest = {
+      variant_id: this.target.variantId,
+      expected_revision: this.target.expectedRevision,
+      request_id: this.createRequestId(),
+      actor: '',
+      reason: '',
+    };
+    this.save(created);
+    return created;
+  }
+
+  save(draft: PrepareClipReReleaseRequest): void {
+    if (
+      draft.variant_id !== this.target.variantId ||
+      draft.expected_revision !== this.target.expectedRevision ||
+      !nonemptyString(draft.request_id) ||
+      typeof draft.actor !== 'string' ||
+      typeof draft.reason !== 'string'
+    ) {
+      throw new Error('Re-release draft does not match the previewed version.');
+    }
+    this.storage.setItem(this.key, JSON.stringify(draft));
+  }
+
+  clear(): void {
+    this.storage.removeItem(this.key);
+  }
+
+  private read(): PrepareClipReReleaseRequest | null {
+    const encoded = this.storage.getItem(this.key);
+    if (!encoded) return null;
+    try {
+      const value = JSON.parse(encoded) as Record<string, unknown>;
+      if (
+        value.variant_id !== this.target.variantId ||
+        value.expected_revision !== this.target.expectedRevision ||
+        !nonemptyString(value.request_id) ||
+        typeof value.actor !== 'string' ||
+        typeof value.reason !== 'string'
+      ) {
+        return null;
+      }
+      return value as unknown as PrepareClipReReleaseRequest;
+    } catch {
+      return null;
+    }
+  }
+}
+
+export class ClipReviewSurfaceMemory {
+  private preferred: ClipReviewSurface = 'base';
+
+  get(_clipId: string, hasBackground: boolean): ClipReviewSurface {
+    return this.preferred === 'background' && hasBackground
+      ? 'background'
+      : 'base';
+  }
+
+  select(_clipId: string, surface: ClipReviewSurface): void {
+    this.preferred = surface;
   }
 }
