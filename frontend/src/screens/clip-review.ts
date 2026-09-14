@@ -58,7 +58,10 @@ import {
   isRejectedClipId,
 } from '../lib/clip-review-list';
 import {
+  clipDistributionLabel,
+  clipVersionState,
   ClipReviewSurfaceMemory,
+  selectedDistributionVersion,
   type ClipReviewSurface,
 } from '../lib/clip-review-surface';
 
@@ -561,18 +564,18 @@ function renderHeader(
       Button({
         variant: 'primary',
         size: 'md',
-        label: ready ? 'Final approve rendered clips' : 'Current renders required',
+        label: ready ? 'Final approve base renders' : 'Current base renders required',
         disabled: !ready,
         title: ready
-          ? 'Approve each current rendered file and its current copy'
-          : 'Render or re-render every kept candidate first',
+          ? 'Approve each current base file and its current copy'
+          : 'Render or re-render every kept base candidate first',
         onClick: async () => {
           try {
             await api.approveClips(
               episodeId,
               kept.map((clip) => String(clip.id ?? clip.clip_id))
             );
-            showToast('Rendered clips approved for the current files.', 'success');
+            showToast('Base renders approved for the current files.', 'success');
             navigate(`/episodes/${episodeId}`);
           } catch (e) {
             showToast((e as Error).message, 'error');
@@ -939,6 +942,7 @@ function clipExpanded(
     review.render_job.status === 'rendering' ||
       background?.render_job.status === 'rendering'
   );
+  const selectingDistribution = signal(false);
   return h(
     'div',
     {
@@ -948,7 +952,7 @@ function clipExpanded(
     },
     renderReviewChoice(
       clipId,
-      review.render,
+      review,
       background,
       surface,
       selectSurface,
@@ -963,6 +967,7 @@ function clipExpanded(
       background,
       surface,
       rendering,
+      selectingDistribution,
       approvalFeedback,
       reload
     ),
@@ -980,25 +985,33 @@ function clipExpanded(
 
 function renderReviewChoice(
   clipId: string,
-  base: ReviewArtifact,
+  review: ClipReviewState,
   background: ShortVariantReview | undefined,
   surface: Signal<ClipReviewSurface>,
   selectSurface: (surface: ClipReviewSurface) => void,
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
+  const base = review.render;
   if (!background) {
     return renderReviewPlayer(clipId, base, navigation, setExpanded);
   }
   const controls = h('div', {
-    class: 'px-5 pt-4 flex items-center justify-center gap-2 bg-surface-inset/50',
+    class:
+      'px-5 pt-4 flex items-center justify-center gap-2 bg-surface-inset/50 flex-wrap',
     role: 'group',
     'aria-label': 'Video version',
   });
   const player = h('div');
   effect(() => {
     const selected = surface();
+    const version = clipVersionState(review, selected);
     controls.replaceChildren(
+      h(
+        'span',
+        { class: 'text-heading-sm uppercase text-ink-tertiary mr-1' },
+        'Preview'
+      ),
       Button({
         variant: selected === 'base' ? 'primary' : 'secondary',
         size: 'sm',
@@ -1010,7 +1023,25 @@ function renderReviewChoice(
         size: 'sm',
         label: 'Background',
         onClick: () => selectSurface('background'),
-      })
+      }),
+      h(
+        'span',
+        {
+          class: `chip ml-2 ${
+            version?.approval.current
+              ? 'text-status-success'
+              : 'text-status-warning'
+          }`,
+        },
+        `${version?.label ?? 'Unknown'} approval: ${
+          version?.approval.current ? 'Approved' : 'Not approved'
+        }`
+      ),
+      h(
+        'span',
+        { class: 'chip text-ink-primary' },
+        `Distribution: ${clipDistributionLabel(review)}`
+      )
     );
     player.querySelector('video')?.pause();
     player.replaceChildren(
@@ -1165,6 +1196,7 @@ function renderChoiceActions(
   background: ShortVariantReview | undefined,
   surface: Signal<ClipReviewSurface>,
   rendering: Signal<boolean>,
+  selectingDistribution: Signal<boolean>,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   reload: () => Promise<void>
 ): HTMLElement {
@@ -1174,6 +1206,7 @@ function renderChoiceActions(
     clip,
     review,
     rendering,
+    selectingDistribution,
     approvalFeedback,
     reload
   );
@@ -1182,8 +1215,10 @@ function renderChoiceActions(
     episodeId,
     clipId,
     background,
+    review,
     review.render.current,
     rendering,
+    selectingDistribution,
     reload
   );
   effect(() => {
@@ -1197,8 +1232,10 @@ function renderVariantActions(
   episodeId: string,
   clipId: string,
   background: ShortVariantReview,
+  review: ClipReviewState,
   baseCurrent: boolean,
   rendering: Signal<boolean>,
+  selectingDistribution: Signal<boolean>,
   reload: () => Promise<void>
 ): HTMLElement {
   const action = h('span');
@@ -1262,6 +1299,14 @@ function renderVariantActions(
     'div',
     { class: 'flex items-center gap-3 px-5 py-4 flex-wrap' },
     action,
+    renderDistributionAction(
+      episodeId,
+      clipId,
+      review,
+      'background',
+      selectingDistribution,
+      reload
+    ),
     h(
       'span',
       { class: 'text-body-sm text-ink-tertiary' },
@@ -1270,12 +1315,69 @@ function renderVariantActions(
   );
 }
 
+function renderDistributionAction(
+  episodeId: string,
+  clipId: string,
+  review: ClipReviewState,
+  surface: ClipReviewSurface,
+  selecting: Signal<boolean>,
+  reload: () => Promise<void>
+): HTMLElement {
+  const host = h('span');
+  effect(() => {
+    const version = clipVersionState(review, surface);
+    const selected = selectedDistributionVersion(review)?.surface === surface;
+    const active = selecting();
+    const current = version?.render.current === true;
+    const approved = version?.approval.current === true;
+    const label = version?.label ?? 'Unknown version';
+    host.replaceChildren(
+      Button({
+        variant: selected ? 'secondary' : 'ghost',
+        size: 'sm',
+        label: selected
+          ? `Distribution: ${label}`
+          : !current
+            ? `Current ${label.toLowerCase()} required`
+            : !approved
+              ? `Approve ${label.toLowerCase()} first`
+              : `Use ${label} for distribution`,
+        disabled: selected || !current || !approved || active || !version,
+        loading: active,
+        title: selected
+          ? `${label} is the version that will be published and scheduled`
+          : `Select the current, separately approved ${label.toLowerCase()} version for publication and scheduling`,
+        onClick: async () => {
+          if (!version) return;
+          selecting.set(true);
+          try {
+            await api.selectClipDistribution(
+              episodeId,
+              clipId,
+              version.variantId,
+              version.approval.revision
+            );
+            showToast(`${label} selected for distribution.`, 'success');
+            await reload();
+          } catch (error) {
+            showToast((error as Error).message, 'error');
+          } finally {
+            selecting.set(false);
+          }
+        },
+      })
+    );
+  });
+  return host;
+}
+
 function renderActions(
   episodeId: string,
   clipId: string,
   clip: UnknownRecord,
   review: ClipReviewState,
   rendering: Signal<boolean>,
+  selectingDistribution: Signal<boolean>,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   reload: () => Promise<void>
 ): HTMLElement {
@@ -1300,11 +1402,11 @@ function renderActions(
         label: saving
           ? 'Saving…'
           : approved
-            ? 'Approved'
+            ? 'Base approved'
             : review.render.current
               ? failed
                 ? 'Retry approval'
-                : 'Final approve'
+                : 'Approve base'
               : active
                 ? 'Rendering…'
                 : review.render.playable
@@ -1375,6 +1477,14 @@ function renderActions(
     'div',
     { class: 'flex items-center gap-2 px-5 py-4 flex-wrap' },
     primary,
+    renderDistributionAction(
+      episodeId,
+      clipId,
+      review,
+      'base',
+      selectingDistribution,
+      reload
+    ),
     Button({
       variant: 'destructive',
       size: 'sm',

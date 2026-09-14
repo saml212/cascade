@@ -7,6 +7,7 @@ import { signal, effect } from '../lib/signals';
 import { api, type UnknownRecord } from '../lib/api';
 import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
+import { distributionVersionLabel } from '../lib/clip-review-surface';
 
 interface ScheduleItem {
   type: 'longform' | 'short' | string;
@@ -23,6 +24,8 @@ interface ScheduleItem {
   request_id?: string;
   error?: string;
   current_release?: boolean | null;
+  version?: 'base' | 'background_motion_v1';
+  variant_id?: null | 'background_motion_v1';
 }
 
 interface ScheduleDay {
@@ -50,6 +53,8 @@ interface PublicationEvidence {
   job_id?: string;
   request_id?: string;
   error?: string;
+  version?: 'base' | 'background_motion_v1';
+  variant_id?: null | 'background_motion_v1';
 }
 
 const TYPE_COLOR: Record<string, string> = {
@@ -316,6 +321,13 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
       { class: 'text-body-sm text-ink-primary leading-snug line-clamp-3' },
       item.title || item.name || 'Untitled'
     ),
+    item.type === 'short'
+      ? h(
+          'div',
+          { class: 'text-code-sm text-ink-secondary font-mono' },
+          `Version · ${distributionVersionLabel(item.version, item.variant_id)}`
+        )
+      : null,
     h(
       'div',
       { class: `text-code-sm font-mono uppercase ${stateClass}` },
@@ -447,7 +459,10 @@ function renderPublicationRecord(record: PublicationEvidence): HTMLElement {
       : record.content_type === 'longform'
       ? 'Longform'
       : record.clip_id
-      ? `Short ${record.clip_id}`
+      ? `Short ${record.clip_id} · ${distributionVersionLabel(
+          record.version,
+          record.variant_id
+        )}`
       : 'Short';
   const destinations =
     record.destinations ??

@@ -316,6 +316,7 @@ export interface ClipReviewState extends UnknownRecord {
   selection: { status: 'selected' | 'unselected' | 'rejected' };
   render: ReviewArtifact;
   approval: { status: string; current: boolean; revision: string };
+  distribution: ClipDistributionState;
   metadata: {
     complete: boolean;
     enabled_destination_count: number;
@@ -340,6 +341,15 @@ export interface ShortVariantReview extends UnknownRecord {
   render: ReviewArtifact;
   approval: { status: string; current: boolean; revision: string };
   render_job: ClipReviewState['render_job'];
+}
+
+export interface ClipDistributionState extends UnknownRecord {
+  version: 'base' | 'background_motion_v1' | 'invalid';
+  variant_id: null | 'background_motion_v1';
+  label: string;
+  current: boolean;
+  approval_current: boolean;
+  revision: string;
 }
 
 export interface EpisodeReviewState extends UnknownRecord {
@@ -605,6 +615,17 @@ export const api = {
       'POST',
       `/api/episodes/${id}/clips/${clipId}/variants/${variantId}/approve`,
       { expected_revision: expectedRevision }
+    ),
+  selectClipDistribution: (
+    id: string,
+    clipId: string,
+    variantId: null | 'background_motion_v1',
+    expectedRevision: string
+  ) =>
+    request<UnknownRecord>(
+      'PUT',
+      `/api/episodes/${id}/clips/${clipId}/distribution`,
+      { variant_id: variantId, expected_revision: expectedRevision }
     ),
   approveClips: (id: string, clipIds: string[]) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/approve`, {

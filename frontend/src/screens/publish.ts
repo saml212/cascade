@@ -12,6 +12,10 @@ import {
 } from '../lib/api';
 import { h, mount } from '../lib/dom';
 import {
+  clipDistributionLabel,
+  clipDistributionReady,
+} from '../lib/clip-review-surface';
+import {
   describeEpisodeStatus,
   episodeDisplayDuration,
   episodeTitle,
@@ -79,8 +83,12 @@ export function Publish(target: HTMLElement, episodeId: string): void {
     const selected = state.clips.filter(
       (clip) => clip.review.selection.status === 'selected'
     );
-    const approved = selected.filter((clip) => clip.review.approval.current);
-    const pending = selected.filter((clip) => !clip.review.approval.current);
+    const approved = selected.filter((clip) =>
+      clipDistributionReady(clip.review)
+    );
+    const pending = selected.filter(
+      (clip) => !clipDistributionReady(clip.review)
+    );
     const unselected = state.clips.filter(
       (clip) => clip.review.selection.status === 'unselected'
     );
@@ -158,8 +166,8 @@ function renderOverview(
   return h(
     'div',
     { class: 'panel p-6 flex items-center gap-10 flex-wrap' },
-    statTile('Final approved', String(approved), 'status-success'),
-    statTile('Selected · pending', String(pending), 'ink-primary'),
+    statTile('Distribution ready', String(approved), 'status-success'),
+    statTile('Selected · not ready', String(pending), 'ink-primary'),
     statTile('Rejected · deferred', String(rejected), 'ink-secondary'),
     statTile(
       'Longform',
@@ -256,8 +264,16 @@ function renderClipList(
   rejected: ReviewedClip[]
 ): HTMLElement {
   const rows = [
-    ...approved.map((clip) => ({ clip, state: 'Final approved', tone: 'success' })),
-    ...pending.map((clip) => ({ clip, state: 'Needs final review', tone: 'warning' })),
+    ...approved.map((clip) => ({
+      clip,
+      state: 'Ready for distribution',
+      tone: 'success',
+    })),
+    ...pending.map((clip) => ({
+      clip,
+      state: 'Version needs approval',
+      tone: 'warning',
+    })),
     ...unselected.map((clip) => ({ clip, state: 'Not selected', tone: 'neutral' })),
     ...rejected.map((clip) => ({ clip, state: 'Rejected · deferred', tone: 'danger' })),
   ];
@@ -275,7 +291,7 @@ function renderClipList(
           { class: 'text-body text-status-warning' },
           `${pluralize(pending.length, 'selected clip')} still ${
             pending.length === 1 ? 'needs' : 'need'
-          } current final approval.`
+          } a current approval for its chosen distribution version.`
         )
       : null,
     h(
@@ -302,6 +318,13 @@ function renderClipList(
             { class: 'text-body text-ink-primary flex-1 truncate' },
             String(clip.title || 'Untitled clip')
           ),
+          clip.review.selection.status === 'selected'
+            ? h(
+                'span',
+                { class: 'chip text-ink-primary' },
+                clipDistributionLabel(clip.review)
+              )
+            : null,
           h(
             'span',
             { class: 'text-body-sm text-ink-tertiary' },
@@ -352,7 +375,7 @@ function renderPublishBar(
           'div',
           { class: 'text-body text-ink-primary font-medium' },
           canPublish
-            ? `${pluralize(approvedCount, 'approved clip')} ready`
+            ? `${pluralize(approvedCount, 'distribution-ready clip')} ready`
             : status.label
         ),
         h(

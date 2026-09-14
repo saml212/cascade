@@ -8,6 +8,11 @@ import {
   type UnknownRecord,
 } from '../../lib/api';
 import { formatDuration, pluralize } from '../../lib/format';
+import {
+  clipDistributionLabel,
+  clipDistributionReady,
+  selectedDistributionVersion,
+} from '../../lib/clip-review-surface';
 import { currentPath, navigate } from '../../lib/router';
 
 export function renderClips(
@@ -74,11 +79,20 @@ function renderClipState(
   const selected = clips.filter(
     (clip) => clip.review.selection.status === 'selected'
   );
-  const currentRenders = selected.filter((clip) => clip.review.render.current);
-  const finalApproved = selected.filter((clip) => clip.review.approval.current);
-  const renderNeeded = selected.filter((clip) => !clip.review.render.current);
+  const currentRenders = selected.filter(
+    (clip) => selectedDistributionVersion(clip.review)?.render.current === true
+  );
+  const finalApproved = selected.filter((clip) =>
+    clipDistributionReady(clip.review)
+  );
+  const renderNeeded = selected.filter(
+    (clip) => selectedDistributionVersion(clip.review)?.render.current !== true
+  );
   const previousPlayable = selected.filter(
-    (clip) => clip.review.render.playable && !clip.review.render.current
+    (clip) => {
+      const render = selectedDistributionVersion(clip.review)?.render;
+      return render?.playable === true && !render.current;
+    }
   );
   const playableClips = clips.filter((clip) => clip.review.render.playable);
   const currentClips = playableClips.filter((clip) => clip.review.render.current);
@@ -99,8 +113,8 @@ function renderClipState(
           { class: 'flex items-center gap-8 flex-wrap' },
           statBlock('Candidates', String(review.clip_summary.candidate_count), 'ink-primary'),
           statBlock('Selected', String(review.clip_summary.selected_count), 'ink-primary'),
-          statBlock('Current renders', String(currentRenders.length), 'ink-primary'),
-          statBlock('Final approved', String(finalApproved.length), 'status-success'),
+          statBlock('Current versions', String(currentRenders.length), 'ink-primary'),
+          statBlock('Distribution ready', String(finalApproved.length), 'status-success'),
           statBlock('Rejected', String(review.clip_summary.rejected_count), 'ink-secondary')
         ),
         Button({
@@ -145,11 +159,11 @@ function renderClipState(
               },
               `${renderNeeded.length} selected ${pluralize(renderNeeded.length, 'clip')} ${
                 renderNeeded.length === 1 ? 'needs' : 'need'
-              } a current render.`,
+              } a current chosen distribution version.`,
               previousPlayable.length > 0
                 ? ` ${previousPlayable.length} previous ${pluralize(previousPlayable.length, 'file')} remain reviewable.`
                 : '',
-              ' Final approval stays locked until current files are reviewed.'
+              ' Distribution stays locked until the exact current versions are reviewed and approved.'
             )
           : null,
         h(
@@ -193,7 +207,7 @@ function renderTile(
   const score = (clip.virality_score as number) ?? null;
   const manual = Boolean(clip.manual);
   const state = clip.review;
-  const statusTone = state.approval.current
+  const statusTone = clipDistributionReady(state)
     ? 'bg-status-success'
     : state.selection.status === 'rejected'
       ? 'bg-status-danger'
@@ -302,7 +316,14 @@ function renderTile(
               { class: 'text-code-sm text-ink-tertiary mt-0.5' },
               'Manual selection · unscored'
             )
-          : null
+          : null,
+      state.selection.status === 'selected'
+        ? h(
+            'div',
+            { class: 'text-code-sm text-ink-secondary mt-0.5' },
+            `Distribution · ${clipDistributionLabel(state)}`
+          )
+        : null
     )
   );
 }
