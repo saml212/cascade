@@ -57,6 +57,10 @@ import {
   groupClipReviewCandidates,
   isRejectedClipId,
 } from '../lib/clip-review-list';
+import {
+  ClipReviewSurfaceMemory,
+  type ClipReviewSurface,
+} from '../lib/clip-review-surface';
 
 interface PlatformSpec {
   key: string;
@@ -129,6 +133,7 @@ export function ClipReview(
   const speakerLabels = signal<Map<number, string>>(new Map());
   const expandedId = signal<string | null>(initialClipId ?? null);
   const showRejected = signal(false);
+  const reviewSurfaces = new ClipReviewSurfaceMemory();
   const setExpanded = (nextId: string | null, focusPlayer = false): void => {
     if (nextId && isRejectedClipId(clips.peek() ?? [], nextId)) {
       showRejected.set(true);
@@ -377,6 +382,7 @@ export function ClipReview(
           clip.review as ClipReviewState,
           approvalFeedback,
           platforms,
+          reviewSurfaces,
           async () => load(),
           setExpanded,
           clipNavigation(playableIds, id),
@@ -641,6 +647,7 @@ function clipCard(
   review: ClipReviewState,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   platforms: PlatformSpec[],
+  reviewSurfaces: ClipReviewSurfaceMemory,
   reload: () => Promise<void>,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void,
   navigation: ClipNavigation | undefined,
@@ -707,6 +714,7 @@ function clipCard(
             clip,
             approvalFeedback,
             platforms,
+            reviewSurfaces,
             reload,
             navigation,
             setExpanded
@@ -913,12 +921,20 @@ function clipExpanded(
   clip: UnknownRecord,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   platforms: PlatformSpec[],
+  reviewSurfaces: ClipReviewSurfaceMemory,
   reload: () => Promise<void>,
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
   const background = review.variants?.background_motion_v1;
-  const surface = signal<'base' | 'background'>('base');
+  const hasBackground = Boolean(background);
+  const surface = signal<ClipReviewSurface>(
+    reviewSurfaces.get(clipId, hasBackground)
+  );
+  const selectSurface = (next: ClipReviewSurface): void => {
+    reviewSurfaces.select(clipId, next);
+    surface.set(next);
+  };
   const rendering = signal(
     review.render_job.status === 'rendering' ||
       background?.render_job.status === 'rendering'
@@ -935,6 +951,7 @@ function clipExpanded(
       review.render,
       background,
       surface,
+      selectSurface,
       navigation,
       setExpanded
     ),
@@ -965,7 +982,8 @@ function renderReviewChoice(
   clipId: string,
   base: ReviewArtifact,
   background: ShortVariantReview | undefined,
-  surface: Signal<'base' | 'background'>,
+  surface: Signal<ClipReviewSurface>,
+  selectSurface: (surface: ClipReviewSurface) => void,
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
@@ -985,13 +1003,13 @@ function renderReviewChoice(
         variant: selected === 'base' ? 'primary' : 'secondary',
         size: 'sm',
         label: 'Base',
-        onClick: () => surface.set('base'),
+        onClick: () => selectSurface('base'),
       }),
       Button({
         variant: selected === 'background' ? 'primary' : 'secondary',
         size: 'sm',
         label: 'Background',
-        onClick: () => surface.set('background'),
+        onClick: () => selectSurface('background'),
       })
     );
     player.querySelector('video')?.pause();
@@ -1145,7 +1163,7 @@ function renderChoiceActions(
   clip: UnknownRecord,
   review: ClipReviewState,
   background: ShortVariantReview | undefined,
-  surface: Signal<'base' | 'background'>,
+  surface: Signal<ClipReviewSurface>,
   rendering: Signal<boolean>,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
   reload: () => Promise<void>
