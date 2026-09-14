@@ -157,7 +157,7 @@ def test_background_composition_copies_complete_base_audio(
     assert "-t" not in command
     graph = command[command.index("-filter_complex") + 1]
     assert "tpad=stop_mode=clone:stop_duration=0.25" in graph
-    assert "enable='not(between(t,2.000000,4.000000))'" in graph
+    assert graph.count("enable='not(between(t,2.000000,4.000000))'") == 2
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
@@ -225,7 +225,7 @@ def test_background_composition_keeps_trailing_aac_packet(
         base,
         output,
         "30/1",
-        [],
+        [(0.2, 0.4)],
         [
             "-c:v",
             "libx264",
@@ -274,6 +274,43 @@ def test_three_person_overlap_stacks_all_crops_in_spatial_order(
     assert "[row0][row1][row2]vstack=inputs=3" in video_filter
     assert "drawbox=x=0:y=637:w=1080:h=6" in video_filter
     assert "drawbox=x=0:y=1277:w=1080:h=6" in video_filter
+
+
+def test_background_three_person_stack_uses_valid_crops_without_base_opt_in(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {"center_x": 80, "center_y": 90, "zoom": 1},
+            {"center_x": 160, "center_y": 90, "zoom": 1},
+            {"center_x": 240, "center_y": 90, "zoom": 1},
+        ]
+    }
+
+    assert agent._three_person_stack_enabled(
+        {}, crop_config, 320, 180, for_background=True
+    )
+    assert not agent._three_person_stack_enabled(
+        {}, crop_config, 320, 180, for_background=False
+    )
+    assert agent._three_person_stack_enabled(
+        {"shorts_three_person_stack": True},
+        crop_config,
+        320,
+        180,
+        for_background=False,
+    )
+    assert "[row0][row1][row2]vstack=inputs=3" in (
+        agent._get_background_crop_filter_no_subs(
+            "BOTH", 320, 180, crop_config, three_person_stack=True
+        )
+    )
+
+    del crop_config["speakers"][1]["center_x"]
+    assert not agent._three_person_stack_enabled(
+        {}, crop_config, 320, 180, for_background=True
+    )
 
 
 @pytest.mark.parametrize(

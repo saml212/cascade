@@ -265,7 +265,7 @@ class ShortsRenderAgent(BaseAgent):
             "[1:v]scale=1080:640:force_original_aspect_ratio=increase,"
             f"crop=1080:640,fps={fps},setpts=PTS-STARTPTS[motion];"
             f"[podcast][motion]overlay=0:1280{enable},"
-            "drawbox=x=0:y=1276:w=1080:h=8:color=black@0.85:t=fill,"
+            f"drawbox=x=0:y=1276:w=1080:h=8:color=black@0.85:t=fill{enable},"
             "tpad=stop_mode=clone:stop_duration=0.25,format=yuv420p[variant]"
         )
         self._run_ffmpeg(
@@ -688,8 +688,12 @@ class ShortsRenderAgent(BaseAgent):
             if background
             else CaptionStyle()
         )
-        three_person_stack_enabled = bool(
-            episode.get("shorts_three_person_stack", False)
+        three_person_stack_enabled = self._three_person_stack_enabled(
+            episode,
+            crop_config,
+            src_w,
+            src_h,
+            for_background=background is not None,
         )
         caption_path = Path(caption_path).with_suffix(".ass")
         caption_path.parent.mkdir(parents=True, exist_ok=True)
@@ -920,6 +924,22 @@ class ShortsRenderAgent(BaseAgent):
             and speaker in {"BOTH", "NONE"}
             and len(crop_config.get("speakers", [])) == 3
         )
+
+    def _three_person_stack_enabled(
+        self, episode, crop_config, src_w, src_h, *, for_background
+    ):
+        if not for_background:
+            return bool(episode.get("shorts_three_person_stack", False))
+        if len(crop_config.get("speakers", [])) != 3:
+            return False
+        try:
+            for index in range(3):
+                self._get_short_crop_region(
+                    f"speaker_{index}", src_w, src_h, crop_config
+                )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
 
     def _short_caption_style(self, speaker, crop_config, three_person_stack_enabled):
         if self._uses_three_person_stack(

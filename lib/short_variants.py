@@ -16,7 +16,7 @@ from lib.timeline import Timeline
 
 BACKGROUND_VARIANT_ID = "background_motion_v1"
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
-BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v1"
+BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v2"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 
 _ASSET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
