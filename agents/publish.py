@@ -30,6 +30,7 @@ from agents.qa import (
 from lib.atomic_write import atomic_write_json
 from lib.delivery_video import render_output_lock
 from lib.short_variants import (
+    BACKGROUND_VARIANT_ID,
     DISTRIBUTION_RELEASE_FIELD,
     distribution_release_revision,
 )
@@ -61,6 +62,31 @@ _UNRESOLVED_PROVIDER_STATE_MARKERS = (
     "unknown",
     "wait",
     "upload",
+)
+_LEGACY_UNRESOLVED_RECEIPT_FIELDS = frozenset(
+    {
+        "clip_id",
+        "completed_at",
+        "error",
+        "external_id",
+        "historical_receipt",
+        "idempotency_key",
+        "job_id",
+        "platform_failures",
+        "platforms",
+        "reconciliation",
+        "request_id",
+        "reservation_active",
+        "response",
+        "reused_receipt",
+        "scheduled",
+        "scheduled_date",
+        "server_request_id",
+        "status",
+        "status_history",
+        "timezone",
+        "was_scheduled",
+    }
 )
 SLOT_HOURS = {"morning": 9, "afternoon": 14, "evening": 18}
 
@@ -246,6 +272,22 @@ def _short_target_fields(clip_id, version):
             else version.get("rerelease_authorization_revision")
         ),
     }
+
+
+def _rerelease_receipt_fields(request):
+    if not isinstance(request, dict):
+        return {}
+    fields = {
+        "rerelease_request_id": request.get("request_id"),
+        "rerelease_actor": request.get("actor"),
+        "rerelease_reason": request.get("reason"),
+        "rerelease_authorization_revision": request.get("revision"),
+        "parent_receipt_history_revision": request.get("receipt_history_revision"),
+    }
+    acknowledgement = request.get("unresolved_history_acknowledgement")
+    if acknowledgement is not None:
+        fields["unresolved_history_acknowledgement"] = acknowledgement
+    return fields
 
 
 def _destination_request_fields(receipt):
@@ -873,11 +915,7 @@ def short_receipt_history_revision(
     publish: dict, clip_id: str, *, exclude_request_id: str | None = None
 ) -> str:
     receipts = [
-        {
-            key: value
-            for key, value in receipt.items()
-            if key not in {"historical_receipt", "reused_receipt"}
-        }
+        _stable_receipt(receipt)
         for receipt in validated_short_receipts(publish)
         if receipt["clip_id"] == clip_id
         and (
@@ -887,6 +925,86 @@ def short_receipt_history_revision(
     ]
     encoded = json.dumps(receipts, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_receipt(receipt: dict) -> dict:
+    return {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"historical_receipt", "reused_receipt"}
+    }
+
+
+def _unresolved_receipt_summary(receipt: dict) -> dict:
+    complete_identity = bool(
+        isinstance(receipt.get("version"), str)
+        and receipt["version"]
+        and (
+            receipt.get("variant_id") is None
+            or (isinstance(receipt.get("variant_id"), str) and receipt["variant_id"])
+        )
+        and isinstance(receipt.get("render_fingerprint"), str)
+        and receipt["render_fingerprint"]
+        and isinstance(receipt.get("approval_revision"), str)
+        and receipt["approval_revision"]
+    )
+
+    def identifier(field: str) -> str | None:
+        value = receipt.get(field)
+        return value if isinstance(value, str) and value else None
+
+    return {
+        "receipt_revision": _document_revision(_stable_receipt(receipt)),
+        "status": receipt.get("status"),
+        "error": (
+            receipt.get("error") if isinstance(receipt.get("error"), str) else None
+        ),
+        "platforms": receipt.get("platforms")
+        if isinstance(receipt.get("platforms"), list)
+        else None,
+        "request_id": identifier("request_id"),
+        "job_id": identifier("job_id") or identifier("server_request_id"),
+        "external_id": identifier("external_id"),
+        "version": receipt.get("version") if complete_identity else None,
+        "variant_id": receipt.get("variant_id") if complete_identity else None,
+        "render_fingerprint": (
+            receipt.get("render_fingerprint") if complete_identity else None
+        ),
+        "approval_revision": (
+            receipt.get("approval_revision") if complete_identity else None
+        ),
+        "artifact_identity": "known" if complete_identity else "unknown",
+    }
+
+
+def _legacy_unresolved_receipt(receipt: dict) -> bool:
+    """Recognize pre-schema receipts without asserting their artifact identity."""
+    return set(receipt) <= _LEGACY_UNRESOLVED_RECEIPT_FIELDS
+
+
+def unresolved_receipt_obligations(
+    publish: dict,
+    clip_id: str,
+    *,
+    profile_username: str | None = None,
+    exclude_request_id: str | None = None,
+) -> tuple[list[dict], bool]:
+    receipts = [
+        receipt
+        for receipt in validated_short_receipts(publish)
+        if receipt["clip_id"] == clip_id
+        and (
+            exclude_request_id is None
+            or receipt.get("rerelease_request_id") != exclude_request_id
+        )
+        and receipt_terminal_destinations(receipt, profile_username=profile_username)
+        is None
+    ]
+    return (
+        [_unresolved_receipt_summary(receipt) for receipt in receipts],
+        bool(receipts)
+        and all(_legacy_unresolved_receipt(receipt) for receipt in receipts),
+    )
 
 
 def short_rerelease_state(
@@ -907,23 +1025,10 @@ def short_rerelease_state(
             "reason": "No prior remote submission requires a re-release.",
             "history_revision": short_receipt_history_revision(publish, clip_id),
         }
+    history_revision = short_receipt_history_revision(publish, clip_id)
     cancellation_request = None
     consumed = {receipt.get("rerelease_request_id") for receipt in receipts}
     for receipt in receipts:
-        evidence = receipt_terminal_destinations(
-            receipt, profile_username=profile_username
-        )
-        if evidence is None:
-            key = receipt_key(receipt)
-            label = key[1] if key else receipt.get("status", "unknown")
-            return {
-                "allowed": False,
-                "reason": (
-                    f"Receipt {label} has unresolved remote destinations. "
-                    "Refresh Upload-Post status before preparing a re-release."
-                ),
-                "history_revision": short_receipt_history_revision(publish, clip_id),
-            }
         operation = validated_schedule_cancellation(receipt)
         if operation and operation["operation_id"] not in consumed:
             target = operation["snapshot"]["target"]
@@ -939,15 +1044,25 @@ def short_rerelease_state(
                 return {
                     "allowed": False,
                     "reason": "Cancelled schedules bind conflicting re-release requests.",
-                    "history_revision": short_receipt_history_revision(
-                        publish, clip_id
-                    ),
+                    "history_revision": history_revision,
                 }
             cancellation_request = request
+    obligations, acknowledgement_allowed = unresolved_receipt_obligations(
+        publish, clip_id, profile_username=profile_username
+    )
+    if obligations:
+        return {
+            "allowed": False,
+            "reason": "Prior receipts have unresolved remote destinations.",
+            "history_revision": history_revision,
+            "unresolved_receipt_obligations": obligations,
+            "unresolved_history_acknowledgement_allowed": acknowledgement_allowed,
+            "cancellation_request": cancellation_request,
+        }
     return {
         "allowed": True,
         "reason": None,
-        "history_revision": short_receipt_history_revision(publish, clip_id),
+        "history_revision": history_revision,
         "receipt_count": len(receipts),
         "cancellation_request": cancellation_request,
     }
@@ -995,10 +1110,31 @@ def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> b
         target_revision=authorization["target_revision"],
         render_fingerprint=authorization["render_fingerprint"],
         receipt_history_revision=history_revision,
+        unresolved_history_acknowledgement=authorization.get(
+            "unresolved_history_acknowledgement"
+        ),
     )
-    return (
+    acknowledgement = authorization.get("unresolved_history_acknowledgement")
+    obligations, acknowledgement_allowed = unresolved_receipt_obligations(
+        publish,
+        str(clip.get("id", "")),
+        exclude_request_id=authorization["request_id"],
+    )
+    acknowledgement_valid = acknowledgement is None and not obligations
+    if isinstance(acknowledgement, dict):
+        acknowledgement_valid = bool(
+            acknowledgement_allowed
+            and version.get("variant_id") == BACKGROUND_VARIANT_ID
+            and acknowledgement
+            == {
+                "receipt_history_revision": history_revision,
+                "obligations": obligations,
+            }
+        )
+    return bool(
         authorization["receipt_history_revision"] == history_revision
         and authorization["revision"] == expected
+        and acknowledgement_valid
     )
 
 
@@ -1612,19 +1748,7 @@ class PublishAgent(BaseAgent):
                 "destination_copy": copy,
                 "copy_schema": SHORT_COPY_SCHEMA,
                 "copy_revision": _document_revision(copy),
-                **(
-                    {
-                        "rerelease_request_id": rerelease.get("request_id"),
-                        "rerelease_actor": rerelease.get("actor"),
-                        "rerelease_reason": rerelease.get("reason"),
-                        "rerelease_authorization_revision": rerelease.get("revision"),
-                        "parent_receipt_history_revision": rerelease.get(
-                            "receipt_history_revision"
-                        ),
-                    }
-                    if isinstance(rerelease, dict)
-                    else {}
-                ),
+                **_rerelease_receipt_fields(rerelease),
             }
             intent["destination_request_revision"] = _document_revision(
                 _destination_request_fields(intent)
@@ -1830,6 +1954,12 @@ class PublishAgent(BaseAgent):
                 )
             if any(
                 receipt.get("destination_request_id") for receipt in previous_shorts
+            ) or any(
+                isinstance(version.get("re_release_request"), dict)
+                and version["re_release_request"].get(
+                    "unresolved_history_acknowledgement"
+                )
+                for version in short_versions.values()
             ):
                 raise RuntimeError(
                     "An existing destination request requires a reviewed explicit "
@@ -2500,14 +2630,7 @@ class PublishAgent(BaseAgent):
             copy_revision=_document_revision(copy),
         )
         request = version.get("re_release_request")
-        if isinstance(request, dict):
-            result.update(
-                rerelease_request_id=request.get("request_id"),
-                rerelease_actor=request.get("actor"),
-                rerelease_reason=request.get("reason"),
-                rerelease_authorization_revision=request.get("revision"),
-                parent_receipt_history_revision=request.get("receipt_history_revision"),
-            )
+        result.update(_rerelease_receipt_fields(request))
         if scheduled_at:
             result.update(
                 scheduled_date=scheduled_at.isoformat(),
@@ -2845,14 +2968,7 @@ class PublishAgent(BaseAgent):
             "receipt_source": existing["source"],
         }
         request = version.get("re_release_request")
-        if isinstance(request, dict):
-            receipt.update(
-                rerelease_request_id=request.get("request_id"),
-                rerelease_actor=request.get("actor"),
-                rerelease_reason=request.get("reason"),
-                rerelease_authorization_revision=request.get("revision"),
-                parent_receipt_history_revision=request.get("receipt_history_revision"),
-            )
+        receipt.update(_rerelease_receipt_fields(request))
         if existing.get("job_id"):
             receipt["job_id"] = existing["job_id"]
         return receipt

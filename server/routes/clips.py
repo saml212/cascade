@@ -100,6 +100,9 @@ class ReReleaseRequest(DistributionSelectionRequest):
     request_id: UUID
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=3, max_length=500)
+    acknowledge_unresolved_history_revision: str | None = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
 
 
 class ScheduleCancellationRequest(ReReleaseRequest):
@@ -318,7 +321,7 @@ _RELEASE_REQUEST_STRING_FIELDS = (
 
 
 def _valid_release_request(value: object) -> bool:
-    return (
+    if not (
         isinstance(value, dict)
         and all(
             isinstance(value.get(field), str) and bool(value[field])
@@ -326,6 +329,26 @@ def _valid_release_request(value: object) -> bool:
         )
         and "variant_id" in value
         and value["variant_id"] in {None, BACKGROUND_VARIANT_ID}
+    ):
+        return False
+    if "unresolved_history_acknowledgement" not in value:
+        return True
+    acknowledgement = value["unresolved_history_acknowledgement"]
+    if not (
+        value["variant_id"] == BACKGROUND_VARIANT_ID
+        and isinstance(acknowledgement, dict)
+        and set(acknowledgement) == {"receipt_history_revision", "obligations"}
+        and acknowledgement.get("receipt_history_revision")
+        == value["receipt_history_revision"]
+        and isinstance(acknowledgement.get("obligations"), list)
+        and acknowledgement["obligations"]
+    ):
+        return False
+    return all(
+        isinstance(item, dict)
+        and isinstance(item.get("receipt_revision"), str)
+        and item.get("artifact_identity") in {"known", "unknown"}
+        for item in acknowledgement["obligations"]
     )
 
 
@@ -346,6 +369,9 @@ def publication_change_lock(
         "re_release_allowed": False,
         "re_release_reason": "Publication receipt history cannot be verified.",
         "re_release_request_consumed": None,
+        "re_release_history_revision": None,
+        "unresolved_receipt_obligations": [],
+        "unresolved_history_acknowledgement_allowed": False,
     }
     has_release_request = release_request is not Ellipsis
     if has_release_request and not _valid_release_request(release_request):
@@ -362,6 +388,9 @@ def publication_change_lock(
             "re_release_allowed": False,
             "re_release_reason": "No prior remote submission requires a re-release.",
             "re_release_request_consumed": None,
+            "re_release_history_revision": None,
+            "unresolved_receipt_obligations": [],
+            "unresolved_history_acknowledgement_allowed": False,
         }
     except (json.JSONDecodeError, OSError):
         return unverifiable
@@ -409,6 +438,13 @@ def publication_change_lock(
             else "No prior remote submission requires a re-release."
         ),
         "re_release_request_consumed": request_consumed,
+        "re_release_history_revision": rerelease.get("history_revision"),
+        "unresolved_receipt_obligations": rerelease.get(
+            "unresolved_receipt_obligations", []
+        ),
+        "unresolved_history_acknowledgement_allowed": rerelease.get(
+            "unresolved_history_acknowledgement_allowed", False
+        ),
     }
 
 
@@ -439,6 +475,9 @@ def _public_distribution(state: dict, change_lock: dict | None = None) -> dict:
         "re_release_allowed": False,
         "re_release_reason": "No prior remote submission requires a re-release.",
         "re_release_request_consumed": None,
+        "re_release_history_revision": None,
+        "unresolved_receipt_obligations": [],
+        "unresolved_history_acknowledgement_allowed": False,
     }
     return {
         key: state[key]
@@ -783,6 +822,12 @@ def _prepare_clip_rerelease_locked(
             parent_revision = short_receipt_history_revision(
                 publish, clip_id, exclude_request_id=request_id
             )
+            acknowledgement = existing.get("unresolved_history_acknowledgement")
+            acknowledged_revision = (
+                acknowledgement.get("receipt_history_revision")
+                if isinstance(acknowledgement, dict)
+                else None
+            )
             expected_inputs = {
                 "request_id": request_id,
                 "actor": actor,
@@ -794,9 +839,15 @@ def _prepare_clip_rerelease_locked(
             }
             expected = distribution_release_revision(
                 **expected_inputs,
+                unresolved_history_acknowledgement=acknowledgement,
             )
-            if existing.get("revision") != expected or any(
-                existing.get(field) != value for field, value in expected_inputs.items()
+            if (
+                req.acknowledge_unresolved_history_revision != acknowledged_revision
+                or existing.get("revision") != expected
+                or any(
+                    existing.get(field) != value
+                    for field, value in expected_inputs.items()
+                )
             ):
                 raise HTTPException(
                     status_code=409,
@@ -831,8 +882,39 @@ def _prepare_clip_rerelease_locked(
                 profile_username if isinstance(profile_username, str) else None
             ),
         )
+        acknowledgement = None
         if eligibility["allowed"] is not True:
-            raise HTTPException(status_code=409, detail=eligibility["reason"])
+            if req.acknowledge_unresolved_history_revision is None:
+                raise HTTPException(status_code=409, detail=eligibility["reason"])
+            if (
+                eligibility.get("unresolved_history_acknowledgement_allowed")
+                is not True
+                or req.variant_id != BACKGROUND_VARIANT_ID
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Only pre-schema unresolved history can be acknowledged "
+                        "for a current approved Motion replacement."
+                    ),
+                )
+            if (
+                req.acknowledge_unresolved_history_revision
+                != eligibility["history_revision"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Unresolved receipt history changed; refresh before re-release.",
+                )
+            acknowledgement = {
+                "receipt_history_revision": eligibility["history_revision"],
+                "obligations": eligibility["unresolved_receipt_obligations"],
+            }
+        elif req.acknowledge_unresolved_history_revision is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="There is no unresolved legacy history to acknowledge.",
+            )
         cancellation_request = eligibility.get("cancellation_request")
         if cancellation_request is not None and cancellation_request != {
             "request_id": request_id,
@@ -863,7 +945,10 @@ def _prepare_clip_rerelease_locked(
             target_revision=state["revision"],
             render_fingerprint=state["render_fingerprint"],
             receipt_history_revision=eligibility["history_revision"],
+            unresolved_history_acknowledgement=acknowledgement,
         )
+        if acknowledgement is not None:
+            authorization["unresolved_history_acknowledgement"] = acknowledgement
         authorization["created_at"] = datetime.now(timezone.utc).isoformat()
         candidate[DISTRIBUTION_RELEASE_FIELD] = authorization
         clips[index] = candidate

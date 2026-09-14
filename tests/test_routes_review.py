@@ -409,6 +409,9 @@ def test_review_exposes_background_variant_as_separate_media(test_client, monkey
         "re_release_allowed": False,
         "re_release_reason": "No prior remote submission requires a re-release.",
         "re_release_request_consumed": None,
+        "re_release_history_revision": None,
+        "unresolved_receipt_obligations": [],
+        "unresolved_history_acknowledgement_allowed": False,
     }
 
     (episode_dir / "publish.json").write_text(

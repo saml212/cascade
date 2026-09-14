@@ -285,6 +285,25 @@ Unknown or stale targets, changed receipt history, malformed state, and a second
 unconsumed request fail with `409`. Never delete or rewrite receipt history to
 bypass these checks.
 
+Some pre-schema receipts cannot be reconciled because they have no saved media
+or destination identity. The review response exposes each such receipt under
+`unresolved_receipt_obligations`, labels an absent artifact identity as
+`unknown`, and returns `re_release_history_revision`. If
+`unresolved_history_acknowledgement_allowed` is true, an operator may prepare
+only the current separately approved Motion replacement by adding:
+
+```text
+"acknowledge_unresolved_history_revision":"sha256:..."
+```
+
+Use the exact revision returned by the review response. This records the old
+receipts as unresolved obligations inside the new release identity; it does not
+mark them failed, cancelled, or published. Any change to the receipt history
+invalidates the authorization. After fresh QA and publish approval, publication
+requires an explicit reviewed destination subset and creates new receipts that
+retain the acknowledgement and parent-history fingerprint. The empty publish
+body remains blocked for this path.
+
 ## Publish an approved destination subset
 
 Keep the global platform plan intact when an account is temporarily unavailable.

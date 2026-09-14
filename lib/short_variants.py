@@ -64,18 +64,22 @@ def distribution_release_revision(
     target_revision: str,
     render_fingerprint: str,
     receipt_history_revision: str,
+    unresolved_history_acknowledgement: dict | None = None,
 ) -> str:
-    return _json_revision(
-        {
-            "request_id": request_id,
-            "actor": actor,
-            "reason": reason,
-            "variant_id": variant_id,
-            "target_revision": target_revision,
-            "render_fingerprint": render_fingerprint,
-            "receipt_history_revision": receipt_history_revision,
-        }
-    )
+    inputs = {
+        "request_id": request_id,
+        "actor": actor,
+        "reason": reason,
+        "variant_id": variant_id,
+        "target_revision": target_revision,
+        "render_fingerprint": render_fingerprint,
+        "receipt_history_revision": receipt_history_revision,
+    }
+    if unresolved_history_acknowledgement is not None:
+        inputs["unresolved_history_acknowledgement"] = (
+            unresolved_history_acknowledgement
+        )
+    return _json_revision(inputs)
 
 
 def background_variant_output(episode_dir: Path, clip_id: str) -> Path:

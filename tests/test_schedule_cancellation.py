@@ -329,6 +329,58 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
     )
 
 
+def test_legacy_ack_keeps_exact_cancelled_schedule_request(test_client, monkeypatch):
+    client, episode_dir, _original, _deleted, request = _setup(test_client, monkeypatch)
+    preview = client.post(
+        "/api/episodes/ep_001/clips/clip_01/schedule-cancellation/preview",
+        json=request,
+    ).json()
+    cancelled = client.post(
+        "/api/episodes/ep_001/clips/clip_01/schedule-cancellation",
+        json=preview["execute"],
+    )
+    assert cancelled.status_code == 200
+
+    publish_path = episode_dir / "publish.json"
+    publish = json.loads(publish_path.read_text())
+    publish["shorts"].append(
+        {
+            "clip_id": "clip_01",
+            "status": "failed",
+            "error": "Legacy response could not be parsed",
+        }
+    )
+    publish_path.write_text(json.dumps(publish))
+
+    from agents.publish import short_rerelease_state
+
+    state = short_rerelease_state(publish, "clip_01", profile_username="up")
+    assert state["unresolved_history_acknowledgement_allowed"] is True
+    assert state["cancellation_request"]["request_id"] == REQUEST_ID
+    acknowledgement = {
+        "acknowledge_unresolved_history_revision": state["history_revision"]
+    }
+    wrong = client.post(
+        "/api/episodes/ep_001/clips/clip_01/re-release",
+        json={
+            **cancelled.json()["next"]["body"],
+            **acknowledgement,
+            "request_id": "aaef05f4-5b12-4425-9e88-a8f160a52337",
+        },
+    )
+    exact = client.post(
+        "/api/episodes/ep_001/clips/clip_01/re-release",
+        json={**cancelled.json()["next"]["body"], **acknowledgement},
+    )
+
+    assert wrong.status_code == 409
+    assert (
+        "exact request and target bound to the cancellation" in wrong.json()["detail"]
+    )
+    assert exact.status_code == 200
+    assert exact.json()["status"] == "prepared"
+
+
 def test_ambiguous_delete_is_durable_and_never_repeated(test_client, monkeypatch):
     client, episode_dir, original, deleted, request = _setup(test_client, monkeypatch)
     from server.routes import clips

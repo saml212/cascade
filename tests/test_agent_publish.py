@@ -2352,6 +2352,83 @@ class TestShortDestinationRequests:
             ],
         )
 
+    def test_legacy_history_acknowledgement_requires_explicit_subset(
+        self, episode_dir, monkeypatch
+    ):
+        acknowledgement = {
+            "receipt_history_revision": "sha256:legacy-history",
+            "obligations": [
+                {
+                    "receipt_revision": "sha256:legacy-receipt",
+                    "artifact_identity": "unknown",
+                }
+            ],
+        }
+        snapshot = {
+            "release_gate": {"safe": True, "revision": "sha256:release"},
+            "approvals": {"editorial": {"revision": "sha256:longform"}},
+        }
+        data = {
+            "episode": {},
+            "snapshot": snapshot,
+            "gate": snapshot["release_gate"],
+            "api_key": "test-key",
+            "user": "test-profile",
+            "approved": [],
+            "metadata": {"longform": {}},
+            "platforms": ["youtube", "tiktok", "instagram", "x"],
+            "previous": {"shorts": []},
+            "previous_shorts": [],
+            "funnel_urls": {"youtube": "", "spotify": ""},
+            "longform_revision": "sha256:longform",
+            "short_metadata": {},
+            "short_versions": {
+                "clip_0": {
+                    "re_release_request": {
+                        "unresolved_history_acknowledgement": acknowledgement
+                    }
+                }
+            },
+        }
+        agent = _make_agent(episode_dir)
+        monkeypatch.setattr(agent, "_inputs", lambda **_kwargs: data)
+        monkeypatch.setattr(
+            "agents.publish.quality_snapshot", lambda *_args, **_kwargs: snapshot
+        )
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="reviewed explicit destination subset"),
+        ):
+            agent.execute()
+
+        run.assert_not_called()
+
+    def test_acknowledgement_is_copied_into_destination_receipt_fields(self):
+        from agents.publish import _rerelease_receipt_fields
+
+        acknowledgement = {
+            "receipt_history_revision": "sha256:legacy-history",
+            "obligations": [{"receipt_revision": "sha256:legacy-receipt"}],
+        }
+        assert _rerelease_receipt_fields(
+            {
+                "request_id": "b8c0b129-599c-48cb-b363-60a5fe4dc46c",
+                "actor": "release-operator",
+                "reason": "Publish approved Motion replacement",
+                "revision": "sha256:authorization",
+                "receipt_history_revision": "sha256:legacy-history",
+                "unresolved_history_acknowledgement": acknowledgement,
+            }
+        ) == {
+            "rerelease_request_id": "b8c0b129-599c-48cb-b363-60a5fe4dc46c",
+            "rerelease_actor": "release-operator",
+            "rerelease_reason": "Publish approved Motion replacement",
+            "rerelease_authorization_revision": "sha256:authorization",
+            "parent_receipt_history_revision": "sha256:legacy-history",
+            "unresolved_history_acknowledgement": acknowledgement,
+        }
+
     def test_preview_execute_persists_intent_before_send_and_normalizes_copy(
         self, env, episode_dir
     ):

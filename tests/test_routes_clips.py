@@ -677,6 +677,259 @@ class TestDistributionSelection:
         assert consumed["re_release_request_consumed"] is True
         assert consumed["re_release_allowed"] is False
 
+    def test_acknowledges_exact_legacy_history_for_motion_rerelease(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        publish = {
+            "shorts": [
+                {
+                    "clip_id": "clip_01",
+                    "status": "failed",
+                    "error": "Expecting value: line 1 column 1 (char 0)",
+                }
+            ]
+        }
+        publish_path = episode_dir / "publish.json"
+        publish_path.write_text(json.dumps(publish))
+        publish_before = publish_path.read_bytes()
+
+        from agents.publish import (
+            short_receipt_history_revision,
+            valid_rerelease_authorization,
+        )
+        from lib.short_variants import distribution_release_revision
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+        history_revision = short_receipt_history_revision(publish, "clip_01")
+        lock = clips_mod.publication_change_lock(episode_dir, "clip_01")
+        obligations = lock["unresolved_receipt_obligations"]
+        assert lock["unresolved_history_acknowledgement_allowed"] is True
+        assert lock["re_release_history_revision"] == history_revision
+        assert len(obligations) == 1
+        assert obligations[0] == {
+            "receipt_revision": obligations[0]["receipt_revision"],
+            "status": "failed",
+            "error": "Expecting value: line 1 column 1 (char 0)",
+            "platforms": None,
+            "request_id": None,
+            "job_id": None,
+            "external_id": None,
+            "version": None,
+            "variant_id": None,
+            "render_fingerprint": None,
+            "approval_revision": None,
+            "artifact_identity": "unknown",
+        }
+        body = {
+            "variant_id": "background_motion_v1",
+            "expected_revision": "sha256:selected-review",
+            "request_id": "793321a8-a45d-41d5-99b6-b4310bd6de90",
+            "actor": "release-operator",
+            "reason": "Release the approved rebuilt Motion clip",
+            "acknowledge_unresolved_history_revision": history_revision,
+        }
+
+        wrong_history = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                **body,
+                "acknowledge_unresolved_history_revision": "sha256:" + "0" * 64,
+            },
+        )
+        base = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={**body, "variant_id": None},
+        )
+        prepared = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release", json=body
+        )
+        stored_after_first = (episode_dir / "clips.json").read_bytes()
+        repeated = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release", json=body
+        )
+        omitted_ack = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                key: value
+                for key, value in body.items()
+                if key != "acknowledge_unresolved_history_revision"
+            },
+        )
+
+        assert wrong_history.status_code == 409
+        assert "history changed" in wrong_history.json()["detail"]
+        assert base.status_code == 409
+        assert "current approved Motion replacement" in base.json()["detail"]
+        assert prepared.status_code == 200
+        assert prepared.json()["status"] == "prepared"
+        assert repeated.status_code == 200
+        assert repeated.json()["status"] == "already_prepared"
+        assert omitted_ack.status_code == 409
+        assert "already bound to different inputs" in omitted_ack.json()["detail"]
+        assert (episode_dir / "clips.json").read_bytes() == stored_after_first
+        assert publish_path.read_bytes() == publish_before
+
+        stored_clip = json.loads(stored_after_first)["clips"][0]
+        authorization = stored_clip["distribution_release"]
+        acknowledgement = authorization["unresolved_history_acknowledgement"]
+        assert acknowledgement == {
+            "receipt_history_revision": history_revision,
+            "obligations": obligations,
+        }
+        version = {
+            "variant_id": "background_motion_v1",
+            "revision": "sha256:selected-review",
+            "render_fingerprint": "sha256:selected-render",
+        }
+        assert valid_rerelease_authorization(publish, stored_clip, version) is True
+        unacknowledged = dict(authorization)
+        unacknowledged.pop("unresolved_history_acknowledgement")
+        unacknowledged["revision"] = distribution_release_revision(
+            request_id=unacknowledged["request_id"],
+            actor=unacknowledged["actor"],
+            reason=unacknowledged["reason"],
+            variant_id=unacknowledged["variant_id"],
+            target_revision=unacknowledged["target_revision"],
+            render_fingerprint=unacknowledged["render_fingerprint"],
+            receipt_history_revision=unacknowledged["receipt_history_revision"],
+        )
+        assert (
+            valid_rerelease_authorization(
+                publish,
+                {**stored_clip, "distribution_release": unacknowledged},
+                version,
+            )
+            is False
+        )
+
+        tampered_document = json.loads(stored_after_first)
+        tampered_clip = tampered_document["clips"][0]
+        tampered_clip.pop("distribution_variant_id")
+        tampered = tampered_clip["distribution_release"]
+        tampered["variant_id"] = None
+        tampered["revision"] = distribution_release_revision(
+            request_id=tampered["request_id"],
+            actor=tampered["actor"],
+            reason=tampered["reason"],
+            variant_id=None,
+            target_revision=tampered["target_revision"],
+            render_fingerprint=tampered["render_fingerprint"],
+            receipt_history_revision=tampered["receipt_history_revision"],
+            unresolved_history_acknowledgement=acknowledgement,
+        )
+        (episode_dir / "clips.json").write_text(json.dumps(tampered_document))
+        tampered_base_retry = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={**body, "variant_id": None},
+        )
+        assert tampered_base_retry.status_code == 409
+        assert "identity cannot be verified" in tampered_base_retry.json()["detail"]
+
+        publish["shorts"][0]["status_history"] = [{"status": "failed"}]
+        assert valid_rerelease_authorization(publish, stored_clip, version) is False
+
+    @pytest.mark.parametrize(
+        "bound_field",
+        [
+            "version",
+            "variant_id",
+            "render_fingerprint",
+            "approval_revision",
+            "release_revision",
+            "target_revision",
+            "copy_revision",
+            "schema",
+            "destination_actor",
+            "rerelease_actor",
+            "parent_receipt_history_revision",
+            "unresolved_history_acknowledgement",
+            "artifact_sha256",
+        ],
+    )
+    def test_legacy_ack_rejects_any_bound_receipt_field(
+        self, test_client, monkeypatch, bound_field
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        receipt = {"clip_id": "clip_01", "status": "failed", bound_field: None}
+        publish = {"shorts": [receipt]}
+        (episode_dir / "publish.json").write_text(json.dumps(publish))
+
+        from agents.publish import short_receipt_history_revision
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(candidate),
+        )
+        lock = clips_mod.publication_change_lock(episode_dir, "clip_01")
+        response = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                "variant_id": "background_motion_v1",
+                "expected_revision": "sha256:selected-review",
+                "request_id": "8331d825-b41b-4cdc-9274-5f58d5fd2719",
+                "actor": "release-operator",
+                "reason": "Release the approved rebuilt Motion clip",
+                "acknowledge_unresolved_history_revision": (
+                    short_receipt_history_revision(publish, "clip_01")
+                ),
+            },
+        )
+
+        assert lock["unresolved_history_acknowledgement_allowed"] is False
+        assert response.status_code == 409
+        assert "Only pre-schema unresolved history" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        ("current", "approval_current"), [(False, True), (True, False)]
+    )
+    def test_legacy_ack_requires_current_approved_motion(
+        self, test_client, monkeypatch, current, approval_current
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        publish = {"shorts": [{"clip_id": "clip_01", "status": "failed"}]}
+        (episode_dir / "publish.json").write_text(json.dumps(publish))
+
+        from agents.publish import short_receipt_history_revision
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._state(
+                candidate, current=current, approval_current=approval_current
+            ),
+        )
+        response = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release",
+            json={
+                "variant_id": "background_motion_v1",
+                "expected_revision": "sha256:selected-review",
+                "request_id": "fd3c4097-e10f-48ee-bb5e-3f27679242f2",
+                "actor": "release-operator",
+                "reason": "Release the approved rebuilt Motion clip",
+                "acknowledge_unresolved_history_revision": (
+                    short_receipt_history_revision(publish, "clip_01")
+                ),
+            },
+        )
+
+        assert response.status_code == 409
+        assert "current and separately approved" in response.json()["detail"]
+
     @pytest.mark.parametrize("status", ["submitted", "unknown", "failed"])
     def test_rerelease_rejects_unresolved_remote_receipt(
         self, test_client, monkeypatch, status
