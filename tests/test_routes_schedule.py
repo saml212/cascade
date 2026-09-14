@@ -139,6 +139,54 @@ def test_calendar_proposal_exposes_selected_variant_identity(tmp_path, monkeypat
     assert short["variant_id"] == "background_motion_v1"
 
 
+def test_prepared_rerelease_is_suggested_despite_historical_receipt(
+    tmp_path, monkeypatch
+):
+    episode = _episode(tmp_path, title="A current episode")
+    (episode / "publish.json").write_text(
+        json.dumps(
+            {
+                "shorts": [
+                    {
+                        "clip_id": "clip_01",
+                        "status": "failed",
+                        "platforms": ["youtube", "instagram"],
+                        "request_id": "old-request",
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        schedule,
+        "review_state",
+        _review(
+            distribution={
+                "version": "background_motion_v1",
+                "variant_id": "background_motion_v1",
+                "current": True,
+                "approval_current": True,
+                "re_release_request": {"request_id": "new-request"},
+                "re_release_request_consumed": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(schedule, "_load_config", dict)
+
+    result = asyncio.run(schedule.get_schedule())
+    shorts = [
+        item
+        for day in result["schedule"]
+        for item in day["items"]
+        if item["type"] == "short"
+    ]
+
+    assert len(shorts) == 1
+    assert shorts[0]["state"] == "suggested"
+    assert shorts[0]["variant_id"] == "background_motion_v1"
+
+
 def test_calendar_surfaces_rss_without_claiming_youtube_publication(
     tmp_path, monkeypatch
 ):

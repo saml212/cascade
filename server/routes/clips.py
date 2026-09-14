@@ -1,6 +1,7 @@
 """Clip candidate editing, rendering, and final-review endpoints."""
 
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -38,6 +40,7 @@ from lib.short_variants import (
     save_background_variant_approval,
     selected_short_variant_id,
 )
+from server.routes import require_episode_dir
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,10 @@ class ReReleaseRequest(DistributionSelectionRequest):
     request_id: UUID
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=3, max_length=500)
+
+
+class ScheduleCancellationRequest(ReReleaseRequest):
+    expected_snapshot_revision: str = Field(min_length=1)
 
 
 def _finite_number(name: str, value: float) -> float:
@@ -693,6 +700,40 @@ async def select_clip_distribution(
     )
 
 
+def _rerelease_target(
+    ep_dir: Path, clip: dict, req: ReReleaseRequest
+) -> tuple[dict, dict]:
+    candidate = dict(clip)
+    if req.variant_id is None:
+        candidate.pop(DISTRIBUTION_VARIANT_FIELD, None)
+    else:
+        try:
+            require_background_variant(req.variant_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+        candidate[DISTRIBUTION_VARIANT_FIELD] = req.variant_id
+    state = _distribution_state(ep_dir, candidate)
+    if req.expected_revision != state["revision"]:
+        raise HTTPException(
+            status_code=409,
+            detail="The target render or its copy changed; refresh before re-releasing it.",
+        )
+    if state["current"] is not True or state["approval_current"] is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="The target version must be current and separately approved.",
+        )
+    if (
+        not isinstance(state.get("render_fingerprint"), str)
+        or not state["render_fingerprint"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The target version has no verifiable render fingerprint.",
+        )
+    return candidate, state
+
+
 def _prepare_clip_rerelease_locked(
     episode_id: str, clip_id: str, req: ReReleaseRequest
 ) -> dict:
@@ -723,36 +764,7 @@ def _prepare_clip_rerelease_locked(
                 detail="Publication receipt history cannot be verified.",
             ) from exc
 
-        candidate = dict(clip)
-        if req.variant_id is None:
-            candidate.pop(DISTRIBUTION_VARIANT_FIELD, None)
-        else:
-            try:
-                require_background_variant(req.variant_id)
-            except KeyError as exc:
-                raise HTTPException(
-                    status_code=404, detail=str(exc).strip("'")
-                ) from exc
-            candidate[DISTRIBUTION_VARIANT_FIELD] = req.variant_id
-        state = _distribution_state(clips_file.parent, candidate)
-        if req.expected_revision != state["revision"]:
-            raise HTTPException(
-                status_code=409,
-                detail="The target render or its copy changed; refresh before re-releasing it.",
-            )
-        if state["current"] is not True or state["approval_current"] is not True:
-            raise HTTPException(
-                status_code=409,
-                detail="The target version must be current and separately approved.",
-            )
-        if (
-            not isinstance(state.get("render_fingerprint"), str)
-            or not state["render_fingerprint"]
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="The target version has no verifiable render fingerprint.",
-            )
+        candidate, state = _rerelease_target(clips_file.parent, clip, req)
 
         request_id = str(req.request_id)
         actor = req.actor.strip()
@@ -821,6 +833,19 @@ def _prepare_clip_rerelease_locked(
         )
         if eligibility["allowed"] is not True:
             raise HTTPException(status_code=409, detail=eligibility["reason"])
+        cancellation_request = eligibility.get("cancellation_request")
+        if cancellation_request is not None and cancellation_request != {
+            "request_id": request_id,
+            "actor": actor,
+            "reason": reason,
+            "variant_id": req.variant_id,
+            "target_revision": state["revision"],
+            "render_fingerprint": state["render_fingerprint"],
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="Use the exact request and target bound to the cancellation.",
+            )
         authorization = {
             "request_id": request_id,
             "actor": actor,
@@ -862,6 +887,426 @@ async def prepare_clip_rerelease(
     return await asyncio.to_thread(
         _prepare_clip_rerelease_locked, episode_id, clip_id, req
     )
+
+
+def _load_cancellation_publish(ep_dir: Path) -> tuple[dict, list[dict]]:
+    from agents.publish import validated_short_receipts
+
+    try:
+        publish = json.loads((ep_dir / "publish.json").read_text())
+        if not isinstance(publish, dict):
+            raise TypeError
+        return publish, validated_short_receipts(publish)
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=409, detail="Publication history cannot be verified."
+        ) from exc
+
+
+def _upload_post_job_evidence(api_key: str, profile: str, job_id: str) -> dict:
+    headers = {"Authorization": f"Apikey {api_key}"}
+    try:
+        with httpx.Client(timeout=10) as client:
+            status_response = client.get(
+                "https://api.upload-post.com/api/uploadposts/status",
+                params={"job_id": job_id},
+                headers=headers,
+            )
+            if status_response.status_code == 404:
+                status_missing, status = True, None
+            else:
+                status_response.raise_for_status()
+                status_missing, status = False, status_response.json()
+                if not isinstance(status, dict):
+                    raise TypeError
+            history_response = client.get(
+                "https://api.upload-post.com/api/uploadposts/history",
+                params={
+                    "job_id": job_id,
+                    "profile_username": profile,
+                    "limit": 100,
+                    "page": 1,
+                },
+                headers=headers,
+            )
+            history_response.raise_for_status()
+            history = history_response.json()
+            if not isinstance(history, dict):
+                raise TypeError
+    except (httpx.HTTPError, TypeError, ValueError) as exc:
+        raise RuntimeError("Cannot verify Upload-Post status/history") from exc
+    return {"status_not_found": status_missing, "status": status, "history": history}
+
+
+def _delete_upload_post_schedule(api_key: str, job_id: str) -> dict:
+    try:
+        response = httpx.delete(
+            f"https://api.upload-post.com/api/uploadposts/schedule/{job_id}",
+            headers={"Authorization": f"Apikey {api_key}"},
+            timeout=30,
+        )
+    except httpx.HTTPError as exc:
+        return {"error": f"Cancellation outcome is unknown: {exc}"}
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    return {
+        "http_status": response.status_code,
+        **({"response": body} if isinstance(body, dict) else {}),
+    }
+
+
+def _cancellation_context(
+    episode_id: str, clip_id: str, req: ReReleaseRequest, publish: dict
+) -> dict:
+    from agents.pipeline import load_config
+    from agents.publish import (
+        PublishAgent,
+        cancellable_scheduled_receipt,
+        cancellation_snapshot,
+        schedule_cancellation_provider_safe,
+    )
+
+    clips, clips_file = load_clips(episode_id)
+    clip, _ = find_clip(clips, clip_id)
+    _, state = _rerelease_target(clips_file.parent, clip, req)
+    existing = clip.get(DISTRIBUTION_RELEASE_FIELD)
+    if DISTRIBUTION_RELEASE_FIELD in clip and not _valid_release_request(existing):
+        raise HTTPException(status_code=409, detail="Re-release identity is malformed.")
+    if isinstance(existing, dict) and not any(
+        receipt.get("clip_id") == clip_id
+        and receipt.get("rerelease_request_id") == existing.get("request_id")
+        for receipt in publish.get("shorts", [])
+    ):
+        raise HTTPException(status_code=409, detail="A re-release is already prepared.")
+    profile = publish.get("profile_username")
+    api_key = os.getenv("UPLOAD_POST_API_KEY", "")
+    if (
+        not isinstance(profile, str)
+        or not profile
+        or profile != os.getenv("UPLOAD_POST_USER", "")
+        or not api_key
+    ):
+        raise HTTPException(
+            status_code=409, detail="Exact provider account is unavailable."
+        )
+    agent = PublishAgent(clips_file.parent, load_config())
+    try:
+        receipt, remote, history_revision = cancellable_scheduled_receipt(
+            publish,
+            clip_id,
+            agent._remote_schedule(api_key, profile),
+            profile_username=profile,
+        )
+        evidence = _upload_post_job_evidence(api_key, profile, receipt["job_id"])
+        safe, reason = schedule_cancellation_provider_safe(
+            receipt, evidence, profile_username=profile, after_delete=False
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not safe:
+        raise HTTPException(status_code=409, detail=reason)
+    target = {
+        "variant_id": req.variant_id,
+        "revision": state["revision"],
+        "render_fingerprint": state["render_fingerprint"],
+    }
+    return {
+        "receipt": receipt,
+        "snapshot": cancellation_snapshot(
+            receipt, history_revision, profile, target, remote
+        ),
+        "pre_delete": {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "evidence": evidence,
+        },
+        "api_key": api_key,
+    }
+
+
+def _cancellation_body(req: ReReleaseRequest, revision: str) -> dict:
+    return {
+        "variant_id": req.variant_id,
+        "expected_revision": req.expected_revision,
+        "request_id": str(req.request_id),
+        "actor": req.actor.strip(),
+        "reason": req.reason.strip(),
+        "expected_snapshot_revision": revision,
+    }
+
+
+def _cancellation_response(episode_id: str, clip_id: str, operation: dict) -> dict:
+    target = operation["snapshot"]["target"]
+    return {
+        "status": "cancelled",
+        "clip_id": clip_id,
+        "operation_id": operation["operation_id"],
+        "replacement_safe": True,
+        "prior_receipt_preserved": True,
+        "next": {
+            "method": "POST",
+            "path": f"/api/episodes/{episode_id}/clips/{clip_id}/re-release",
+            "body": {
+                "variant_id": target["variant_id"],
+                "expected_revision": target["revision"],
+                "request_id": operation["operation_id"],
+                "actor": operation["actor"],
+                "reason": operation["reason"],
+            },
+        },
+    }
+
+
+def _preview_schedule_cancellation_locked(
+    episode_id: str, clip_id: str, req: ReReleaseRequest
+) -> dict:
+    from agents.publish import publication_lock
+
+    if not req.actor.strip() or len(req.reason.strip()) < 3:
+        raise HTTPException(status_code=422, detail="Actor and reason are required.")
+    with publication_lock(EPISODES_DIR):
+        ep_dir = require_episode_dir(EPISODES_DIR, episode_id)
+        publish, _ = _load_cancellation_publish(ep_dir)
+        context = _cancellation_context(episode_id, clip_id, req, publish)
+        receipt, snapshot = context["receipt"], context["snapshot"]
+        return {
+            "status": "cancellable",
+            "clip_id": clip_id,
+            "replacement_safe": False,
+            "target": snapshot["target"],
+            "receipt": {
+                "revision": snapshot["receipt_revision"],
+                "job_id": receipt["job_id"],
+                "external_id": receipt["external_id"],
+                "profile_username": snapshot["profile_username"],
+                "scheduled_date": receipt["scheduled_date"],
+                "platforms": receipt["platforms"],
+            },
+            "remote_job": snapshot["remote_job"],
+            "snapshot_revision": snapshot["revision"],
+            "execute": _cancellation_body(req, snapshot["revision"]),
+        }
+
+
+@router.post("/{clip_id}/schedule-cancellation/preview")
+async def preview_schedule_cancellation(
+    episode_id: str, clip_id: str, req: ReReleaseRequest
+) -> dict:
+    return await asyncio.to_thread(
+        _preview_schedule_cancellation_locked, episode_id, clip_id, req
+    )
+
+
+def _post_delete_cancellation(
+    ep_dir: Path, publish: dict, receipts: list[dict], index: int, api_key: str
+) -> dict:
+    from agents.pipeline import load_config
+    from agents.publish import PublishAgent, schedule_cancellation_provider_safe
+
+    receipt = receipts[index]
+    operation = receipt["schedule_cancellation"]
+    original = receipt["pre_cancellation_receipt"]
+    profile = operation["snapshot"]["profile_username"]
+    calendar = evidence = None
+    try:
+        calendar = PublishAgent(ep_dir, load_config())._remote_schedule(
+            api_key, profile
+        )
+        if not isinstance(calendar, list) or any(
+            not isinstance(item, dict) for item in calendar
+        ):
+            raise ValueError("Provider calendar is malformed")
+        absent = not any(
+            item.get("job_id") == original["job_id"]
+            or item.get("external_id") == original["external_id"]
+            for item in calendar
+        )
+        evidence = _upload_post_job_evidence(api_key, profile, original["job_id"])
+        safe, reason = schedule_cancellation_provider_safe(
+            original, evidence, profile_username=profile, after_delete=True
+        )
+    except (RuntimeError, ValueError) as exc:
+        absent, safe, reason = False, False, str(exc)
+    operation["post_delete"] = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "calendar": calendar,
+        "evidence": evidence,
+    }
+    if not absent or not safe:
+        atomic_write_json(ep_dir / "publish.json", publish)
+        raise HTTPException(status_code=409, detail=reason or "Job remains scheduled.")
+    completed = datetime.now(timezone.utc).isoformat()
+    destinations = {
+        platform: {"state": "cancelled"} for platform in original["platforms"]
+    }
+    event = {
+        "observed_at": completed,
+        "previous_status": original.get("status"),
+        "status": "cancelled",
+        "provider_status": "cancelled",
+        "profile_username": profile,
+        "evidence_source": "schedule_cancellation",
+        "terminal_destinations": destinations,
+    }
+    operation.update(state="cancelled", completed_at=completed, terminal_event=event)
+    receipts[index] = {
+        **receipt,
+        "status": "cancelled",
+        "scheduled": False,
+        "terminal_destinations": destinations,
+        "status_history": [*original.get("status_history", []), event],
+    }
+    publish["shorts"] = receipts
+    atomic_write_json(ep_dir / "publish.json", publish)
+    return receipts[index]
+
+
+def _cancel_schedule_locked(
+    episode_id: str, clip_id: str, req: ScheduleCancellationRequest
+) -> dict:
+    from agents.publish import (
+        SCHEDULE_CANCELLATION_SCHEMA,
+        publication_lock,
+        validated_schedule_cancellation,
+    )
+
+    actor, reason = req.actor.strip(), req.reason.strip()
+    if not actor or len(reason) < 3:
+        raise HTTPException(status_code=422, detail="Actor and reason are required.")
+    with publication_lock(EPISODES_DIR):
+        ep_dir = require_episode_dir(EPISODES_DIR, episode_id)
+        publish, receipts = _load_cancellation_publish(ep_dir)
+        matches = [
+            (index, receipt, receipt.get("schedule_cancellation"))
+            for index, receipt in enumerate(receipts)
+            if isinstance(receipt.get("schedule_cancellation"), dict)
+            and receipt["schedule_cancellation"].get("operation_id")
+            == str(req.request_id)
+        ]
+        if len(matches) > 1:
+            raise HTTPException(
+                status_code=409, detail="Cancellation ID is duplicated."
+            )
+        if matches:
+            index, receipt, operation = matches[0]
+            if receipt.get("clip_id") != clip_id or operation.get("clip_id") != clip_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cancellation ID belongs to a different clip.",
+                )
+            target = operation.get("snapshot", {}).get("target", {})
+            if validated_schedule_cancellation(receipt) is None or (
+                operation.get("actor"),
+                operation.get("reason"),
+                operation.get("snapshot", {}).get("revision"),
+                target.get("variant_id"),
+                target.get("revision"),
+            ) != (
+                actor,
+                reason,
+                req.expected_snapshot_revision,
+                req.variant_id,
+                req.expected_revision,
+            ):
+                raise HTTPException(
+                    status_code=409, detail="Cancellation inputs changed."
+                )
+            if operation["state"] == "cancelled":
+                return _cancellation_response(episode_id, clip_id, operation)
+            if operation["state"] != "delete_confirmed":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Prior outcome is unresolved; do not send another DELETE.",
+                )
+        else:
+            context = _cancellation_context(episode_id, clip_id, req, publish)
+            snapshot, receipt = context["snapshot"], context["receipt"]
+            if req.expected_snapshot_revision != snapshot["revision"]:
+                raise HTTPException(
+                    status_code=409, detail="Snapshot changed; preview again."
+                )
+            current_clips, _ = load_clips(episode_id)
+            current_clip, _ = find_clip(current_clips, clip_id)
+            _, current_target = _rerelease_target(ep_dir, current_clip, req)
+            if any(
+                current_target.get(key) != snapshot["target"].get(key)
+                for key in ("variant_id", "revision", "render_fingerprint")
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The target changed during provider verification; preview again.",
+                )
+            index = receipts.index(receipt)
+            original = copy.deepcopy(receipt)
+            operation = {
+                "schema": SCHEDULE_CANCELLATION_SCHEMA,
+                "operation_id": str(req.request_id),
+                "clip_id": clip_id,
+                "actor": actor,
+                "reason": reason,
+                "state": "delete_started",
+                "snapshot": snapshot,
+                "pre_delete": context["pre_delete"],
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            receipts[index] = {
+                **receipt,
+                "pre_cancellation_receipt": original,
+                "schedule_cancellation": operation,
+            }
+            publish["shorts"] = receipts
+            atomic_write_json(ep_dir / "publish.json", publish)
+            outcome = _delete_upload_post_schedule(
+                context["api_key"], original["job_id"]
+            )
+            operation["delete"] = {
+                "job_id": original["job_id"],
+                "attempted_at": datetime.now(timezone.utc).isoformat(),
+                **outcome,
+            }
+            confirmed = (
+                outcome.get("http_status") == 200
+                and isinstance(outcome.get("response"), dict)
+                and outcome["response"].get("success") is True
+            )
+            if not confirmed:
+                operation["state"] = "outcome_uncertain"
+                atomic_write_json(ep_dir / "publish.json", publish)
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cancellation is unconfirmed; do not send another DELETE.",
+                )
+            operation.update(state="delete_confirmed")
+            operation["delete"]["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+            atomic_write_json(ep_dir / "publish.json", publish)
+        api_key = os.getenv("UPLOAD_POST_API_KEY", "")
+        profile = os.getenv("UPLOAD_POST_USER", "")
+        if not api_key or profile != operation["snapshot"]["profile_username"]:
+            raise HTTPException(
+                status_code=409,
+                detail="The exact Upload-Post account is unavailable.",
+            )
+        receipt = _post_delete_cancellation(ep_dir, publish, receipts, index, api_key)
+        operation = validated_schedule_cancellation(receipt)
+        if operation is None:
+            raise HTTPException(
+                status_code=409, detail="Cancellation proof is invalid."
+            )
+        return _cancellation_response(episode_id, clip_id, operation)
+
+
+@router.post("/{clip_id}/schedule-cancellation")
+async def cancel_clip_schedule(
+    episode_id: str, clip_id: str, req: ScheduleCancellationRequest
+) -> dict:
+    return await asyncio.to_thread(_cancel_schedule_locked, episode_id, clip_id, req)
 
 
 @router.post("/{clip_id}/reject")

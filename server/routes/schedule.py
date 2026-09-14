@@ -22,6 +22,7 @@ _RECORDED_PUBLICATION_STATES = {
     "failed",
     "partial_failure",
     "unknown",
+    "cancelled",
 }
 
 
@@ -109,6 +110,11 @@ def _publication_evidence(ep_dir: Path, episode: dict, config: dict) -> list[dic
             or short.get("status") not in _RECORDED_PUBLICATION_STATES
         ):
             continue
+        if short.get("status") == "cancelled":
+            from agents.publish import validated_schedule_cancellation
+
+            if validated_schedule_cancellation(short) is None:
+                continue
         destinations = short.get("platforms")
         if not isinstance(destinations, list) or not destinations:
             destinations = ["unknown"]
@@ -247,11 +253,22 @@ async def _get_approved_items(
         clips_by_id = {
             str(clip["id"]): clip for clip in reviewed_clips if clip.get("id")
         }
+        prepared_ids = {
+            str(clip["id"])
+            for clip in reviewed_clips
+            if clip.get("id")
+            and isinstance(clip.get("review", {}).get("distribution"), dict)
+            and isinstance(
+                clip["review"]["distribution"].get("re_release_request"), dict
+            )
+            and clip["review"]["distribution"].get("re_release_request_consumed")
+            is False
+        }
         receipt_ids = {
             str(receipt["clip_id"])
             for receipt in receipts
             if isinstance(receipt, dict) and receipt.get("clip_id")
-        }
+        } - prepared_ids
         current_release = (
             publish.get("release_revision") == gate.get("revision")
             if publish.get("release_revision") and gate.get("revision")

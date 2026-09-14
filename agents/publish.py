@@ -31,12 +31,14 @@ from lib.short_variants import (
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
 SCHEDULE_URL = "https://api.upload-post.com/api/uploadposts/schedule"
+SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v1"
 RECORDED_STATES = {
     "submitted",
     "published",
     "already_submitted",
     "partial_failure",
     "unknown",
+    "cancelled",
 }
 TERMINAL_DESTINATION_STATES = {"published", "failed", "cancelled"}
 _UNRESOLVED_PROVIDER_STATE_MARKERS = (
@@ -84,6 +86,19 @@ def validated_short_receipts(publish: dict) -> list[dict]:
         for receipt in receipts
     ):
         raise ValueError("Publication receipt history cannot be verified")
+    operations = [
+        validated_schedule_cancellation(receipt)
+        for receipt in receipts
+        if "schedule_cancellation" in receipt
+    ]
+    if any(operation is None for operation in operations) or any(
+        len({key(operation) for operation in operations}) != len(operations)
+        for key in (
+            lambda value: value["operation_id"],
+            lambda value: value["snapshot"]["remote_job"]["job_id"],
+        )
+    ):
+        raise ValueError("Schedule cancellation history cannot be verified")
     return receipts
 
 
@@ -176,6 +191,271 @@ def validated_terminal_destinations(
     return destinations
 
 
+def _document_revision(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _has_exact_keys(value: object, keys: set[str]) -> bool:
+    return isinstance(value, dict) and set(value) == keys
+
+
+def _matches_exact_receipt(receipt: dict, expected: dict) -> bool:
+    return receipt == expected or receipt == {**expected, "historical_receipt": True}
+
+
+def cancellation_snapshot(
+    receipt: dict, history_revision: str, profile: str, target: dict, remote_job: dict
+) -> dict:
+    snapshot = {
+        "receipt_revision": _document_revision(receipt),
+        "history_revision": history_revision,
+        "profile_username": profile,
+        "target": target,
+        "remote_job": remote_job,
+    }
+    return {**snapshot, "revision": _document_revision(snapshot)}
+
+
+def _matching_schedule_row(receipt: dict, remote: object, profile: str) -> bool:
+    try:
+        platforms = receipt["platforms"]
+        fields = remote.get("fields")
+        return bool(
+            isinstance(remote, dict)
+            and remote.get("job_id") == receipt["job_id"]
+            and remote.get("external_id") == receipt["external_id"]
+            and remote.get("profile_username") == profile
+            and isinstance(remote.get("platforms"), list)
+            and len(remote["platforms"]) == len(set(remote["platforms"]))
+            and set(remote["platforms"]) == set(platforms)
+            and remote.get("source_filename") == f"{receipt['clip_id']}.mp4"
+            and (fields is None or fields.get("external_id") == receipt["external_id"])
+            and _instant(_parse_remote_schedule_time(remote["scheduled_date"]))
+            == _instant(_parse_time(receipt["scheduled_date"]))
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def validated_schedule_cancellation(receipt: dict) -> dict | None:
+    """Validate the durable operation embedded in a scheduled receipt."""
+    operation = receipt.get("schedule_cancellation")
+    original = receipt.get("pre_cancellation_receipt")
+    if not isinstance(operation, dict) or not isinstance(original, dict):
+        return None
+    snapshot = operation.get("snapshot")
+    target = snapshot.get("target") if isinstance(snapshot, dict) else None
+    remote = snapshot.get("remote_job") if isinstance(snapshot, dict) else None
+    state = operation.get("state")
+    base_keys = {
+        "schema",
+        "operation_id",
+        "clip_id",
+        "actor",
+        "reason",
+        "state",
+        "snapshot",
+        "pre_delete",
+        "started_at",
+    }
+    if not isinstance(state, str) or state not in {
+        "delete_started",
+        "outcome_uncertain",
+        "delete_confirmed",
+        "cancelled",
+    }:
+        return None
+    expected_keys = {
+        "delete_started": base_keys,
+        "outcome_uncertain": base_keys | {"delete"},
+        "delete_confirmed": base_keys | {"delete"},
+        "cancelled": base_keys
+        | {"delete", "post_delete", "completed_at", "terminal_event"},
+    }[state]
+    if state == "delete_confirmed" and "post_delete" in operation:
+        expected_keys = expected_keys | {"post_delete"}
+    if not (
+        _has_exact_keys(operation, expected_keys)
+        and _has_exact_keys(target, {"variant_id", "revision", "render_fingerprint"})
+        and _has_exact_keys(operation.get("pre_delete"), {"checked_at", "evidence"})
+    ):
+        return None
+    if not (
+        operation.get("schema") == SCHEDULE_CANCELLATION_SCHEMA
+        and all(
+            isinstance(operation.get(key), str) and operation[key]
+            for key in ("operation_id", "clip_id", "actor", "reason", "started_at")
+        )
+        and operation["actor"] == operation["actor"].strip()
+        and operation["reason"] == operation["reason"].strip()
+        and len(operation["reason"]) >= 3
+        and operation["clip_id"] == original.get("clip_id")
+        and "schedule_cancellation" not in original
+        and "pre_cancellation_receipt" not in original
+        and original.get("scheduled") is True
+        and validated_terminal_destinations(
+            original.get("platforms"),
+            {
+                platform: {"state": "cancelled"}
+                for platform in (original.get("platforms") or [])
+            },
+        )
+        is not None
+        and isinstance(snapshot, dict)
+        and isinstance(snapshot.get("history_revision"), str)
+        and isinstance(snapshot.get("profile_username"), str)
+        and bool(snapshot["profile_username"])
+        and snapshot
+        == cancellation_snapshot(
+            original,
+            snapshot["history_revision"],
+            snapshot.get("profile_username"),
+            target,
+            remote,
+        )
+        and isinstance(target, dict)
+        and "variant_id" in target
+        and (target["variant_id"] is None or isinstance(target["variant_id"], str))
+        and all(
+            isinstance(target.get(key), str) and target[key]
+            for key in ("revision", "render_fingerprint")
+        )
+        and _matching_schedule_row(original, remote, snapshot["profile_username"])
+        and isinstance(operation.get("pre_delete"), dict)
+        and isinstance(operation["pre_delete"].get("checked_at"), str)
+        and schedule_cancellation_provider_safe(
+            original,
+            operation["pre_delete"].get("evidence"),
+            profile_username=snapshot["profile_username"],
+            after_delete=False,
+        )[0]
+    ):
+        return None
+    if state != "cancelled" and not _matches_exact_receipt(
+        receipt,
+        {
+            **original,
+            "pre_cancellation_receipt": original,
+            "schedule_cancellation": operation,
+        },
+    ):
+        return None
+    deletion = operation.get("delete")
+    if state == "delete_started":
+        return operation
+    if not (
+        isinstance(deletion, dict)
+        and deletion.get("job_id") == original["job_id"]
+        and isinstance(deletion.get("attempted_at"), str)
+        and deletion["attempted_at"]
+    ):
+        return None
+    if state == "outcome_uncertain":
+        error_shape = (
+            _has_exact_keys(deletion, {"job_id", "attempted_at", "error"})
+            and isinstance(deletion.get("error"), str)
+            and bool(deletion["error"])
+        )
+        response_keys = {"job_id", "attempted_at", "http_status"}
+        if "response" in deletion:
+            response_keys.add("response")
+        response_shape = (
+            _has_exact_keys(deletion, response_keys)
+            and isinstance(deletion.get("http_status"), int)
+            and not isinstance(deletion.get("http_status"), bool)
+            and ("response" not in deletion or isinstance(deletion["response"], dict))
+            and not (
+                deletion["http_status"] == 200
+                and isinstance(deletion.get("response"), dict)
+                and deletion["response"].get("success") is True
+            )
+        )
+        return operation if error_shape or response_shape else None
+    if not (
+        _has_exact_keys(
+            deletion,
+            {"job_id", "attempted_at", "http_status", "response", "confirmed_at"},
+        )
+        and deletion.get("http_status") == 200
+        and isinstance(deletion.get("response"), dict)
+        and deletion["response"].get("success") is True
+        and isinstance(deletion.get("confirmed_at"), str)
+        and deletion["confirmed_at"]
+    ):
+        return None
+    if state == "delete_confirmed" and "post_delete" not in operation:
+        return operation
+    if state == "delete_confirmed":
+        post = operation["post_delete"]
+        if not (
+            _has_exact_keys(post, {"checked_at", "calendar", "evidence"})
+            and isinstance(post["checked_at"], str)
+            and post["checked_at"]
+            and (
+                post["calendar"] is None
+                or (
+                    isinstance(post["calendar"], list)
+                    and all(isinstance(item, dict) for item in post["calendar"])
+                )
+            )
+            and (post["evidence"] is None or isinstance(post["evidence"], dict))
+        ):
+            return None
+    if state != "cancelled":
+        return operation
+
+    post = operation.get("post_delete")
+    destinations = {
+        platform: {"state": "cancelled"} for platform in original["platforms"]
+    }
+    event = operation.get("terminal_event")
+    history = original.get("status_history", [])
+    if not (
+        _has_exact_keys(post, {"checked_at", "calendar", "evidence"})
+        and isinstance(post.get("checked_at"), str)
+        and isinstance(post.get("calendar"), list)
+        and all(isinstance(item, dict) for item in post["calendar"])
+        and not any(
+            item.get("job_id") == original["job_id"]
+            or item.get("external_id") == original["external_id"]
+            for item in post["calendar"]
+        )
+        and schedule_cancellation_provider_safe(
+            original,
+            post.get("evidence"),
+            profile_username=snapshot["profile_username"],
+            after_delete=True,
+        )[0]
+        and isinstance(history, list)
+        and isinstance(operation.get("completed_at"), str)
+        and event
+        == {
+            "observed_at": operation["completed_at"],
+            "previous_status": original.get("status"),
+            "status": "cancelled",
+            "provider_status": "cancelled",
+            "profile_username": snapshot["profile_username"],
+            "evidence_source": "schedule_cancellation",
+            "terminal_destinations": destinations,
+        }
+        and _matches_exact_receipt(
+            receipt,
+            {
+                **original,
+                "status": "cancelled",
+                "scheduled": False,
+                "terminal_destinations": destinations,
+                "status_history": [*history, event],
+                "pre_cancellation_receipt": original,
+                "schedule_cancellation": operation,
+            },
+        )
+    ):
+        return None
+    return operation
+
+
 def _provider_result_has_unresolved_work(value: dict) -> bool:
     provider_state = str(value.get("status") or value.get("state") or "").lower()
     return (
@@ -218,7 +498,12 @@ def receipt_terminal_destinations(
                 not profile_username
                 or history[-1].get("profile_username") == profile_username
             )
-            and history[-1].get("evidence_source") in {"status", "history"}
+            and history[-1].get("evidence_source")
+            in {"status", "history", "schedule_cancellation"}
+            and (
+                history[-1].get("evidence_source") != "schedule_cancellation"
+                or validated_schedule_cancellation(receipt) is not None
+            )
         ):
             return recorded
         return None
@@ -424,6 +709,8 @@ def short_rerelease_state(
             "reason": "No prior remote submission requires a re-release.",
             "history_revision": short_receipt_history_revision(publish, clip_id),
         }
+    cancellation_request = None
+    consumed = {receipt.get("rerelease_request_id") for receipt in receipts}
     for receipt in receipts:
         evidence = receipt_terminal_destinations(
             receipt, profile_username=profile_username
@@ -439,11 +726,32 @@ def short_rerelease_state(
                 ),
                 "history_revision": short_receipt_history_revision(publish, clip_id),
             }
+        operation = validated_schedule_cancellation(receipt)
+        if operation and operation["operation_id"] not in consumed:
+            target = operation["snapshot"]["target"]
+            request = {
+                "request_id": operation["operation_id"],
+                "actor": operation["actor"],
+                "reason": operation["reason"],
+                "variant_id": target["variant_id"],
+                "target_revision": target["revision"],
+                "render_fingerprint": target["render_fingerprint"],
+            }
+            if cancellation_request not in (None, request):
+                return {
+                    "allowed": False,
+                    "reason": "Cancelled schedules bind conflicting re-release requests.",
+                    "history_revision": short_receipt_history_revision(
+                        publish, clip_id
+                    ),
+                }
+            cancellation_request = request
     return {
         "allowed": True,
         "reason": None,
         "history_revision": short_receipt_history_revision(publish, clip_id),
         "receipt_count": len(receipts),
+        "cancellation_request": cancellation_request,
     }
 
 
@@ -522,6 +830,218 @@ def _parse_remote_schedule_time(value: str) -> datetime:
 
 def _instant(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def cancellable_scheduled_receipt(
+    publish: dict,
+    clip_id: str,
+    remote_schedule: object,
+    *,
+    profile_username: str,
+    now: datetime | None = None,
+) -> tuple[dict, dict, str]:
+    """Resolve one future local receipt and its exact provider calendar row."""
+    if (
+        not profile_username
+        or not isinstance(remote_schedule, list)
+        or any(not isinstance(item, dict) for item in remote_schedule)
+    ):
+        raise ValueError("Upload-Post schedule or profile cannot be verified")
+    receipts = [
+        receipt
+        for receipt in validated_short_receipts(publish)
+        if receipt["clip_id"] == clip_id
+    ]
+    pending = [
+        receipt
+        for receipt in receipts
+        if receipt_terminal_destinations(receipt, profile_username=profile_username)
+        is None
+    ]
+    candidates = [
+        receipt
+        for receipt in pending
+        if receipt.get("scheduled") is True and "schedule_cancellation" not in receipt
+    ]
+    if len(pending) != 1 or len(candidates) != 1:
+        raise ValueError("The clip has no single cancellable scheduled receipt")
+    receipt = candidates[0]
+    platforms = receipt.get("platforms")
+    if (
+        not isinstance(receipt.get("status_history", []), list)
+        or validated_terminal_destinations(
+            platforms,
+            {platform: {"state": "cancelled"} for platform in platforms or []},
+        )
+        is None
+    ):
+        raise ValueError("The scheduled receipt identity cannot be verified")
+    try:
+        scheduled_at = _parse_time(receipt["scheduled_date"])
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("The scheduled receipt date cannot be verified") from exc
+    reference = now or datetime.now(timezone.utc)
+    if _instant(scheduled_at) <= _instant(reference):
+        raise ValueError("Only future scheduled jobs can be cancelled")
+    matches = [
+        item
+        for item in remote_schedule
+        if item.get("job_id") == receipt.get("job_id")
+        or item.get("external_id") == receipt.get("external_id")
+    ]
+    if len(matches) != 1 or not _matching_schedule_row(
+        receipt, matches[0], profile_username
+    ):
+        raise ValueError("The provider calendar row does not exactly match the receipt")
+    return receipt, matches[0], short_receipt_history_revision(publish, clip_id)
+
+
+def _provider_states(item: dict) -> set[str]:
+    return {
+        str(item[key]).strip().lower()
+        for key in ("upload_status", "upload_overall_status", "status", "state")
+        if item.get(key) not in (None, "")
+    }
+
+
+def _provider_row_is_queued(item: dict) -> bool:
+    states = _provider_states(item)
+    return (
+        bool(states)
+        and states <= {"queued", "scheduled"}
+        and item.get("success") is None
+        and not any(
+            item.get(key)
+            for key in (
+                "fallback_to_inbox",
+                "retryable",
+                "is_retryable",
+                "post_url",
+                "video_url",
+                "url",
+            )
+        )
+    )
+
+
+def schedule_cancellation_provider_safe(
+    receipt: dict,
+    evidence: object,
+    *,
+    profile_username: str,
+    after_delete: bool,
+) -> tuple[bool, str | None]:
+    """Accept exact queued provider evidence before DELETE and absence afterward."""
+    if not (
+        _has_exact_keys(evidence, {"status_not_found", "status", "history"})
+        and isinstance(evidence["status_not_found"], bool)
+        and isinstance(evidence.get("history"), dict)
+        and (evidence["status"] is None) is evidence["status_not_found"]
+    ):
+        return False, "Provider status/history evidence is malformed"
+    identity = _provider_identity(receipt)
+    status_missing = evidence.get("status_not_found") is True
+    status = evidence.get("status")
+    history = evidence["history"]
+    status_confirmed = False
+    if not identity:
+        return False, "Provider receipt identity is missing"
+    if not status_missing:
+        if not isinstance(status, dict) or status_identity_conflicts(
+            receipt, status, profile_username=profile_username
+        ):
+            return False, "Provider status conflicts with the scheduled receipt"
+        top_match, _ = _identity_evidence(identity, status)
+        results = status.get("results")
+        children = (
+            list(results.values()) if isinstance(results, dict) else results or []
+        )
+        if not isinstance(children, list) or any(
+            not isinstance(item, dict) for item in children
+        ):
+            return False, "Provider status results are malformed"
+        bound = [
+            item
+            for index, item in enumerate([status, *children])
+            if _identity_evidence(identity, item)[0] or index and top_match
+        ]
+        if not bound:
+            return False, "Provider status did not confirm the scheduled job"
+        if after_delete:
+            if any(
+                not _provider_states(item)
+                or not _provider_states(item) <= {"cancelled", "canceled"}
+                or item.get("success") not in (None, False)
+                or item.get("fallback_to_inbox") is True
+                or item.get("retryable") is True
+                or item.get("is_retryable") is True
+                or any(item.get(key) for key in ("post_url", "video_url", "url"))
+                for item in bound
+            ):
+                return False, "Provider status conflicts with cancellation"
+        elif not all(_provider_row_is_queued(item) for item in bound):
+            return False, "Provider status no longer describes queued work"
+        status_confirmed = True
+
+    active = history.get("in_progress")
+    completed = history.get("history")
+    if (
+        not isinstance(active, list)
+        or not isinstance(completed, list)
+        or any(not isinstance(item, dict) for item in [*active, *completed])
+    ):
+        return False, "Provider history is malformed"
+    matched_active, matched_completed = [], []
+    for collection, matches in (
+        (active, matched_active),
+        (completed, matched_completed),
+    ):
+        for item in collection:
+            matched, conflict = _identity_evidence(identity, item)
+            if matched and (
+                conflict or item.get("profile_username") != profile_username
+            ):
+                return False, "Provider history conflicts with the scheduled receipt"
+            if matched:
+                matches.append(item)
+    if after_delete:
+        if (
+            matched_active
+            or matched_completed
+            or not (status_missing or status_confirmed)
+        ):
+            return False, "Provider history still contains work for the cancelled job"
+        return True, None
+    if matched_completed:
+        return False, "Provider history already contains terminal work for this job"
+    if not matched_active:
+        return (
+            (True, None)
+            if status_confirmed
+            else (False, "Provider did not confirm queued work for this job")
+        )
+    try:
+        scheduled = _instant(_parse_time(receipt["scheduled_date"]))
+        dates = [
+            _instant(_parse_remote_schedule_time(item["run_date"]))
+            for item in matched_active
+        ]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False, "Provider history has an invalid scheduled date"
+    platforms = receipt.get("platforms")
+    seen = [item.get("platform") for item in matched_active]
+    if (
+        len(seen) != len(set(seen))
+        or set(seen) != set(platforms or [])
+        or any(
+            not _provider_row_is_queued(item)
+            or item.get("is_scheduled") is not True
+            or date != scheduled
+            for item, date in zip(matched_active, dates, strict=True)
+        )
+    ):
+        return False, "Provider work history is not uniformly queued for this schedule"
+    return True, None
 
 
 class PublishAgent(BaseAgent):
@@ -977,6 +1497,7 @@ class PublishAgent(BaseAgent):
                     item
                     for item in recorded_for_clip
                     if item.get("external_id") == identity
+                    and item.get("status") != "cancelled"
                 ),
                 None,
             )
@@ -1454,7 +1975,14 @@ class PublishAgent(BaseAgent):
                 if not isinstance(publish, dict):
                     raise TypeError("top-level value is not an object")
                 shorts = publish.get("shorts", [])
-                if not isinstance(shorts, list):
+                if not isinstance(shorts, list) or any(
+                    not isinstance(item, dict)
+                    or (
+                        "schedule_cancellation" in item
+                        and validated_schedule_cancellation(item) is None
+                    )
+                    for item in shorts
+                ):
                     raise TypeError("shorts is not a list")
             except (OSError, json.JSONDecodeError, TypeError) as error:
                 raise RuntimeError(

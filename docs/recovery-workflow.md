@@ -251,6 +251,22 @@ terminal per-destination evidence. Submitted, scheduled, pending, queued,
 inbox-only, unknown, incomplete, or identity-less records remain blocked; they
 need provider reconciliation before a re-release can be prepared.
 
+For a future Upload-Post job that is still uniformly queued, first preview the
+exact cancellation:
+
+```text
+POST /api/episodes/{episode_id}/clips/{clip_id}/schedule-cancellation/preview
+{"variant_id":"background_motion_v1","expected_revision":"sha256:...","request_id":"<new UUID>","actor":"...","reason":"..."}
+```
+
+Review the returned local receipt, provider job, profile, date, platforms, and
+target. Send the response's `execute` body unchanged to the same path without
+`/preview`. Cascade writes the request before the provider `DELETE`, retains the
+original receipt, and marks it cancelled only after an exact successful delete,
+calendar absence, and exact status/history evidence. If the response is
+ambiguous, do not issue another delete; reconcile the stored operation. On
+success, send the returned `next.body` to the returned re-release path.
+
 When `review.distribution.re_release_allowed` is true, prepare the exact approved
 target with:
 

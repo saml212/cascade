@@ -1008,6 +1008,17 @@ async def check_upload_urls(episode_id: str) -> CheckUploadUrlsResponse:
     for clip_result in short_receipts:
         clip_id = clip_result.get("clip_id", "")
         clip_query = _status_query(clip_result)
+        cancellation = clip_result.get("schedule_cancellation")
+        if isinstance(cancellation, dict) and cancellation.get("state") != "cancelled":
+            result.shorts.append(
+                {
+                    "clip_id": clip_id,
+                    "status": "cancellation_pending",
+                    "url": None,
+                    "error": "Schedule cancellation awaits exact provider proof.",
+                }
+            )
+            continue
         terminal = receipt_terminal_destinations(
             clip_result, profile_username=profile_username or None
         )
