@@ -1691,6 +1691,88 @@ def apply_finding_reviews(
     return result
 
 
+def apply_selected_master_continuity_proof(
+    report: dict, output_continuity: dict | None
+) -> dict:
+    """Attach exact current selected-master evidence through the existing QA gate."""
+    result = copy.deepcopy(report)
+    scope = result.get("scope", {})
+    outputs = scope.get("outputs_checked") or []
+    if not isinstance(outputs, list):
+        return result
+    native_proofs = [
+        proof
+        for proof in outputs
+        if not isinstance(proof, dict)
+        or "output_continuity_report_fingerprint" not in proof
+    ]
+    if len(native_proofs) != len(outputs):
+        scope["outputs_checked"] = native_proofs
+        result["release_gate"] = release_gate(result)
+    if native_proofs:
+        return result
+    if (
+        not isinstance(output_continuity, dict)
+        or output_continuity.get("reviewable") is not True
+        or output_continuity.get("status") != "pass"
+        or output_continuity.get("safe") is not True
+        or not output_continuity.get("fingerprint")
+    ):
+        return result
+    provenance = scope.get("selected_mix_provenance", {})
+    selected_output = provenance.get("selected_output") or {}
+    expected_identity = selected_output.get("fingerprint") or {}
+    master = next(
+        (
+            artifact
+            for artifact in output_continuity.get("artifacts", [])
+            if artifact.get("role") == "selected_audio_master"
+            and artifact.get("clip_id") is None
+        ),
+        {},
+    )
+    if (
+        not expected_identity.get("id")
+        or master.get("status") != "pass"
+        or master.get("detector_status") != "pass"
+        or master.get("mechanically_verified") is not True
+    ):
+        return result
+    observed_identity = master.get("scan_identity")
+    if not (
+        isinstance(observed_identity, dict)
+        and selected_output.get("path")
+        == master.get("path")
+        == observed_identity.get("resolved_path")
+        and expected_identity.get("size_bytes") == observed_identity.get("size_bytes")
+        and expected_identity.get("mtime_ns") == observed_identity.get("mtime_ns")
+    ):
+        return result
+    proof = {
+        "role": "selected_audio_master",
+        "status": "pass",
+        "source_report_fingerprint": result.get("fingerprint"),
+        "selected_mix_fingerprint": provenance.get("fingerprint"),
+        "fingerprint": expected_identity,
+        "output_continuity_report_fingerprint": output_continuity.get("fingerprint"),
+        "output_continuity_artifact_revision": master.get("revision"),
+        "verification": {
+            "status": "pass",
+            "checks": [
+                {
+                    "name": "current_selected_master_continuity",
+                    "pass": True,
+                    "artifact_revision": master.get("revision"),
+                    "report_fingerprint": output_continuity.get("fingerprint"),
+                }
+            ],
+        },
+    }
+    scope["outputs_checked"] = [proof]
+    result["release_gate"] = release_gate(result)
+    return result
+
+
 def _output_proof_state(report: dict) -> tuple[str, dict | None]:
     """Classify evidence for the currently selected audio master."""
     scope = report.get("scope", {})

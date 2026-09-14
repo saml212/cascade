@@ -36,6 +36,8 @@ from lib.audio_qa import (
     OutputContinuityConfig,
     WindowStats,
     analyze_output_continuity,
+    apply_output_finding_reviews,
+    apply_selected_master_continuity_proof,
     output_continuity_report_fingerprint,
 )
 from lib.audio_qa import release_gate as audio_release_gate
@@ -892,6 +894,134 @@ def test_finding_review_rejects_split_ranges_and_missing_output_proof(
     ][0]
     assert unverified["review"]["allowed"] is False
     assert "verified current selected audio master" in unverified["review"]["reason"]
+
+
+def _bind_source_report_to_current_master(episode_dir: Path, report: dict) -> None:
+    master = episode_dir / "work" / "audio_mix.wav"
+    stat = master.stat()
+    report["scope"]["outputs_checked"] = []
+    report["scope"]["selected_mix_provenance"]["selected_output"] = {
+        "path": str(master.resolve()),
+        "fingerprint": {
+            "id": "sha256:current-master",
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        },
+    }
+    report["release_gate"] = audio_release_gate(report)
+    _write_json(episode_dir / "qa" / "audio-quality.json", report)
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    qa_report["audio_quality"] = report
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+
+def test_finding_review_uses_exact_current_output_continuity_proof(quality_client):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    report = _install_reviewable_report(
+        episode_dir, [_reviewable_finding("aq_external_proof", 10)]
+    )
+    _bind_source_report_to_current_master(episode_dir, report)
+
+    before = client.get("/api/episodes/ep_test/quality").json()
+    finding = before["audio_quality"]["findings"][0]
+    assert finding["review"]["allowed"] is True
+    assert before["release_gate"]["status"] == "blocked"
+
+    reviewed = client.post(
+        "/api/episodes/ep_test/audio-qc/findings/aq_external_proof/review",
+        json=_review_request(finding),
+    )
+
+    assert reviewed.status_code == 200
+    assert reviewed.json()["resolution"]["status"] == "accepted"
+    assert reviewed.json()["audio_release_gate"]["status"] == "pass"
+    assert reviewed.json()["quality"]["overall"] == "pass"
+
+
+@pytest.mark.parametrize("proof_state", ["missing", "stale", "failed", "mismatch"])
+def test_finding_review_rejects_invalid_output_continuity_bridge(
+    quality_client, proof_state
+):
+    client, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    report = _install_reviewable_report(
+        episode_dir, [_reviewable_finding(f"aq_{proof_state}", 10)]
+    )
+    _bind_source_report_to_current_master(episode_dir, report)
+    qa_report = json.loads((episode_dir / "qa" / "qa.json").read_text())
+    if proof_state == "missing":
+        qa_report.pop("selected_master_output_continuity")
+    elif proof_state == "stale":
+        qa_report["selected_master_output_continuity"] = _output_continuity_report(
+            episode_dir, [], artifact_statuses={"selected_audio_master": "stale"}
+        )
+    elif proof_state == "failed":
+        qa_report["selected_master_output_continuity"] = _output_continuity_report(
+            episode_dir,
+            [_output_finding("oc_failed", "selected_audio_master", "master-rev")],
+        )
+    else:
+        report["scope"]["selected_mix_provenance"]["selected_output"]["fingerprint"][
+            "mtime_ns"
+        ] += 1
+        qa_report["audio_quality"] = report
+    _write_json(episode_dir / "qa" / "qa.json", qa_report)
+
+    finding = client.get("/api/episodes/ep_test/quality").json()["audio_quality"][
+        "findings"
+    ][0]
+
+    assert finding["review"]["allowed"] is False
+    assert "verified current selected audio master" in finding["review"]["reason"]
+
+
+def test_selected_master_proof_rejects_cached_pass_after_file_stat_change(
+    quality_client,
+):
+    _, episodes_dir = quality_client
+    episode_dir = _seed_release(episodes_dir)
+    report = _install_reviewable_report(
+        episode_dir, [_reviewable_finding("aq_replaced", 10)]
+    )
+    _bind_source_report_to_current_master(episode_dir, report)
+    report["findings"][0]["resolution"] = {
+        "status": "accepted",
+        "finding_fingerprint": "fingerprint-aq_replaced",
+        "reviewed_by": "Technical reviewer",
+        "reviewed_at": "2026-09-13T00:00:00+00:00",
+        "evidence": {"note": "Verified against the current canonical output."},
+    }
+    output_report = json.loads((episode_dir / "qa" / "qa.json").read_text())[
+        "selected_master_output_continuity"
+    ]
+    effective_output = apply_output_finding_reviews(
+        output_report, None, output_revision=None
+    )
+    persisted = apply_selected_master_continuity_proof(report, effective_output)
+    assert persisted["scope"]["outputs_checked"][0]["status"] == "pass"
+    assert persisted["release_gate"]["status"] == "pass"
+
+    master = episode_dir / "work" / "audio_mix.wav"
+    original = master.stat()
+    replacement = master.with_suffix(".replacement")
+    replacement.write_bytes(b"edited")
+    os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+    replacement.replace(master)
+
+    stale_output = apply_output_finding_reviews(
+        output_report, None, output_revision=None
+    )
+    refreshed = apply_selected_master_continuity_proof(persisted, stale_output)
+
+    master_artifact = next(
+        artifact
+        for artifact in stale_output["artifacts"]
+        if artifact["role"] == "selected_audio_master"
+    )
+    assert master_artifact["status"] == "stale"
+    assert refreshed["scope"]["outputs_checked"] == []
+    assert refreshed["release_gate"]["status"] == "output_unverified"
 
 
 def test_output_finding_review_is_explicit_and_preserves_raw_evidence(

@@ -25,6 +25,7 @@ from lib.audio_qa import (
     AUDIO_FINDING_REVIEWS_SCHEMA,
     PREVIEW_ALGORITHM_VERSION,
     apply_finding_reviews,
+    apply_selected_master_continuity_proof,
     render_finding_preview,
 )
 from lib.audio_repair import (
@@ -122,6 +123,10 @@ def _effective_audio_report(episode_dir: Path) -> dict:
     report = _read_report(episode_dir / AUDIO_REPORT_PATH, "Audio quality report")
     snapshot = quality_snapshot(episode_dir)
     output = snapshot.get("artifacts", {}).get("release_video", {}).get("review_output")
+    report = apply_selected_master_continuity_proof(
+        report,
+        snapshot.get("audio_quality", {}).get("selected_master_output_continuity"),
+    )
     effective = apply_finding_reviews(
         report,
         _read_finding_reviews(episode_dir),

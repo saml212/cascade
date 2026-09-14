@@ -29,6 +29,7 @@ from lib.audio_qa import (
     analyze_output_continuity,
     apply_finding_reviews,
     apply_output_finding_reviews,
+    apply_selected_master_continuity_proof,
     output_finding_review_groups,
     review_output_revision,
     selected_output_proof_status,
@@ -1300,6 +1301,19 @@ def quality_snapshot(
     audio_quality = report.get("audio_quality") or _load_json(
         episode_dir / AUDIO_REPORT_PATH
     )
+    raw_output_continuity = report.get("selected_master_output_continuity")
+    output_continuity = (
+        apply_output_finding_reviews(
+            raw_output_continuity,
+            review_document,
+            output_revision=output_revision,
+        )
+        if isinstance(raw_output_continuity, dict) and raw_output_continuity
+        else {}
+    )
+    audio_quality = apply_selected_master_continuity_proof(
+        audio_quality, output_continuity
+    )
     audio_quality = apply_finding_reviews(
         audio_quality,
         review_document,
@@ -1313,16 +1327,6 @@ def quality_snapshot(
         qa_current=qa_current,
     )
     audio_gate = audio_quality.get("release_gate", {})
-    raw_output_continuity = report.get("selected_master_output_continuity")
-    output_continuity = (
-        apply_output_finding_reviews(
-            raw_output_continuity,
-            review_document,
-            output_revision=output_revision,
-        )
-        if isinstance(raw_output_continuity, dict) and raw_output_continuity
-        else {}
-    )
     output_continuity = _attach_output_review_context(
         output_continuity,
         current_longform,
@@ -1916,7 +1920,10 @@ class QAAgent(BaseAgent):
 
         self.report_progress(2, 3, "Analyzing source and release audio continuity")
         audio_report = {}
+        audio_error = None
         timeline = None
+        review_document = _load_json(self.episode_dir / AUDIO_FINDING_REVIEWS_PATH)
+        output_revision = None
         try:
             timeline = (
                 Timeline.from_edits(source_duration, episode.get("longform_edits", []))
@@ -1931,37 +1938,12 @@ class QAAgent(BaseAgent):
             current_review_longform, _ = _render_status(
                 self.episode_dir, episode, clips, self.config
             )
-            audio_report = apply_finding_reviews(
-                audio_report,
-                _load_json(self.episode_dir / AUDIO_FINDING_REVIEWS_PATH),
-                output_revision=review_output_revision(
-                    current_review_longform,
-                    output_path=self.episode_dir / "upload_video.mp4",
-                ),
-            )
-            self.save_json(AUDIO_REPORT_PATH, audio_report)
-            gate = audio_release_gate(audio_report)
-            target = (
-                skipped_checks if gate.get("status") == "not_applicable" else checks
-            )
-            target.append(
-                {
-                    "name": "audio_continuity",
-                    "status": gate.get("status", "unknown"),
-                    "pass": None
-                    if gate.get("status") == "not_applicable"
-                    else gate.get("status") == "pass",
-                    "detail": gate.get("reason", "Audio continuity report unavailable"),
-                }
+            output_revision = review_output_revision(
+                current_review_longform,
+                output_path=self.episode_dir / "upload_video.mp4",
             )
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            checks.append(
-                {
-                    "name": "audio_continuity",
-                    "pass": False,
-                    "detail": str(exc),
-                }
-            )
+            audio_error = str(exc)
 
         output_continuity = {}
         try:
@@ -1975,16 +1957,14 @@ class QAAgent(BaseAgent):
                 timeline,
                 ffmpeg_bin=self.get_config("tools", "ffmpeg", default=None),
             )
-            checks.append(
-                {
-                    "name": "selected_master_output_continuity",
-                    "status": output_continuity.get("status", "unknown"),
-                    "pass": output_continuity.get("safe") is True,
-                    "detail": output_continuity.get(
-                        "detail", "Release audio continuity is unavailable."
-                    ),
-                }
-            )
+            output_check = {
+                "name": "selected_master_output_continuity",
+                "status": output_continuity.get("status", "unknown"),
+                "pass": output_continuity.get("safe") is True,
+                "detail": output_continuity.get(
+                    "detail", "Release audio continuity is unavailable."
+                ),
+            }
         except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
             output_continuity = {
                 "schema": OUTPUT_CONTINUITY_SCHEMA,
@@ -1994,14 +1974,52 @@ class QAAgent(BaseAgent):
                 "artifacts": [],
                 "findings": [],
             }
-            checks.append(
+            output_check = {
+                "name": "selected_master_output_continuity",
+                "status": "error",
+                "pass": False,
+                "detail": str(exc),
+            }
+
+        if audio_error is None:
+            effective_output_continuity = apply_output_finding_reviews(
+                output_continuity,
+                review_document,
+                output_revision=output_revision,
+            )
+            audio_report = apply_selected_master_continuity_proof(
+                audio_report, effective_output_continuity
+            )
+            audio_report = apply_finding_reviews(
+                audio_report,
+                review_document,
+                output_revision=output_revision,
+            )
+            gate = audio_release_gate(audio_report)
+            audio_report["release_gate"] = gate
+            self.save_json(AUDIO_REPORT_PATH, audio_report)
+            target = (
+                skipped_checks if gate.get("status") == "not_applicable" else checks
+            )
+            target.append(
                 {
-                    "name": "selected_master_output_continuity",
-                    "status": "error",
-                    "pass": False,
-                    "detail": str(exc),
+                    "name": "audio_continuity",
+                    "status": gate.get("status", "unknown"),
+                    "pass": None
+                    if gate.get("status") == "not_applicable"
+                    else gate.get("status") == "pass",
+                    "detail": gate.get("reason", "Audio continuity report unavailable"),
                 }
             )
+        else:
+            checks.append(
+                {
+                    "name": "audio_continuity",
+                    "pass": False,
+                    "detail": audio_error,
+                }
+            )
+        checks.append(output_check)
 
         hard_pass = all(check["pass"] for check in checks)
         result = {
