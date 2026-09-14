@@ -1390,13 +1390,36 @@ class TestClipMutation:
         assert response.status_code == 404
         assert "Unknown short variant" in response.json()["detail"]
 
-    def test_variant_approval_binds_exact_revision_without_approving_base(
+    def test_variant_approval_restores_candidate_without_approving_base(
         self, test_client, monkeypatch
     ):
         client, episodes_dir = test_client
         ep_dir = _create_episode(episodes_dir, "ep_001")
-        clip = dict(SAMPLE_CLIPS[0])
-        _add_clips(episodes_dir, "ep_001", [clip])
+        clip = dict(
+            SAMPLE_CLIPS[0],
+            status="approved",
+            selection_status="selected",
+            approved_revision="sha256:base-copy",
+            approved_render_fingerprint="sha256:base-render",
+            distribution_variant_id="background_motion_v1",
+        )
+        _add_clips(episodes_dir, "ep_001", [clip, SAMPLE_CLIPS[1]])
+        updated = client.patch(
+            "/api/episodes/ep_001/clips/clip_01/metadata",
+            json={
+                "metadata": {
+                    "facebook": {
+                        "title": "New destination title",
+                        "description": "New destination description",
+                    }
+                }
+            },
+        )
+        assert updated.status_code == 200
+        changed = json.loads((ep_dir / "clips.json").read_text())["clips"][0]
+        assert changed["status"] == "pending"
+        assert "approved_revision" not in changed
+        assert "approved_render_fingerprint" not in changed
         record = {
             "fingerprint": "sha256:variant",
             "output": {
@@ -1408,7 +1431,7 @@ class TestClipMutation:
         from agents.qa import clip_review_revision
         from server.routes import clips as clips_mod
 
-        revision = clip_review_revision(clip, record, None)
+        revision = clip_review_revision(changed, record, None)
         monkeypatch.setattr(clips_mod, "_current_render", lambda *_args: {})
         monkeypatch.setattr(
             clips_mod,
@@ -1419,26 +1442,70 @@ class TestClipMutation:
             ),
         )
         saved = []
+
+        def save_with_concurrent_edit(*args):
+            saved.append(args)
+            document = json.loads((ep_dir / "clips.json").read_text())
+            document["clips"][0]["metadata"]["facebook"]["title"] = (
+                "Concurrent destination title"
+            )
+            _add_clips(episodes_dir, "ep_001", document["clips"])
+            return record
+
         monkeypatch.setattr(
             clips_mod,
             "save_background_variant_approval",
-            lambda *_args: saved.append(_args) or record,
+            save_with_concurrent_edit,
         )
 
         stale = client.post(
             "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
             json={"expected_revision": "sha256:stale"},
         )
-        approved = client.post(
+        conflicted = client.post(
             "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
             json={"expected_revision": revision},
         )
 
         assert stale.status_code == 409
+        assert conflicted.status_code == 409
+        assert "copy changed" in conflicted.json()["detail"]
+        concurrent = json.loads((ep_dir / "clips.json").read_text())["clips"][0]
+        assert concurrent["metadata"]["facebook"]["title"] == (
+            "Concurrent destination title"
+        )
+        assert concurrent["status"] == "pending"
+        revision = clip_review_revision(concurrent, record, None)
+
+        def save_with_unrelated_edit(*args):
+            saved.append(args)
+            document = json.loads((ep_dir / "clips.json").read_text())
+            document["clips"][1]["title"] = "Concurrent unrelated title"
+            _add_clips(episodes_dir, "ep_001", document["clips"])
+            return record
+
+        monkeypatch.setattr(
+            clips_mod,
+            "save_background_variant_approval",
+            save_with_unrelated_edit,
+        )
+        approved = client.post(
+            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
+            json={"expected_revision": revision},
+        )
+
         assert approved.status_code == 200
         assert approved.json()["approved_revision"] == revision
-        assert len(saved) == 1
-        assert json.loads((ep_dir / "clips.json").read_text())["clips"][0] == clip
+        assert len(saved) == 2
+        stored = json.loads((ep_dir / "clips.json").read_text())["clips"][0]
+        assert stored["status"] == "approved"
+        assert stored["selection_status"] == "selected"
+        assert stored["distribution_variant_id"] == "background_motion_v1"
+        assert stored["metadata"] == concurrent["metadata"]
+        assert "approved_revision" not in stored
+        assert "approved_render_fingerprint" not in stored
+        other = json.loads((ep_dir / "clips.json").read_text())["clips"][1]
+        assert other["title"] == "Concurrent unrelated title"
 
     def test_current_render_requires_provenance_current_speaker_plan(
         self, test_client, monkeypatch

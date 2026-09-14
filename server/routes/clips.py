@@ -1739,6 +1739,17 @@ async def approve_clip_variant(
                 status_code=409,
                 detail="The variant changed while approval was being saved.",
             )
+        latest_clips, clips_file = load_clips(episode_id)
+        latest_clip, index = find_clip(latest_clips, clip_id)
+        if latest_clip != clip:
+            raise HTTPException(
+                status_code=409,
+                detail="The clip or its copy changed while approval was being saved.",
+            )
+        latest_clip["selection_status"] = "selected"
+        latest_clip["status"] = "approved"
+        latest_clips[index] = latest_clip
+        save_clips(latest_clips, clips_file)
     return {
         "status": "approved",
         "clip_id": clip_id,
