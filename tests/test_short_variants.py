@@ -152,16 +152,6 @@ def test_non_mapping_variant_sidecar_fails_closed(tmp_path):
     (
         ("variant_id", "wrong", "verification_inputs_unavailable"),
         ("layout_version", [], "verification_inputs_unavailable"),
-        (
-            "layout_version",
-            "portrait-over-motion/v1",
-            "verification_inputs_unavailable",
-        ),
-        (
-            "layout_version",
-            "portrait-over-motion/v2",
-            "verification_inputs_unavailable",
-        ),
         ("output", {}, "artifact_changed"),
     ),
 )
@@ -178,6 +168,27 @@ def test_malformed_nested_variant_identity_is_never_current(
 
     assert state["current"] is False
     assert state["reason_code"] == reason
+
+
+@pytest.mark.parametrize(
+    "layout_version", ("portrait-over-motion/v1", "portrait-over-motion/v2")
+)
+def test_previous_layout_has_specific_stale_reason(
+    tmp_path, monkeypatch, layout_version
+):
+    episode_dir, base_record, encoding, record, output = _record(tmp_path, monkeypatch)
+    record["layout_version"] = layout_version
+    output.with_suffix(".json").write_text(json.dumps(record))
+
+    _, state = background_variant_state(
+        episode_dir, "clip_01", base_record=base_record, encoding=encoding
+    )
+
+    assert state["current"] is False
+    assert state["reason_code"] == "verification_inputs_unavailable"
+    assert state["detail"] == (
+        f"Background layout {layout_version} is out of date; re-render this variant."
+    )
 
 
 def test_recorded_variant_path_cannot_redirect_review(tmp_path, monkeypatch):

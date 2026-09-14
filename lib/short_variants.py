@@ -259,9 +259,10 @@ def background_variant_state(
             recorded_base = record.get("base_render")
             recorded_asset = record.get("asset")
             recorded_output = record.get("output")
+            recorded_layout = record.get("layout_version")
             if (
                 record.get("variant_id") != BACKGROUND_VARIANT_ID
-                or record.get("layout_version") != BACKGROUND_LAYOUT_VERSION
+                or not isinstance(recorded_layout, str)
                 or record.get("encoding") != encoding
                 or not isinstance(recorded_base, dict)
                 or not isinstance(recorded_asset, dict)
@@ -270,6 +271,16 @@ def background_variant_state(
                     str(recorded_output.get("content_revision", ""))
                 )
             ):
+                raise TypeError("The variant manifest is malformed")
+            if recorded_layout != BACKGROUND_LAYOUT_VERSION:
+                if recorded_layout in {
+                    "portrait-over-motion/v1",
+                    "portrait-over-motion/v2",
+                }:
+                    raise ValueError(
+                        f"Background layout {recorded_layout} is out of date; "
+                        "re-render this variant."
+                    )
                 raise TypeError("The variant manifest is malformed")
             asset_id = recorded_asset.get("asset_id")
             if not isinstance(asset_id, str):
