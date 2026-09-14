@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.timeline import Timeline
+from server.routes import require_episode_dir
 from server.routes.delivery import DeliveryTrimRequest, save_delivery_trim
 
 logger = logging.getLogger(__name__)
@@ -24,14 +25,6 @@ EPISODES_DIR = get_episodes_dir()
 class TrimRequest(BaseModel):
     trim_start_seconds: float = 0.0
     trim_end_seconds: float = 0.0
-
-
-def _episode_dir(episode_id: str) -> Path:
-    root = EPISODES_DIR.resolve()
-    episode_dir = (root / episode_id).resolve()
-    if episode_dir.parent != root or not (episode_dir / "episode.json").is_file():
-        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-    return episode_dir
 
 
 def _terminal_bounds(episode_dir: Path, duration: float) -> tuple[float, float]:
@@ -53,7 +46,7 @@ def _terminal_bounds(episode_dir: Path, duration: float) -> tuple[float, float]:
 @router.post("/trim")
 async def trim_episode(episode_id: str, req: TrimRequest) -> dict:
     """Save legacy trim requests as source-clock edit bounds."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     source = episode_dir / "source_merged.mp4"
     if not source.is_file():
         raise HTTPException(status_code=404, detail="source_merged.mp4 not found")

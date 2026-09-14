@@ -63,6 +63,7 @@ from server.media_inspection import (
     inspect_media_window,
     resolve_target,
 )
+from server.routes import require_episode_dir
 from server.routes.clips import render_job_state, variant_render_job_id
 
 router = APIRouter(prefix="/api/episodes", tags=["review"])
@@ -124,14 +125,6 @@ def _read_json(path: Path, default):
         return json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
-
-
-def _episode_dir(episode_id: str) -> Path:
-    root = get_episodes_dir().resolve()
-    episode_dir = (root / episode_id).resolve()
-    if episode_dir.parent != root or not (episode_dir / "episode.json").is_file():
-        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-    return episode_dir
 
 
 def _transcript_corrections_document(episode_dir: Path) -> dict:
@@ -893,7 +886,9 @@ def episode_review_state(episode_dir: Path) -> dict:
 @router.get("/{episode_id}/review")
 async def review_state(episode_id: str) -> dict:
     """Return reviewable files, their freshness, copy, and approval state."""
-    return await asyncio.to_thread(episode_review_state, _episode_dir(episode_id))
+    return await asyncio.to_thread(
+        episode_review_state, require_episode_dir(get_episodes_dir(), episode_id)
+    )
 
 
 def _stored_clips(episode_dir: Path) -> list[dict]:
@@ -908,7 +903,7 @@ async def _inspection_target(
     clip_id: str | None,
     variant_id: str | None,
 ) -> tuple[Path, InspectionTarget]:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     episode = _read_json(episode_dir / "episode.json", {})
     clip = None
     if target in {"short", "short_variant"}:
@@ -1041,7 +1036,7 @@ async def inspection_audio_preview(
     logical_track: int | None = None,
     channel: Literal["left", "right"] | None = None,
 ) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     episode = _read_json(episode_dir / "episode.json", {})
     try:
         result = await asyncio.to_thread(
@@ -1087,7 +1082,7 @@ async def inspection_transcript(episode_id: str) -> dict:
 
 @router.get("/{episode_id}/inspection/transcript/repair")
 async def inspection_transcript_repair(episode_id: str) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     try:
         document = await asyncio.to_thread(
             _transcript_repair_document, episode_dir, load_config()
@@ -1107,7 +1102,7 @@ async def inspection_transcript_repair(episode_id: str) -> dict:
 async def apply_inspection_transcript_repair(
     episode_id: str, request: TranscriptClockRepairRequest
 ) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     try:
         result = await asyncio.to_thread(
             _apply_transcript_clock_repair,
@@ -1137,7 +1132,7 @@ async def apply_inspection_transcript_repair(
 
 @router.get("/{episode_id}/inspection/transcript/corrections")
 async def inspection_transcript_corrections(episode_id: str) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     episode = _read_json(episode_dir / "episode.json", {})
     config = load_config()
     try:
@@ -1173,7 +1168,7 @@ async def inspection_transcript_corrections(episode_id: str) -> dict:
 async def apply_inspection_transcript_corrections(
     episode_id: str, request: TranscriptCorrectionsRequest
 ) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     try:
         result = await asyncio.to_thread(
             _apply_transcript_corrections,
@@ -1210,7 +1205,7 @@ async def inspection_shot_plan(episode_id: str) -> dict:
 
 @router.get("/{episode_id}/inspection/clip-boundaries")
 async def inspection_clip_boundaries(episode_id: str) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     episode = _read_json(episode_dir / "episode.json", {})
     clips = _stored_clips(episode_dir)
     return _boundary_evidence_with_inspection(
@@ -1225,7 +1220,7 @@ async def _current_inspection_document(
     key: str,
     loader,
 ) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(get_episodes_dir(), episode_id)
     episode = _read_json(episode_dir / "episode.json", {})
     document = await asyncio.to_thread(loader, episode_dir, episode, load_config())
     if document is None:

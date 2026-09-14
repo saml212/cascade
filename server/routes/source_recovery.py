@@ -32,7 +32,7 @@ from lib.atomic_write import atomic_write_json
 from lib.audio_mix import json_fingerprint
 from lib.ffprobe import probe
 from lib.paths import get_episodes_dir
-from server.routes import clips, delivery, pipeline
+from server.routes import clips, delivery, pipeline, require_episode_dir
 
 router = APIRouter(prefix="/api/episodes", tags=["source-recovery"])
 EPISODES_DIR = get_episodes_dir()
@@ -118,14 +118,6 @@ class RecoveryConflict(RuntimeError):
 
 class RecoveryApplyError(RuntimeError):
     """Recovery failed after mutation began and rollback was attempted."""
-
-
-def _episode_dir(episode_id: str) -> Path:
-    root = EPISODES_DIR.resolve()
-    episode_dir = (root / episode_id).resolve()
-    if episode_dir.parent != root or not (episode_dir / "episode.json").is_file():
-        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-    return episode_dir
 
 
 def _public_identity(snapshot: dict, filename: str) -> dict:
@@ -555,7 +547,7 @@ def _apply_recovery(
 
 @router.get("/{episode_id}/inspection/source-recovery")
 async def inspect_source_recovery(episode_id: str) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     try:
         inspection, _ = await asyncio.to_thread(
             _build_inspection, episode_id, episode_dir
@@ -573,7 +565,7 @@ async def inspect_source_recovery(episode_id: str) -> dict:
 
 @router.post("/{episode_id}/inspection/source-recovery")
 async def recover_source(episode_id: str, request: SourceRecoveryRequest) -> dict:
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     if not _RECOVERY_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another source recovery is active")
     try:

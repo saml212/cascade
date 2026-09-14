@@ -38,6 +38,7 @@ from lib.audio_repair import (
     select_grounded_repair_findings,
 )
 from lib.paths import get_episodes_dir
+from server.routes import require_episode_dir
 
 router = APIRouter(prefix="/api/episodes", tags=["quality"])
 EPISODES_DIR = get_episodes_dir()
@@ -76,14 +77,6 @@ class AudioOutputFindingReviewRequest(BaseModel):
     expected_report_fingerprint: str = Field(min_length=1)
     expected_event_fingerprint: str = Field(min_length=1)
     expected_output_revision: str = Field(min_length=1)
-
-
-def _episode_dir(episode_id: str) -> Path:
-    root = EPISODES_DIR.resolve()
-    episode_dir = (root / episode_id).resolve()
-    if episode_dir.parent != root or not (episode_dir / "episode.json").is_file():
-        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
-    return episode_dir
 
 
 def _read_report(path: Path, label: str) -> dict:
@@ -545,20 +538,22 @@ def _bound_audio_response(
 @router.get("/{episode_id}/quality")
 async def get_quality(episode_id: str) -> dict:
     """Return the current revision, findings, artifacts, approvals, and blockers."""
-    return await asyncio.to_thread(quality_snapshot, _episode_dir(episode_id))
+    return await asyncio.to_thread(
+        quality_snapshot, require_episode_dir(EPISODES_DIR, episode_id)
+    )
 
 
 @router.get("/{episode_id}/quality/report")
 async def get_quality_report(episode_id: str) -> dict:
     """Return the persisted QA-agent report without hiding failed checks."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     return _read_report(episode_dir / QUALITY_REPORT_PATH, "Quality report")
 
 
 @router.get("/{episode_id}/audio-qc")
 async def get_audio_quality_report(episode_id: str) -> dict:
     """Return source-clock continuity evidence for agent or human review."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     return await asyncio.to_thread(_effective_audio_report, episode_dir)
 
 
@@ -568,7 +563,10 @@ async def review_audio_finding(
 ) -> dict:
     """Record one explicit finding decision against current rendered evidence."""
     return await asyncio.to_thread(
-        _record_audio_finding_review, _episode_dir(episode_id), finding_id, request
+        _record_audio_finding_review,
+        require_episode_dir(EPISODES_DIR, episode_id),
+        finding_id,
+        request,
     )
 
 
@@ -579,7 +577,7 @@ async def review_audio_output_finding(
     """Record one semantic output decision against exact current evidence."""
     return await asyncio.to_thread(
         _record_output_finding_review,
-        _episode_dir(episode_id),
+        require_episode_dir(EPISODES_DIR, episode_id),
         event_id,
         request,
     )
@@ -588,7 +586,7 @@ async def review_audio_output_finding(
 @router.get("/{episode_id}/audio-qc/repair-plan")
 async def get_audio_repair_plan(episode_id: str) -> dict:
     """Return the current bounded recovery plan and its verification evidence."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     return _read_report(episode_dir / REPAIR_PLAN_PATH, "Audio repair plan")
 
 
@@ -597,7 +595,7 @@ async def create_audio_repair_plan(
     episode_id: str, request: AudioRepairPlanRequest | None = None
 ) -> dict:
     """Build a conservative plan and fully disposition the current findings."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     report = _read_report(episode_dir / AUDIO_REPORT_PATH, "Audio quality report")
     automatic_ids = select_grounded_repair_findings(report)
     finding_ids = (
@@ -640,7 +638,7 @@ async def create_audio_repair_plan(
 @router.get("/{episode_id}/audio-qc/repair-candidate")
 async def get_audio_repair_candidate(episode_id: str) -> dict:
     """Return the preserved full-audio candidate manifest."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     return _read_report(episode_dir / REPAIR_CANDIDATE_PATH, "Audio repair candidate")
 
 
@@ -649,7 +647,7 @@ async def create_audio_repair_candidate(episode_id: str) -> dict:
     """Render a review candidate in controlled cache without replacing the master."""
     from agents.pipeline import load_config
 
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     report = _read_report(episode_dir / AUDIO_REPORT_PATH, "Audio quality report")
     plan = _read_report(episode_dir / REPAIR_PLAN_PATH, "Audio repair plan")
     output = AUDIO_REPAIR_CACHE_ROOT / episode_id / "audio-repair-candidate.wav"
@@ -668,7 +666,7 @@ async def create_audio_repair_candidate(episode_id: str) -> dict:
 @router.get("/{episode_id}/audio-qc/repair-candidate/audio")
 async def get_audio_repair_candidate_file(episode_id: str):
     """Serve only the manifest-bound candidate from the controlled cache."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     manifest = _read_report(
         episode_dir / REPAIR_CANDIDATE_PATH, "Audio repair candidate"
     )
@@ -693,7 +691,7 @@ async def get_audio_repair_selection(episode_id: str) -> dict:
     """Return the revision-bound audio source selected for future renders."""
     from agents.pipeline import load_config
 
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     try:
         episode = _read_report(episode_dir / "episode.json", "Episode")
         selection = current_audio_selection(episode_dir, episode, load_config())
@@ -707,7 +705,7 @@ async def select_audio_repair(episode_id: str) -> dict:
     """Select the proven candidate without approving or replacing the base mix."""
     from agents.pipeline import load_config
 
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     report = _read_report(episode_dir / AUDIO_REPORT_PATH, "Audio quality report")
     plan = _read_report(episode_dir / REPAIR_PLAN_PATH, "Audio repair plan")
     manifest = _read_report(
@@ -728,7 +726,7 @@ async def select_audio_repair(episode_id: str) -> dict:
 @router.delete("/{episode_id}/audio-qc/repair-selection")
 async def delete_audio_repair_selection(episode_id: str) -> dict:
     """Clear the selected repair source while leaving the base mix intact."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     removed = await asyncio.to_thread(
         _call_locked,
         f"{episode_id}:audio-repair-selection",
@@ -745,7 +743,7 @@ async def get_audio_repair_preview(
     variant: str = Query(pattern="^(source|grounded-fallback)$"),
 ):
     """Serve one plan-owned preview without accepting caller paths."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     plan_path = episode_dir / REPAIR_PLAN_PATH
     plan = _read_report(plan_path, "Audio repair plan")
     entries = plan.get("repairs", []) + plan.get("held_out_controls", [])
@@ -781,7 +779,7 @@ async def get_audio_finding_preview(
     variant: str = Query(pattern="^(source|grounded-fallback)$"),
 ):
     """Render one report-owned preview; callers cannot provide filesystem paths."""
-    episode_dir = _episode_dir(episode_id)
+    episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     report = _read_report(episode_dir / AUDIO_REPORT_PATH, "Audio quality report")
     finding = next(
         (item for item in report.get("findings", []) if item.get("id") == finding_id),

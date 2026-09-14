@@ -96,17 +96,17 @@ def test_review_builds_snapshot_off_the_event_loop(test_client, monkeypatch):
     from server.routes import review
 
     threads = {}
-    resolve_episode = review._episode_dir
+    resolve_episode = review.require_episode_dir
 
-    def resolve(episode_id):
+    def resolve(root, episode_id):
         threads["route"] = threading.get_ident()
-        return resolve_episode(episode_id)
+        return resolve_episode(root, episode_id)
 
     def snapshot(episode_dir):
         threads["snapshot"] = threading.get_ident()
         return {"schema": "cascade.review/v1", "episode_id": episode_dir.name}
 
-    monkeypatch.setattr(review, "_episode_dir", resolve)
+    monkeypatch.setattr(review, "require_episode_dir", resolve)
     monkeypatch.setattr(review, "episode_review_state", snapshot)
 
     response = client.get("/api/episodes/ep_001/review")
