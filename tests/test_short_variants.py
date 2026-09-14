@@ -157,6 +157,11 @@ def test_non_mapping_variant_sidecar_fails_closed(tmp_path):
             "portrait-over-motion/v1",
             "verification_inputs_unavailable",
         ),
+        (
+            "layout_version",
+            "portrait-over-motion/v2",
+            "verification_inputs_unavailable",
+        ),
         ("output", {}, "artifact_changed"),
     ),
 )

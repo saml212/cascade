@@ -113,14 +113,28 @@ def test_two_person_both_span_stacks_close_crops(tmp_episode_dir, sample_config)
     assert "[top][bottom]vstack=inputs=2" in video_filter
 
 
-def test_background_overlap_panels_center_on_configured_faces(
+def test_background_overlap_panels_use_landscape_crop_settings(
     tmp_episode_dir, sample_config
 ):
     agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
     crop_config = {
         "speakers": [
-            {"center_x": 500, "center_y": 465, "zoom": 1},
-            {"center_x": 1420, "center_y": 520, "zoom": 1},
+            {
+                "center_x": 500,
+                "center_y": 465,
+                "zoom": 1.4,
+                "longform_center_x": 520,
+                "longform_center_y": 400,
+                "longform_zoom": 1,
+            },
+            {
+                "center_x": 1420,
+                "center_y": 520,
+                "zoom": 1.4,
+                "longform_center_x": 1400,
+                "longform_center_y": 460,
+                "longform_zoom": 1,
+            },
         ]
     }
 
@@ -128,8 +142,8 @@ def test_background_overlap_panels_center_on_configured_faces(
         "BOTH", 1920, 1080, crop_config
     )
 
-    assert "[motion0]crop=606:358:196:286" in video_filter
-    assert "[motion1]crop=606:358:1116:340" in video_filter
+    assert "[motion0]crop=960:568:40:116" in video_filter
+    assert "[motion1]crop=960:568:920:176" in video_filter
     assert video_filter.count("scale=1080:640") == 2
     assert "pad=1080:1920:0:0:black" in video_filter
 
@@ -302,6 +316,11 @@ def test_background_three_person_stack_uses_valid_crops_without_base_opt_in(
         for_background=False,
     )
     assert "[row0][row1][row2]vstack=inputs=3" in (
+        agent._get_background_crop_filter_no_subs(
+            "BOTH", 320, 180, crop_config, three_person_stack=True
+        )
+    )
+    assert "[stack1]crop=160:94:80:42" in (
         agent._get_background_crop_filter_no_subs(
             "BOTH", 320, 180, crop_config, three_person_stack=True
         )

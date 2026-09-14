@@ -934,7 +934,7 @@ class ShortsRenderAgent(BaseAgent):
             return False
         try:
             for index in range(3):
-                self._get_short_crop_region(
+                self._get_background_panel_region(
                     f"speaker_{index}", src_w, src_h, crop_config
                 )
         except (KeyError, TypeError, ValueError):
@@ -958,37 +958,17 @@ class ShortsRenderAgent(BaseAgent):
         three_person_stack=False,
     ):
         if three_person_stack:
-            return self._get_short_crop_filter_no_subs(
-                speaker,
-                src_w,
-                src_h,
-                crop_config,
-                three_person_stack=True,
+            return self._three_person_stack_filter(
+                src_w, src_h, crop_config, background_anchors=True
             )
         if speaker == "BOTH" and len(crop_config.get("speakers", [])) == 2:
             panels = []
             for index, label in enumerate(("top", "bottom")):
-                center_x, center_y, _, _ = resolve_speaker(
-                    f"speaker_{index}",
-                    src_w,
-                    src_h,
-                    crop_config,
-                    for_shorts=True,
-                )
-                crop_w, _, _, _ = self._get_short_crop_region(
+                _, panel_w, panel_h, x, y = self._get_background_panel_region(
                     f"speaker_{index}", src_w, src_h, crop_config
                 )
-                panel_w = min(src_w, crop_w)
-                panel_h = panel_w * 16 / 27
-                if panel_h > src_h:
-                    panel_h = src_h
-                    panel_w = panel_h * 27 / 16
-                panel_w = max(2, int(panel_w) // 2 * 2)
-                panel_h = max(2, int(panel_h) // 2 * 2)
-                x = max(0, min(round(center_x - panel_w / 2), src_w - panel_w))
-                y = max(0, min(round(center_y - panel_h / 2), src_h - panel_h))
                 panels.append(
-                    f"[motion{index}]crop={panel_w}:{panel_h}:{x // 2 * 2}:{y // 2 * 2},"
+                    f"[motion{index}]crop={panel_w}:{panel_h}:{x}:{y},"
                     f"{get_scale_filter(1080, 640)},format=yuv420p[{label}]"
                 )
             chain = (
@@ -1024,6 +1004,70 @@ class ShortsRenderAgent(BaseAgent):
                 f"{get_scale_filter(1080, 1280)},"
                 "pad=1080:1920:0:0:black,format=yuv420p"
             )
+        polish = get_video_polish_filters(self.config)
+        return f"{chain},{polish}" if polish else chain
+
+    def _get_background_panel_region(self, speaker, src_w, src_h, crop_config):
+        center_x, center_y, zoom, _ = resolve_speaker(
+            speaker, src_w, src_h, crop_config, for_shorts=False
+        )
+        _, _, panel_w, _ = compute_crop(
+            src_w, src_h, center_x, center_y, zoom, "speaker"
+        )
+        panel_h = panel_w * 16 / 27
+        if panel_h > src_h:
+            panel_h = src_h
+            panel_w = panel_h * 27 / 16
+        panel_w = max(2, int(panel_w) // 2 * 2)
+        panel_h = max(2, int(panel_h) // 2 * 2)
+        x = max(0, min(round(center_x - panel_w / 2), src_w - panel_w))
+        y = max(0, min(round(center_y - panel_h / 2), src_h - panel_h))
+        return center_x, panel_w, panel_h, x // 2 * 2, y // 2 * 2
+
+    def _three_person_stack_filter(
+        self, src_w, src_h, crop_config, *, background_anchors=False
+    ):
+        regions = []
+        for index in range(3):
+            if background_anchors:
+                center_x, panel_w, panel_h, x, y = self._get_background_panel_region(
+                    f"speaker_{index}", src_w, src_h, crop_config
+                )
+            else:
+                portrait_w, portrait_h, portrait_x, portrait_y = (
+                    self._get_short_crop_region(
+                        f"speaker_{index}", src_w, src_h, crop_config
+                    )
+                )
+                panel_w = min(src_w, portrait_w)
+                panel_h = panel_w * 16 / 27
+                if panel_h > src_h:
+                    panel_h = src_h
+                    panel_w = panel_h * 27 / 16
+                panel_w = max(2, int(panel_w) // 2 * 2)
+                panel_h = max(2, int(panel_h) // 2 * 2)
+                center_x = portrait_x + portrait_w / 2
+                x = max(0, min(round(center_x - panel_w / 2), src_w - panel_w))
+                upper_body_y = portrait_y + max(0, portrait_h - panel_h) / 6
+                y = max(0, min(round(upper_body_y), src_h - panel_h))
+                x = x // 2 * 2
+                y = y // 2 * 2
+            regions.append((center_x, index, panel_w, panel_h, x, y))
+
+        panels = []
+        for row, (_, index, panel_w, panel_h, x, y) in enumerate(sorted(regions)):
+            panels.append(
+                f"[stack{index}]crop={panel_w}:{panel_h}:{x}:{y},"
+                f"{get_scale_filter(1080, 640)},format=yuv420p[row{row}]"
+            )
+        chain = (
+            "split=3[stack0][stack1][stack2];"
+            f"{';'.join(panels)};"
+            "[row0][row1][row2]vstack=inputs=3,"
+            "drawbox=x=0:y=637:w=1080:h=6:color=black@0.8:t=fill,"
+            "drawbox=x=0:y=1277:w=1080:h=6:color=black@0.8:t=fill,"
+            "format=yuv420p"
+        )
         polish = get_video_polish_filters(self.config)
         return f"{chain},{polish}" if polish else chain
 
@@ -1071,42 +1115,7 @@ class ShortsRenderAgent(BaseAgent):
             polish = get_video_polish_filters(self.config)
             return f"{chain},{polish}" if polish else chain
         if self._uses_three_person_stack(speaker, crop_config, three_person_stack):
-            regions = []
-            for index in range(3):
-                portrait_w, portrait_h, portrait_x, portrait_y = (
-                    self._get_short_crop_region(
-                        f"speaker_{index}", src_w, src_h, crop_config
-                    )
-                )
-                panel_w = min(src_w, portrait_w)
-                panel_h = panel_w * 16 / 27
-                if panel_h > src_h:
-                    panel_h = src_h
-                    panel_w = panel_h * 27 / 16
-                panel_w = max(2, int(panel_w) // 2 * 2)
-                panel_h = max(2, int(panel_h) // 2 * 2)
-                cx = portrait_x + portrait_w / 2
-                x = max(0, min(round(cx - panel_w / 2), src_w - panel_w))
-                upper_body_y = portrait_y + max(0, portrait_h - panel_h) / 6
-                y = max(0, min(round(upper_body_y), src_h - panel_h))
-                regions.append((cx, index, panel_w, panel_h, x // 2 * 2, y // 2 * 2))
-
-            panels = []
-            for row, (_, index, panel_w, panel_h, x, y) in enumerate(sorted(regions)):
-                panels.append(
-                    f"[stack{index}]crop={panel_w}:{panel_h}:{x}:{y},"
-                    f"{get_scale_filter(1080, 640)},format=yuv420p[row{row}]"
-                )
-            chain = (
-                "split=3[stack0][stack1][stack2];"
-                f"{';'.join(panels)};"
-                "[row0][row1][row2]vstack=inputs=3,"
-                "drawbox=x=0:y=637:w=1080:h=6:color=black@0.8:t=fill,"
-                "drawbox=x=0:y=1277:w=1080:h=6:color=black@0.8:t=fill,"
-                "format=yuv420p"
-            )
-            polish = get_video_polish_filters(self.config)
-            return f"{chain},{polish}" if polish else chain
+            return self._three_person_stack_filter(src_w, src_h, crop_config)
         if speaker in {"BOTH", "NONE"}:
             chain = (
                 "scale=1080:1920:force_original_aspect_ratio=decrease:"
