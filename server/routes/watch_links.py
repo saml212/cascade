@@ -9,7 +9,11 @@ from fastapi.responses import HTMLResponse
 
 from agents.pipeline import load_config
 from lib.paths import get_episodes_dir
-from links.episode_hub import build_episode_watch_document, render_episode_page
+from links.episode_hub import (
+    build_episode_watch_document,
+    configured_apple_catalog,
+    render_episode_page,
+)
 from server.routes import require_episode_dir
 
 router = APIRouter(prefix="/api/episodes", tags=["watch-links"])
@@ -19,7 +23,12 @@ EPISODES_DIR = get_episodes_dir()
 def _watch_document(episode_id: str) -> dict:
     episode_dir = require_episode_dir(EPISODES_DIR, episode_id)
     try:
-        return build_episode_watch_document(episode_dir, load_config())
+        config = load_config()
+        return build_episode_watch_document(
+            episode_dir,
+            config,
+            apple_catalog=configured_apple_catalog(config),
+        )
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

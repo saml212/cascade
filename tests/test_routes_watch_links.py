@@ -38,11 +38,11 @@ def watch_links_api(tmp_path, monkeypatch):
     )
     app = FastAPI()
     app.include_router(watch_links.router)
-    return TestClient(app), episode_file
+    return TestClient(app), episode_file, config
 
 
 def test_watch_links_and_html_are_current_and_read_only(watch_links_api):
-    client, episode_file = watch_links_api
+    client, episode_file, _config = watch_links_api
     before = episode_file.read_bytes()
 
     response = client.get("/api/episodes/ep_test/watch-links")
@@ -62,8 +62,65 @@ def test_watch_links_and_html_are_current_and_read_only(watch_links_api):
 
 @pytest.mark.parametrize("episode_id", ["missing", ".."])
 def test_watch_links_rejects_missing_and_traversal(watch_links_api, episode_id):
-    client, _ = watch_links_api
+    client, _episode_file, _config = watch_links_api
 
     response = client.get(f"/api/episodes/{episode_id}/watch-links")
 
     assert response.status_code == 404
+
+
+def test_watch_links_reads_explicit_id_apple_catalog_from_trusted_config(
+    watch_links_api, tmp_path
+):
+    client, episode_file, config = watch_links_api
+    catalog = tmp_path / "apple-verified-catalog.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "show_url": "https://podcasts.apple.com/show/local",
+                "episodes": [
+                    {
+                        "episode_id": "different_episode",
+                        "title": "Guest & Host",
+                        "url": "https://podcasts.apple.com/episode/wrong",
+                    },
+                    {
+                        "episode_id": "ep_test",
+                        "feed_guid": "video:ep_test",
+                        "url": "https://podcasts.apple.com/episode/exact",
+                    },
+                ],
+            }
+        )
+    )
+    config["podcast"]["links"]["apple_catalog_path"] = str(catalog)
+    before = episode_file.read_bytes()
+
+    response = client.get("/api/episodes/ep_test/watch-links")
+    preview = client.get("/api/episodes/ep_test/watch-page")
+
+    assert response.status_code == 200
+    apple = next(
+        item
+        for item in response.json()["destinations"]
+        if item["key"] == "apple_podcasts"
+    )
+    assert apple == {
+        "key": "apple_podcasts",
+        "label": "Watch on Apple Podcasts",
+        "url": "https://podcasts.apple.com/episode/exact",
+        "scope": "episode",
+    }
+    assert response.json()["exact_episode_destination_count"] == 3
+    assert "https://podcasts.apple.com/episode/exact" in preview.text
+    assert episode_file.read_bytes() == before
+
+
+def test_watch_links_rejects_relative_apple_catalog_path(watch_links_api):
+    client, _episode_file, config = watch_links_api
+    config["podcast"]["links"]["apple_catalog_path"] = "apple-catalog.json"
+
+    response = client.get("/api/episodes/ep_test/watch-links")
+
+    assert response.status_code == 409
+    assert "must be an absolute path" in response.json()["detail"]

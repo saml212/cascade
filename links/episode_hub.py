@@ -61,6 +61,19 @@ def _read_json(path: Path) -> dict:
     return value
 
 
+def configured_apple_catalog(config: dict) -> dict | None:
+    """Read the explicit-ID Apple catalog named by trusted local config."""
+    value = config.get("podcast", {}).get("links", {}).get("apple_catalog_path")
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise TypeError("podcast.links.apple_catalog_path must be an absolute path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("podcast.links.apple_catalog_path must be an absolute path")
+    return _read_json(path)
+
+
 def _site_identity(config: dict) -> dict:
     podcast = config.get("podcast", {})
     links = podcast.get("links", {})
