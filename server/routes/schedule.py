@@ -181,6 +181,51 @@ def _receipt_state(receipt: dict) -> str | None:
     return None
 
 
+def _receipt_artifact_current(receipt: dict, version: object) -> bool | None:
+    """Compare a complete receipt identity with the selected short artifact."""
+    fields = ("version", "variant_id", "render_fingerprint")
+    if not isinstance(version, dict) or not all(
+        field in receipt and field in version for field in fields
+    ):
+        return None
+    request = version.get("re_release_request")
+    if request is not None and (
+        not isinstance(request, dict)
+        or any(
+            not isinstance(request.get(field), str) or not request[field]
+            for field in ("request_id", "revision")
+        )
+    ):
+        return None
+    actual = tuple(receipt[field] for field in fields) + (
+        receipt.get("rerelease_request_id"),
+        receipt.get("rerelease_authorization_revision"),
+    )
+    expected = tuple(version[field] for field in fields) + (
+        request.get("request_id")
+        if isinstance(request, dict)
+        else version.get("rerelease_request_id"),
+        request.get("revision")
+        if isinstance(request, dict)
+        else version.get("rerelease_authorization_revision"),
+    )
+    for identity in (actual, expected):
+        if (
+            not isinstance(identity[0], str)
+            or not identity[0]
+            or (identity[1] is not None and not isinstance(identity[1], str))
+            or not isinstance(identity[2], str)
+            or not identity[2]
+            or any(
+                value is not None and not isinstance(value, str)
+                for value in identity[3:]
+            )
+            or (identity[3] is None) != (identity[4] is None)
+        ):
+            return None
+    return actual == expected
+
+
 def _release_gate(ep_dir: Path, config: dict) -> dict:
     try:
         gate = quality_snapshot(ep_dir, include_findings=False, config=config).get(
@@ -293,11 +338,8 @@ async def _get_approved_items(
             for receipt in receipts
             if isinstance(receipt, dict) and receipt.get("clip_id")
         } - prepared_ids
-        current_release = (
-            publish.get("release_revision") == gate.get("revision")
-            if publish.get("release_revision") and gate.get("revision")
-            else None
-        )
+        short_versions = gate.get("short_versions", {})
+        short_versions = short_versions if isinstance(short_versions, dict) else {}
         for receipt in receipts:
             receipt_state = (
                 _receipt_state(receipt) if isinstance(receipt, dict) else None
@@ -328,7 +370,9 @@ async def _get_approved_items(
                 job_id=receipt.get("job_id"),
                 request_id=receipt.get("request_id"),
                 error=receipt.get("error"),
-                current_release=current_release,
+                artifact_current=_receipt_artifact_current(
+                    receipt, short_versions.get(clip_id)
+                ),
             )
             items.append(item)
 

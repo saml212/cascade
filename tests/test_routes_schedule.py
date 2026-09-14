@@ -328,6 +328,131 @@ def test_published_receipt_is_not_labeled_scheduled():
     assert schedule._receipt_state({"status": "published"}) is None
 
 
+def test_receipt_artifact_current_uses_stable_media_and_rerelease_identity():
+    version = {
+        "version": "background_motion_v1",
+        "variant_id": "background_motion_v1",
+        "render_fingerprint": "sha256:current-media",
+        "re_release_request": {
+            "request_id": "replacement-01",
+            "revision": "sha256:replacement",
+        },
+    }
+    receipt = {
+        "version": "background_motion_v1",
+        "variant_id": "background_motion_v1",
+        "render_fingerprint": "sha256:current-media",
+        "rerelease_request_id": "replacement-01",
+        "rerelease_authorization_revision": "sha256:replacement",
+        "approval_revision": "sha256:older-copy-approval",
+    }
+
+    assert schedule._receipt_artifact_current(receipt, version) is True
+    assert (
+        schedule._receipt_artifact_current(
+            receipt | {"render_fingerprint": "sha256:prior-media"}, version
+        )
+        is False
+    )
+    assert (
+        schedule._receipt_artifact_current(
+            {
+                key: value
+                for key, value in receipt.items()
+                if key != "render_fingerprint"
+            },
+            version,
+        )
+        is None
+    )
+
+
+def test_same_clip_destination_receipts_keep_separate_current_rows(
+    tmp_path, monkeypatch
+):
+    _fix_now(monkeypatch)
+    episode = _episode(
+        tmp_path,
+        youtube_longform_url="https://youtube.example/video",
+        publish_schedule=[
+            {
+                "clip_id": "clip_01",
+                "scheduled_date": "2099-07-05T09:00:00-07:00",
+            }
+        ],
+    )
+    identity = {
+        "version": "background_motion_v1",
+        "variant_id": "background_motion_v1",
+        "render_fingerprint": "sha256:current-media",
+        "rerelease_request_id": None,
+        "rerelease_authorization_revision": None,
+    }
+    (episode / "publish.json").write_text(
+        json.dumps(
+            {
+                "release_revision": "sha256:prior-aggregate-release",
+                "shorts": [
+                    {
+                        **identity,
+                        "clip_id": "clip_01",
+                        "status": "submitted",
+                        "scheduled": True,
+                        "scheduled_date": "2099-07-05T09:00:00-07:00",
+                        "platforms": ["youtube", "tiktok"],
+                        "job_id": "job-video",
+                    },
+                    {
+                        **identity,
+                        "clip_id": "clip_01",
+                        "status": "submitted",
+                        "scheduled": True,
+                        "scheduled_date": "2099-07-05T09:00:00-07:00",
+                        "platforms": ["x"],
+                        "job_id": "job-x",
+                    },
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
+    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_load_config", dict)
+    monkeypatch.setattr(
+        schedule,
+        "quality_snapshot",
+        lambda *_args, **_kwargs: {
+            "release_gate": {
+                "can_approve_publish": True,
+                "revision": "sha256:current-aggregate-release",
+                "blockers": [],
+                "short_versions": {
+                    "clip_01": {
+                        "version": "background_motion_v1",
+                        "variant_id": "background_motion_v1",
+                        "render_fingerprint": "sha256:current-media",
+                    }
+                },
+            }
+        },
+    )
+
+    result = asyncio.run(schedule.get_schedule())
+    items = [
+        item
+        for day in result["schedule"]
+        for item in day["items"]
+        if item["type"] == "short"
+    ]
+
+    assert [item["job_id"] for item in items] == ["job-video", "job-x"]
+    assert [item["destinations"] for item in items] == [
+        ["youtube", "tiktok"],
+        ["x"],
+    ]
+    assert [item["artifact_current"] for item in items] == [True, True]
+
+
 def test_delete_confirmed_receipt_is_pending_cancellation_not_scheduled(
     tmp_path, monkeypatch
 ):
@@ -427,7 +552,7 @@ def test_receipt_date_and_state_override_plan(
     assert items[0]["scheduled_date"] == "2099-07-05T09:00:00-07:00"
     assert items[0]["planned_date"] == "2099-07-04T18:00:00-07:00"
     assert items[0]["job_id"] == "job-01"
-    assert items[0]["current_release"] is False
+    assert items[0]["artifact_current"] is None
 
 
 def test_qa_blocked_clip_is_held_out_of_suggestions(tmp_path, monkeypatch):

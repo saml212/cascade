@@ -32,7 +32,7 @@ interface ScheduleItem {
   job_id?: string;
   request_id?: string;
   error?: string;
-  current_release?: boolean | null;
+  artifact_current?: boolean | null;
   version?: 'base' | 'background_motion_v1';
   variant_id?: null | 'background_motion_v1';
 }
@@ -322,15 +322,6 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
               timeZone: timezone,
             })
           )
-        : destinations.length > 0
-        ? h(
-            'span',
-            {
-              class:
-                'text-code-sm text-ink-tertiary font-mono tabular ml-auto uppercase',
-            },
-            destinations.join(', ')
-          )
         : null
     ),
     h(
@@ -343,6 +334,15 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
           'div',
           { class: 'text-code-sm text-ink-secondary font-mono' },
           `Version · ${distributionVersionLabel(item.version, item.variant_id)}`
+        )
+      : null,
+    destinations.length > 0
+      ? h(
+          'div',
+          { class: 'text-code-sm text-ink-secondary font-mono uppercase' },
+          `Destinations · ${destinations
+            .map((value) => value.replaceAll('_', ' '))
+            .join(', ')}`
         )
       : null,
     h(
@@ -366,11 +366,11 @@ function renderItem(item: ScheduleItem, timezone?: string): HTMLElement {
           })}`
         )
       : null,
-    item.current_release === false
+    item.artifact_current === false
       ? h(
           'div',
           { class: 'text-code-sm text-status-warning font-mono' },
-          'Receipt belongs to a prior release revision'
+          'Scheduled media differs from the current selected version'
         )
       : null,
     item.error
