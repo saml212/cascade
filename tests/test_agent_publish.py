@@ -3549,6 +3549,70 @@ class TestExpandedShortDestinations:
         ):
             assert field in command
 
+    @pytest.mark.parametrize(
+        ("platforms", "copy", "expected_title", "specific_field"),
+        (
+            (
+                ["instagram"],
+                {"instagram": {"text": "Full Instagram copy"}},
+                "Full Instagram copy",
+                "instagram_title=Full Instagram copy",
+            ),
+            (
+                ["youtube"],
+                {"youtube": {"title": "YT", "description": "Body"}},
+                "Generic clip title",
+                "youtube_title=YT",
+            ),
+            (
+                ["x"],
+                {"x": {"text": "X copy"}},
+                "Generic clip title",
+                "x_title=X copy",
+            ),
+            (
+                ["instagram", "youtube"],
+                {
+                    "instagram": {"text": "Full Instagram copy"},
+                    "youtube": {"title": "YT", "description": "Body"},
+                },
+                "Generic clip title",
+                "instagram_title=Full Instagram copy",
+            ),
+        ),
+    )
+    def test_only_single_instagram_replaces_generic_fallback_title(
+        self, episode_dir, platforms, copy, expected_title, specific_field
+    ):
+        agent = _make_agent(episode_dir)
+        (episode_dir / "shorts" / "clip_0.mp4").write_bytes(b"video")
+        with patch.object(
+            agent, "_submit", return_value={"status": "submitted"}
+        ) as submit:
+            agent._submit_short(
+                {"id": "clip_0", "title": "Generic clip title"},
+                {},
+                platforms,
+                None,
+                "https://youtube.example/full",
+                "https://spotify.example/full",
+                {
+                    "path": "shorts/clip_0.mp4",
+                    "version": "base",
+                    "variant_id": None,
+                    "render_fingerprint": "sha256:render",
+                    "revision": "sha256:approval",
+                },
+                "cascade-short-id",
+                "secret",
+                "test_user",
+                destination_target={"destination_copy": copy},
+            )
+
+        fields = _multipart_values(submit.call_args.args[0])
+        assert f"title={expected_title}" in fields
+        assert specific_field in fields
+
     def test_plaintext_multipart_fields_never_use_curl_file_syntax(self, episode_dir):
         agent = _make_agent(episode_dir)
         path = episode_dir / "shorts" / "clip_0.mp4"

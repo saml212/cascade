@@ -2766,10 +2766,6 @@ class PublishAgent(BaseAgent):
             self.logger.warning("Short not found: %s", clip_id)
             return None
         title = clip.get("title", f"Clip {clip_id}")
-        command = self._base_command(
-            path, title, platforms, identity, api_key, user, 600
-        )
-
         copy = (
             destination_target["destination_copy"]
             if destination_target
@@ -2782,6 +2778,12 @@ class PublishAgent(BaseAgent):
                 spotify_url=spotify_url,
                 channel_handle=self.config.get("podcast", {}).get("channel_handle", ""),
             )
+        )
+        upload_title = (
+            copy["instagram"]["text"] if platforms == ["instagram"] else title
+        )
+        command = self._base_command(
+            path, upload_title, platforms, identity, api_key, user, 600
         )
         for platform in platforms:
             for field, value in upload_fields(platform, copy.get(platform, {})).items():
