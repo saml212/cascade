@@ -24,7 +24,7 @@ ffmpeg, the ASS format is plain text, and the only operation we need is
 python-ass or pysubs2 would be more dependency than code.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -94,6 +94,94 @@ class CaptionStyle:
     play_res_x: int = DEFAULT_PLAY_RES_X
     play_res_y: int = DEFAULT_PLAY_RES_Y
     bold: bool = True
+
+
+@dataclass(frozen=True)
+class CaptionPlacement:
+    """Absolute ASS position for one caption event."""
+
+    x: int
+    y: int
+    alignment: int = ALIGNMENT_BOTTOM_CENTER
+    font_size: int | None = None
+    background_box: tuple[int, int, int, int] | None = None
+
+
+def _speaker_identities(mapping: Mapping[str, object]) -> set[tuple[str, object]]:
+    identities: set[tuple[str, object]] = set()
+    logical_track = mapping.get("logical_track", mapping.get("track"))
+    if isinstance(logical_track, int) and not isinstance(logical_track, bool):
+        identities.add(("logical_track", logical_track))
+    camera_channel = mapping.get("camera_channel")
+    if isinstance(camera_channel, str) and camera_channel.strip():
+        identities.add(("camera_channel", camera_channel.strip().casefold()))
+    for field in ("person", "label"):
+        value = mapping.get(field)
+        if isinstance(value, str) and value.strip():
+            identities.add(("person", value.strip().casefold()))
+    return identities
+
+
+def resolve_caption_speaker_targets(
+    diarized: Mapping[str, object],
+    segment_document: Mapping[str, object],
+    crop_config: Mapping[str, object],
+) -> dict[int, str]:
+    """Resolve source-clock ASR ids to reviewed crop speakers.
+
+    Explicit transcript bindings win. Older transcripts without a target use a
+    unique identity match against the acoustic track map and configured crops.
+    Missing, conflicting, and explicit wide-shot bindings resolve to ``BOTH`` so
+    callers can use a neutral placement rather than guessing a panel.
+    """
+    if diarized.get("clock") != "source" or segment_document.get("clock") != "source":
+        return {}
+
+    speakers = crop_config.get("speakers", [])
+    if not isinstance(speakers, list):
+        speakers = []
+    valid_targets = {f"speaker_{index}" for index in range(len(speakers))}
+    targets_by_identity: dict[tuple[str, object], set[str]] = {}
+
+    def register(target: object, mapping: Mapping[str, object]) -> None:
+        if target not in valid_targets:
+            return
+        for identity in _speaker_identities(mapping):
+            targets_by_identity.setdefault(identity, set()).add(str(target))
+
+    for mapping in segment_document.get("track_mapping") or []:
+        if isinstance(mapping, Mapping):
+            register(mapping.get("speaker"), mapping)
+    for index, speaker in enumerate(speakers):
+        if isinstance(speaker, Mapping):
+            register(f"speaker_{index}", speaker)
+
+    resolved: dict[int, str] = {}
+    for mapping in diarized.get("speaker_map") or []:
+        if not isinstance(mapping, Mapping):
+            continue
+        source = mapping.get("index")
+        if not isinstance(source, int) or isinstance(source, bool):
+            continue
+
+        explicit_target = mapping.get("target_speaker")
+        if explicit_target == "BOTH" or explicit_target in valid_targets:
+            resolved[source] = str(explicit_target)
+            continue
+        if explicit_target is not None:
+            resolved[source] = "BOTH"
+            continue
+        if float(mapping.get("mapping_confidence", 1.0) or 0.0) < 0.6:
+            resolved[source] = "BOTH"
+            continue
+
+        candidates = {
+            target
+            for identity in _speaker_identities(mapping)
+            for target in targets_by_identity.get(identity, set())
+        }
+        resolved[source] = candidates.pop() if len(candidates) == 1 else "BOTH"
+    return resolved
 
 
 # ── timecode formatting ─────────────────────────────────────────────────────
@@ -337,8 +425,33 @@ def build_ass(phrases: Iterable[dict], style: CaptionStyle | None = None) -> str
     lines = [header]
     for ph in phrases:
         text = escape_ass_text(ph["text"])
+        placement = ph.get("placement")
+        layer = 0
+        if placement is not None:
+            if not isinstance(placement, CaptionPlacement):
+                raise TypeError("caption placement must be a CaptionPlacement")
+            if placement.background_box is not None:
+                box_x, box_y, box_w, box_h = placement.background_box
+                drawing = (
+                    f"{{\\an7\\pos({box_x},{box_y})\\p1\\bord0\\shad0"
+                    "\\1c&H000000&}"
+                    f"m 0 0 l {box_w} 0 l {box_w} {box_h} l 0 {box_h}"
+                    "{\\p0}"
+                )
+                lines.append(
+                    f"Dialogue: 0,{fmt_ass_time(ph['start'])},"
+                    f"{fmt_ass_time(ph['end'])},Default,,0,0,0,,{drawing}\n"
+                )
+                layer = 1
+            overrides = [
+                f"\\an{placement.alignment}",
+                f"\\pos({placement.x},{placement.y})",
+            ]
+            if placement.font_size is not None:
+                overrides.append(f"\\fs{placement.font_size}")
+            text = "{" + "".join(overrides) + "}" + text
         lines.append(
-            f"Dialogue: 0,"
+            f"Dialogue: {layer},"
             f"{fmt_ass_time(ph['start'])},"
             f"{fmt_ass_time(ph['end'])},"
             "Default,,0,0,0,,"
@@ -354,6 +467,10 @@ def generate_ass_from_diarized(
     end: float,
     ass_path: Path,
     style: CaptionStyle | None = None,
+    *,
+    speaker_targets: Mapping[int, str] | None = None,
+    speaker_placements: Mapping[str, CaptionPlacement] | None = None,
+    fallback_placement: CaptionPlacement | None = None,
 ) -> int:
     """One-call helper that mirrors the SRT generator's signature.
 
@@ -368,6 +485,10 @@ def generate_ass_from_diarized(
         clip_start=start,
         words_per_phrase=style.words_per_phrase,
     )
+    if speaker_targets is not None and speaker_placements is not None:
+        for phrase in phrases:
+            target = speaker_targets.get(phrase.get("speaker"), "BOTH")
+            phrase["placement"] = speaker_placements.get(target, fallback_placement)
     ass_text = build_ass(phrases, style)
     ass_path.write_text(ass_text, encoding="utf-8")
     return len(phrases)

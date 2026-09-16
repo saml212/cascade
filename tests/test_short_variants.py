@@ -14,6 +14,7 @@ from lib.short_variants import (
     CONTAIN_BLUR_FIT_MODE,
     DEFAULT_BACKGROUND_ASSET_ID,
     GAMEPLAY_SURROUND_ASSET_SET_ID,
+    GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
     GAMEPLAY_SURROUND_LAYOUT_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
     GAMEPLAY_SURROUND_VARIANT_ID,
@@ -259,11 +260,19 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
         base_identity=base_identity,
         asset=asset_set,
         encoding=encoding,
-        captions={"path": "captions.ass", "format": "ass", "burned_in": True},
+        captions={
+            "path": "captions.ass",
+            "format": "ass",
+            "burned_in": True,
+            "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+        },
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
 
     assert record["layout_version"] == GAMEPLAY_SURROUND_LAYOUT_VERSION
+    assert record["captions"]["placement_policy"] == (
+        GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION
+    )
     assert record["asset"]["render_plan"] == GAMEPLAY_SURROUND_RENDER_PLAN
     assert len(record["asset"]["assets"]) == 3
     _, current = background_variant_state(
@@ -288,6 +297,48 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
     )
     assert stale["current"] is False
     assert "asset or its render plan changed" in stale["detail"]
+
+
+def test_caption_policy_invalidates_only_gameplay_surround(tmp_path, monkeypatch):
+    ordinary_asset = _asset(tmp_path, monkeypatch)
+    gameplay_assets = _gameplay_asset_set(tmp_path, monkeypatch)
+    base_record = {"fingerprint": "sha256:base"}
+    base_identity = {"device": 1, "inode": 2, "size_bytes": 3, "mtime_ns": 4}
+    encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
+    ordinary = background_variant_fingerprint(
+        base_record, base_identity, ordinary_asset, encoding
+    )
+    gameplay = background_variant_fingerprint(
+        base_record,
+        base_identity,
+        gameplay_assets,
+        encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    from lib import short_variants as short_variants_module
+
+    monkeypatch.setattr(
+        short_variants_module,
+        "GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION",
+        "source-speaker-panel/test-change",
+    )
+
+    assert (
+        background_variant_fingerprint(
+            base_record, base_identity, ordinary_asset, encoding
+        )
+        == ordinary
+    )
+    assert (
+        background_variant_fingerprint(
+            base_record,
+            base_identity,
+            gameplay_assets,
+            encoding,
+            variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        )
+        != gameplay
+    )
 
 
 def test_variant_artifact_paths_are_isolated(tmp_path):

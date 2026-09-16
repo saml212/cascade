@@ -14,20 +14,22 @@ from pathlib import Path
 
 import pytest
 
-from lib.ass import generate_ass_from_diarized
-
+from lib.ass import CaptionPlacement, CaptionStyle, generate_ass_from_diarized
+from lib.delivery_video import ffmpeg_executable
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    shutil.which("ffprobe") is None,
     reason="ffmpeg/ffprobe not on PATH",
 )
+
+FFMPEG = ffmpeg_executable()
 
 
 def _make_test_video(path: Path, duration: float = 4.0):
     """Render a 1080x1920 testsrc video so the subtitles filter has
     something to overlay."""
     cmd = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-loglevel",
         "error",
@@ -74,7 +76,7 @@ def _diarized_with_words():
 
 
 # Reuse the project's path-escape helper so we burn the same way the agent does.
-from lib.srt import escape_srt_path  # noqa: E402
+from lib.srt import escape_srt_path
 
 
 def _burn_subtitles(
@@ -82,7 +84,7 @@ def _burn_subtitles(
 ):
     ass_escaped = escape_srt_path(ass_in)
     cmd = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-loglevel",
         "error",
@@ -98,7 +100,7 @@ def _burn_subtitles(
     else:
         cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
     cmd.append(str(video_out))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         # Surface libass errors directly so the test failure is actionable
         raise AssertionError(
@@ -182,7 +184,7 @@ class TestEndToEndRender:
         for src, png in [(video, unburned_png), (burned, burned_png)]:
             subprocess.run(
                 [
-                    "ffmpeg",
+                    FFMPEG,
                     "-y",
                     "-loglevel",
                     "error",
@@ -219,7 +221,7 @@ class TestEndToEndRender:
         # the burn step exactly.
         video = tmp_path / "src.mkv"
         cmd_src = [
-            "ffmpeg",
+            FFMPEG,
             "-y",
             "-loglevel",
             "error",
@@ -251,7 +253,7 @@ class TestEndToEndRender:
                 out = tmp_path / f"{label}_{region}.png"
                 subprocess.run(
                     [
-                        "ffmpeg",
+                        FFMPEG,
                         "-y",
                         "-loglevel",
                         "error",
@@ -287,3 +289,131 @@ class TestEndToEndRender:
             "Bottom half of burned video is identical to unburned — captions "
             "did not render in the expected bottom-third region."
         )
+
+    def test_speaker_switches_move_pixels_and_unknown_uses_header(self, tmp_path):
+        video = tmp_path / "speaker-panels.mkv"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                (
+                    "color=black:size=1080x1920:duration=3:rate=30,"
+                    "drawbox=x=270:y=0:w=540:h=72:color=white:t=fill"
+                ),
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv420p",
+                str(video),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        diarized = {
+            "utterances": [
+                {
+                    "speaker": 5,
+                    "words": [{"word": "TOP", "start": 0.1, "end": 0.5, "speaker": 5}],
+                },
+                {
+                    "speaker": 9,
+                    "words": [
+                        {
+                            "word": "BOTTOM",
+                            "start": 1.0,
+                            "end": 1.4,
+                            "speaker": 9,
+                        }
+                    ],
+                },
+                {
+                    "speaker": 3,
+                    "words": [
+                        {
+                            "word": "UNKNOWN",
+                            "start": 2.0,
+                            "end": 2.4,
+                            "speaker": 3,
+                        }
+                    ],
+                },
+            ]
+        }
+        captions = tmp_path / "speaker-panels.ass"
+        generate_ass_from_diarized(
+            diarized,
+            0,
+            3,
+            captions,
+            CaptionStyle(font_size=52, margin_l=300, margin_r=300, margin_v=840),
+            speaker_targets={5: "speaker_2", 9: "speaker_0", 3: "BOTH"},
+            speaker_placements={
+                "speaker_2": CaptionPlacement(540, 357),
+                "speaker_1": CaptionPlacement(540, 737),
+                "speaker_0": CaptionPlacement(540, 1120),
+            },
+            fallback_placement=CaptionPlacement(
+                540,
+                36,
+                alignment=5,
+                font_size=24,
+                background_box=(270, 0, 540, 72),
+            ),
+        )
+        burned = tmp_path / "speaker-panels-burned.mkv"
+        _burn_subtitles(video, captions, burned, lossless=True)
+
+        def region_bytes(path, timestamp, crop):
+            result = subprocess.run(
+                [
+                    FFMPEG,
+                    "-v",
+                    "error",
+                    "-ss",
+                    str(timestamp),
+                    "-i",
+                    str(path),
+                    "-vf",
+                    f"crop={crop},format=rgb24",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            return result.stdout
+
+        regions = {
+            "header": "1080:72:0:0",
+            "top": "1080:380:0:72",
+            "middle": "1080:380:0:452",
+            "bottom": "1080:384:0:832",
+        }
+
+        def changed(timestamp, region):
+            crop = regions[region]
+            return region_bytes(video, timestamp, crop) != region_bytes(
+                burned, timestamp, crop
+            )
+
+        assert changed(0.3, "top")
+        assert not changed(0.3, "header")
+        assert not changed(0.3, "middle")
+        assert not changed(0.3, "bottom")
+        assert changed(1.2, "bottom")
+        assert not changed(1.2, "header")
+        assert not changed(1.2, "top")
+        assert not changed(1.2, "middle")
+        assert changed(2.2, "header")
+        assert not changed(2.2, "top")
+        assert not changed(2.2, "middle")
+        assert not changed(2.2, "bottom")

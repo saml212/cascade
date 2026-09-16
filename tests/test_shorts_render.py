@@ -294,6 +294,49 @@ def test_gameplay_surround_podcast_column_keeps_every_configured_speaker(
     assert "drawbox=x=0:y=569:w=540:h=6" in video_filter
 
 
+@pytest.mark.parametrize(
+    ("center_xs", "expected"),
+    [
+        ([900], {"speaker_0": 1080}),
+        ([1200, 500], {"speaker_1": 508, "speaker_0": 1080}),
+        (
+            [1210, 825, 565],
+            {"speaker_2": 357, "speaker_1": 737, "speaker_0": 1120},
+        ),
+    ],
+)
+def test_gameplay_caption_positions_follow_exact_spatial_panel_rows(
+    tmp_episode_dir, sample_config, center_xs, expected
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {
+                "center_x": center_x,
+                "center_y": 540,
+                "longform_center_x": center_x,
+                "longform_center_y": 540,
+                "zoom": 1,
+                "longform_zoom": 1,
+            }
+            for center_x in center_xs
+        ]
+    }
+
+    placements, fallback = agent._gameplay_surround_caption_placements(
+        1920, 1080, crop_config
+    )
+
+    assert {speaker: placement.y for speaker, placement in placements.items()} == (
+        expected
+    )
+    assert all(placement.x == 540 for placement in placements.values())
+    assert fallback.x == 540
+    assert fallback.y == 36
+    assert fallback.font_size == 24
+    assert fallback.background_box == (270, 0, 540, 72)
+
+
 def test_gameplay_surround_requires_reviewed_layout_above_three_speakers(
     tmp_episode_dir, sample_config
 ):

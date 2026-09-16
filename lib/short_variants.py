@@ -25,6 +25,7 @@ BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 GAMEPLAY_SURROUND_VARIANT_MODE = "podcast_gameplay_surround_v1"
 GAMEPLAY_SURROUND_LAYOUT_VERSION = "gameplay-surround/v1"
+GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION = "source-speaker-panel/v1"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
 MINECRAFT_PARKOUR_ASSET_ID = "spicy_sauce_minecraft_12_v1"
@@ -445,18 +446,19 @@ def background_variant_fingerprint(
     variant_id: str = BACKGROUND_VARIANT_ID,
 ) -> str:
     require_background_variant_asset(variant_id, str(asset.get("asset_id", "")))
-    return _json_revision(
-        {
-            "variant_id": variant_id,
-            "layout": _variant_layout(variant_id),
-            "base": {
-                "render_fingerprint": base_record.get("fingerprint"),
-                "scan_identity": base_identity,
-            },
-            "asset": _variant_asset_record(asset, include_provenance=False),
-            "encoding": encoding,
-        }
-    )
+    state = {
+        "variant_id": variant_id,
+        "layout": _variant_layout(variant_id),
+        "base": {
+            "render_fingerprint": base_record.get("fingerprint"),
+            "scan_identity": base_identity,
+        },
+        "asset": _variant_asset_record(asset, include_provenance=False),
+        "encoding": encoding,
+    }
+    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        state["caption_policy"] = GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION
+    return _json_revision(state)
 
 
 def variant_record(

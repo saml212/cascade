@@ -11,7 +11,12 @@ from pathlib import Path
 from agents.base import BaseAgent, timed_ffmpeg
 from agents.speaker_cut import current_speaker_segments
 from agents.transcribe import current_diarized_transcript
-from lib.ass import CaptionStyle, generate_ass_from_diarized
+from lib.ass import (
+    CaptionPlacement,
+    CaptionStyle,
+    generate_ass_from_diarized,
+    resolve_caption_speaker_targets,
+)
 from lib.audio_mix import generate_audio_mix
 from lib.crop import compute_crop, resolve_speaker
 from lib.delivery_video import (
@@ -54,6 +59,7 @@ from lib.loudness import (
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     CONTAIN_BLUR_FIT_MODE,
+    GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
     GAMEPLAY_SURROUND_VARIANT_ID,
     background_variant_fingerprint,
@@ -272,6 +278,7 @@ class ShortsRenderAgent(BaseAgent):
                         "base_record": base_record,
                         "base_identity": base_identity,
                     },
+                    segment_document=segment_document,
                 )
         except BaseException:
             if not had_output:
@@ -851,6 +858,7 @@ class ShortsRenderAgent(BaseAgent):
         clip=None,
         encoding=None,
         background=None,
+        segment_document=None,
     ) -> dict:
         """Render one clip; positional arguments remain compatible with chat actions."""
         episode = episode or self.load_json("episode.json")
@@ -890,7 +898,26 @@ class ShortsRenderAgent(BaseAgent):
         )
         caption_path = Path(caption_path).with_suffix(".ass")
         caption_path.parent.mkdir(parents=True, exist_ok=True)
-        generate_ass_from_diarized(captions, 0, timeline.duration, caption_path, style)
+        caption_options = {}
+        if gameplay_surround:
+            speaker_placements, fallback_placement = (
+                self._gameplay_surround_caption_placements(src_w, src_h, crop_config)
+            )
+            caption_options = {
+                "speaker_targets": resolve_caption_speaker_targets(
+                    captions, segment_document or {}, crop_config
+                ),
+                "speaker_placements": speaker_placements,
+                "fallback_placement": fallback_placement,
+            }
+        generate_ass_from_diarized(
+            captions,
+            0,
+            timeline.duration,
+            caption_path,
+            style,
+            **caption_options,
+        )
 
         encoding = encoding or get_video_encoding_policy(self.config, "shorts")
         budget = render_space_budget(timeline.duration, encoding)
@@ -1029,6 +1056,11 @@ class ShortsRenderAgent(BaseAgent):
                     "path": str(caption_path.relative_to(self.episode_dir)),
                     "format": "ass",
                     "burned_in": True,
+                    **(
+                        {"placement_policy": (GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION)}
+                        if gameplay_surround
+                        else {}
+                    ),
                 },
                 variant_id=background["variant_id"],
             )
@@ -1161,32 +1193,24 @@ class ShortsRenderAgent(BaseAgent):
             return CaptionStyle(margin_v=BACKGROUND_CAPTION_MARGIN_V)
         return CaptionStyle()
 
-    def _get_gameplay_surround_podcast_filter_no_subs(
+    def _gameplay_surround_panel_rows(
         self, src_w: int, src_h: int, crop_config: dict
-    ) -> str:
-        """Show every configured speaker in the narrow center podcast column."""
+    ) -> list[tuple[int, int, int | None, int | None, int | None, int | None]]:
+        """Return podcast-column rows in the compositor's spatial order."""
         speakers = crop_config.get("speakers", [])
-        if not speakers:
-            return (
-                "scale=540:1144:force_original_aspect_ratio=decrease:"
-                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
-                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
-            )
-
         if len(speakers) > 3:
             raise ValueError(
                 "Gameplay surround needs a reviewed layout for more than 3 speakers"
             )
         count = len(speakers)
-        if count == 1:
-            return (
-                "scale=540:1144:force_original_aspect_ratio=decrease:"
-                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
-                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
-            )
+        if not count:
+            return []
         base_height = (1144 // count) // 2 * 2
         target_heights = [base_height] * count
         target_heights[-1] += 1144 - sum(target_heights)
+        if count == 1:
+            return [(0, target_heights[0], None, None, None, None)]
+
         anchors = []
         for index in range(count):
             center_x, center_y, zoom, _ = resolve_speaker(
@@ -1194,7 +1218,7 @@ class ShortsRenderAgent(BaseAgent):
             )
             anchors.append((center_x, index, center_y, zoom))
 
-        regions = []
+        rows = []
         for row, (center_x, index, center_y, zoom) in enumerate(sorted(anchors)):
             target_h = target_heights[row]
             _, _, anchor_w, _ = compute_crop(
@@ -1214,12 +1238,73 @@ class ShortsRenderAgent(BaseAgent):
                 0,
                 min(round(center_y - viewport_h / 2 - headroom), src_h - viewport_h),
             )
-            regions.append((index, viewport_w, viewport_h, x // 2 * 2, y // 2 * 2))
+            rows.append(
+                (
+                    index,
+                    target_h,
+                    viewport_w,
+                    viewport_h,
+                    x // 2 * 2,
+                    y // 2 * 2,
+                )
+            )
+        return rows
 
+    def _gameplay_surround_caption_placements(
+        self, src_w: int, src_h: int, crop_config: dict
+    ) -> tuple[dict[str, CaptionPlacement], CaptionPlacement]:
+        """Place known speakers in their row and unknown speech in the header."""
+        plan = GAMEPLAY_SURROUND_RENDER_PLAN
+        x = plan["left_width"] + plan["podcast_width"] // 2
+        cursor = plan["podcast_header_height"]
+        placements = {}
+        for index, height, *_ in self._gameplay_surround_panel_rows(
+            src_w, src_h, crop_config
+        ):
+            inset = min(136, height // 4)
+            placements[f"speaker_{index}"] = CaptionPlacement(
+                x=x,
+                y=cursor + height - inset,
+            )
+            cursor += height
+        fallback = CaptionPlacement(
+            x=x,
+            y=plan["podcast_header_height"] // 2,
+            alignment=5,
+            font_size=24,
+            background_box=(
+                plan["left_width"],
+                0,
+                plan["podcast_width"],
+                plan["podcast_header_height"],
+            ),
+        )
+        return placements, fallback
+
+    def _get_gameplay_surround_podcast_filter_no_subs(
+        self, src_w: int, src_h: int, crop_config: dict
+    ) -> str:
+        """Show every configured speaker in the narrow center podcast column."""
+        speakers = crop_config.get("speakers", [])
+        if not speakers:
+            return (
+                "scale=540:1144:force_original_aspect_ratio=decrease:"
+                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
+                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+            )
+
+        count = len(speakers)
+        if count == 1:
+            return (
+                "scale=540:1144:force_original_aspect_ratio=decrease:"
+                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
+                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+            )
+        rows = self._gameplay_surround_panel_rows(src_w, src_h, crop_config)
+        target_heights = [row[1] for row in rows]
         panels = []
         labels = []
-        for row, (index, width, height, x, y) in enumerate(regions):
-            target_h = target_heights[row]
+        for row, (index, target_h, width, height, x, y) in enumerate(rows):
             panels.append(
                 f"[surround{index}]crop={width}:{height}:{x}:{y},"
                 f"{get_scale_filter(540, target_h)},format=yuv420p[row{row}]"

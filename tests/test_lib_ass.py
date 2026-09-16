@@ -9,6 +9,7 @@ test_lib_ass_render.py — kept separate because it requires ffmpeg.
 import pytest
 
 from lib.ass import (
+    CaptionPlacement,
     CaptionStyle,
     build_ass,
     escape_ass_text,
@@ -16,7 +17,9 @@ from lib.ass import (
     generate_ass_from_diarized,
     group_words_into_phrases,
     requires_single_lane_caption_timing,
+    resolve_caption_speaker_targets,
 )
+from lib.timeline import Timeline, rebase_diarized
 
 # ── timecode formatting ─────────────────────────────────────────────────────
 
@@ -146,9 +149,7 @@ class TestGroupWordsIntoPhrases:
             _word("reply", 0.7, 1.1, speaker=1),
         ]
 
-        legacy = group_words_into_phrases(
-            words, clip_start=0.0, resolve_overlaps=False
-        )
+        legacy = group_words_into_phrases(words, clip_start=0.0, resolve_overlaps=False)
         phrases = group_words_into_phrases(words, clip_start=0.0)
 
         assert legacy[0]["end"] > legacy[1]["start"]
@@ -385,3 +386,110 @@ class TestGenerateAssFromDiarized:
         # Start time field is the second comma-separated field
         start_tc = first_dialogue.split(",")[1]
         assert start_tc == "0:00:00.00"
+
+    def test_speaker_positions_preserve_text_and_timing_across_edits(self, tmp_path):
+        source = {
+            "clock": "source",
+            "utterances": [
+                {
+                    "speaker": 5,
+                    "words": [
+                        {"word": "outside", "start": 9.0, "end": 9.2, "speaker": 5},
+                        {"word": "top", "start": 10.1, "end": 10.4, "speaker": 5},
+                        {"word": "switch", "start": 11.0, "end": 11.3, "speaker": 7},
+                        {"word": "removed", "start": 13.0, "end": 13.3, "speaker": 7},
+                        {"word": "bottom", "start": 14.2, "end": 14.5, "speaker": 9},
+                    ],
+                }
+            ],
+        }
+        rebased = rebase_diarized(source, Timeline(20, [(10, 12), (14, 15)]))
+        legacy = tmp_path / "legacy.ass"
+        placed = tmp_path / "placed.ass"
+        generate_ass_from_diarized(rebased, 0, 3, legacy)
+        generate_ass_from_diarized(
+            rebased,
+            0,
+            3,
+            placed,
+            speaker_targets={5: "speaker_2", 7: "speaker_1", 9: "speaker_0"},
+            speaker_placements={
+                "speaker_2": CaptionPlacement(540, 357),
+                "speaker_1": CaptionPlacement(540, 737),
+                "speaker_0": CaptionPlacement(540, 1120),
+            },
+            fallback_placement=CaptionPlacement(540, 36, alignment=5),
+        )
+
+        def dialogue_fields(path):
+            fields = []
+            for line in path.read_text().splitlines():
+                if not line.startswith("Dialogue:"):
+                    continue
+                parts = line.split(",", 9)
+                text = parts[9]
+                if text.startswith("{"):
+                    text = text.split("}", 1)[1]
+                fields.append((parts[1], parts[2], text))
+            return fields
+
+        assert dialogue_fields(placed) == dialogue_fields(legacy)
+        placed_text = placed.read_text()
+        assert "outside" not in placed_text
+        assert "removed" not in placed_text
+        assert r"\pos(540,357)" in placed_text
+        assert r"\pos(540,737)" in placed_text
+        assert r"\pos(540,1120)" in placed_text
+
+
+def test_caption_speaker_targets_prefer_bindings_and_conservative_fallbacks():
+    crop_config = {
+        "speakers": [
+            {"label": "PJ", "track": 1},
+            {"label": "Christopher", "track": 2},
+            {"label": "Ty", "track": 3},
+        ]
+    }
+    segments = {
+        "clock": "source",
+        "track_mapping": [
+            {"speaker": "speaker_0", "person": "PJ", "logical_track": 1},
+            {
+                "speaker": "speaker_1",
+                "person": "Christopher",
+                "logical_track": 2,
+            },
+            {"speaker": "speaker_2", "person": "Ty", "logical_track": 3},
+        ],
+    }
+    transcript = {
+        "clock": "source",
+        "speaker_map": [
+            {
+                "index": 0,
+                "target_speaker": "speaker_1",
+                "person": "PJ",
+                "logical_track": 1,
+            },
+            {"index": 1, "target_speaker": "speaker_2", "logical_track": 3},
+            {"index": 3, "logical_track": 3},
+            {"index": 2, "target_speaker": "BOTH", "person": "Laura"},
+            {"index": 4, "person": "Christopher"},
+            {"index": 5, "logical_track": 1, "mapping_confidence": 0.2},
+        ],
+    }
+
+    assert resolve_caption_speaker_targets(transcript, segments, crop_config) == {
+        0: "speaker_1",
+        1: "speaker_2",
+        2: "BOTH",
+        3: "speaker_2",
+        4: "speaker_1",
+        5: "BOTH",
+    }
+    assert (
+        resolve_caption_speaker_targets(
+            {**transcript, "clock": "output"}, segments, crop_config
+        )
+        == {}
+    )
