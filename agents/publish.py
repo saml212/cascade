@@ -27,12 +27,14 @@ from agents.qa import (
     publication_identity,
     quality_snapshot,
     release_metadata_issues,
+    short_distribution_state,
     youtube_made_for_kids,
 )
 from lib.atomic_write import atomic_write_json
-from lib.delivery_video import render_output_lock
+from lib.delivery_video import read_render_manifest, render_output_lock
 from lib.short_distribution import (
     EXPANSION_DESTINATIONS,
+    PLATFORM_COPY_FIELDS,
     SHORT_DESTINATIONS,
     SHORT_PLATFORM_SPECS,
     configured_destination_bindings,
@@ -44,7 +46,10 @@ from lib.short_distribution import (
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     DISTRIBUTION_RELEASE_FIELD,
+    DISTRIBUTION_VARIANT_FIELD,
+    background_variant_output,
     distribution_release_revision,
+    require_background_variant,
 )
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
@@ -58,6 +63,7 @@ PINTEREST_BOARD_URL = "https://api.upload-post.com/api/uploadposts/pinterest/boa
 SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v1"
 SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v1"
 EXPANDED_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v2"
+ARTIFACT_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v3"
 RECORDED_STATES = {
     "submitted",
     "published",
@@ -333,9 +339,28 @@ def _destination_request_fields(receipt):
         "copy_revision": receipt["copy_revision"],
         "external_id": receipt["external_id"],
     }
+    if receipt["destination_schema"] == ARTIFACT_SHORT_DESTINATION_SCHEMA:
+        fields["scheduled"] = receipt["scheduled"]
     if "destination_bindings" in receipt:
         fields["destination_bindings"] = receipt["destination_bindings"]
     return fields
+
+
+def _valid_destination_copy_shape(copy: object, platforms: list[str]) -> bool:
+    if not isinstance(copy, dict) or set(copy) != set(platforms):
+        return False
+    for platform in platforms:
+        fields = copy.get(platform)
+        allowed = set(SHORT_PLATFORM_SPECS[platform]["upload_fields"])
+        configured_required = set(PLATFORM_COPY_FIELDS[platform])
+        required = configured_required & allowed or allowed
+        if (
+            not isinstance(fields, dict)
+            or not required <= set(fields) <= allowed
+            or any(not isinstance(value, str) for value in fields.values())
+        ):
+            return False
+    return True
 
 
 def _destination_receipt_valid(receipt: dict) -> bool:
@@ -348,14 +373,27 @@ def _destination_receipt_valid(receipt: dict) -> bool:
         request = _destination_request_fields(receipt)
         schema = receipt.get("destination_schema")
         expanded = bool(set(platforms) & EXPANSION_DESTINATIONS)
-        _parse_time(receipt["scheduled_date"])
+        artifact_request = schema == ARTIFACT_SHORT_DESTINATION_SCHEMA
+        scheduled = receipt.get("scheduled") if artifact_request else True
+        if not artifact_request or scheduled:
+            _parse_time(receipt["scheduled_date"])
         return bool(
             request_id == receipt["destination_request_id"]
             and schema
-            == (
-                EXPANDED_SHORT_DESTINATION_SCHEMA
-                if expanded
-                else SHORT_DESTINATION_SCHEMA
+            in {
+                ARTIFACT_SHORT_DESTINATION_SCHEMA,
+                (
+                    EXPANDED_SHORT_DESTINATION_SCHEMA
+                    if expanded
+                    else SHORT_DESTINATION_SCHEMA
+                ),
+            }
+            and (
+                not artifact_request
+                or (
+                    isinstance(scheduled, bool)
+                    and (scheduled or receipt.get("scheduled_date") is None)
+                )
             )
             and receipt.get("copy_schema") == SHORT_COPY_SCHEMA
             and isinstance(receipt["destination_episode_id"], str)
@@ -375,14 +413,7 @@ def _destination_receipt_valid(receipt: dict) -> bool:
             and valid_destination_bindings(
                 receipt.get("destination_bindings"), platforms
             )
-            and isinstance(copy, dict)
-            and set(copy) == set(platforms)
-            and all(
-                isinstance(fields, dict)
-                and fields
-                and all(isinstance(value, str) for value in fields.values())
-                for fields in copy.values()
-            )
+            and _valid_destination_copy_shape(copy, platforms)
             and receipt["target_revision"] == _document_revision(target)
             and receipt["copy_revision"] == _document_revision(copy)
             and receipt["external_id"]
@@ -1697,6 +1728,13 @@ class PublishAgent(BaseAgent):
             for item in metadata.get("clips", [])
             if isinstance(item, dict) and item.get("id")
         }
+        approval_short_metadata = {
+            str(item["id"]): item
+            for item in self.load_json_safe(
+                "metadata/metadata.json", {"clips": []}
+            ).get("clips", [])
+            if isinstance(item, dict) and item.get("id")
+        }
         short_versions = gate.get("short_versions")
         if not isinstance(short_versions, dict) or any(
             not isinstance(short_versions.get(str(clip.get("id", ""))), dict)
@@ -1722,8 +1760,62 @@ class PublishAgent(BaseAgent):
             "funnel_urls": funnel_urls,
             "longform_revision": longform_revision,
             "short_metadata": short_metadata,
+            "approval_short_metadata": approval_short_metadata,
             "short_versions": short_versions,
         }
+
+    def _destination_versions(self, data, overrides):
+        versions = dict(data["short_versions"])
+        if not overrides:
+            return versions
+        records = read_render_manifest(self.episode_dir).get("shorts", {})
+        by_id = {str(clip.get("id", "")): clip for clip in data["approved"]}
+        for clip_id, variant_id in overrides.items():
+            if versions[clip_id].get("variant_id") == variant_id:
+                raise RuntimeError(
+                    f"{clip_id} already selects {variant_id}; remove its override"
+                )
+            candidate = dict(by_id[clip_id])
+            candidate[DISTRIBUTION_VARIANT_FIELD] = variant_id
+            candidate.pop(DISTRIBUTION_RELEASE_FIELD, None)
+            version = short_distribution_state(
+                self.episode_dir,
+                data["episode"],
+                self.config,
+                candidate,
+                records.get(clip_id),
+                data["approval_short_metadata"].get(clip_id),
+            )
+            if (
+                version.get("current") is not True
+                or version.get("approval_current") is not True
+            ):
+                raise RuntimeError(
+                    f"The requested destination variant for {clip_id} is not "
+                    "current and approved"
+                )
+            versions[clip_id] = version
+        return versions
+
+    @staticmethod
+    def _validated_variant_overrides(data, value):
+        overrides = value.get("variant_overrides", {})
+        approved_ids = {str(clip.get("id", "")) for clip in data["approved"]}
+        if not isinstance(overrides, dict) or any(
+            not isinstance(clip_id, str)
+            or clip_id not in approved_ids
+            or not isinstance(variant_id, str)
+            for clip_id, variant_id in overrides.items()
+        ):
+            raise RuntimeError(
+                "variant_overrides must map approved clip IDs to variants"
+            )
+        try:
+            for variant_id in overrides.values():
+                require_background_variant(variant_id)
+        except KeyError as exc:
+            raise RuntimeError(str(exc).strip("'")) from exc
+        return overrides
 
     def _destination_plan(self, data, value):
         if not isinstance(value, dict):
@@ -1734,6 +1826,9 @@ class PublishAgent(BaseAgent):
             raise RuntimeError("Short destination request_id must be a UUID") from exc
         actor, reason = value.get("actor"), value.get("reason")
         destinations = value.get("destinations")
+        overrides = self._validated_variant_overrides(data, value)
+        copy_overrides = value.get("copy_overrides", {})
+        publish_now = value.get("publish_now", False)
         if value.get("request_id") != request_id:
             raise RuntimeError("Short destination request_id must be canonical")
         if not isinstance(actor, str) or actor != actor.strip() or not actor:
@@ -1748,14 +1843,27 @@ class PublishAgent(BaseAgent):
         ):
             raise RuntimeError("Choose at least one unique short destination")
         destinations = sorted(destinations)
-        approved_destinations = sorted(data["platforms"])
+        if not isinstance(publish_now, bool):
+            raise TypeError("publish_now must be true or false")
+        if not isinstance(copy_overrides, dict) or any(
+            not isinstance(clip_id, str) or not isinstance(copy, dict)
+            for clip_id, copy in copy_overrides.items()
+        ):
+            raise RuntimeError("copy_overrides must map clip IDs to copy objects")
+        # A reviewed one-off expansion request may use a verified configured
+        # binding while the destination remains disabled for global releases.
+        approved_destinations = sorted(
+            set(data["platforms"]) | (set(destinations) & EXPANSION_DESTINATIONS)
+        )
         if not set(destinations) <= set(approved_destinations):
             raise RuntimeError("Destinations are outside the approved publish plan")
         revision = data["gate"]["revision"]
         if value.get("expected_release_revision") != revision:
             raise RuntimeError("Destination preview does not match the current release")
         destination_schema = (
-            EXPANDED_SHORT_DESTINATION_SCHEMA
+            ARTIFACT_SHORT_DESTINATION_SCHEMA
+            if overrides or copy_overrides or publish_now
+            else EXPANDED_SHORT_DESTINATION_SCHEMA
             if set(destinations) & EXPANSION_DESTINATIONS
             else SHORT_DESTINATION_SCHEMA
         )
@@ -1774,6 +1882,11 @@ class PublishAgent(BaseAgent):
             raise RuntimeError("clip_ids must name unique approved clips")
         else:
             selected_ids = [item for item in approved_ids if item in requested_ids]
+        if not set(overrides) <= set(selected_ids):
+            raise RuntimeError("variant_overrides must name selected clips")
+        if not set(copy_overrides) <= set(selected_ids):
+            raise RuntimeError("copy_overrides must name selected clips")
+        effective_versions = self._destination_versions(data, overrides)
         hub_url = episode_hub_url(self.config, self.episode_dir.name)
         if set(destinations) - {"x"} and not hub_url:
             raise RuntimeError("An HTTPS exact-episode hub URL is required")
@@ -1797,7 +1910,11 @@ class PublishAgent(BaseAgent):
             if clip_id in schedule_by_clip:
                 raise RuntimeError(f"Schedule has duplicate entries for {clip_id}")
             schedule_by_clip[clip_id] = entry
-        missing = [item for item in selected_ids if item not in schedule_by_clip]
+        missing = [
+            item
+            for item in selected_ids
+            if not publish_now and item not in schedule_by_clip
+        ]
         if missing:
             raise RuntimeError(
                 "Selected clips need explicit schedule entries: " + ", ".join(missing)
@@ -1815,7 +1932,7 @@ class PublishAgent(BaseAgent):
         identities = set()
         co_schedule_ids = set()
         for clip_id in selected_ids:
-            clip, version = by_id[clip_id], data["short_versions"][clip_id]
+            clip, version = by_id[clip_id], effective_versions[clip_id]
             rerelease = version.get("re_release_request")
             target = _short_target_fields(clip_id, version)
             target_revision = _document_revision(target)
@@ -1827,10 +1944,14 @@ class PublishAgent(BaseAgent):
                 clip_id,
                 destination_schema,
             )
-            scheduled_at = self._schedule_to_datetime(
-                schedule_by_clip[clip_id], tz_name, reference=reference
+            scheduled_at = (
+                None
+                if publish_now
+                else self._schedule_to_datetime(
+                    schedule_by_clip[clip_id], tz_name, reference=reference
+                )
             )
-            if not (
+            if scheduled_at is not None and not (
                 _instant(reference)
                 < _instant(scheduled_at)
                 <= _instant(reference + timedelta(days=365))
@@ -1846,7 +1967,7 @@ class PublishAgent(BaseAgent):
             ]
             covered = {
                 platform
-                for item in current_waves
+                for item in recorded
                 if item.get("status") != "cancelled"
                 for platform in item.get("platforms", [])
             }
@@ -1859,8 +1980,16 @@ class PublishAgent(BaseAgent):
                         + ", ".join(sorted(overlap))
                     )
                 if not overlap and item.get("external_id"):
-                    prior_time = _parse_time(item["scheduled_date"])
-                    if _instant(prior_time) > _instant(reference):
+                    prior_time = (
+                        _parse_time(item["scheduled_date"])
+                        if item.get("scheduled") is not False
+                        else None
+                    )
+                    if (
+                        prior_time
+                        and scheduled_at is not None
+                        and _instant(prior_time) > _instant(reference)
+                    ):
                         if _instant(prior_time) != _instant(scheduled_at):
                             raise RuntimeError(
                                 f"{clip_id} deferred destinations must use its "
@@ -1868,25 +1997,52 @@ class PublishAgent(BaseAgent):
                             )
                         co_schedule_ids.add(item["external_id"])
             historical = [item for item in recorded if item not in current_waves]
-            if historical and not (
-                valid_rerelease_authorization({"shorts": prior}, clip, version)
-                or valid_rerelease_copy_continuation(
-                    {"shorts": prior}, clip, version, current_waves
+            historical_overlap = {
+                platform
+                for item in historical
+                if item.get("status") != "cancelled"
+                for platform in item.get("platforms", [])
+            } & set(destinations)
+            if historical_overlap and clip_id in overrides:
+                raise RuntimeError(
+                    f"{clip_id} already has historical receipts for: "
+                    + ", ".join(sorted(historical_overlap))
+                )
+            if (
+                historical
+                and clip_id not in overrides
+                and not (
+                    valid_rerelease_authorization({"shorts": prior}, clip, version)
+                    or valid_rerelease_copy_continuation(
+                        {"shorts": prior}, clip, version, current_waves
+                    )
                 )
             ):
                 raise RuntimeError(
                     f"A historical publication receipt exists for {clip_id}; "
                     "prepare an explicit re-release identity"
                 )
-            copy = short_destination_copy(
-                data["short_metadata"].get(clip_id, {}),
-                destinations,
-                title=str(clip.get("title") or f"Clip {clip_id}"),
-                hub_url=hub_url,
-                youtube_url=data["funnel_urls"]["youtube"],
-                spotify_url=data["funnel_urls"]["spotify"],
-                channel_handle=self.config.get("podcast", {}).get("channel_handle", ""),
-            )
+            copy = copy_overrides.get(clip_id)
+            if copy is None:
+                copy = short_destination_copy(
+                    data["short_metadata"].get(clip_id, {}),
+                    destinations,
+                    title=str(clip.get("title") or f"Clip {clip_id}"),
+                    hub_url=hub_url,
+                    youtube_url=data["funnel_urls"]["youtube"],
+                    spotify_url=data["funnel_urls"]["spotify"],
+                    channel_handle=self.config.get("podcast", {}).get(
+                        "channel_handle", ""
+                    ),
+                )
+            elif set(copy) != set(destinations):
+                raise RuntimeError(
+                    f"{clip_id} copy_override must match requested destinations"
+                )
+            if not _valid_destination_copy_shape(copy, destinations):
+                raise RuntimeError(
+                    f"{clip_id} destination copy is missing required string fields"
+                )
             copy_issues = validate_destination_copy(copy)
             if copy_issues:
                 raise RuntimeError(
@@ -1907,8 +2063,10 @@ class PublishAgent(BaseAgent):
                 "request_id": identity,
                 "external_id": identity,
                 "idempotency_key": identity,
-                "scheduled": True,
-                "scheduled_date": scheduled_at.isoformat(),
+                "scheduled": scheduled_at is not None,
+                "scheduled_date": (
+                    scheduled_at.isoformat() if scheduled_at is not None else None
+                ),
                 "timezone": tz_name,
                 "version": version["version"],
                 "variant_id": version["variant_id"],
@@ -1971,15 +2129,16 @@ class PublishAgent(BaseAgent):
         ]
         reservations = list(occupied)
         for target in targets:
-            self._reserve(
-                reservations,
-                _parse_time(target["scheduled_date"]),
-                target["external_id"],
-                target["clip_id"],
-                tz_name,
-                weekday,
-                weekend,
-            )
+            if target["scheduled"]:
+                self._reserve(
+                    reservations,
+                    _parse_time(target["scheduled_date"]),
+                    target["external_id"],
+                    target["clip_id"],
+                    tz_name,
+                    weekday,
+                    weekend,
+                )
         preview_revision = _document_revision(
             {
                 "schema": destination_schema,
@@ -1997,6 +2156,9 @@ class PublishAgent(BaseAgent):
             "request_id": request_id,
             "actor": actor,
             "reason": reason,
+            "variant_overrides": overrides,
+            "copy_overrides": copy_overrides,
+            "publish_now": publish_now,
             "approved_destinations": approved_destinations,
             "requested_destinations": destinations,
             "deferred_destinations": sorted(
@@ -2018,8 +2180,9 @@ class PublishAgent(BaseAgent):
     def preview_short_destinations(self, value):
         with publication_lock(self.episode_dir.parent):
             data = self._inputs()
+            locked_overrides = self._validated_variant_overrides(data, value)
             with self._publication_output_locks(
-                data["approved"], data["short_versions"]
+                data["approved"], data["short_versions"], locked_overrides
             ):
                 live_gate = quality_snapshot(self.episode_dir, config=self.config)[
                     "release_gate"
@@ -2039,6 +2202,9 @@ class PublishAgent(BaseAgent):
                 "actor": plan["actor"],
                 "reason": plan["reason"],
                 "expected_release_revision": plan["release_revision"],
+                "variant_overrides": plan["variant_overrides"],
+                "copy_overrides": plan["copy_overrides"],
+                "publish_now": plan["publish_now"],
                 "preview_revision": plan["preview_revision"],
             },
         }
@@ -2077,7 +2243,13 @@ class PublishAgent(BaseAgent):
         )
         revision = gate["revision"]
         youtube_url = funnel_urls["youtube"]
-        with self._publication_output_locks(approved, short_versions):
+        destination_request = getattr(self, "short_destination_request", None)
+        locked_overrides = (
+            self._validated_variant_overrides(data, destination_request)
+            if isinstance(destination_request, dict)
+            else {}
+        )
+        with self._publication_output_locks(approved, short_versions, locked_overrides):
             live_snapshot = quality_snapshot(self.episode_dir, config=self.config)
             live_gate = live_snapshot["release_gate"]
             if (
@@ -2092,16 +2264,18 @@ class PublishAgent(BaseAgent):
                     "Release media, copy, or approvals changed after publication "
                     "started; nothing was submitted"
                 )
-            destination_request = getattr(self, "short_destination_request", None)
             if destination_request is not None:
                 plan = self._destination_plan(data, destination_request)
+                destination_versions = self._destination_versions(
+                    data, plan["variant_overrides"]
+                )
                 previous_shorts = self._persist_destination_intents(
                     previous, plan["targets"]
                 )
                 selected = set(plan["selected_clip_ids"])
                 shorts = self._publish_shorts(
                     [clip for clip in approved if str(clip.get("id", "")) in selected],
-                    short_versions,
+                    destination_versions,
                     short_metadata,
                     [
                         {
@@ -2109,6 +2283,7 @@ class PublishAgent(BaseAgent):
                             "scheduled_date": target["scheduled_date"],
                         }
                         for target in plan["targets"]
+                        if target["scheduled"]
                     ],
                     previous_shorts,
                     episode,
@@ -2223,7 +2398,7 @@ class PublishAgent(BaseAgent):
         )
 
     @contextmanager
-    def _publication_output_locks(self, clips, short_versions):
+    def _publication_output_locks(self, clips, short_versions, variant_overrides=None):
         paths = {self.episode_dir / "upload_video.mp4"}
         for clip in clips:
             clip_id = str(clip.get("id", ""))
@@ -2236,6 +2411,8 @@ class PublishAgent(BaseAgent):
                         f"The selected short version for {clip_id} has no media path"
                     )
                 paths.add(self.episode_dir / relative_path)
+        for clip_id, variant_id in (variant_overrides or {}).items():
+            paths.add(background_variant_output(self.episode_dir, clip_id, variant_id))
         with ExitStack() as stack:
             for path in sorted(paths):
                 stack.enter_context(render_output_lock(path))
@@ -2593,9 +2770,14 @@ class PublishAgent(BaseAgent):
                 else:
                     remaining.append((clip, version, identity, destination_target))
 
-            if not schedule:
+            scheduled_remaining = [
+                item
+                for item in remaining
+                if not item[3] or item[3].get("scheduled") is not False
+            ]
+            if not schedule and scheduled_remaining:
                 schedule = self._generate_schedule(
-                    [clip for clip, _, _, _ in remaining],
+                    [clip for clip, _, _, _ in scheduled_remaining],
                     weekday_limit,
                     weekend_limit,
                     tz_name=tz_name,
@@ -2615,7 +2797,9 @@ class PublishAgent(BaseAgent):
                     schedule_by_clip[clip_id] = entry
             unscheduled = [
                 str(clip.get("id", ""))
-                for clip, _, _, _ in remaining
+                for clip, _, _, destination_target in remaining
+                if not destination_target
+                or destination_target.get("scheduled") is not False
                 if str(clip.get("id", "")) not in schedule_by_clip
             ]
             if unscheduled:
@@ -2629,8 +2813,13 @@ class PublishAgent(BaseAgent):
             for clip, version, identity, destination_target in remaining:
                 clip_id = str(clip.get("id", ""))
                 entry = schedule_by_clip.get(clip_id)
+                immediate = bool(
+                    destination_target and destination_target.get("scheduled") is False
+                )
                 scheduled_at = (
-                    self._schedule_to_datetime(entry, tz_name, reference=reference)
+                    None
+                    if immediate
+                    else self._schedule_to_datetime(entry, tz_name, reference=reference)
                     if entry
                     else None
                 )

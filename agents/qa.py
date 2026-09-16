@@ -55,6 +55,7 @@ from lib.short_variants import (
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
     background_variant_approval_state,
+    background_variant_label,
     background_variant_output,
     background_variant_state,
     selected_short_variant_id,
@@ -832,7 +833,7 @@ def _selected_short_version_inputs(
                 "status": "invalid",
             }
             continue
-        record = variant_record(episode_dir, clip_id)
+        record = variant_record(episode_dir, clip_id, variant_id)
         asset = record.get("asset") if isinstance(record.get("asset"), dict) else {}
         output = record.get("output") if isinstance(record.get("output"), dict) else {}
         approval = (
@@ -910,6 +911,7 @@ def short_distribution_state(
         str(clip["id"]),
         base_record=base_record or None,
         encoding=encoding,
+        variant_id=variant_id,
     )
     revision = clip_review_revision(clip, record, metadata_entry)
     approval = background_variant_approval_state(record, render, revision)
@@ -917,14 +919,14 @@ def short_distribution_state(
     return {
         "version": variant_id,
         "variant_id": variant_id,
-        "label": "Motion background",
+        "label": background_variant_label(variant_id),
         "current": render.get("current") is True,
         "approval_current": approval.get("current") is True,
         "revision": revision,
         "path": str(
-            background_variant_output(episode_dir, str(clip["id"])).relative_to(
-                episode_dir
-            )
+            background_variant_output(
+                episode_dir, str(clip["id"]), variant_id
+            ).relative_to(episode_dir)
         ),
         "render_fingerprint": record.get("fingerprint"),
         "asset_id": asset.get("asset_id"),

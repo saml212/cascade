@@ -53,14 +53,15 @@ from lib.loudness import (
 )
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
-    DEFAULT_BACKGROUND_ASSET_ID,
     background_variant_fingerprint,
     background_variant_output,
     background_variant_state,
+    default_background_asset_id,
     file_content_identity,
     load_background_asset,
     record_background_variant,
     require_background_variant,
+    require_background_variant_asset,
 )
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
@@ -106,19 +107,26 @@ class ShortsRenderAgent(BaseAgent):
             return self._repair_clip_audio_locked(clip_id, output)
 
     def render_background_variant(
-        self, clip_id: str, asset_id: str = DEFAULT_BACKGROUND_ASSET_ID
+        self,
+        clip_id: str,
+        asset_id: str | None = None,
+        variant_id: str = BACKGROUND_VARIANT_ID,
     ) -> dict:
         """Compose one optional motion variant from a current canonical short."""
+        selected_asset_id = asset_id or default_background_asset_id(variant_id)
+        require_background_variant_asset(variant_id, selected_asset_id)
         clips = self.load_json("clips.json").get("clips", [])
         clip = next((item for item in clips if item.get("id") == clip_id), None)
         if clip is None:
             raise KeyError(f"Unknown clip: {clip_id}")
-        output = background_variant_output(self.episode_dir, clip_id)
+        output = background_variant_output(self.episode_dir, clip_id, variant_id)
         with render_output_lock(output):
-            return self._render_background_variant_locked(clip, asset_id, output)
+            return self._render_background_variant_locked(
+                clip, selected_asset_id, variant_id, output
+            )
 
     def _render_background_variant_locked(
-        self, clip: dict, asset_id: str, output: Path
+        self, clip: dict, asset_id: str, variant_id: str, output: Path
     ) -> dict:
         episode = self.load_json("episode.json")
         self.config = render_config_for_episode(episode, self.config)
@@ -186,12 +194,14 @@ class ShortsRenderAgent(BaseAgent):
             base_identity,
             asset,
             encoding,
+            variant_id=variant_id,
         )
         current_record, current_state = background_variant_state(
             self.episode_dir,
             str(clip["id"]),
             base_record=base_record,
             encoding=encoding,
+            variant_id=variant_id,
         )
         if (
             current_state["current"]
@@ -215,7 +225,7 @@ class ShortsRenderAgent(BaseAgent):
                     self.episode_dir
                     / "subtitles"
                     / "short_variants"
-                    / BACKGROUND_VARIANT_ID
+                    / variant_id
                     / f"{clip['id']}.ass",
                     float(clip["start_seconds"]),
                     float(clip["end_seconds"]),
@@ -235,6 +245,7 @@ class ShortsRenderAgent(BaseAgent):
                     clip=clip,
                     encoding=encoding,
                     background={
+                        "variant_id": variant_id,
                         "asset": asset,
                         "base_path": base_path,
                         "base_duration": base_duration,
@@ -362,7 +373,7 @@ class ShortsRenderAgent(BaseAgent):
     def _variant_result(output: Path, record: dict, *, reused: bool) -> dict:
         return {
             "clip_id": output.stem,
-            "variant_id": BACKGROUND_VARIANT_ID,
+            "variant_id": record.get("variant_id"),
             "asset_id": record.get("asset", {}).get("asset_id"),
             "output_path": str(output),
             "reused": reused,
@@ -824,6 +835,7 @@ class ShortsRenderAgent(BaseAgent):
                     "format": "ass",
                     "burned_in": True,
                 },
+                variant_id=background["variant_id"],
             )
         return record_short_render(
             self.episode_dir,
@@ -1145,12 +1157,14 @@ def render_single_clip_variant(
     config: dict,
     clip_id: str,
     variant_id: str,
-    asset_id: str = DEFAULT_BACKGROUND_ASSET_ID,
+    asset_id: str | None = None,
 ) -> dict:
     """Render one supported optional short without changing the canonical short."""
     require_background_variant(variant_id)
+    selected_asset_id = asset_id or default_background_asset_id(variant_id)
+    require_background_variant_asset(variant_id, selected_asset_id)
     return ShortsRenderAgent(episode_dir, config).render_background_variant(
-        clip_id, asset_id
+        clip_id, selected_asset_id, variant_id
     )
 
 

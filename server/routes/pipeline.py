@@ -127,6 +127,9 @@ class ShortDestinationRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=3, max_length=1000)
     expected_release_revision: str = Field(min_length=1)
+    variant_overrides: dict[str, str] = Field(default_factory=dict)
+    copy_overrides: dict[str, dict] = Field(default_factory=dict)
+    publish_now: bool = False
 
 
 class ShortDestinationExecution(ShortDestinationRequest):
@@ -266,7 +269,9 @@ async def run_single_agent(
             raise HTTPException(
                 status_code=400, detail="publish input is only valid for publish"
             )
-        agent.short_destination_request = req.publish.model_dump(mode="json")
+        agent.short_destination_request = req.publish.model_dump(
+            mode="json", exclude_unset=True
+        )
 
     outcome = {}
     loop = asyncio.get_running_loop()
@@ -338,7 +343,7 @@ async def preview_short_destinations(
     try:
         return await asyncio.to_thread(
             PublishAgent(episode_dir, load_config()).preview_short_destinations,
-            request.model_dump(mode="json"),
+            request.model_dump(mode="json", exclude_unset=True),
         )
     except (RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

@@ -15,9 +15,12 @@ from lib.ffprobe import file_fingerprint, scan_identity
 from lib.timeline import Timeline
 
 BACKGROUND_VARIANT_ID = "background_motion_v1"
+SATISFYING_VARIANT_ID = "satisfying_motion_v1"
+BACKGROUND_VARIANT_IDS = (BACKGROUND_VARIANT_ID, SATISFYING_VARIANT_ID)
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
+SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
@@ -40,8 +43,37 @@ def background_assets_dir() -> Path:
 
 
 def require_background_variant(variant_id: str) -> None:
-    if variant_id != BACKGROUND_VARIANT_ID:
+    if variant_id not in BACKGROUND_VARIANT_IDS:
         raise KeyError(f"Unknown short variant: {variant_id}")
+
+
+def background_variant_label(variant_id: str) -> str:
+    require_background_variant(variant_id)
+    return (
+        "Satisfying footage"
+        if variant_id == SATISFYING_VARIANT_ID
+        else "Motion background"
+    )
+
+
+def default_background_asset_id(variant_id: str) -> str:
+    require_background_variant(variant_id)
+    return (
+        SATISFYING_BACKGROUND_ASSET_ID
+        if variant_id == SATISFYING_VARIANT_ID
+        else DEFAULT_BACKGROUND_ASSET_ID
+    )
+
+
+def require_background_variant_asset(variant_id: str, asset_id: str) -> None:
+    require_background_variant(variant_id)
+    if (
+        variant_id == SATISFYING_VARIANT_ID
+        and asset_id != SATISFYING_BACKGROUND_ASSET_ID
+    ):
+        raise KeyError(
+            f"{SATISFYING_VARIANT_ID} requires {SATISFYING_BACKGROUND_ASSET_ID}"
+        )
 
 
 def selected_short_variant_id(clip: dict) -> str | None:
@@ -82,14 +114,23 @@ def distribution_release_revision(
     return _json_revision(inputs)
 
 
-def background_variant_output(episode_dir: Path, clip_id: str) -> Path:
-    return (
-        Path(episode_dir) / "short_variants" / BACKGROUND_VARIANT_ID / f"{clip_id}.mp4"
+def background_variant_output(
+    episode_dir: Path,
+    clip_id: str,
+    variant_id: str = BACKGROUND_VARIANT_ID,
+) -> Path:
+    require_background_variant(variant_id)
+    return Path(episode_dir) / "short_variants" / variant_id / f"{clip_id}.mp4"
+
+
+def _record_path(
+    episode_dir: Path,
+    clip_id: str,
+    variant_id: str = BACKGROUND_VARIANT_ID,
+) -> Path:
+    return background_variant_output(episode_dir, clip_id, variant_id).with_suffix(
+        ".json"
     )
-
-
-def _record_path(episode_dir: Path, clip_id: str) -> Path:
-    return background_variant_output(episode_dir, clip_id).with_suffix(".json")
 
 
 def _scan(path: Path) -> dict:
@@ -196,10 +237,13 @@ def background_variant_fingerprint(
     base_identity: dict,
     asset: dict,
     encoding: dict,
+    *,
+    variant_id: str = BACKGROUND_VARIANT_ID,
 ) -> str:
+    require_background_variant_asset(variant_id, str(asset.get("asset_id", "")))
     return _json_revision(
         {
-            "variant_id": BACKGROUND_VARIANT_ID,
+            "variant_id": variant_id,
             "layout": BACKGROUND_LAYOUT_VERSION,
             "base": {
                 "render_fingerprint": base_record.get("fingerprint"),
@@ -219,9 +263,13 @@ def background_variant_fingerprint(
     )
 
 
-def variant_record(episode_dir: Path, clip_id: str) -> dict:
+def variant_record(
+    episode_dir: Path,
+    clip_id: str,
+    variant_id: str = BACKGROUND_VARIANT_ID,
+) -> dict:
     try:
-        value = json.loads(_record_path(episode_dir, clip_id).read_text())
+        value = json.loads(_record_path(episode_dir, clip_id, variant_id).read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -239,12 +287,14 @@ def record_background_variant(
     asset: dict,
     encoding: dict,
     captions: dict,
+    variant_id: str = BACKGROUND_VARIANT_ID,
 ) -> dict:
-    output = background_variant_output(episode_dir, clip_id)
+    require_background_variant_asset(variant_id, str(asset.get("asset_id", "")))
+    output = background_variant_output(episode_dir, clip_id, variant_id)
     output_content = file_content_identity(output)
     output_identity = output_content["scan_identity"]
     record = {
-        "variant_id": BACKGROUND_VARIANT_ID,
+        "variant_id": variant_id,
         "path": str(output.relative_to(episode_dir)),
         "render_mode": BACKGROUND_VARIANT_MODE,
         "layout_version": BACKGROUND_LAYOUT_VERSION,
@@ -277,7 +327,7 @@ def record_background_variant(
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
     # The renderer holds this variant's render_output_lock through this write.
-    atomic_write_json(_record_path(episode_dir, clip_id), record)
+    atomic_write_json(_record_path(episode_dir, clip_id, variant_id), record)
     return record
 
 
@@ -287,10 +337,12 @@ def background_variant_state(
     *,
     base_record: dict | None,
     encoding: dict,
+    variant_id: str = BACKGROUND_VARIANT_ID,
 ) -> tuple[dict, dict]:
     """Return a recorded variant and shared render-artifact state."""
-    output = background_variant_output(episode_dir, clip_id)
-    record = variant_record(episode_dir, clip_id)
+    require_background_variant(variant_id)
+    output = background_variant_output(episode_dir, clip_id, variant_id)
+    record = variant_record(episode_dir, clip_id, variant_id)
     expected = None
     stale_detail = None
     if base_record:
@@ -302,7 +354,7 @@ def background_variant_state(
             recorded_output = record.get("output")
             recorded_layout = record.get("layout_version")
             if (
-                record.get("variant_id") != BACKGROUND_VARIANT_ID
+                record.get("variant_id") != variant_id
                 or not isinstance(recorded_layout, str)
                 or record.get("encoding") != encoding
                 or not isinstance(recorded_base, dict)
@@ -327,6 +379,7 @@ def background_variant_state(
             asset_id = recorded_asset.get("asset_id")
             if not isinstance(asset_id, str):
                 raise TypeError("The variant manifest has no asset identity")
+            require_background_variant_asset(variant_id, asset_id)
             asset = load_background_asset(asset_id)
             if base_record.get("fingerprint") != recorded_base.get(
                 "fingerprint"
@@ -352,6 +405,7 @@ def background_variant_state(
                     base_identity,
                     asset,
                     encoding,
+                    variant_id=variant_id,
                 )
         except (KeyError, OSError, TypeError, ValueError) as exc:
             stale_detail = str(exc)
@@ -409,17 +463,23 @@ def background_variant_approval_state(
 
 
 def save_background_variant_approval(
-    episode_dir: Path, clip_id: str, expected_record: dict, revision: str
+    episode_dir: Path,
+    clip_id: str,
+    expected_record: dict,
+    revision: str,
+    variant_id: str = BACKGROUND_VARIANT_ID,
 ) -> dict | None:
     # The route holds this variant's render_output_lock through this write.
-    current = variant_record(episode_dir, clip_id)
+    current = variant_record(episode_dir, clip_id, variant_id)
     output_identity = (
         current.get("output", {}).get("scan_identity")
         if isinstance(current.get("output"), dict)
         else None
     )
     try:
-        live_output_identity = _scan(background_variant_output(episode_dir, clip_id))
+        live_output_identity = _scan(
+            background_variant_output(episode_dir, clip_id, variant_id)
+        )
     except OSError:
         live_output_identity = None
     if (
@@ -433,5 +493,5 @@ def save_background_variant_approval(
         "revision": revision,
         "approved_at": datetime.now(timezone.utc).isoformat(),
     }
-    atomic_write_json(_record_path(episode_dir, clip_id), updated)
+    atomic_write_json(_record_path(episode_dir, clip_id, variant_id), updated)
     return updated

@@ -51,10 +51,12 @@ from lib.paths import get_episodes_dir
 from lib.short_distribution import PLATFORM_COPY_FIELDS, SHORT_PLATFORM_SPECS
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
-    DEFAULT_BACKGROUND_ASSET_ID,
+    BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
     background_variant_approval_state,
+    background_variant_label,
     background_variant_state,
+    default_background_asset_id,
     require_background_variant,
     selected_short_variant_id,
 )
@@ -801,31 +803,51 @@ def episode_review_state(episode_dir: Path) -> dict:
             ),
             episode_id,
         )
-        variant_record, variant_render = background_variant_state(
-            episode_dir,
-            clip_id,
-            base_record=render_record if render["current"] else None,
-            encoding=variant_encoding,
-        )
-        variant_render = _with_media_url(variant_render, episode_id)
-        variant_revision = clip_review_revision(
-            clip, variant_record, approval_metadata_by_id.get(clip_id)
-        )
-        variant_asset = variant_record.get("asset")
-        variant_asset_id = (
-            variant_asset.get("asset_id") if isinstance(variant_asset, dict) else None
-        )
-        if not isinstance(variant_asset_id, str):
-            variant_asset_id = DEFAULT_BACKGROUND_ASSET_ID
         base_approval = _approval_state(
             clip,
             render,
             render_record,
             approval_metadata_by_id.get(clip_id),
         )
-        variant_approval = background_variant_approval_state(
-            variant_record, variant_render, variant_revision
-        )
+        variants = {}
+        variant_states = {}
+        for variant_id in BACKGROUND_VARIANT_IDS:
+            variant_record, variant_render = background_variant_state(
+                episode_dir,
+                clip_id,
+                base_record=render_record if render["current"] else None,
+                encoding=variant_encoding,
+                variant_id=variant_id,
+            )
+            variant_render = _with_media_url(variant_render, episode_id)
+            variant_revision = clip_review_revision(
+                clip, variant_record, approval_metadata_by_id.get(clip_id)
+            )
+            variant_approval = background_variant_approval_state(
+                variant_record, variant_render, variant_revision
+            )
+            variant_states[variant_id] = (variant_render, variant_approval)
+            if variant_id != BACKGROUND_VARIANT_ID and not variant_record:
+                continue
+            variant_asset = variant_record.get("asset")
+            variant_asset_id = (
+                variant_asset.get("asset_id")
+                if isinstance(variant_asset, dict)
+                else None
+            )
+            if not isinstance(variant_asset_id, str):
+                variant_asset_id = default_background_asset_id(variant_id)
+            variants[variant_id] = {
+                "id": variant_id,
+                "label": background_variant_label(variant_id),
+                "asset_id": variant_asset_id,
+                "render": variant_render,
+                "approval": variant_approval,
+                "render_job": render_job_state(
+                    episode_dir,
+                    variant_render_job_id(clip_id, variant_id),
+                ),
+            }
         raw_release_request = clip.get(DISTRIBUTION_RELEASE_FIELD)
         release_request = (
             raw_release_request if isinstance(raw_release_request, dict) else None
@@ -849,14 +871,19 @@ def episode_review_state(episode_dir: Path) -> dict:
                 **change_lock,
             }
         else:
-            selected_render = variant_render if selected_variant_id else render
-            selected_approval = (
-                variant_approval if selected_variant_id else base_approval
+            selected_render, selected_approval = (
+                variant_states[selected_variant_id]
+                if selected_variant_id
+                else (render, base_approval)
             )
             distribution = {
                 "version": selected_variant_id or "base",
                 "variant_id": selected_variant_id,
-                "label": "Motion background" if selected_variant_id else "Base",
+                "label": (
+                    background_variant_label(selected_variant_id)
+                    if selected_variant_id
+                    else "Base"
+                ),
                 "current": selected_render["current"],
                 "approval_current": selected_approval["current"],
                 "revision": selected_approval["revision"],
@@ -874,19 +901,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                     "distribution": distribution,
                     "metadata": _metadata_state(copy, destinations),
                     "render_job": render_job_state(episode_dir, clip_id),
-                    "variants": {
-                        BACKGROUND_VARIANT_ID: {
-                            "id": BACKGROUND_VARIANT_ID,
-                            "label": "Motion background",
-                            "asset_id": variant_asset_id,
-                            "render": variant_render,
-                            "approval": variant_approval,
-                            "render_job": render_job_state(
-                                episode_dir,
-                                variant_render_job_id(clip_id, BACKGROUND_VARIANT_ID),
-                            ),
-                        }
-                    },
+                    "variants": variants,
                 },
             }
         )

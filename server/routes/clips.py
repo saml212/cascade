@@ -30,11 +30,12 @@ from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
-    DEFAULT_BACKGROUND_ASSET_ID,
+    BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
     background_variant_output,
     background_variant_state,
+    default_background_asset_id,
     distribution_release_revision,
     require_background_variant,
     save_background_variant_approval,
@@ -84,7 +85,7 @@ class BulkClipRequest(BaseModel):
 
 
 class VariantRenderRequest(BaseModel):
-    asset_id: str = DEFAULT_BACKGROUND_ASSET_ID
+    asset_id: str | None = None
 
 
 class VariantApprovalRequest(BaseModel):
@@ -328,7 +329,9 @@ def _valid_release_request(value: object) -> bool:
             for field in _RELEASE_REQUEST_STRING_FIELDS
         )
         and "variant_id" in value
-        and value["variant_id"] in {None, BACKGROUND_VARIANT_ID}
+        and (
+            value["variant_id"] is None or value["variant_id"] in BACKGROUND_VARIANT_IDS
+        )
     ):
         return False
     if "unresolved_history_acknowledgement" not in value:
@@ -1614,7 +1617,7 @@ async def _run_clip_render_operation(
                         load_config(),
                         clip_id,
                         variant_id,
-                        asset_id or DEFAULT_BACKGROUND_ASSET_ID,
+                        asset_id or default_background_asset_id(variant_id),
                     )
                 else:
                     operation = (
@@ -1689,7 +1692,7 @@ async def render_clip_variant(
         episode_id,
         clip_id,
         variant_id=variant_id,
-        asset_id=req.asset_id if req else DEFAULT_BACKGROUND_ASSET_ID,
+        asset_id=req.asset_id if req else None,
     )
 
 
@@ -1711,7 +1714,7 @@ async def approve_clip_variant(
     from lib.delivery_video import render_config_for_episode, render_output_lock
     from lib.encoding import get_video_encoding_policy
 
-    with render_output_lock(background_variant_output(ep_dir, clip_id)):
+    with render_output_lock(background_variant_output(ep_dir, clip_id, variant_id)):
         base_record = _current_render(ep_dir, clip)
         try:
             episode = json.loads((ep_dir / "episode.json").read_text())
@@ -1721,7 +1724,11 @@ async def approve_clip_variant(
         except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         record, render = background_variant_state(
-            ep_dir, clip_id, base_record=base_record, encoding=encoding
+            ep_dir,
+            clip_id,
+            base_record=base_record,
+            encoding=encoding,
+            variant_id=variant_id,
         )
         revision = clip_review_revision(clip, record, _metadata_entry(ep_dir, clip_id))
         if req.expected_revision != revision:
@@ -1734,7 +1741,12 @@ async def approve_clip_variant(
                 status_code=409,
                 detail="This variant needs a current render before approval.",
             )
-        if save_background_variant_approval(ep_dir, clip_id, record, revision) is None:
+        if (
+            save_background_variant_approval(
+                ep_dir, clip_id, record, revision, variant_id
+            )
+            is None
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="The variant changed while approval was being saved.",

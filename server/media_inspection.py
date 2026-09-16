@@ -162,6 +162,7 @@ def resolve_target(
                 str(clip["id"]),
                 base_record=base_record,
                 encoding=get_video_encoding_policy(config, "shorts"),
+                variant_id=str(variant_id),
             )
             if not state["current"]:
                 raise ValueError("Current short_variant render is unavailable")
