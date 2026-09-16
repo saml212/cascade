@@ -371,6 +371,9 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
     )
 
     from lib.short_variants import (
+        GAMEPLAY_SURROUND_ASSET_SET_ID,
+        GAMEPLAY_SURROUND_ASSETS,
+        GAMEPLAY_SURROUND_VARIANT_ID,
         GTA_DRIVING_ASSET_ID,
         GTA_DRIVING_VARIANT_ID,
         MINECRAFT_PARKOUR_ASSET_ID,
@@ -406,11 +409,18 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
             SUBWAY_SURFERS_ASSET_ID,
         ),
         GTA_DRIVING_VARIANT_ID: ("GTA driving", GTA_DRIVING_ASSET_ID),
+        GAMEPLAY_SURROUND_VARIANT_ID: (
+            "Gameplay surround",
+            GAMEPLAY_SURROUND_ASSET_SET_ID,
+        ),
     }
     for variant_id, (label, asset_id) in expected.items():
         assert variants[variant_id]["label"] == label
         assert variants[variant_id]["asset_id"] == asset_id
         assert variants[variant_id]["render"]["status"] == "missing"
+    assert variants[GAMEPLAY_SURROUND_VARIANT_ID]["asset_ids"] == [
+        asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS
+    ]
     assert "satisfying_motion_v1" not in variants
 
 

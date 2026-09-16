@@ -677,8 +677,11 @@ class TestDistributionSelection:
         assert consumed["re_release_request_consumed"] is True
         assert consumed["re_release_allowed"] is False
 
-    def test_acknowledges_exact_legacy_history_for_motion_rerelease(
-        self, test_client, monkeypatch
+    @pytest.mark.parametrize(
+        "variant_id", ("background_motion_v1", "gameplay_surround_v1")
+    )
+    def test_acknowledges_exact_legacy_history_for_variant_rerelease(
+        self, test_client, monkeypatch, variant_id
     ):
         client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
@@ -729,7 +732,7 @@ class TestDistributionSelection:
             "artifact_identity": "unknown",
         }
         body = {
-            "variant_id": "background_motion_v1",
+            "variant_id": variant_id,
             "expected_revision": "sha256:selected-review",
             "request_id": "793321a8-a45d-41d5-99b6-b4310bd6de90",
             "actor": "release-operator",
@@ -767,7 +770,7 @@ class TestDistributionSelection:
         assert wrong_history.status_code == 409
         assert "history changed" in wrong_history.json()["detail"]
         assert base.status_code == 409
-        assert "current approved Motion replacement" in base.json()["detail"]
+        assert "current approved short-variant replacement" in base.json()["detail"]
         assert prepared.status_code == 200
         assert prepared.json()["status"] == "prepared"
         assert repeated.status_code == 200
@@ -785,7 +788,7 @@ class TestDistributionSelection:
             "obligations": obligations,
         }
         version = {
-            "variant_id": "background_motion_v1",
+            "variant_id": variant_id,
             "revision": "sha256:selected-review",
             "render_fingerprint": "sha256:selected-render",
         }
@@ -1383,6 +1386,7 @@ class TestClipMutation:
             ("minecraft_parkour_v1", "spicy_sauce_minecraft_12_v1"),
             ("subway_surfers_v1", "orbitalncg_subway_surfers_12_v1"),
             ("gta_driving_v1", "orbitalncg_gta_driving_15_v1"),
+            ("gameplay_surround_v1", "gameplay_surround_assets_v1"),
         ),
     )
     def test_gameplay_variant_render_uses_bound_asset_and_job_identity(

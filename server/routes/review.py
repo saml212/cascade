@@ -54,6 +54,7 @@ from lib.short_variants import (
     DISTRIBUTION_RELEASE_FIELD,
     SATISFYING_VARIANT_ID,
     background_variant_approval_state,
+    background_variant_asset_ids,
     background_variant_label,
     background_variant_state,
     default_background_asset_id,
@@ -837,10 +838,22 @@ def episode_review_state(episode_dir: Path) -> dict:
             )
             if not isinstance(variant_asset_id, str):
                 variant_asset_id = default_background_asset_id(variant_id)
+            variant_asset_ids = (
+                [
+                    item.get("asset_id")
+                    for item in variant_asset.get("assets", [])
+                    if isinstance(item, dict) and isinstance(item.get("asset_id"), str)
+                ]
+                if isinstance(variant_asset, dict)
+                else []
+            )
+            if not variant_asset_ids:
+                variant_asset_ids = list(background_variant_asset_ids(variant_id))
             variants[variant_id] = {
                 "id": variant_id,
                 "label": background_variant_label(variant_id),
                 "asset_id": variant_asset_id,
+                "asset_ids": variant_asset_ids,
                 "render": variant_render,
                 "approval": variant_approval,
                 "render_job": render_job_state(

@@ -29,7 +29,6 @@ from lib.clips import (
 from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
-    BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
@@ -349,7 +348,7 @@ def _valid_release_request(value: object) -> bool:
         return True
     acknowledgement = value["unresolved_history_acknowledgement"]
     if not (
-        value["variant_id"] == BACKGROUND_VARIANT_ID
+        value["variant_id"] in BACKGROUND_VARIANT_IDS
         and isinstance(acknowledgement, dict)
         and set(acknowledgement) == {"receipt_history_revision", "obligations"}
         and acknowledgement.get("receipt_history_revision")
@@ -903,13 +902,13 @@ def _prepare_clip_rerelease_locked(
             if (
                 eligibility.get("unresolved_history_acknowledgement_allowed")
                 is not True
-                or req.variant_id != BACKGROUND_VARIANT_ID
+                or req.variant_id not in BACKGROUND_VARIANT_IDS
             ):
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         "Only pre-schema unresolved history can be acknowledged "
-                        "for a current approved Motion replacement."
+                        "for a current approved short-variant replacement."
                     ),
                 )
             if (

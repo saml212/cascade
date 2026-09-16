@@ -15,13 +15,15 @@ from agents.shorts_render import (
     render_single_clip,
     repair_single_clip_audio,
 )
-from lib.ass import DEFAULT_MARGIN_V
+from lib.ass import DEFAULT_MARGIN_V, build_ass, generate_ass_from_diarized
 from lib.delivery_video import (
     audio_packet_signature,
     ffmpeg_executable,
     render_space_budget,
 )
 from lib.encoding import get_video_encoding_policy
+from lib.ffprobe import probe as ffprobe_probe
+from lib.short_variants import GAMEPLAY_SURROUND_VARIANT_ID
 from lib.timeline import Timeline
 
 
@@ -255,6 +257,258 @@ def test_background_composition_keeps_trailing_aac_packet(
     )
 
     assert audio_packet_signature(output) == audio_packet_signature(base)
+
+
+def test_gameplay_surround_podcast_column_keeps_every_configured_speaker(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {
+                "center_x": 450,
+                "center_y": 500,
+                "zoom": 1.4,
+                "longform_center_x": 480,
+                "longform_center_y": 480,
+                "longform_zoom": 1,
+            },
+            {
+                "center_x": 1470,
+                "center_y": 520,
+                "zoom": 1.4,
+                "longform_center_x": 1440,
+                "longform_center_y": 500,
+                "longform_zoom": 1,
+            },
+        ]
+    }
+
+    video_filter = agent._get_gameplay_surround_podcast_filter_no_subs(
+        1920, 1080, crop_config
+    )
+
+    assert video_filter.startswith("split=2[surround0][surround1]")
+    assert video_filter.count("scale=540:572") == 2
+    assert "[row0][row1]vstack=inputs=2" in video_filter
+    assert "drawbox=x=0:y=569:w=540:h=6" in video_filter
+
+
+def test_gameplay_surround_requires_reviewed_layout_above_three_speakers(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {"center_x": 100 + index * 100, "center_y": 90, "zoom": 1}
+            for index in range(4)
+        ]
+    }
+
+    with pytest.raises(ValueError, match="reviewed layout for more than 3"):
+        agent._get_gameplay_surround_podcast_filter_no_subs(640, 360, crop_config)
+
+
+def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    commands = []
+    agent._run_ffmpeg = lambda command, **_kwargs: commands.append(command)
+    assets = [
+        {
+            "role": "subway",
+            "path": tmp_episode_dir / "subway.mp4",
+            "playback_start_seconds": 7.25,
+            "focus_x": 0.4,
+            "focus_y": 0.5,
+            "fit_mode": "stretch",
+        },
+        {
+            "role": "gta",
+            "path": tmp_episode_dir / "gta.mp4",
+            "playback_start_seconds": 11.5,
+            "focus_x": 0.6,
+            "focus_y": 0.5,
+        },
+        {
+            "role": "minecraft",
+            "path": tmp_episode_dir / "minecraft.mp4",
+            "playback_start_seconds": 18,
+            "focus_x": 0.55,
+            "focus_y": 0.45,
+        },
+    ]
+
+    agent._compose_gameplay_surround_variant(
+        tmp_episode_dir / "podcast.mp4",
+        assets,
+        tmp_episode_dir / "base.mp4",
+        tmp_episode_dir / "captions.ass",
+        tmp_episode_dir / "variant.mp4",
+        "30/1",
+        ["-c:v", "libx264"],
+    )
+
+    graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "[1:v]trim=start=7.250000,setpts=PTS-STARTPTS" in graph
+    assert "[2:v]trim=start=11.500000,setpts=PTS-STARTPTS" in graph
+    assert "[3:v]trim=start=18.000000,setpts=PTS-STARTPTS" in graph
+    assert "[1:v]trim=start=7.250000,setpts=PTS-STARTPTS,scale=270:1216" in graph
+    assert "crop=270:1216:(iw-ow)*0.400000:(ih-oh)*0.500000" not in graph
+    assert "crop=270:1216:(iw-ow)*0.600000:(ih-oh)*0.500000" in graph
+    assert "crop=1080:704:(iw-ow)*0.550000:(ih-oh)*0.450000" in graph
+    assert (
+        "drawtext=text='thelocalpod.link':fontcolor=white:fontsize=36:"
+        "x=(w-text_w)/2:y=1286" in graph
+    )
+
+
+def test_gameplay_surround_captions_stay_inside_center_column(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    style = agent._caption_style({"variant_id": GAMEPLAY_SURROUND_VARIANT_ID})
+
+    assert style.margin_l == 300
+    assert style.margin_r == 300
+    assert style.font_size == 52
+    ass = build_ass([], style)
+    style_line = next(line for line in ass.splitlines() if line.startswith("Style:"))
+    assert ",2,300,300,840,1" in style_line
+
+
+def _sample_rgb(ffmpeg: str, path, x: int, y: int) -> tuple[int, int, int]:
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-ss",
+            "0.4",
+            "-i",
+            str(path),
+            "-vf",
+            f"crop=1:1:{x}:{y},format=rgb24",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return tuple(result.stdout[:3])
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
+    tmp_episode_dir, sample_config
+):
+    ffmpeg = ffmpeg_executable()
+    podcast = tmp_episode_dir / "podcast.mp4"
+    subway = tmp_episode_dir / "subway.mp4"
+    gta = tmp_episode_dir / "gta.mp4"
+    minecraft = tmp_episode_dir / "minecraft.mp4"
+    base = tmp_episode_dir / "base-surround.mp4"
+    captions = tmp_episode_dir / "surround.ass"
+    output = tmp_episode_dir / "surround.mp4"
+    for path, color, size in (
+        (podcast, "yellow", "540x1144"),
+        (subway, "blue", "160x284"),
+        (gta, "red", "160x284"),
+        (minecraft, "green", "320x180"),
+    ):
+        subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color={color}:size={size}:rate=30:duration=1",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(path),
+            ],
+            check=True,
+        )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=1080x1920:rate=30:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1.05",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-y",
+            str(base),
+        ],
+        check=True,
+    )
+    generate_ass_from_diarized({"utterances": []}, 0, 1, captions)
+    assets = [
+        {"role": "subway", "path": subway},
+        {"role": "gta", "path": gta},
+        {"role": "minecraft", "path": minecraft},
+    ]
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    agent._compose_gameplay_surround_variant(
+        podcast,
+        assets,
+        base,
+        captions,
+        output,
+        "30/1",
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            "1M",
+            "-maxrate",
+            "2M",
+            "-bufsize",
+            "4M",
+        ],
+    )
+
+    stream = next(
+        item
+        for item in ffprobe_probe(output)["streams"]
+        if item["codec_type"] == "video"
+    )
+    assert (stream["width"], stream["height"]) == (1080, 1920)
+    assert audio_packet_signature(output) == audio_packet_signature(base)
+
+    left = _sample_rgb(ffmpeg, output, 100, 600)
+    center = _sample_rgb(ffmpeg, output, 540, 600)
+    right = _sample_rgb(ffmpeg, output, 980, 600)
+    bottom = _sample_rgb(ffmpeg, output, 540, 1500)
+    assert left[2] > left[0] + 80 and left[2] > left[1] + 80
+    assert center[0] > 180 and center[1] > 180 and center[2] < 80
+    assert right[0] > right[1] + 80 and right[0] > right[2] + 80
+    assert bottom[1] > bottom[0] + 40 and bottom[1] > bottom[2] + 40
 
 
 def test_background_caption_margin_stays_above_motion_panel():

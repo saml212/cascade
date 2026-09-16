@@ -63,6 +63,7 @@ import {
   clipDistributionSelectable,
   clipReReleaseViewState,
   clipVersionState,
+  clipVariantForSurface,
   confirmsClipReRelease,
   ClipReReleaseDraftStore,
   ClipReviewSurfaceMemory,
@@ -1019,11 +1020,16 @@ function clipExpanded(
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
-  const background = review.variants?.background_motion_v1;
-  const hasBackground = Boolean(background);
+  const variantSurfaces = (['background', 'gameplay'] as const).filter(
+    (candidate) => Boolean(clipVariantForSurface(review, candidate))
+  );
+  const availableSurfaces = new Set<ClipReviewSurface>([
+    'base',
+    ...variantSurfaces,
+  ]);
   const selectedSurface = selectedDistributionVersion(review)?.surface ?? 'base';
   const surface = signal<ClipReviewSurface>(
-    reviewSurfaces.get(clipId, hasBackground, selectedSurface)
+    reviewSurfaces.get(clipId, availableSurfaces, selectedSurface)
   );
   const selectSurface = (next: ClipReviewSurface): void => {
     reviewSurfaces.select(clipId, next);
@@ -1031,7 +1037,11 @@ function clipExpanded(
   };
   const rendering = signal(
     review.render_job.status === 'rendering' ||
-      background?.render_job.status === 'rendering'
+      variantSurfaces.some(
+        (candidate) =>
+          clipVariantForSurface(review, candidate)?.render_job.status ===
+          'rendering'
+      )
   );
   const selectingDistribution = signal(false);
   return h(
@@ -1044,7 +1054,6 @@ function clipExpanded(
     renderReviewChoice(
       clipId,
       review,
-      background,
       surface,
       selectSurface,
       navigation,
@@ -1055,7 +1064,6 @@ function clipExpanded(
       clipId,
       clip,
       review,
-      background,
       surface,
       rendering,
       selectingDistribution,
@@ -1077,14 +1085,16 @@ function clipExpanded(
 function renderReviewChoice(
   clipId: string,
   review: ClipReviewState,
-  background: ShortVariantReview | undefined,
   surface: Signal<ClipReviewSurface>,
   selectSurface: (surface: ClipReviewSurface) => void,
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
   const base = review.render;
-  if (!background) {
+  const variantSurfaces = (['background', 'gameplay'] as const).filter(
+    (candidate) => Boolean(clipVariantForSurface(review, candidate))
+  );
+  if (variantSurfaces.length === 0) {
     return renderReviewPlayer(clipId, base, navigation, setExpanded);
   }
   const controls = h('div', {
@@ -1109,11 +1119,14 @@ function renderReviewChoice(
         label: 'Base',
         onClick: () => selectSurface('base'),
       }),
-      Button({
-        variant: selected === 'background' ? 'primary' : 'secondary',
-        size: 'sm',
-        label: 'Background',
-        onClick: () => selectSurface('background'),
+      ...variantSurfaces.map((candidate) => {
+        const candidateVersion = clipVersionState(review, candidate);
+        return Button({
+          variant: selected === candidate ? 'primary' : 'secondary',
+          size: 'sm',
+          label: candidateVersion?.label ?? 'Variant',
+          onClick: () => selectSurface(candidate),
+        });
       }),
       h(
         'span',
@@ -1135,13 +1148,17 @@ function renderReviewChoice(
       )
     );
     player.querySelector('video')?.pause();
+    const versionLabel =
+      selected === 'base'
+        ? 'base render'
+        : `${version?.label ?? 'variant'} render`;
     player.replaceChildren(
       renderReviewPlayer(
         clipId,
-        selected === 'background' ? background.render : base,
+        version?.render ?? base,
         navigation,
         setExpanded,
-        selected === 'background' ? 'background variant' : 'base render'
+        versionLabel
       )
     );
   });
@@ -1171,8 +1188,8 @@ function renderReviewPlayer(
       h(
         'p',
         { class: 'text-body-sm text-ink-tertiary mt-1' },
-        versionLabel === 'background variant'
-          ? 'Render the motion version to inspect framing, captions, audio, and timing.'
+        versionLabel !== 'base render'
+          ? `Render the ${versionLabel.replace(' render', '').toLowerCase()} version to inspect framing, captions, audio, and timing.`
           : 'Render this candidate to inspect framing, captions, audio, and timing.'
       )
     );
@@ -1233,7 +1250,10 @@ function renderReviewPlayer(
             download:
               versionLabel === 'base render'
                 ? `${clipId}.mp4`
-                : `${clipId}-background.mp4`,
+                : `${clipId}-${versionLabel
+                    .replace(' render', '')
+                    .toLowerCase()
+                    .replaceAll(' ', '-')}.mp4`,
             class:
               'text-body-sm text-ink-secondary hover:text-ink-primary underline underline-offset-4',
           },
@@ -1284,7 +1304,6 @@ function renderChoiceActions(
   clipId: string,
   clip: UnknownRecord,
   review: ClipReviewState,
-  background: ShortVariantReview | undefined,
   surface: Signal<ClipReviewSurface>,
   rendering: Signal<boolean>,
   selectingDistribution: Signal<boolean>,
@@ -1301,34 +1320,52 @@ function renderChoiceActions(
     approvalFeedback,
     reload
   );
-  if (!background) return base;
-  const variant = renderVariantActions(
-    episodeId,
-    clipId,
-    background,
-    review,
-    review.render.current,
-    rendering,
-    selectingDistribution,
-    reload
+  const variants = (['background', 'gameplay'] as const).flatMap(
+    (candidate) => {
+      const variant = clipVariantForSurface(review, candidate);
+      return variant
+        ? [
+            {
+              surface: candidate,
+              element: renderVariantActions(
+                episodeId,
+                clipId,
+                variant,
+                candidate,
+                review,
+                review.render.current,
+                rendering,
+                selectingDistribution,
+                reload
+              ),
+            },
+          ]
+        : [];
+    }
   );
+  if (variants.length === 0) return base;
   effect(() => {
     base.classList.toggle('hidden', surface() !== 'base');
-    variant.classList.toggle('hidden', surface() !== 'background');
+    for (const variant of variants) {
+      variant.element.classList.toggle('hidden', surface() !== variant.surface);
+    }
   });
-  return h('div', null, base, variant);
+  return h('div', null, base, ...variants.map((variant) => variant.element));
 }
 
 function renderVariantActions(
   episodeId: string,
   clipId: string,
-  background: ShortVariantReview,
+  variant: ShortVariantReview,
+  surface: Exclude<ClipReviewSurface, 'base'>,
   review: ClipReviewState,
   baseCurrent: boolean,
   rendering: Signal<boolean>,
   selectingDistribution: Signal<boolean>,
   reload: () => Promise<void>
 ): HTMLElement {
+  const label = variant.label || 'Variant';
+  const lowerLabel = label.toLowerCase();
   const action = h('span');
   effect(() => {
     const active = rendering();
@@ -1338,41 +1375,38 @@ function renderVariantActions(
         size: 'sm',
         label: !baseCurrent
           ? 'Render base first'
-          : background.approval.current
-          ? 'Background approved'
-          : background.render.current
-            ? 'Approve background'
+          : variant.approval.current
+          ? `${label} approved`
+          : variant.render.current
+            ? `Approve ${lowerLabel}`
             : active
-              ? 'Rendering background…'
-              : background.render.playable
-                ? 'Re-render background'
-                : 'Render background',
-        disabled: !baseCurrent || background.approval.current || active,
+              ? `Rendering ${lowerLabel}…`
+              : variant.render.playable
+                ? `Re-render ${lowerLabel}`
+                : `Render ${lowerLabel}`,
+        disabled: !baseCurrent || variant.approval.current || active,
         loading: active,
         onClick: async () => {
           try {
-            if (background.render.current) {
+            if (variant.render.current) {
               await api.approveClipVariant(
                 episodeId,
                 clipId,
-                background.id,
-                background.approval.revision
+                variant.id,
+                variant.approval.revision
               );
-              showToast(
-                'Background version approved for this render and copy.',
-                'success'
-              );
+              showToast(`${label} approved for this render and copy.`, 'success');
             } else {
               rendering.set(true);
-              showToast('Rendering the background version locally…');
+              showToast(`Rendering ${lowerLabel} locally…`);
               await api.renderClipVariant(
                 episodeId,
                 clipId,
-                background.id,
-                background.asset_id
+                variant.id,
+                variant.asset_id
               );
               showToast(
-                'Background version rendered. Review it before approval.',
+                `${label} rendered. Review it before approval.`,
                 'success'
               );
             }
@@ -1394,14 +1428,18 @@ function renderVariantActions(
       episodeId,
       clipId,
       review,
-      'background',
+      surface,
       selectingDistribution,
       reload
     ),
     h(
       'span',
       { class: 'text-body-sm text-ink-tertiary' },
-      `Uses ${background.asset_id.replaceAll('_', ' ')}. Base approval and delivery stay separate.`
+      `Uses ${(
+        variant.asset_ids?.length ? variant.asset_ids : [variant.asset_id]
+      )
+        .map((assetId) => assetId.replaceAll('_', ' '))
+        .join(', ')}. Base approval and delivery stay separate.`
     )
   );
 }

@@ -44,7 +44,7 @@ from lib.short_distribution import (
     validate_destination_media,
 )
 from lib.short_variants import (
-    BACKGROUND_VARIANT_ID,
+    BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
     background_variant_output,
@@ -1304,7 +1304,7 @@ def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> b
     if isinstance(acknowledgement, dict):
         acknowledgement_valid = bool(
             acknowledgement_allowed
-            and version.get("variant_id") == BACKGROUND_VARIANT_ID
+            and version.get("variant_id") in BACKGROUND_VARIANT_IDS
             and acknowledgement
             == {
                 "receipt_history_revision": history_revision,

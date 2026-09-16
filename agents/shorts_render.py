@@ -53,12 +53,15 @@ from lib.loudness import (
 )
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
+    GAMEPLAY_SURROUND_RENDER_PLAN,
+    GAMEPLAY_SURROUND_VARIANT_ID,
     background_variant_fingerprint,
     background_variant_output,
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
     load_background_asset,
+    load_background_variant_asset,
     record_background_variant,
     require_background_variant,
     require_background_variant_asset,
@@ -179,14 +182,30 @@ class ShortsRenderAgent(BaseAgent):
         base_identity = scan_identity(base_path)
         if base_identity is None:
             raise OSError("Canonical short changed while its identity was read")
-        asset = load_background_asset(asset_id, verify_content=True)
-        asset_probe = ffprobe(asset["path"])
-        if not any(
-            item.get("codec_type") == "video" for item in asset_probe["streams"]
-        ):
-            raise ValueError("Background asset has no video stream")
-        if any(item.get("codec_type") == "audio" for item in asset_probe["streams"]):
-            raise ValueError("Background assets must be silent")
+        asset = (
+            load_background_variant_asset(variant_id, verify_content=True)
+            if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+            else load_background_asset(asset_id, verify_content=True)
+        )
+        media_assets = asset.get("assets", [asset])
+        for media_asset in media_assets:
+            asset_probe = ffprobe(media_asset["path"])
+            if not any(
+                item.get("codec_type") == "video" for item in asset_probe["streams"]
+            ):
+                raise ValueError("Background asset has no video stream")
+            if any(
+                item.get("codec_type") == "audio" for item in asset_probe["streams"]
+            ):
+                raise ValueError("Background assets must be silent")
+            if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+                asset_duration = float(asset_probe["format"]["duration"])
+                playback_start = float(media_asset.get("playback_start_seconds", 0.0))
+                if asset_duration - playback_start < base_duration:
+                    raise ValueError(
+                        "Gameplay assets must provide enough in-game footage after "
+                        "their playback start for the complete sample"
+                    )
 
         encoding = get_video_encoding_policy(self.config, "shorts")
         fingerprint = background_variant_fingerprint(
@@ -321,6 +340,133 @@ class ShortsRenderAgent(BaseAgent):
             check=True,
         )
 
+    def _compose_gameplay_surround_variant(
+        self,
+        podcast_video: Path,
+        assets: list[dict],
+        base_short: Path,
+        caption_path: Path,
+        output: Path,
+        fps: str,
+        encoder_args: list[str],
+    ) -> None:
+        """Compose the approved four-panel layout without touching base audio."""
+        by_role = {item["role"]: item for item in assets}
+        required = {"subway", "gta", "minecraft"}
+        if set(by_role) != required:
+            raise ValueError("Gameplay surround requires subway, gta, and minecraft")
+        plan = GAMEPLAY_SURROUND_RENDER_PLAN
+        upper_h = plan["upper_height"]
+        bottom_h = plan["bottom_height"]
+        side_w = plan["left_width"]
+        podcast_w = plan["podcast_width"]
+        header_h = plan["podcast_header_height"]
+        podcast_h = upper_h - header_h
+        border = plan["panel_border"]
+        brand = plan["brand"]
+        brand_font_size = plan["brand_font_size"]
+        brand_y = plan["brand_y"]
+        subtitle_filter = f"subtitles='{escape_srt_path(caption_path)}'"
+        subway = by_role["subway"]
+        gta = by_role["gta"]
+        minecraft = by_role["minecraft"]
+
+        def playback_filter(asset: dict) -> str:
+            start = float(asset.get("playback_start_seconds", 0.0))
+            return f"trim=start={start:.6f},setpts=PTS-STARTPTS,"
+
+        def focus_crop(asset: dict, width: int, height: int) -> str:
+            focus_x = float(asset.get("focus_x", 0.5))
+            focus_y = float(asset.get("focus_y", 0.5))
+            return f"crop={width}:{height}:(iw-ow)*{focus_x:.6f}:(ih-oh)*{focus_y:.6f}"
+
+        def panel_fit(asset: dict, width: int, height: int) -> str:
+            if asset.get("fit_mode", "crop") == "stretch":
+                return f"scale={width}:{height}"
+            return (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"{focus_crop(asset, width, height)}"
+            )
+
+        graph = (
+            f"[0:v]scale={podcast_w}:{podcast_h},setsar=1,"
+            "tpad=stop_mode=clone:stop_duration=0.25[podcast];"
+            f"color=c=0x10151d:s={podcast_w}x{header_h}:r={fps},"
+            "drawtext=text='THE LOCAL PODCAST':fontcolor=white:fontsize=28:"
+            "x=(w-text_w)/2:y=(h-text_h)/2[header];"
+            "[header][podcast]vstack=inputs=2[center];"
+            f"[1:v]{playback_filter(subway)}"
+            f"{panel_fit(subway, side_w, upper_h)},fps={fps},setsar=1,"
+            "drawtext=text='SUBWAY SURFERS':fontcolor=white:fontsize=22:"
+            "x=(w-text_w)/2:y=24:box=1:boxcolor=black@0.62:boxborderw=8[left];"
+            f"[2:v]{playback_filter(gta)}"
+            f"{panel_fit(gta, side_w, upper_h)},fps={fps},setsar=1,"
+            "drawtext=text='GTA DRIVING':fontcolor=white:fontsize=22:"
+            "x=(w-text_w)/2:y=24:box=1:boxcolor=black@0.62:boxborderw=8[right];"
+            f"[3:v]{playback_filter(minecraft)}"
+            f"{panel_fit(minecraft, 1080, bottom_h)},fps={fps},setsar=1,"
+            "drawtext=text='MINECRAFT PARKOUR':fontcolor=white:fontsize=24:"
+            "x=24:y=24:box=1:boxcolor=black@0.62:boxborderw=8[bottom];"
+            "[left][center][right]hstack=inputs=3[upper];"
+            "[upper][bottom]vstack=inputs=2[canvas];"
+            f"[canvas]drawbox=x={side_w - border // 2}:y=0:w={border}:h={upper_h}:"
+            "color=black@0.88:t=fill,"
+            f"drawbox=x={side_w + podcast_w - border // 2}:y=0:w={border}:"
+            f"h={upper_h}:color=black@0.88:t=fill,"
+            f"drawbox=x=0:y={upper_h - border // 2}:w=1080:h={border}:"
+            "color=black@0.88:t=fill,"
+            f"drawtext=text='{brand}':fontcolor=white:fontsize={brand_font_size}:"
+            f"x=(w-text_w)/2:y={brand_y}:box=1:boxcolor=black@0.72:"
+            f"boxborderw=14,{subtitle_filter},format=yuv420p[variant]"
+        )
+        self._run_ffmpeg(
+            [
+                ffmpeg_executable(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(podcast_video),
+                "-stream_loop",
+                "-1",
+                "-i",
+                str(by_role["subway"]["path"]),
+                "-stream_loop",
+                "-1",
+                "-i",
+                str(by_role["gta"]["path"]),
+                "-stream_loop",
+                "-1",
+                "-i",
+                str(by_role["minecraft"]["path"]),
+                "-i",
+                str(base_short),
+                "-filter_complex",
+                graph,
+                "-map",
+                "[variant]",
+                "-map",
+                "4:a:0",
+                *encoder_args,
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-shortest",
+                *get_color_metadata_args(),
+                "-use_editlist",
+                "0",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
     def _finish_background_variant(
         self,
         podcast_video: Path,
@@ -329,20 +475,32 @@ class ShortsRenderAgent(BaseAgent):
         suppress_motion: list[tuple[float, float]],
         encoder_args: list[str],
         background: dict,
+        caption_path: Path,
     ) -> dict:
         base_path = background["base_path"]
         asset = background["asset"]
         base_signature = audio_packet_signature(base_path, runner=self._run_ffmpeg)
         with staged_render_output(output) as staged:
-            self._compose_background_variant(
-                podcast_video,
-                asset["path"],
-                base_path,
-                staged,
-                fps,
-                suppress_motion,
-                encoder_args,
-            )
+            if background["variant_id"] == GAMEPLAY_SURROUND_VARIANT_ID:
+                self._compose_gameplay_surround_variant(
+                    podcast_video,
+                    asset["assets"],
+                    base_path,
+                    caption_path,
+                    staged,
+                    fps,
+                    encoder_args,
+                )
+            else:
+                self._compose_background_variant(
+                    podcast_video,
+                    asset["path"],
+                    base_path,
+                    staged,
+                    fps,
+                    suppress_motion,
+                    encoder_args,
+                )
             media = validate_av_output(staged, background["base_duration"])
             if (media["width"], media["height"]) != (1080, 1920):
                 raise RuntimeError("Background variant must be 1080x1920")
@@ -360,21 +518,28 @@ class ShortsRenderAgent(BaseAgent):
             }
             if scan_identity(base_path) != background["base_identity"]:
                 raise RuntimeError("Canonical short changed during variant render")
-            if (
-                file_content_identity(asset["path"], asset["content_revision"])[
-                    "scan_identity"
-                ]
-                != asset["scan_identity"]
-            ):
-                raise RuntimeError("Background asset changed during variant render")
+            for media_asset in asset.get("assets", [asset]):
+                if (
+                    file_content_identity(
+                        media_asset["path"], media_asset["content_revision"]
+                    )["scan_identity"]
+                    != media_asset["scan_identity"]
+                ):
+                    raise RuntimeError("Background asset changed during variant render")
         return media
 
     @staticmethod
     def _variant_result(output: Path, record: dict, *, reused: bool) -> dict:
+        recorded_asset = record.get("asset", {})
         return {
             "clip_id": output.stem,
             "variant_id": record.get("variant_id"),
-            "asset_id": record.get("asset", {}).get("asset_id"),
+            "asset_id": recorded_asset.get("asset_id"),
+            "asset_ids": [
+                item.get("asset_id")
+                for item in recorded_asset.get("assets", [])
+                if isinstance(item, dict)
+            ],
             "output_path": str(output),
             "reused": reused,
             "render": record,
@@ -687,11 +852,10 @@ class ShortsRenderAgent(BaseAgent):
         render_segments = build_render_segments(timeline, segments, frame_rate=fps)
         render_segments = self._apply_overlap_policy(render_segments)
         captions = rebase_diarized(diarized, timeline)
-        style = (
-            CaptionStyle(margin_v=BACKGROUND_CAPTION_MARGIN_V)
-            if background
-            else CaptionStyle()
+        gameplay_surround = bool(
+            background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID
         )
+        style = self._caption_style(background)
         three_person_stack_enabled = self._three_person_stack_enabled(
             episode,
             crop_config,
@@ -741,25 +905,30 @@ class ShortsRenderAgent(BaseAgent):
                 filters = []
                 if lut_filter:
                     filters.append(lut_filter)
-                crop_filter = (
-                    self._get_background_crop_filter_no_subs(
+                if gameplay_surround:
+                    crop_filter = self._get_gameplay_surround_podcast_filter_no_subs(
+                        src_w,
+                        src_h,
+                        crop_config,
+                    )
+                elif background:
+                    crop_filter = self._get_background_crop_filter_no_subs(
                         segment["speaker"],
                         src_w,
                         src_h,
                         crop_config,
                         three_person_stack=three_person,
                     )
-                    if background
-                    else self._get_short_crop_filter_no_subs(
+                else:
+                    crop_filter = self._get_short_crop_filter_no_subs(
                         segment["speaker"],
                         src_w,
                         src_h,
                         crop_config,
                         three_person_stack=three_person_stack_enabled,
                     )
-                )
                 filters.append(crop_filter)
-                if "Dialogue:" in segment_ass.read_text():
+                if not gameplay_surround and "Dialogue:" in segment_ass.read_text():
                     filters.append(f"subtitles='{escape_srt_path(segment_ass)}'")
                 segment_path = scratch / f"segment_{index:03d}.mp4"
                 render_video_segment(
@@ -791,6 +960,7 @@ class ShortsRenderAgent(BaseAgent):
                     ],
                     encoder_args,
                     background,
+                    caption_path,
                 )
                 if background
                 else mux_timeline_audio(
@@ -952,6 +1122,105 @@ class ShortsRenderAgent(BaseAgent):
         ):
             return CaptionStyle(margin_v=THREE_PERSON_STACK_CAPTION_MARGIN_V)
         return CaptionStyle()
+
+    @staticmethod
+    def _caption_style(background: dict | None) -> CaptionStyle:
+        if background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID:
+            return CaptionStyle(
+                font_size=52,
+                margin_l=300,
+                margin_r=300,
+                margin_v=BACKGROUND_CAPTION_MARGIN_V,
+            )
+        if background:
+            return CaptionStyle(margin_v=BACKGROUND_CAPTION_MARGIN_V)
+        return CaptionStyle()
+
+    def _get_gameplay_surround_podcast_filter_no_subs(
+        self, src_w: int, src_h: int, crop_config: dict
+    ) -> str:
+        """Show every configured speaker in the narrow center podcast column."""
+        speakers = crop_config.get("speakers", [])
+        if not speakers:
+            return (
+                "scale=540:1144:force_original_aspect_ratio=decrease:"
+                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
+                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+            )
+
+        if len(speakers) > 3:
+            raise ValueError(
+                "Gameplay surround needs a reviewed layout for more than 3 speakers"
+            )
+        count = len(speakers)
+        if count == 1:
+            return (
+                "scale=540:1144:force_original_aspect_ratio=decrease:"
+                "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
+                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+            )
+        base_height = (1144 // count) // 2 * 2
+        target_heights = [base_height] * count
+        target_heights[-1] += 1144 - sum(target_heights)
+        anchors = []
+        for index in range(count):
+            center_x, center_y, zoom, _ = resolve_speaker(
+                f"speaker_{index}", src_w, src_h, crop_config, for_shorts=False
+            )
+            anchors.append((center_x, index, center_y, zoom))
+
+        regions = []
+        for row, (center_x, index, center_y, zoom) in enumerate(sorted(anchors)):
+            target_h = target_heights[row]
+            _, _, anchor_w, _ = compute_crop(
+                src_w, src_h, center_x, center_y, zoom, "speaker"
+            )
+            target_ratio = 540 / target_h
+            viewport_w = min(float(src_w), float(anchor_w))
+            viewport_h = viewport_w / target_ratio
+            if viewport_h > src_h:
+                viewport_h = float(src_h)
+                viewport_w = viewport_h * target_ratio
+            viewport_w = max(2, int(viewport_w) // 2 * 2)
+            viewport_h = max(2, int(viewport_h) // 2 * 2)
+            x = max(0, min(round(center_x - viewport_w / 2), src_w - viewport_w))
+            headroom = viewport_h * BACKGROUND_PANEL_HEADROOM_FRACTION
+            y = max(
+                0,
+                min(round(center_y - viewport_h / 2 - headroom), src_h - viewport_h),
+            )
+            regions.append((index, viewport_w, viewport_h, x // 2 * 2, y // 2 * 2))
+
+        panels = []
+        labels = []
+        for row, (index, width, height, x, y) in enumerate(regions):
+            target_h = target_heights[row]
+            panels.append(
+                f"[surround{index}]crop={width}:{height}:{x}:{y},"
+                f"{get_scale_filter(540, target_h)},format=yuv420p[row{row}]"
+            )
+            labels.append(f"[row{row}]")
+        separators = []
+        cursor = 0
+        for height in target_heights[:-1]:
+            cursor += height
+            separators.append(
+                f"drawbox=x=0:y={cursor - 3}:w=540:h=6:color=black@0.85:t=fill"
+            )
+        chain = (
+            f"split={count}"
+            + "".join(f"[surround{index}]" for index in range(count))
+            + ";"
+            + ";".join(panels)
+            + ";"
+            + "".join(labels)
+            + f"vstack=inputs={count}"
+        )
+        if separators:
+            chain += "," + ",".join(separators)
+        chain += ",format=yuv420p"
+        polish = get_video_polish_filters(self.config)
+        return f"{chain},{polish}" if polish else chain
 
     def _get_background_crop_filter_no_subs(
         self,

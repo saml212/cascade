@@ -4,15 +4,34 @@ import type {
   PrepareClipReReleaseRequest,
   PrepareClipReReleaseResponse,
   ReviewArtifact,
+  ShortVariantReview,
 } from './api';
 import type { StatusDescriptor } from './format';
 
-export type ClipReviewSurface = 'base' | 'background';
+export type ClipReviewSurface = 'base' | 'background' | 'gameplay';
+export type ClipVariantId = 'background_motion_v1' | 'gameplay_surround_v1';
+
+function isClipVariantId(value: unknown): value is ClipVariantId {
+  return value === 'background_motion_v1' || value === 'gameplay_surround_v1';
+}
+
+function variantSurface(variantId: ClipVariantId): ClipReviewSurface {
+  return variantId === 'gameplay_surround_v1' ? 'gameplay' : 'background';
+}
+
+export function clipVariantForSurface(
+  review: ClipReviewState,
+  surface: ClipReviewSurface
+): ShortVariantReview | undefined {
+  if (surface === 'background') return review.variants?.background_motion_v1;
+  if (surface === 'gameplay') return review.variants?.gameplay_surround_v1;
+  return undefined;
+}
 
 export interface ClipVersionState {
   surface: ClipReviewSurface;
-  version: 'base' | 'background_motion_v1';
-  variantId: null | 'background_motion_v1';
+  version: 'base' | ClipVariantId;
+  variantId: null | ClipVariantId;
   label: string;
   render: ReviewArtifact;
   approval: { status: string; current: boolean; revision: string };
@@ -32,13 +51,17 @@ export function clipVersionState(
       approval: review.approval,
     };
   }
-  const variant = review.variants?.background_motion_v1;
-  if (!variant || variant.id !== 'background_motion_v1') return null;
+  const variant = clipVariantForSurface(review, surface);
+  if (!variant || !isClipVariantId(variant.id)) return null;
   return {
     surface,
-    version: 'background_motion_v1',
-    variantId: 'background_motion_v1',
-    label: variant.label || 'Motion background',
+    version: variant.id,
+    variantId: variant.id,
+    label:
+      variant.label ||
+      (variant.id === 'gameplay_surround_v1'
+        ? 'Gameplay surround'
+        : 'Motion background'),
     render: variant.render,
     approval: variant.approval,
   };
@@ -53,10 +76,10 @@ export function selectedDistributionVersion(
     return clipVersionState(review, 'base');
   }
   if (
-    distribution.version === 'background_motion_v1' &&
-    distribution.variant_id === 'background_motion_v1'
+    isClipVariantId(distribution.version) &&
+    distribution.variant_id === distribution.version
   ) {
-    return clipVersionState(review, 'background');
+    return clipVersionState(review, variantSurface(distribution.version));
   }
   return null;
 }
@@ -119,11 +142,10 @@ export function distributionVersionLabel(
   version: unknown,
   variantId: unknown
 ): string {
-  if (
-    version === 'background_motion_v1' &&
-    variantId === 'background_motion_v1'
-  ) {
-    return 'Motion background';
+  if (isClipVariantId(version) && variantId === version) {
+    return version === 'gameplay_surround_v1'
+      ? 'Gameplay surround'
+      : 'Motion background';
   }
   if ((version == null || version === 'base') && variantId == null) return 'Base';
   return 'Unknown version';
@@ -196,8 +218,7 @@ function validReReleaseRequest(
     'created_at',
   ];
   if (
-    (request.variant_id !== null &&
-      request.variant_id !== 'background_motion_v1') ||
+    (request.variant_id !== null && !isClipVariantId(request.variant_id)) ||
     requiredStrings.some((field) => !nonemptyString(request[field]))
   ) {
     return null;
@@ -292,7 +313,7 @@ export function clipReReleaseViewState(
 export interface ClipReReleaseDraftTarget {
   episodeId: string;
   clipId: string;
-  variantId: null | 'background_motion_v1';
+  variantId: null | ClipVariantId;
   expectedRevision: string;
   previousRequestId: string | null;
 }
@@ -378,13 +399,11 @@ export class ClipReviewSurfaceMemory {
 
   get(
     _clipId: string,
-    hasBackground: boolean,
+    available: ReadonlySet<ClipReviewSurface>,
     selected: ClipReviewSurface
   ): ClipReviewSurface {
     const surface = this.preferred ?? selected;
-    return surface === 'background' && hasBackground
-      ? 'background'
-      : 'base';
+    return available.has(surface) ? surface : 'base';
   }
 
   select(_clipId: string, surface: ClipReviewSurface): void {

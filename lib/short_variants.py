@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -19,13 +20,36 @@ SATISFYING_VARIANT_ID = "satisfying_motion_v1"
 MINECRAFT_PARKOUR_VARIANT_ID = "minecraft_parkour_v1"
 SUBWAY_SURFERS_VARIANT_ID = "subway_surfers_v1"
 GTA_DRIVING_VARIANT_ID = "gta_driving_v1"
+GAMEPLAY_SURROUND_VARIANT_ID = "gameplay_surround_v1"
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
+GAMEPLAY_SURROUND_VARIANT_MODE = "podcast_gameplay_surround_v1"
+GAMEPLAY_SURROUND_LAYOUT_VERSION = "gameplay-surround/v1"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
 MINECRAFT_PARKOUR_ASSET_ID = "spicy_sauce_minecraft_12_v1"
 SUBWAY_SURFERS_ASSET_ID = "orbitalncg_subway_surfers_12_v1"
 GTA_DRIVING_ASSET_ID = "orbitalncg_gta_driving_15_v1"
+GAMEPLAY_SURROUND_ASSET_SET_ID = "gameplay_surround_assets_v1"
+GAMEPLAY_SURROUND_ASSETS = (
+    ("subway", SUBWAY_SURFERS_ASSET_ID),
+    ("gta", GTA_DRIVING_ASSET_ID),
+    ("minecraft", MINECRAFT_PARKOUR_ASSET_ID),
+)
+GAMEPLAY_SURROUND_RENDER_PLAN = {
+    "canvas": [1080, 1920],
+    "upper_height": 1216,
+    "bottom_height": 704,
+    "left_width": 270,
+    "podcast_width": 540,
+    "right_width": 270,
+    "podcast_header_height": 72,
+    "panel_border": 6,
+    "asset_roles": [role for role, _ in GAMEPLAY_SURROUND_ASSETS],
+    "brand": "thelocalpod.link",
+    "brand_font_size": 36,
+    "brand_y": 1286,
+}
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
@@ -36,6 +60,7 @@ _VARIANT_LABELS = {
     MINECRAFT_PARKOUR_VARIANT_ID: "Minecraft parkour",
     SUBWAY_SURFERS_VARIANT_ID: "Subway Surfers",
     GTA_DRIVING_VARIANT_ID: "GTA driving",
+    GAMEPLAY_SURROUND_VARIANT_ID: "Gameplay surround",
 }
 _VARIANT_ASSETS = {
     BACKGROUND_VARIANT_ID: DEFAULT_BACKGROUND_ASSET_ID,
@@ -43,6 +68,7 @@ _VARIANT_ASSETS = {
     MINECRAFT_PARKOUR_VARIANT_ID: MINECRAFT_PARKOUR_ASSET_ID,
     SUBWAY_SURFERS_VARIANT_ID: SUBWAY_SURFERS_ASSET_ID,
     GTA_DRIVING_VARIANT_ID: GTA_DRIVING_ASSET_ID,
+    GAMEPLAY_SURROUND_VARIANT_ID: GAMEPLAY_SURROUND_ASSET_SET_ID,
 }
 BACKGROUND_VARIANT_IDS = tuple(_VARIANT_LABELS)
 
@@ -83,6 +109,14 @@ def require_background_variant_asset(variant_id: str, asset_id: str) -> None:
     expected_asset_id = _VARIANT_ASSETS[variant_id]
     if variant_id != BACKGROUND_VARIANT_ID and asset_id != expected_asset_id:
         raise KeyError(f"{variant_id} requires {expected_asset_id}")
+
+
+def background_variant_asset_ids(variant_id: str) -> tuple[str, ...]:
+    """Return the immutable media asset IDs required by a variant."""
+    require_background_variant(variant_id)
+    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        return tuple(asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS)
+    return (_VARIANT_ASSETS[variant_id],)
 
 
 def selected_short_variant_id(clip: dict) -> str | None:
@@ -231,6 +265,29 @@ def load_background_asset(asset_id: str, *, verify_content: bool = False) -> dic
         )
         if manifest.get(key) is not None
     }
+    playback = {}
+    for key, default, minimum, maximum in (
+        ("playback_start_seconds", 0.0, 0.0, None),
+        ("focus_x", 0.5, 0.0, 1.0),
+        ("focus_y", 0.5, 0.0, 1.0),
+    ):
+        if key not in manifest:
+            continue
+        value = manifest.get(key, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+            or (maximum is not None and value > maximum)
+        ):
+            raise ValueError(f"Background asset manifest has invalid {key}")
+        playback[key] = float(value)
+    fit_mode = manifest.get("fit_mode")
+    if fit_mode is not None:
+        if fit_mode not in {"crop", "stretch"}:
+            raise ValueError("Background asset manifest has invalid fit_mode")
+        playback["fit_mode"] = fit_mode
     return {
         "asset_id": asset_id,
         "path": path,
@@ -238,7 +295,136 @@ def load_background_asset(asset_id: str, *, verify_content: bool = False) -> dic
         "manifest_revision": _json_revision(manifest),
         "scan_identity": content["scan_identity"],
         "provenance": provenance,
+        **playback,
     }
+
+
+def load_background_variant_asset(
+    variant_id: str, *, verify_content: bool = False
+) -> dict:
+    """Load the fixed asset, or fixed multi-asset set, required by a variant."""
+    require_background_variant(variant_id)
+    if variant_id != GAMEPLAY_SURROUND_VARIANT_ID:
+        return load_background_asset(
+            default_background_asset_id(variant_id), verify_content=verify_content
+        )
+    assets = []
+    for role, asset_id in GAMEPLAY_SURROUND_ASSETS:
+        assets.append(
+            {
+                "role": role,
+                **load_background_asset(asset_id, verify_content=verify_content),
+            }
+        )
+    return {
+        "asset_id": GAMEPLAY_SURROUND_ASSET_SET_ID,
+        "assets": assets,
+        "render_plan": GAMEPLAY_SURROUND_RENDER_PLAN,
+    }
+
+
+def _asset_record(asset: dict, *, include_provenance: bool) -> dict:
+    keys = [
+        "asset_id",
+        "content_revision",
+        "manifest_revision",
+        "scan_identity",
+        "playback_start_seconds",
+        "focus_x",
+        "focus_y",
+        "fit_mode",
+    ]
+    if include_provenance:
+        keys.append("provenance")
+    recorded = {key: asset[key] for key in keys if key in asset}
+    if "role" in asset:
+        recorded["role"] = asset["role"]
+    return recorded
+
+
+def _variant_asset_record(asset: dict, *, include_provenance: bool) -> dict:
+    if asset.get("asset_id") != GAMEPLAY_SURROUND_ASSET_SET_ID:
+        return _asset_record(asset, include_provenance=include_provenance)
+    assets = asset.get("assets")
+    if not isinstance(assets, list) or len(assets) != len(GAMEPLAY_SURROUND_ASSETS):
+        raise TypeError("Gameplay surround requires its three fixed assets")
+    identities = [
+        (item.get("role"), item.get("asset_id"))
+        for item in assets
+        if isinstance(item, dict)
+    ]
+    if identities != list(GAMEPLAY_SURROUND_ASSETS):
+        raise TypeError("Gameplay surround asset roles or identities are invalid")
+    return {
+        "asset_id": GAMEPLAY_SURROUND_ASSET_SET_ID,
+        "assets": [
+            _asset_record(item, include_provenance=include_provenance)
+            for item in assets
+        ],
+        "render_plan": GAMEPLAY_SURROUND_RENDER_PLAN,
+    }
+
+
+def _recorded_asset_identity(recorded: dict) -> dict:
+    asset_id = recorded.get("asset_id")
+    if asset_id != GAMEPLAY_SURROUND_ASSET_SET_ID:
+        return {
+            key: recorded[key]
+            for key in (
+                "asset_id",
+                "content_revision",
+                "manifest_revision",
+                "scan_identity",
+                "playback_start_seconds",
+                "focus_x",
+                "focus_y",
+                "fit_mode",
+            )
+            if key in recorded
+        }
+    assets = recorded.get("assets")
+    if not isinstance(assets, list) or any(
+        not isinstance(item, dict) for item in assets
+    ):
+        raise TypeError("The gameplay surround asset manifest is malformed")
+    return {
+        "asset_id": asset_id,
+        "assets": [
+            {
+                key: item[key]
+                for key in (
+                    "asset_id",
+                    "content_revision",
+                    "manifest_revision",
+                    "scan_identity",
+                    "role",
+                    "playback_start_seconds",
+                    "focus_x",
+                    "focus_y",
+                    "fit_mode",
+                )
+                if key in item
+            }
+            for item in assets
+        ],
+        "render_plan": recorded.get("render_plan"),
+    }
+
+
+def _variant_layout(variant_id: str) -> str:
+    return (
+        GAMEPLAY_SURROUND_LAYOUT_VERSION
+        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        else BACKGROUND_LAYOUT_VERSION
+    )
+
+
+def _variant_mode(variant_id: str) -> str:
+    return (
+        GAMEPLAY_SURROUND_VARIANT_MODE
+        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        else BACKGROUND_VARIANT_MODE
+    )
 
 
 def background_variant_fingerprint(
@@ -253,20 +439,12 @@ def background_variant_fingerprint(
     return _json_revision(
         {
             "variant_id": variant_id,
-            "layout": BACKGROUND_LAYOUT_VERSION,
+            "layout": _variant_layout(variant_id),
             "base": {
                 "render_fingerprint": base_record.get("fingerprint"),
                 "scan_identity": base_identity,
             },
-            "asset": {
-                key: asset[key]
-                for key in (
-                    "asset_id",
-                    "content_revision",
-                    "manifest_revision",
-                    "scan_identity",
-                )
-            },
+            "asset": _variant_asset_record(asset, include_provenance=False),
             "encoding": encoding,
         }
     )
@@ -305,8 +483,8 @@ def record_background_variant(
     record = {
         "variant_id": variant_id,
         "path": str(output.relative_to(episode_dir)),
-        "render_mode": BACKGROUND_VARIANT_MODE,
-        "layout_version": BACKGROUND_LAYOUT_VERSION,
+        "render_mode": _variant_mode(variant_id),
+        "layout_version": _variant_layout(variant_id),
         "fingerprint": fingerprint,
         "clip_source_intervals": [list(item) for item in timeline.keep_intervals],
         "output_duration_seconds": round(timeline.duration, 3),
@@ -314,16 +492,7 @@ def record_background_variant(
             "fingerprint": base_record["fingerprint"],
             "scan_identity": base_identity,
         },
-        "asset": {
-            key: asset[key]
-            for key in (
-                "asset_id",
-                "content_revision",
-                "manifest_revision",
-                "scan_identity",
-                "provenance",
-            )
-        },
+        "asset": _variant_asset_record(asset, include_provenance=True),
         "encoding": encoding,
         "captions": captions,
         "output": {
@@ -374,7 +543,8 @@ def background_variant_state(
                 )
             ):
                 raise TypeError("The variant manifest is malformed")
-            if recorded_layout != BACKGROUND_LAYOUT_VERSION:
+            expected_layout = _variant_layout(variant_id)
+            if recorded_layout != expected_layout:
                 if recorded_layout in {
                     "portrait-over-motion/v1",
                     "portrait-over-motion/v2",
@@ -389,24 +559,25 @@ def background_variant_state(
             if not isinstance(asset_id, str):
                 raise TypeError("The variant manifest has no asset identity")
             require_background_variant_asset(variant_id, asset_id)
-            asset = load_background_asset(asset_id)
+            asset = (
+                load_background_variant_asset(variant_id)
+                if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                else load_background_asset(asset_id)
+            )
             if base_record.get("fingerprint") != recorded_base.get(
                 "fingerprint"
             ) or base_identity != recorded_base.get("scan_identity"):
                 stale_detail = (
                     "The canonical base short changed after this variant was rendered."
                 )
-            elif any(
-                asset[key] != recorded_asset.get(key)
-                for key in (
-                    "asset_id",
-                    "content_revision",
-                    "manifest_revision",
-                    "scan_identity",
-                )
-            ):
+            elif _variant_asset_record(
+                asset, include_provenance=False
+            ) != _recorded_asset_identity(recorded_asset):
                 stale_detail = (
-                    "The background asset changed after this variant was rendered."
+                    "A gameplay surround asset or its render plan changed after "
+                    "this variant was rendered."
+                    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                    else "The background asset changed after this variant was rendered."
                 )
             else:
                 expected = background_variant_fingerprint(
@@ -424,7 +595,7 @@ def background_variant_state(
         output,
         record,
         expected_fingerprint=expected,
-        expected_mode=BACKGROUND_VARIANT_MODE,
+        expected_mode=_variant_mode(variant_id),
     )
     expected_path = str(output.relative_to(episode_dir))
     if render["playable"] and record.get("path") != expected_path:

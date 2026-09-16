@@ -61,6 +61,7 @@ DEFAULT_SHADOW = 0
 # frame).
 ALIGNMENT_BOTTOM_CENTER = 2
 DEFAULT_MARGIN_V = 280
+DEFAULT_MARGIN_H = 80
 
 # Phrase grouping: 3 words/phrase keeps reading-speed comfortable and matches
 # the 2-4 word range that interview-clip channels actually use.
@@ -86,6 +87,8 @@ class CaptionStyle:
     outline: int = DEFAULT_OUTLINE
     shadow: int = DEFAULT_SHADOW
     alignment: int = ALIGNMENT_BOTTOM_CENTER
+    margin_l: int = DEFAULT_MARGIN_H
+    margin_r: int = DEFAULT_MARGIN_H
     margin_v: int = DEFAULT_MARGIN_V
     words_per_phrase: int = DEFAULT_WORDS_PER_PHRASE
     play_res_x: int = DEFAULT_PLAY_RES_X
@@ -299,8 +302,8 @@ def _format_style_line(style: CaptionStyle) -> str:
         f"{style.outline},"  # Outline
         f"{style.shadow},"  # Shadow
         f"{style.alignment},"  # Alignment (numpad)
-        "80,"  # MarginL
-        "80,"  # MarginR
+        f"{style.margin_l},"  # MarginL
+        f"{style.margin_r},"  # MarginR
         f"{style.margin_v},"  # MarginV
         "1"  # Encoding (1 = default)
     )

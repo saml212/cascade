@@ -338,14 +338,15 @@ export interface ShortVariantReview extends UnknownRecord {
   id: string;
   label: string;
   asset_id: string;
+  asset_ids?: string[];
   render: ReviewArtifact;
   approval: { status: string; current: boolean; revision: string };
   render_job: ClipReviewState['render_job'];
 }
 
 export interface ClipDistributionState extends UnknownRecord {
-  version: 'base' | 'background_motion_v1' | 'invalid';
-  variant_id: null | 'background_motion_v1';
+  version: 'base' | 'background_motion_v1' | 'gameplay_surround_v1' | 'invalid';
+  variant_id: null | 'background_motion_v1' | 'gameplay_surround_v1';
   label: string;
   current: boolean;
   approval_current: boolean;
@@ -362,7 +363,7 @@ export interface ClipReReleaseRequestState extends UnknownRecord {
   request_id: string;
   actor: string;
   reason: string;
-  variant_id: null | 'background_motion_v1';
+  variant_id: null | 'background_motion_v1' | 'gameplay_surround_v1';
   target_revision: string;
   render_fingerprint: string;
   receipt_history_revision: string;
@@ -371,7 +372,7 @@ export interface ClipReReleaseRequestState extends UnknownRecord {
 }
 
 export interface PrepareClipReReleaseRequest {
-  variant_id: null | 'background_motion_v1';
+  variant_id: null | 'background_motion_v1' | 'gameplay_surround_v1';
   expected_revision: string;
   request_id: string;
   actor: string;
@@ -652,7 +653,7 @@ export const api = {
   selectClipDistribution: (
     id: string,
     clipId: string,
-    variantId: null | 'background_motion_v1',
+    variantId: null | 'background_motion_v1' | 'gameplay_surround_v1',
     expectedRevision: string
   ) =>
     request<UnknownRecord>(

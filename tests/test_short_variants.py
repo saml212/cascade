@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+from copy import deepcopy
 
 import pytest
 
@@ -11,6 +12,10 @@ from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
     DEFAULT_BACKGROUND_ASSET_ID,
+    GAMEPLAY_SURROUND_ASSET_SET_ID,
+    GAMEPLAY_SURROUND_LAYOUT_VERSION,
+    GAMEPLAY_SURROUND_RENDER_PLAN,
+    GAMEPLAY_SURROUND_VARIANT_ID,
     GTA_DRIVING_ASSET_ID,
     GTA_DRIVING_VARIANT_ID,
     MINECRAFT_PARKOUR_ASSET_ID,
@@ -26,6 +31,7 @@ from lib.short_variants import (
     default_background_asset_id,
     file_content_identity,
     load_background_asset,
+    load_background_variant_asset,
     record_background_variant,
     require_background_variant_asset,
     save_background_variant_approval,
@@ -98,6 +104,39 @@ def _record(tmp_path, monkeypatch):
     return episode_dir, base_record, encoding, record, output
 
 
+def _gameplay_asset_set(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    root.mkdir(exist_ok=True)
+    for asset_id in (
+        SUBWAY_SURFERS_ASSET_ID,
+        GTA_DRIVING_ASSET_ID,
+        MINECRAFT_PARKOUR_ASSET_ID,
+    ):
+        media = root / f"{asset_id}.mp4"
+        media.write_bytes(f"silent {asset_id}".encode())
+        (root / f"{asset_id}.json").write_text(
+            json.dumps(
+                {
+                    "asset_id": asset_id,
+                    "file": media.name,
+                    "sha256": hashlib.sha256(media.read_bytes()).hexdigest(),
+                    "origin": "test generator",
+                    "license": "original",
+                    "playback_start_seconds": 1.0,
+                    "focus_x": 0.5,
+                    "focus_y": 0.5,
+                    "fit_mode": (
+                        "stretch" if asset_id == SUBWAY_SURFERS_ASSET_ID else "crop"
+                    ),
+                }
+            )
+        )
+    monkeypatch.setenv("CASCADE_BACKGROUND_ASSETS_DIR", str(root))
+    return load_background_variant_asset(
+        GAMEPLAY_SURROUND_VARIANT_ID, verify_content=True
+    )
+
+
 @pytest.mark.parametrize(
     ("variant_id", "asset_id", "label"),
     (
@@ -120,6 +159,134 @@ def test_gameplay_variants_bind_stable_asset_identity(variant_id, asset_id, labe
     require_background_variant_asset(variant_id, asset_id)
     with pytest.raises(KeyError, match=f"{variant_id} requires {asset_id}"):
         require_background_variant_asset(variant_id, "another_asset")
+
+
+def test_gameplay_surround_binds_all_assets_and_layout(tmp_path, monkeypatch):
+    asset_set = _gameplay_asset_set(tmp_path, monkeypatch)
+
+    assert default_background_asset_id(GAMEPLAY_SURROUND_VARIANT_ID) == (
+        GAMEPLAY_SURROUND_ASSET_SET_ID
+    )
+    assert [item["role"] for item in asset_set["assets"]] == [
+        "subway",
+        "gta",
+        "minecraft",
+    ]
+    assert [item["asset_id"] for item in asset_set["assets"]] == [
+        SUBWAY_SURFERS_ASSET_ID,
+        GTA_DRIVING_ASSET_ID,
+        MINECRAFT_PARKOUR_ASSET_ID,
+    ]
+    assert asset_set["render_plan"] == GAMEPLAY_SURROUND_RENDER_PLAN
+    require_background_variant_asset(
+        GAMEPLAY_SURROUND_VARIANT_ID, GAMEPLAY_SURROUND_ASSET_SET_ID
+    )
+
+
+def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
+    tmp_path, monkeypatch
+):
+    episode_dir = tmp_path / "episode"
+    base = episode_dir / "shorts" / "clip_01.mp4"
+    output = background_variant_output(
+        episode_dir, "clip_01", GAMEPLAY_SURROUND_VARIANT_ID
+    )
+    for path, content in ((base, b"base"), (output, b"surround")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (episode_dir / "captions.ass").write_text("[Script Info]\n")
+    asset_set = _gameplay_asset_set(tmp_path, monkeypatch)
+    base_record = {"fingerprint": "sha256:base"}
+    base_identity = file_content_identity(base)["scan_identity"]
+    encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
+    fingerprint = background_variant_fingerprint(
+        base_record,
+        base_identity,
+        asset_set,
+        encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    changed_focus = deepcopy(asset_set)
+    changed_focus["assets"][1]["focus_x"] = 0.625
+    assert (
+        background_variant_fingerprint(
+            base_record,
+            base_identity,
+            changed_focus,
+            encoding,
+            variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        )
+        != fingerprint
+    )
+    changed_fit = deepcopy(asset_set)
+    changed_fit["assets"][0]["fit_mode"] = "crop"
+    assert (
+        background_variant_fingerprint(
+            base_record,
+            base_identity,
+            changed_fit,
+            encoding,
+            variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        )
+        != fingerprint
+    )
+    from lib import short_variants as short_variants_module
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(
+            short_variants_module,
+            "GAMEPLAY_SURROUND_LAYOUT_VERSION",
+            "gameplay-surround/test-change",
+        )
+        assert (
+            background_variant_fingerprint(
+                base_record,
+                base_identity,
+                asset_set,
+                encoding,
+                variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+            )
+            != fingerprint
+        )
+    record = record_background_variant(
+        episode_dir,
+        "clip_01",
+        fingerprint=fingerprint,
+        timeline=Timeline.from_edits(1),
+        media={"duration_seconds": 1, "width": 1080, "height": 1920},
+        base_record=base_record,
+        base_identity=base_identity,
+        asset=asset_set,
+        encoding=encoding,
+        captions={"path": "captions.ass", "format": "ass", "burned_in": True},
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+
+    assert record["layout_version"] == GAMEPLAY_SURROUND_LAYOUT_VERSION
+    assert record["asset"]["render_plan"] == GAMEPLAY_SURROUND_RENDER_PLAN
+    assert len(record["asset"]["assets"]) == 3
+    _, current = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert current["current"] is True
+
+    manifest = tmp_path / "assets" / f"{GTA_DRIVING_ASSET_ID}.json"
+    changed = json.loads(manifest.read_text())
+    changed["description"] = "manifest changed"
+    manifest.write_text(json.dumps(changed))
+    _, stale = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert stale["current"] is False
+    assert "asset or its render plan changed" in stale["detail"]
 
 
 def test_variant_artifact_paths_are_isolated(tmp_path):
@@ -179,6 +346,27 @@ def test_asset_verification_hashes_content_and_rejects_escape(tmp_path, monkeypa
         assert "inside the asset directory" in str(exc)
     else:
         raise AssertionError("asset path escape was accepted")
+
+
+def test_asset_manifest_rejects_unknown_fit_mode(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    root.mkdir()
+    media = root / "motion.mp4"
+    media.write_bytes(b"silent motion")
+    (root / "motion.json").write_text(
+        json.dumps(
+            {
+                "asset_id": "motion_v1",
+                "file": media.name,
+                "sha256": hashlib.sha256(media.read_bytes()).hexdigest(),
+                "fit_mode": "follow-subject",
+            }
+        )
+    )
+    monkeypatch.setenv("CASCADE_BACKGROUND_ASSETS_DIR", str(root))
+
+    with pytest.raises(ValueError, match="invalid fit_mode"):
+        load_background_asset("motion_v1")
 
 
 def test_same_path_variant_replacement_is_stale_and_cannot_be_approved(
