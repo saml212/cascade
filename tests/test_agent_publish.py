@@ -3125,8 +3125,10 @@ class TestExpandedShortDestinations:
         original_receipt = json.loads((episode_dir / "publish.json").read_text())[
             "shorts"
         ][0]
-
         config = _destination_config()
+        config["podcast"]["links"] = {
+            "episode_url_template": "https://thelocalpod.link/#{episode_id}"
+        }
         config["platforms"]["facebook"] = {
             "enabled": True,
             "account_username": "facebook-account-id",
@@ -3140,6 +3142,7 @@ class TestExpandedShortDestinations:
         }
         _write_json(clips_path, clips)
         _refresh_copy_approvals(episode_dir, config)
+        episode_before = (episode_dir / "episode.json").read_bytes()
 
         agent = _make_agent(episode_dir, config)
         binding_checks = []
@@ -3173,7 +3176,7 @@ class TestExpandedShortDestinations:
         )
         copy = second["targets"][0]["destination_copy"]["facebook"]
         assert copy["description"].endswith(
-            "Full episode: https://media.example/links/episodes/ep_test.html"
+            "Full episode: https://thelocalpod.link/#ep_test"
         )
 
         agent.short_destination_request = second["execute"]
@@ -3189,6 +3192,7 @@ class TestExpandedShortDestinations:
         assert len(binding_checks) == 2
         stored = json.loads((episode_dir / "publish.json").read_text())["shorts"]
         assert {**original_receipt, "historical_receipt": True} in stored
+        assert (episode_dir / "episode.json").read_bytes() == episode_before
         assert {tuple(item["platforms"]) for item in result["shorts"]} == {
             ("facebook",),
             ("tiktok", "youtube"),

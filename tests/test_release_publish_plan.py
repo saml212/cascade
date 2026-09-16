@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from agents.qa import current_funnel_urls, current_publish_plan, release_revision
+from agents.qa import (
+    current_funnel_urls,
+    current_publish_plan,
+    episode_hub_url,
+    release_revision,
+)
 
 
 def _config() -> dict:
@@ -100,6 +105,55 @@ def test_disabled_expansion_destinations_do_not_change_existing_publish_plan(tmp
         }
 
     assert current_publish_plan(config, episode, environment=environment) == original
+
+
+def test_episode_url_template_replaces_legacy_hub_and_changes_release(tmp_path):
+    config = _config()
+    episode = _episode()
+    environment = {"UPLOAD_POST_USER": "account-a"}
+    legacy_revision = release_revision(
+        tmp_path, episode, config=config, environment=environment
+    )
+
+    assert episode_hub_url(config, "ep/a b") == (
+        "https://private.invalid/media/links/episodes/ep%2Fa%20b.html"
+    )
+
+    config["podcast"]["links"] = {
+        "episode_url_template": "https://thelocalpod.link/#{episode_id}"
+    }
+
+    assert episode_hub_url(config, "ep/a b") == "https://thelocalpod.link/#ep%2Fa%20b"
+    assert (
+        current_publish_plan(config, episode, environment=environment)["upload_post"][
+            "short_copy"
+        ]["episode_hub_url"]
+        == "https://thelocalpod.link/#ep_private"
+    )
+    assert (
+        release_revision(tmp_path, episode, config=config, environment=environment)
+        != legacy_revision
+    )
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "http://thelocalpod.link/#{episode_id}",
+        "https://thelocalpod.link/#episodes",
+        "https://thelocalpod.link/#{episode_id}/{other}",
+        "https://thelocalpod.link:bad/#{episode_id}",
+        "https://thelocalpod.link:99999/#{episode_id}",
+        "https://./#{episode_id}",
+        "https://thelocalpod.link/\x00{episode_id}",
+    ),
+)
+def test_episode_url_template_rejects_unsafe_or_ambiguous_values(template):
+    config = _config()
+    config["podcast"]["links"] = {"episode_url_template": template}
+
+    with pytest.raises(ValueError, match="episode_url_template"):
+        episode_hub_url(config, "ep_private")
 
 
 def test_enabled_expansion_account_and_target_are_release_bound(tmp_path):

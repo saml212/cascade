@@ -172,6 +172,7 @@ owner_email = ""                          # Email for RSS feed (required by Appl
 # Handles are auto-extracted from URLs and shown as link labels
 display_name = ""                         # Override title on links page (optional)
 tagline = ""                              # Shown below your podcast name
+episode_url_template = ""                 # Optional HTTPS URL with one {episode_id}
 spotify = ""
 youtube = ""
 instagram = ""

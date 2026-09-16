@@ -10,7 +10,7 @@ import subprocess
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from agents.base import BaseAgent
 from agents.transcribe import current_diarized_transcript
@@ -146,10 +146,42 @@ def _private_identity(scope: str, value: object) -> str:
 
 
 def episode_hub_url(config: dict, episode_id: str) -> str | None:
-    base = str(config.get("podcast", {}).get("r2", {}).get("public_url", "")).rstrip(
-        "/"
-    )
-    if not episode_id or not base.startswith("https://"):
+    if not episode_id:
+        return None
+    podcast = config.get("podcast", {})
+    template = podcast.get("links", {}).get("episode_url_template")
+    if template not in (None, ""):
+        if not isinstance(template, str):
+            raise TypeError("podcast.links.episode_url_template must be a string")
+        remainder = template.replace("{episode_id}", "", 1)
+        if template.count("{episode_id}") != 1 or "{" in remainder or "}" in remainder:
+            raise ValueError(
+                "podcast.links.episode_url_template must contain exactly one "
+                "{episode_id} placeholder"
+            )
+        url = template.replace("{episode_id}", quote(episode_id, safe=""))
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            parsed = None
+            port = None
+        if (
+            parsed is None
+            or parsed.scheme != "https"
+            or not parsed.hostname
+            or not parsed.hostname.strip(".")
+            or parsed.username is not None
+            or parsed.password is not None
+            or (port is not None and not 1 <= port <= 65535)
+            or any(ord(char) < 32 or ord(char) == 127 for char in url)
+        ):
+            raise ValueError(
+                "podcast.links.episode_url_template must produce an HTTPS URL"
+            )
+        return url
+    base = str(podcast.get("r2", {}).get("public_url", "")).rstrip("/")
+    if not base.startswith("https://"):
         return None
     return f"{base}/links/episodes/{quote(episode_id, safe='')}.html"
 

@@ -20,6 +20,45 @@ submitting an explicit destination subset. Existing destination receipts remain
 immutable, and later disjoint subsets publish only destinations still missing for
 the same selected media.
 
+`podcast.links.episode_url_template` optionally selects the human-facing episode
+URL used in new short-form copy. It must be an HTTPS URL containing exactly one
+`{episode_id}` placeholder; Cascade URL-encodes the ID before substitution. When
+the setting is empty, copy keeps using the legacy
+`podcast.r2.public_url/links/episodes/<episode_id>.html` route. The R2 setting
+continues to own media, RSS, artwork, and legacy watch pages. Changing the
+template changes the release revision for new work but does not edit existing
+receipts or remote jobs.
+
+To prepare one Facebook pilot, update only that clip's reviewed base copy:
+
+```http
+PATCH /api/episodes/{episode_id}/clips/{clip_id}/metadata
+Content-Type: application/json
+
+{
+  "metadata": {
+    "facebook": {
+      "title": "Reviewed Reel title",
+      "description": "Reviewed Reel description"
+    }
+  }
+}
+```
+
+The route merges the Facebook block with other platform metadata and clears the
+clip's prior approval. Keep the URL out of `description`: the preview builder
+appends `Full episode: <resolved episode URL>`. Review that final payload, then
+repeat the normal variant approval, QA, and release approval flow before a
+Facebook-only submission.
+
+The resolved URL is shared by destinations that receive episode links. Do not
+include Instagram in a generated wave when the template uses a `#...` fragment:
+Instagram parses the fragment as a hashtag and does not make caption URLs
+clickable. Until Instagram has destination-specific URL formatting, use native
+copy with the bare show URL plus an explicit guest or episode cue, such as `Full
+episode at thelocalpod.link — choose Arnold Gray.` Facebook and YouTube can
+retain the episode fragment.
+
 ## API Costs per Episode (current)
 - Deepgram transcription: ~$0.50 (stays on API — best-in-class STT).
 - Claude clip mining: ~$0.10-0.30 (pending migration to `claude` CLI / Max subscription).
