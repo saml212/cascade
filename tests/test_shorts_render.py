@@ -421,6 +421,34 @@ def test_gameplay_surround_captions_stay_inside_center_column(
     assert ",2,300,300,840,1" in style_line
 
 
+def test_gameplay_render_requires_caption_context_before_writing(
+    tmp_episode_dir, sample_config
+):
+    audio = tmp_episode_dir / "audio.wav"
+    audio.write_bytes(b"audio")
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+
+    with pytest.raises(ValueError, match="valid caption context revision"):
+        agent._render_short_unlocked(
+            tmp_episode_dir / "source.mp4",
+            tmp_episode_dir / "variant.mp4",
+            tmp_episode_dir / "captions.ass",
+            0,
+            1,
+            [{"start": 0, "end": 1, "speaker": "speaker_0"}],
+            320,
+            180,
+            "128k",
+            {"speakers": [{"center_x": 160, "center_y": 90}]},
+            ["-c:v", "libx264"],
+            audio_mix_path=audio,
+            timeline=Timeline(1, [(0, 1)]),
+            diarized={"utterances": []},
+            episode={},
+            background={"variant_id": GAMEPLAY_SURROUND_VARIANT_ID},
+        )
+
+
 def _sample_rgb(ffmpeg: str, path, x: int, y: int) -> tuple[int, int, int]:
     result = subprocess.run(
         [

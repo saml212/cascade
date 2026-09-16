@@ -67,11 +67,13 @@ from lib.short_variants import (
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
+    gameplay_surround_caption_context_revision,
     load_background_asset,
     load_background_variant_asset,
     record_background_variant,
     require_background_variant,
     require_background_variant_asset,
+    require_gameplay_caption_context_revision,
 )
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
@@ -215,12 +217,27 @@ class ShortsRenderAgent(BaseAgent):
                     )
 
         encoding = get_video_encoding_policy(self.config, "shorts")
+        diarized = None
+        caption_context_revision = None
+        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+            diarized = current_diarized_transcript(
+                self.episode_dir, episode, self.config
+            )
+            if not diarized:
+                raise ValueError("Current transcript is required for variant captions")
+            caption_context_revision = gameplay_surround_caption_context_revision(
+                self.episode_dir,
+                episode=episode,
+                diarized=diarized,
+                segment_document=segment_document,
+            )
         fingerprint = background_variant_fingerprint(
             base_record,
             base_identity,
             asset,
             encoding,
             variant_id=variant_id,
+            caption_context_revision=caption_context_revision,
         )
         current_record, current_state = background_variant_state(
             self.episode_dir,
@@ -238,7 +255,9 @@ class ShortsRenderAgent(BaseAgent):
 
         encoder_args = get_video_encoder_args(self.config, "shorts")
         lut_filter = get_lut_filter(self.config)
-        diarized = current_diarized_transcript(self.episode_dir, episode, self.config)
+        diarized = diarized or current_diarized_transcript(
+            self.episode_dir, episode, self.config
+        )
         if not diarized:
             raise ValueError("Current transcript is required for variant captions")
         had_output = output.is_file()
@@ -277,6 +296,7 @@ class ShortsRenderAgent(BaseAgent):
                         "base_duration": base_duration,
                         "base_record": base_record,
                         "base_identity": base_identity,
+                        "caption_context_revision": caption_context_revision,
                     },
                     segment_document=segment_document,
                 )
@@ -861,6 +881,13 @@ class ShortsRenderAgent(BaseAgent):
         segment_document=None,
     ) -> dict:
         """Render one clip; positional arguments remain compatible with chat actions."""
+        gameplay_surround = bool(
+            background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID
+        )
+        if gameplay_surround:
+            require_gameplay_caption_context_revision(
+                background.get("caption_context_revision")
+            )
         episode = episode or self.load_json("episode.json")
         diarized = diarized or self.load_json("diarized_transcript.json")
         if not audio_mix_path or not Path(audio_mix_path).exists():
@@ -885,9 +912,6 @@ class ShortsRenderAgent(BaseAgent):
         render_segments = build_render_segments(timeline, segments, frame_rate=fps)
         render_segments = self._apply_overlap_policy(render_segments)
         captions = rebase_diarized(diarized, timeline)
-        gameplay_surround = bool(
-            background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID
-        )
         style = self._caption_style(background)
         three_person_stack_enabled = self._three_person_stack_enabled(
             episode,
@@ -1058,6 +1082,11 @@ class ShortsRenderAgent(BaseAgent):
                     "burned_in": True,
                     **(
                         {"placement_policy": (GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION)}
+                        if gameplay_surround
+                        else {}
+                    ),
+                    **(
+                        {"context_revision": background["caption_context_revision"]}
                         if gameplay_surround
                         else {}
                     ),

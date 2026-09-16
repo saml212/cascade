@@ -10,7 +10,9 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from lib.ass import resolve_caption_speaker_targets
 from lib.atomic_write import atomic_write_json
+from lib.crop import visual_crop_state
 from lib.delivery_video import render_artifact_state
 from lib.ffprobe import file_fingerprint, scan_identity
 from lib.timeline import Timeline
@@ -26,6 +28,7 @@ BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 GAMEPLAY_SURROUND_VARIANT_MODE = "podcast_gameplay_surround_v1"
 GAMEPLAY_SURROUND_LAYOUT_VERSION = "gameplay-surround/v1"
 GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION = "source-speaker-panel/v1"
+GAMEPLAY_SURROUND_CAPTION_CONTEXT_VERSION = "speaker-panel-effective/v1"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
 MINECRAFT_PARKOUR_ASSET_ID = "spicy_sauce_minecraft_12_v1"
@@ -437,6 +440,66 @@ def _variant_mode(variant_id: str) -> str:
     )
 
 
+def gameplay_surround_caption_context_revision(
+    episode_dir: Path,
+    *,
+    episode: dict | None = None,
+    diarized: dict | None = None,
+    segment_document: dict | None = None,
+) -> str:
+    """Fingerprint inputs unique to gameplay speaker-panel caption placement."""
+
+    def load_document(filename: str) -> dict:
+        try:
+            document = json.loads((Path(episode_dir) / filename).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Gameplay caption context needs current {filename}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise TypeError(f"Gameplay caption context needs a mapping in {filename}")
+        return document
+
+    episode = episode if episode is not None else load_document("episode.json")
+    diarized = (
+        diarized if diarized is not None else load_document("diarized_transcript.json")
+    )
+    segment_document = (
+        segment_document
+        if segment_document is not None
+        else load_document("segments.json")
+    )
+    crop_config = episode.get("crop_config") or {}
+    if not isinstance(crop_config, dict):
+        raise TypeError("Gameplay caption context needs a crop mapping")
+    speaker_targets = resolve_caption_speaker_targets(
+        diarized, segment_document, crop_config
+    )
+    configured_speakers = crop_config.get("speakers", [])
+    longform_speakers = (
+        visual_crop_state(crop_config, "longform")["speakers"]
+        if isinstance(configured_speakers, list) and len(configured_speakers) >= 2
+        else []
+    )
+    state = {
+        "version": GAMEPLAY_SURROUND_CAPTION_CONTEXT_VERSION,
+        "speaker_targets": [
+            {"asr_speaker": source, "target": target}
+            for source, target in sorted(speaker_targets.items())
+        ],
+        "longform_speakers": longform_speakers,
+    }
+    return _json_revision(state)
+
+
+def require_gameplay_caption_context_revision(value: object) -> str:
+    """Require the effective caption context bound to a gameplay render."""
+    revision = str(value or "")
+    if not _SHA256.fullmatch(revision):
+        raise ValueError("Gameplay surround requires a valid caption context revision")
+    return revision
+
+
 def background_variant_fingerprint(
     base_record: dict,
     base_identity: dict,
@@ -444,6 +507,7 @@ def background_variant_fingerprint(
     encoding: dict,
     *,
     variant_id: str = BACKGROUND_VARIANT_ID,
+    caption_context_revision: str | None = None,
 ) -> str:
     require_background_variant_asset(variant_id, str(asset.get("asset_id", "")))
     state = {
@@ -457,7 +521,13 @@ def background_variant_fingerprint(
         "encoding": encoding,
     }
     if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
-        state["caption_policy"] = GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION
+        caption_context_revision = require_gameplay_caption_context_revision(
+            caption_context_revision
+        )
+        state["caption_policy"] = {
+            "version": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": caption_context_revision,
+        }
     return _json_revision(state)
 
 
@@ -575,6 +645,17 @@ def background_variant_state(
                 if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
                 else load_background_asset(asset_id)
             )
+            caption_context_revision = (
+                gameplay_surround_caption_context_revision(episode_dir)
+                if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                else None
+            )
+            recorded_captions = record.get("captions")
+            recorded_caption_context = (
+                recorded_captions.get("context_revision")
+                if isinstance(recorded_captions, dict)
+                else None
+            )
             if base_record.get("fingerprint") != recorded_base.get(
                 "fingerprint"
             ) or base_identity != recorded_base.get("scan_identity"):
@@ -590,6 +671,14 @@ def background_variant_state(
                     if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
                     else "The background asset changed after this variant was rendered."
                 )
+            elif (
+                variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                and recorded_caption_context != caption_context_revision
+            ):
+                stale_detail = (
+                    "The gameplay caption speaker bindings or panel anchors changed "
+                    "after this variant was rendered."
+                )
             else:
                 expected = background_variant_fingerprint(
                     base_record,
@@ -597,6 +686,7 @@ def background_variant_state(
                     asset,
                     encoding,
                     variant_id=variant_id,
+                    caption_context_revision=caption_context_revision,
                 )
         except (KeyError, OSError, TypeError, ValueError) as exc:
             stale_detail = str(exc)

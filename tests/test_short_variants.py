@@ -8,6 +8,7 @@ from copy import deepcopy
 import pytest
 
 from agents.qa import clip_review_revision, short_distribution_state
+from lib.crop import visual_crop_state
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
@@ -32,6 +33,7 @@ from lib.short_variants import (
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
+    gameplay_surround_caption_context_revision,
     load_background_asset,
     load_background_variant_asset,
     record_background_variant,
@@ -139,6 +141,51 @@ def _gameplay_asset_set(tmp_path, monkeypatch):
     )
 
 
+def _write_gameplay_caption_context(episode_dir):
+    episode = {
+        "crop_config": {
+            "speakers": [
+                {
+                    "label": "Host",
+                    "center_x": 400,
+                    "center_y": 520,
+                    "zoom": 1.2,
+                    "longform_center_x": 400,
+                    "longform_center_y": 500,
+                    "longform_zoom": 1,
+                },
+                {
+                    "label": "Guest",
+                    "center_x": 1500,
+                    "center_y": 520,
+                    "zoom": 1.2,
+                    "longform_center_x": 1500,
+                    "longform_center_y": 500,
+                    "longform_zoom": 1,
+                },
+            ]
+        }
+    }
+    diarized = {
+        "clock": "source",
+        "speaker_map": [{"index": 5, "logical_track": 1, "mapping_confidence": 1.0}],
+    }
+    segments = {
+        "clock": "source",
+        "track_mapping": [
+            {"speaker": "speaker_0", "person": "Host", "logical_track": 1},
+            {"speaker": "speaker_1", "person": "Guest", "logical_track": 2},
+        ],
+    }
+    for filename, document in (
+        ("episode.json", episode),
+        ("diarized_transcript.json", diarized),
+        ("segments.json", segments),
+    ):
+        (episode_dir / filename).write_text(json.dumps(document))
+    return episode, diarized, segments
+
+
 @pytest.mark.parametrize(
     ("variant_id", "asset_id", "label"),
     (
@@ -185,7 +232,7 @@ def test_gameplay_surround_binds_all_assets_and_layout(tmp_path, monkeypatch):
     )
 
 
-def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
+def test_gameplay_surround_currentness_binds_assets_and_effective_caption_context(
     tmp_path, monkeypatch
 ):
     episode_dir = tmp_path / "episode"
@@ -197,6 +244,8 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
     (episode_dir / "captions.ass").write_text("[Script Info]\n")
+    _write_gameplay_caption_context(episode_dir)
+    caption_context_revision = gameplay_surround_caption_context_revision(episode_dir)
     asset_set = _gameplay_asset_set(tmp_path, monkeypatch)
     base_record = {"fingerprint": "sha256:base"}
     base_identity = file_content_identity(base)["scan_identity"]
@@ -207,6 +256,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
         asset_set,
         encoding,
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        caption_context_revision=caption_context_revision,
     )
     changed_focus = deepcopy(asset_set)
     changed_focus["assets"][1]["focus_x"] = 0.625
@@ -217,6 +267,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
             changed_focus,
             encoding,
             variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+            caption_context_revision=caption_context_revision,
         )
         != fingerprint
     )
@@ -229,6 +280,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
             changed_fit,
             encoding,
             variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+            caption_context_revision=caption_context_revision,
         )
         != fingerprint
     )
@@ -247,6 +299,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
                 asset_set,
                 encoding,
                 variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+                caption_context_revision=caption_context_revision,
             )
             != fingerprint
         )
@@ -265,6 +318,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
             "format": "ass",
             "burned_in": True,
             "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": caption_context_revision,
         },
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
@@ -273,6 +327,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
     assert record["captions"]["placement_policy"] == (
         GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION
     )
+    assert record["captions"]["context_revision"] == caption_context_revision
     assert record["asset"]["render_plan"] == GAMEPLAY_SURROUND_RENDER_PLAN
     assert len(record["asset"]["assets"]) == 3
     _, current = background_variant_state(
@@ -283,6 +338,61 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
     assert current["current"] is True
+
+    transcript_path = episode_dir / "diarized_transcript.json"
+    transcript = json.loads(transcript_path.read_text())
+    transcript["speaker_map"][0]["mapping_confidence"] = 0.9
+    transcript_path.write_text(json.dumps(transcript))
+    segments_path = episode_dir / "segments.json"
+    segments = json.loads(segments_path.read_text())
+    segments["track_mapping"][0]["person"] = "Renamed host"
+    segments_path.write_text(json.dumps(segments))
+    assert gameplay_surround_caption_context_revision(episode_dir) == (
+        caption_context_revision
+    )
+    _, still_current = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert still_current["current"] is True
+
+    segments["track_mapping"][0]["logical_track"] = 2
+    segments["track_mapping"][1]["logical_track"] = 1
+    segments_path.write_text(json.dumps(segments))
+    _, rebound = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert rebound["current"] is False
+    assert "speaker bindings or panel anchors changed" in rebound["detail"]
+
+    _, _, original_segments = _write_gameplay_caption_context(episode_dir)
+    assert json.loads(segments_path.read_text()) == original_segments
+    episode_path = episode_dir / "episode.json"
+    original_episode = json.loads(episode_path.read_text())
+    reordered_episode = deepcopy(original_episode)
+    reordered_episode["crop_config"]["speakers"][0]["longform_center_x"] = 1600
+    reordered_episode["crop_config"]["speakers"][1]["longform_center_x"] = 300
+    assert visual_crop_state(
+        original_episode["crop_config"], "short"
+    ) == visual_crop_state(reordered_episode["crop_config"], "short")
+    episode_path.write_text(json.dumps(reordered_episode))
+    _, reordered = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert reordered["current"] is False
+    assert "speaker bindings or panel anchors changed" in reordered["detail"]
+    episode_path.write_text(json.dumps(original_episode))
 
     manifest = tmp_path / "assets" / f"{GTA_DRIVING_ASSET_ID}.json"
     changed = json.loads(manifest.read_text())
@@ -305,8 +415,19 @@ def test_caption_policy_invalidates_only_gameplay_surround(tmp_path, monkeypatch
     base_record = {"fingerprint": "sha256:base"}
     base_identity = {"device": 1, "inode": 2, "size_bytes": 3, "mtime_ns": 4}
     encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
+    caption_context_revision = "sha256:" + "a" * 64
     ordinary = background_variant_fingerprint(
         base_record, base_identity, ordinary_asset, encoding
+    )
+    assert (
+        background_variant_fingerprint(
+            base_record,
+            base_identity,
+            ordinary_asset,
+            encoding,
+            caption_context_revision="sha256:gameplay-only",
+        )
+        == ordinary
     )
     gameplay = background_variant_fingerprint(
         base_record,
@@ -314,6 +435,7 @@ def test_caption_policy_invalidates_only_gameplay_surround(tmp_path, monkeypatch
         gameplay_assets,
         encoding,
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        caption_context_revision=caption_context_revision,
     )
     from lib import short_variants as short_variants_module
 
@@ -336,9 +458,19 @@ def test_caption_policy_invalidates_only_gameplay_surround(tmp_path, monkeypatch
             gameplay_assets,
             encoding,
             variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+            caption_context_revision=caption_context_revision,
         )
         != gameplay
     )
+
+    with pytest.raises(ValueError, match="valid caption context revision"):
+        background_variant_fingerprint(
+            base_record,
+            base_identity,
+            gameplay_assets,
+            encoding,
+            variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        )
 
 
 def test_variant_artifact_paths_are_isolated(tmp_path):
