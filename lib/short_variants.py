@@ -482,17 +482,19 @@ def speaker_panel_caption_context_revision(
     diarized: dict | None = None,
     segment_document: dict | None = None,
 ) -> str:
-    """Fingerprint inputs unique to gameplay speaker-panel caption placement."""
+    """Fingerprint inputs unique to speaker-panel caption placement."""
 
     def load_document(filename: str) -> dict:
         try:
             document = json.loads((Path(episode_dir) / filename).read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"Gameplay caption context needs current {filename}"
+                f"Speaker-panel caption context needs current {filename}"
             ) from exc
         if not isinstance(document, dict):
-            raise TypeError(f"Gameplay caption context needs a mapping in {filename}")
+            raise TypeError(
+                f"Speaker-panel caption context needs a mapping in {filename}"
+            )
         return document
 
     episode = episode if episode is not None else load_document("episode.json")
@@ -506,7 +508,7 @@ def speaker_panel_caption_context_revision(
     )
     crop_config = episode.get("crop_config") or {}
     if not isinstance(crop_config, dict):
-        raise TypeError("Gameplay caption context needs a crop mapping")
+        raise TypeError("Speaker-panel caption context needs a crop mapping")
     speaker_targets = resolve_caption_speaker_targets(
         diarized, segment_document, crop_config
     )
@@ -752,8 +754,8 @@ def background_variant_state(
                 and recorded_caption_context != caption_context_revision
             ):
                 stale_detail = (
-                    "The gameplay caption speaker bindings or panel anchors changed "
-                    "after this variant was rendered."
+                    "The speaker bindings or panel anchors changed for speaker-panel "
+                    "captions after this variant was rendered."
                 )
             else:
                 expected = background_variant_fingerprint(
