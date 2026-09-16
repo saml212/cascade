@@ -2163,6 +2163,208 @@ _SHORT_ONLY_RELEASE_BLOCKERS = frozenset(
     }
 )
 
+_LONGFORM_QA_SHORT_ONLY_CHECKS = frozenset({"all_shorts_rendered"})
+_LONGFORM_QA_REQUIRED_CHECKS = frozenset(
+    {
+        "source_merged_exists",
+        "source_merged_duration",
+        "source_merged_has_audio",
+        "review_video_exists",
+        "transcript_srt_exists",
+        "metadata_valid",
+        "selected_master_output_continuity",
+    }
+)
+_LONGFORM_QA_REQUIRED_ARTIFACTS = frozenset(
+    {("selected_audio_master", None), ("upload_video", None)}
+)
+
+
+def _longform_quality_evidence(snapshot: dict) -> dict:
+    """Attribute a current aggregate QA failure to shorts or the full episode."""
+    quality = snapshot.get("quality", {})
+    current_revision = quality.get("current_revision")
+    report_revision = quality.get("report_revision")
+    blockers: list[dict] = []
+    excluded_checks: list[dict] = []
+    excluded_artifacts: list[dict] = []
+    current_report = bool(
+        current_revision and report_revision and report_revision == current_revision
+    )
+    if not current_report:
+        blockers.append(
+            {
+                "code": "longform_quality_report_missing_or_stale",
+                "message": "Run QA for the current longform revision.",
+            }
+        )
+
+    checks = [
+        check for check in (quality.get("checks") or []) if isinstance(check, dict)
+    ]
+    checks_by_name: dict[str, list[dict]] = {}
+    for check in checks:
+        name = str(check.get("name", ""))
+        checks_by_name.setdefault(name, []).append(check)
+        if name in _LONGFORM_QA_SHORT_ONLY_CHECKS:
+            if check.get("pass") is not True:
+                excluded_checks.append(
+                    {
+                        "name": name,
+                        "status": check.get("status"),
+                        "detail": check.get("detail"),
+                    }
+                )
+            continue
+        if name == "selected_master_output_continuity":
+            continue
+        if check.get("pass") is not True:
+            blockers.append(
+                {
+                    "code": "longform_quality_check_failed",
+                    "check": name or None,
+                    "status": check.get("status"),
+                    "message": check.get("detail")
+                    or f"Longform QA check {name or 'unknown'} did not pass.",
+                }
+            )
+
+    for name in sorted(_LONGFORM_QA_REQUIRED_CHECKS):
+        matches = checks_by_name.get(name, [])
+        if len(matches) != 1:
+            blockers.append(
+                {
+                    "code": "longform_quality_check_missing_or_ambiguous",
+                    "check": name,
+                    "message": f"Current QA must contain exactly one {name} check.",
+                }
+            )
+
+    audio_quality = snapshot.get("audio_quality") or {}
+    continuity = audio_quality.get("selected_master_output_continuity") or {}
+    if not isinstance(continuity, dict):
+        continuity = {}
+    if (
+        continuity.get("current") is not True
+        or not continuity.get("fingerprint")
+        or continuity.get("reviewable") is not True
+    ):
+        blockers.append(
+            {
+                "code": "longform_output_continuity_invalid",
+                "message": (
+                    "Current structurally valid output continuity evidence is required."
+                ),
+            }
+        )
+    artifacts_by_key: dict[tuple[object, object], list[dict]] = {}
+    for artifact in continuity.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        key = (artifact.get("role"), artifact.get("clip_id"))
+        artifacts_by_key.setdefault(key, []).append(artifact)
+        if artifact.get("role") == "short":
+            if artifact.get("required", True) and artifact.get("status") != "pass":
+                excluded_artifacts.append(
+                    {
+                        "role": "short",
+                        "clip_id": artifact.get("clip_id"),
+                        "status": artifact.get("status"),
+                        "detail": artifact.get("detail"),
+                    }
+                )
+            continue
+        if (
+            key not in _LONGFORM_QA_REQUIRED_ARTIFACTS
+            and artifact.get("required", True)
+            and artifact.get("status") != "pass"
+        ):
+            blockers.append(
+                {
+                    "code": "longform_output_artifact_failed",
+                    "role": artifact.get("role"),
+                    "status": artifact.get("status"),
+                    "message": artifact.get("detail")
+                    or "A required non-short output artifact did not pass.",
+                }
+            )
+
+    required_artifacts = []
+    for key in sorted(_LONGFORM_QA_REQUIRED_ARTIFACTS, key=lambda value: value[0]):
+        matches = artifacts_by_key.get(key, [])
+        if len(matches) != 1:
+            blockers.append(
+                {
+                    "code": "longform_output_artifact_missing_or_ambiguous",
+                    "role": key[0],
+                    "message": (
+                        f"Current QA must contain exactly one {key[0]} artifact."
+                    ),
+                }
+            )
+            continue
+        artifact = matches[0]
+        required_artifacts.append(
+            {
+                "role": key[0],
+                "status": artifact.get("status"),
+                "currentness": artifact.get("currentness"),
+                "mechanically_verified": artifact.get("mechanically_verified"),
+                "revision": artifact.get("revision"),
+            }
+        )
+        if not (
+            artifact.get("required") is True
+            and artifact.get("status") == "pass"
+            and artifact.get("currentness") == "current"
+            and artifact.get("mechanically_verified") is True
+        ):
+            blockers.append(
+                {
+                    "code": "longform_output_artifact_failed",
+                    "role": key[0],
+                    "status": artifact.get("status"),
+                    "message": artifact.get("detail")
+                    or f"Current {key[0]} continuity evidence did not pass.",
+                }
+            )
+
+    attributed_short_failure = bool(excluded_checks or excluded_artifacts)
+    if (
+        current_report
+        and quality.get("status") != "passed"
+        and not attributed_short_failure
+    ):
+        blockers.append(
+            {
+                "code": "longform_aggregate_quality_failure_unattributed",
+                "message": (
+                    "Aggregate QA failed without an explicit short-only failed check "
+                    "or artifact."
+                ),
+            }
+        )
+
+    return {
+        "status": "passed" if current_report and not blockers else "blocked",
+        "safe": current_report and not blockers,
+        "aggregate_status": quality.get("status"),
+        "aggregate_overall": quality.get("overall"),
+        "aggregate_failure_attributed_to_shorts": bool(
+            current_report
+            and not blockers
+            and quality.get("status") != "passed"
+            and attributed_short_failure
+        ),
+        "current_revision": current_revision,
+        "report_revision": report_revision,
+        "report_fingerprint": continuity.get("fingerprint"),
+        "required_artifacts": required_artifacts,
+        "excluded_short_checks": excluded_checks,
+        "excluded_short_artifacts": excluded_artifacts,
+        "blockers": blockers,
+    }
+
 
 def longform_publication_snapshot(
     episode_dir: str | Path,
@@ -2193,6 +2395,7 @@ def longform_publication_snapshot(
     quality = base.get("quality", {})
     editorial = base.get("approvals", {}).get("editorial", {})
     release_gate = base.get("release_gate", {})
+    longform_quality = _longform_quality_evidence(base)
     metadata = canonical_release_metadata(episode_dir, episode).get("longform", {})
     aggregate_plan = release_gate.get("publish_plan", {})
     upload_plan = aggregate_plan.get("upload_post", {})
@@ -2209,12 +2412,20 @@ def longform_publication_snapshot(
         ),
     }
 
+    excluded_release_blockers = _SHORT_ONLY_RELEASE_BLOCKERS | {
+        "publish_approval_missing_or_stale"
+    }
+    if longform_quality["safe"]:
+        excluded_release_blockers = excluded_release_blockers | {
+            "quality_checks_failed"
+        }
     prerequisites = [
         dict(blocker)
         for blocker in release_gate.get("blockers", [])
-        if blocker.get("code")
-        not in _SHORT_ONLY_RELEASE_BLOCKERS | {"publish_approval_missing_or_stale"}
+        if blocker.get("code") not in excluded_release_blockers
     ]
+    if not longform_quality["safe"]:
+        prerequisites.extend(longform_quality["blockers"])
 
     enabled = [
         name
@@ -2272,6 +2483,7 @@ def longform_publication_snapshot(
         "editorial_revision": editorial.get("revision"),
         "quality_revision": quality.get("current_revision"),
         "qa_report_revision": quality.get("report_revision"),
+        "longform_quality": longform_quality,
         "render": render_record,
         "upload_video": _file_signature(episode_dir / "upload_video.mp4"),
         "metadata": metadata,
@@ -2316,6 +2528,7 @@ def longform_publication_snapshot(
         "source_release_revision": release_gate.get("revision"),
         "editorial_revision": editorial.get("revision"),
         "quality_revision": quality.get("current_revision"),
+        "longform_quality": longform_quality,
         "publish_plan": plan,
         "enabled_destinations": enabled,
         "blockers": blockers,

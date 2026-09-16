@@ -550,34 +550,103 @@ class TestQAAgent:
         assert saved["selected_master_output_continuity"] == raw_continuity
 
 
-def test_longform_gate_ignores_only_short_blockers(tmp_episode_dir):
-    episode_path = tmp_episode_dir / "episode.json"
-    episode = {
-        "episode_id": tmp_episode_dir.name,
-        "title": "Corrected episode",
-        "description": "Corrected description",
-    }
-    episode_path.write_text(json.dumps(episode))
-    (tmp_episode_dir / "upload_video.mp4").write_bytes(b"corrected video")
-    aggregate = {
+def _longform_aggregate_snapshot(
+    *,
+    short_status="pass",
+    upload_status="pass",
+    continuity_reviewable=True,
+    extra_checks=None,
+    extra_release_blockers=None,
+):
+    continuity_pass = short_status == "pass" and upload_status == "pass"
+    checks = [
+        {"name": name, "pass": True, "detail": "passed"}
+        for name in (
+            "source_merged_exists",
+            "source_merged_duration",
+            "source_merged_has_audio",
+            "review_video_exists",
+            "all_shorts_rendered",
+            "transcript_srt_exists",
+            "metadata_valid",
+        )
+    ]
+    checks.extend(extra_checks or [])
+    checks.append(
+        {
+            "name": "selected_master_output_continuity",
+            "pass": continuity_pass,
+            "status": "pass" if continuity_pass else "stale",
+            "detail": "all outputs passed" if continuity_pass else "shorts are stale",
+        }
+    )
+    artifacts = [
+        {
+            "role": "selected_audio_master",
+            "required": True,
+            "status": "pass",
+            "currentness": "current",
+            "mechanically_verified": True,
+            "revision": "sha256:master",
+        },
+        {
+            "role": "upload_video",
+            "required": True,
+            "status": upload_status,
+            "currentness": "current",
+            "mechanically_verified": upload_status == "pass",
+            "revision": "sha256:upload",
+            "detail": "full episode audio discontinuity"
+            if upload_status != "pass"
+            else "passed",
+        },
+    ]
+    selected_clip_ids = (
+        "clip_01",
+        "clip_02",
+        "clip_03",
+        "clip_05",
+        "clip_08",
+        "clip_11",
+        "clip_12",
+        "clip_13",
+        "clip_14",
+        "clip_15",
+    )
+    artifacts.extend(
+        {
+            "role": "short",
+            "clip_id": clip_id,
+            "required": True,
+            "status": short_status,
+            "currentness": "stale" if short_status == "stale" else "current",
+            "mechanically_verified": short_status == "pass",
+            "revision": f"sha256:{clip_id}",
+            "detail": "Selected short is stale for current release inputs.",
+        }
+        for clip_id in selected_clip_ids
+    )
+    failed = not all(check.get("pass") is True for check in checks)
+    blockers = list(extra_release_blockers or [])
+    if failed:
+        blockers.insert(
+            0,
+            {
+                "code": "quality_checks_failed",
+                "message": "The current QA report contains blocking findings.",
+            },
+        )
+    return {
         "quality": {
-            "status": "passed",
+            "status": "blocked" if failed else "passed",
             "current_revision": "sha256:quality",
             "report_revision": "sha256:quality",
+            "checks": checks,
         },
         "release_gate": {
             "safe": False,
             "revision": "sha256:aggregate",
-            "blockers": [
-                {
-                    "code": "approved_shorts_missing",
-                    "message": "Ten approved shorts are stale.",
-                },
-                {
-                    "code": "publish_approval_missing_or_stale",
-                    "message": "Global approval required.",
-                },
-            ],
+            "blockers": blockers,
             "publish_plan": {
                 "upload_post": {
                     "destinations": ["youtube", "tiktok"],
@@ -588,7 +657,43 @@ def test_longform_gate_ignores_only_short_blockers(tmp_episode_dir):
             },
         },
         "approvals": {"editorial": {"current": True, "revision": "sha256:editorial"}},
+        "audio_quality": {
+            "selected_master_output_continuity": {
+                "current": True,
+                "fingerprint": "sha256:continuity",
+                "reviewable": continuity_reviewable,
+                "status": "pass" if continuity_pass else "stale",
+                "safe": continuity_pass,
+                "artifacts": artifacts,
+            }
+        },
     }
+
+
+def test_arnold_longform_gate_attributes_stale_shorts_without_waiving_aggregate_qa(
+    tmp_episode_dir,
+):
+    episode_path = tmp_episode_dir / "episode.json"
+    episode = {
+        "episode_id": tmp_episode_dir.name,
+        "title": "Corrected episode",
+        "description": "Corrected description",
+    }
+    episode_path.write_text(json.dumps(episode))
+    (tmp_episode_dir / "upload_video.mp4").write_bytes(b"corrected video")
+    aggregate = _longform_aggregate_snapshot(
+        short_status="stale",
+        extra_release_blockers=[
+            {
+                "code": "approved_shorts_missing",
+                "message": "Ten approved shorts are stale.",
+            },
+            {
+                "code": "publish_approval_missing_or_stale",
+                "message": "Global approval required.",
+            },
+        ],
+    )
 
     with patch("agents.qa.quality_snapshot", return_value=aggregate):
         awaiting = longform_publication_snapshot(tmp_episode_dir, config={})
@@ -601,8 +706,143 @@ def test_longform_gate_ignores_only_short_blockers(tmp_episode_dir):
 
     assert awaiting["can_approve"] is True
     assert awaiting["safe"] is False
+    assert awaiting["longform_quality"]["safe"] is True
+    assert (
+        awaiting["longform_quality"]["aggregate_failure_attributed_to_shorts"] is True
+    )
+    assert len(awaiting["longform_quality"]["excluded_short_artifacts"]) == 10
+    assert {
+        item["clip_id"]
+        for item in awaiting["longform_quality"]["excluded_short_artifacts"]
+    } == {
+        "clip_01",
+        "clip_02",
+        "clip_03",
+        "clip_05",
+        "clip_08",
+        "clip_11",
+        "clip_12",
+        "clip_13",
+        "clip_14",
+        "clip_15",
+    }
     assert approved["safe"] is True
     assert aggregate["release_gate"]["safe"] is False
+    assert aggregate["quality"]["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("upload_status", "extra_checks", "expected_code"),
+    [
+        ("failed", [], "longform_output_artifact_failed"),
+        (
+            "pass",
+            [
+                {
+                    "name": "future_full_audio_check",
+                    "pass": False,
+                    "status": "failed",
+                    "detail": "Measured full-episode splice discontinuity.",
+                }
+            ],
+            "longform_quality_check_failed",
+        ),
+    ],
+)
+def test_longform_gate_keeps_full_audio_and_unknown_qa_failures(
+    tmp_episode_dir, upload_status, extra_checks, expected_code
+):
+    (tmp_episode_dir / "episode.json").write_text(
+        json.dumps(
+            {
+                "episode_id": tmp_episode_dir.name,
+                "title": "Corrected episode",
+                "description": "Corrected description",
+            }
+        )
+    )
+    aggregate = _longform_aggregate_snapshot(
+        short_status="stale",
+        upload_status=upload_status,
+        extra_checks=extra_checks,
+    )
+
+    with patch("agents.qa.quality_snapshot", return_value=aggregate):
+        gate = longform_publication_snapshot(tmp_episode_dir, config={})
+
+    assert gate["can_approve"] is False
+    assert gate["longform_quality"]["safe"] is False
+    assert expected_code in {
+        item["code"] for item in gate["longform_quality"]["blockers"]
+    }
+    assert "quality_checks_failed" in {item["code"] for item in gate["blockers"]}
+
+
+def test_longform_gate_rejects_invalid_effective_continuity_with_passing_remnants(
+    tmp_episode_dir,
+):
+    (tmp_episode_dir / "episode.json").write_text(
+        json.dumps(
+            {
+                "episode_id": tmp_episode_dir.name,
+                "title": "Corrected episode",
+                "description": "Corrected description",
+            }
+        )
+    )
+    aggregate = _longform_aggregate_snapshot(
+        short_status="stale",
+        continuity_reviewable=False,
+    )
+    continuity = aggregate["audio_quality"]["selected_master_output_continuity"]
+    continuity.update(status="error", safe=False)
+    continuity_check = next(
+        check
+        for check in aggregate["quality"]["checks"]
+        if check["name"] == "selected_master_output_continuity"
+    )
+    continuity_check["pass"] = False
+    continuity_check.update(status="error", detail="continuity report is invalid")
+
+    with patch("agents.qa.quality_snapshot", return_value=aggregate):
+        gate = longform_publication_snapshot(tmp_episode_dir, config={})
+
+    assert gate["can_approve"] is False
+    assert gate["longform_quality"]["safe"] is False
+    assert "longform_output_continuity_invalid" in {
+        item["code"] for item in gate["longform_quality"]["blockers"]
+    }
+
+
+def test_longform_gate_rejects_unattributed_aggregate_failure(tmp_episode_dir):
+    (tmp_episode_dir / "episode.json").write_text(
+        json.dumps(
+            {
+                "episode_id": tmp_episode_dir.name,
+                "title": "Corrected episode",
+                "description": "Corrected description",
+            }
+        )
+    )
+    aggregate = _longform_aggregate_snapshot()
+    aggregate["quality"]["status"] = "blocked"
+    aggregate["quality"]["overall"] = "fail"
+    aggregate["release_gate"]["blockers"].insert(
+        0,
+        {
+            "code": "quality_checks_failed",
+            "message": "The current QA report contains blocking findings.",
+        },
+    )
+
+    with patch("agents.qa.quality_snapshot", return_value=aggregate):
+        gate = longform_publication_snapshot(tmp_episode_dir, config={})
+
+    assert gate["can_approve"] is False
+    assert gate["longform_quality"]["safe"] is False
+    assert "longform_aggregate_quality_failure_unattributed" in {
+        item["code"] for item in gate["longform_quality"]["blockers"]
+    }
 
 
 def test_longform_gate_keeps_nonshort_delivery_blockers(tmp_episode_dir):
@@ -615,31 +855,14 @@ def test_longform_gate_keeps_nonshort_delivery_blockers(tmp_episode_dir):
             }
         )
     )
-    aggregate = {
-        "quality": {
-            "status": "passed",
-            "current_revision": "sha256:quality",
-            "report_revision": "sha256:quality",
-        },
-        "release_gate": {
-            "safe": False,
-            "revision": "sha256:aggregate",
-            "blockers": [
-                {
-                    "code": "release_video_invalid",
-                    "message": "Canonical video is stale.",
-                }
-            ],
-            "publish_plan": {
-                "upload_post": {
-                    "destinations": ["youtube"],
-                    "account_identity": "sha256:user",
-                },
-                "video_podcast_rss": {"enabled": False},
-            },
-        },
-        "approvals": {"editorial": {"current": True, "revision": "sha256:editorial"}},
-    }
+    aggregate = _longform_aggregate_snapshot(
+        extra_release_blockers=[
+            {
+                "code": "release_video_invalid",
+                "message": "Canonical video is stale.",
+            }
+        ],
+    )
 
     with patch("agents.qa.quality_snapshot", return_value=aggregate):
         gate = longform_publication_snapshot(tmp_episode_dir, config={})
