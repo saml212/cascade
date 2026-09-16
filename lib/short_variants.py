@@ -16,14 +16,35 @@ from lib.timeline import Timeline
 
 BACKGROUND_VARIANT_ID = "background_motion_v1"
 SATISFYING_VARIANT_ID = "satisfying_motion_v1"
-BACKGROUND_VARIANT_IDS = (BACKGROUND_VARIANT_ID, SATISFYING_VARIANT_ID)
+MINECRAFT_PARKOUR_VARIANT_ID = "minecraft_parkour_v1"
+SUBWAY_SURFERS_VARIANT_ID = "subway_surfers_v1"
+GTA_DRIVING_VARIANT_ID = "gta_driving_v1"
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
+MINECRAFT_PARKOUR_ASSET_ID = "spicy_sauce_minecraft_12_v1"
+SUBWAY_SURFERS_ASSET_ID = "orbitalncg_subway_surfers_12_v1"
+GTA_DRIVING_ASSET_ID = "orbitalncg_gta_driving_15_v1"
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
+
+_VARIANT_LABELS = {
+    BACKGROUND_VARIANT_ID: "Motion background",
+    SATISFYING_VARIANT_ID: "Satisfying footage",
+    MINECRAFT_PARKOUR_VARIANT_ID: "Minecraft parkour",
+    SUBWAY_SURFERS_VARIANT_ID: "Subway Surfers",
+    GTA_DRIVING_VARIANT_ID: "GTA driving",
+}
+_VARIANT_ASSETS = {
+    BACKGROUND_VARIANT_ID: DEFAULT_BACKGROUND_ASSET_ID,
+    SATISFYING_VARIANT_ID: SATISFYING_BACKGROUND_ASSET_ID,
+    MINECRAFT_PARKOUR_VARIANT_ID: MINECRAFT_PARKOUR_ASSET_ID,
+    SUBWAY_SURFERS_VARIANT_ID: SUBWAY_SURFERS_ASSET_ID,
+    GTA_DRIVING_VARIANT_ID: GTA_DRIVING_ASSET_ID,
+}
+BACKGROUND_VARIANT_IDS = tuple(_VARIANT_LABELS)
 
 _ASSET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -49,31 +70,19 @@ def require_background_variant(variant_id: str) -> None:
 
 def background_variant_label(variant_id: str) -> str:
     require_background_variant(variant_id)
-    return (
-        "Satisfying footage"
-        if variant_id == SATISFYING_VARIANT_ID
-        else "Motion background"
-    )
+    return _VARIANT_LABELS[variant_id]
 
 
 def default_background_asset_id(variant_id: str) -> str:
     require_background_variant(variant_id)
-    return (
-        SATISFYING_BACKGROUND_ASSET_ID
-        if variant_id == SATISFYING_VARIANT_ID
-        else DEFAULT_BACKGROUND_ASSET_ID
-    )
+    return _VARIANT_ASSETS[variant_id]
 
 
 def require_background_variant_asset(variant_id: str, asset_id: str) -> None:
     require_background_variant(variant_id)
-    if (
-        variant_id == SATISFYING_VARIANT_ID
-        and asset_id != SATISFYING_BACKGROUND_ASSET_ID
-    ):
-        raise KeyError(
-            f"{SATISFYING_VARIANT_ID} requires {SATISFYING_BACKGROUND_ASSET_ID}"
-        )
+    expected_asset_id = _VARIANT_ASSETS[variant_id]
+    if variant_id != BACKGROUND_VARIANT_ID and asset_id != expected_asset_id:
+        raise KeyError(f"{variant_id} requires {expected_asset_id}")
 
 
 def selected_short_variant_id(clip: dict) -> str | None:

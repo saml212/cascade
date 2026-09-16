@@ -3,6 +3,8 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from agents.publish import (
     ARTIFACT_SHORT_DESTINATION_SCHEMA,
     EXPANDED_SHORT_DESTINATION_SCHEMA,
@@ -94,9 +96,28 @@ def test_destination_copy_requires_provider_fields_as_strings():
     )
 
 
+@pytest.mark.parametrize(
+    "variant_id",
+    ("minecraft_parkour_v1", "subway_surfers_v1", "gta_driving_v1"),
+)
+def test_gameplay_variant_overrides_preserve_saved_selection(tmp_path, variant_id):
+    agent = PublishAgent(tmp_path, {})
+    approved = [{"id": "clip_04", "distribution_variant_id": "background_motion_v1"}]
+    data = {"approved": approved}
+
+    result = agent._validated_variant_overrides(
+        data,
+        {"variant_overrides": {"clip_04": variant_id}},
+    )
+
+    assert result == {"clip_04": variant_id}
+    assert approved[0]["distribution_variant_id"] == "background_motion_v1"
+
+
 def test_variant_currentness_uses_the_frozen_approval_metadata(tmp_path, monkeypatch):
     agent = PublishAgent(tmp_path, {})
     frozen = {"id": "clip_04", "facebook": {"title": "reviewed"}}
+    gameplay_variant = "minecraft_parkour_v1"
     data = {
         "episode": {},
         "approved": [{"id": "clip_04", "distribution_variant_id": "old"}],
@@ -108,13 +129,15 @@ def test_variant_currentness_uses_the_frozen_approval_metadata(tmp_path, monkeyp
     )
 
     def state(_episode_dir, _episode, _config, clip, _record, metadata):
-        assert clip["distribution_variant_id"] == "satisfying_motion_v1"
+        assert clip["distribution_variant_id"] == gameplay_variant
         assert metadata is frozen
         return {"current": True, "approval_current": True}
 
     monkeypatch.setattr("agents.publish.short_distribution_state", state)
-    versions = agent._destination_versions(data, {"clip_04": "satisfying_motion_v1"})
+    versions = agent._destination_versions(data, {"clip_04": gameplay_variant})
     assert versions["clip_04"]["approval_current"] is True
+    assert data["approved"][0]["distribution_variant_id"] == "old"
+    assert data["short_versions"]["clip_04"]["variant_id"] == "background_motion_v1"
 
 
 def test_immediate_destination_uses_override_media_without_schedule_fields(

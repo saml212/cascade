@@ -362,6 +362,58 @@ def test_review_distinguishes_missing_short_from_stale(test_client):
     }
 
 
+def test_review_advertises_gameplay_variants_before_render(test_client, monkeypatch):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    _write_clips(
+        episode_dir,
+        [{"id": "clip_01", "start_seconds": 10, "end_seconds": 30}],
+    )
+
+    from lib.short_variants import (
+        GTA_DRIVING_ASSET_ID,
+        GTA_DRIVING_VARIANT_ID,
+        MINECRAFT_PARKOUR_ASSET_ID,
+        MINECRAFT_PARKOUR_VARIANT_ID,
+        SUBWAY_SURFERS_ASSET_ID,
+        SUBWAY_SURFERS_VARIANT_ID,
+    )
+    from server.routes import review
+
+    def missing_variant(_episode_dir, clip_id, *, variant_id, **_kwargs):
+        return {}, {
+            "status": "missing",
+            "current": False,
+            "playable": False,
+            "path": f"short_variants/{variant_id}/{clip_id}.mp4",
+            "reason_code": "artifact_missing",
+            "detail": "No rendered file exists yet.",
+        }
+
+    monkeypatch.setattr(review, "background_variant_state", missing_variant)
+
+    response = client.get("/api/episodes/ep_001/review")
+
+    assert response.status_code == 200
+    variants = response.json()["clips"][0]["review"]["variants"]
+    expected = {
+        MINECRAFT_PARKOUR_VARIANT_ID: (
+            "Minecraft parkour",
+            MINECRAFT_PARKOUR_ASSET_ID,
+        ),
+        SUBWAY_SURFERS_VARIANT_ID: (
+            "Subway Surfers",
+            SUBWAY_SURFERS_ASSET_ID,
+        ),
+        GTA_DRIVING_VARIANT_ID: ("GTA driving", GTA_DRIVING_ASSET_ID),
+    }
+    for variant_id, (label, asset_id) in expected.items():
+        assert variants[variant_id]["label"] == label
+        assert variants[variant_id]["asset_id"] == asset_id
+        assert variants[variant_id]["render"]["status"] == "missing"
+    assert "satisfying_motion_v1" not in variants
+
+
 def test_review_exposes_background_variant_as_separate_media(test_client, monkeypatch):
     client, episodes_dir = test_client
     episode_dir = _create_episode(episodes_dir, "ep_001")

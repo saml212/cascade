@@ -1377,6 +1377,56 @@ class TestClipMutation:
         ]["clip_01@background_motion_v1"]
         assert job["status"] == "succeeded"
 
+    @pytest.mark.parametrize(
+        ("variant_id", "asset_id"),
+        (
+            ("minecraft_parkour_v1", "spicy_sauce_minecraft_12_v1"),
+            ("subway_surfers_v1", "orbitalncg_subway_surfers_12_v1"),
+            ("gta_driving_v1", "orbitalncg_gta_driving_15_v1"),
+        ),
+    )
+    def test_gameplay_variant_render_uses_bound_asset_and_job_identity(
+        self, test_client, monkeypatch, variant_id, asset_id
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+
+        import agents.shorts_render as render_mod
+
+        monkeypatch.setattr(
+            render_mod,
+            "render_single_clip_variant",
+            lambda episode_dir, _config, clip_id, requested_variant, requested_asset: {
+                "clip_id": clip_id,
+                "variant_id": requested_variant,
+                "asset_id": requested_asset,
+                "output_path": str(
+                    episode_dir
+                    / "short_variants"
+                    / requested_variant
+                    / f"{clip_id}.mp4"
+                ),
+                "reused": False,
+                "render": {"fingerprint": "sha256:variant"},
+            },
+        )
+
+        response = client.post(
+            f"/api/episodes/ep_001/clips/clip_01/variants/{variant_id}/render",
+            json={},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["variant_id"] == variant_id
+        assert response.json()["asset_id"] == asset_id
+        jobs = json.loads((ep_dir / "work" / "clip_render_jobs.json").read_text())[
+            "jobs"
+        ]
+        assert jobs[f"clip_01@{variant_id}"]["status"] == "succeeded"
+        assert "clip_01@background_motion_v1" not in jobs
+        assert "clip_01@satisfying_motion_v1" not in jobs
+
     def test_variant_routes_reject_unknown_id(self, test_client):
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")
@@ -1390,9 +1440,10 @@ class TestClipMutation:
         assert response.status_code == 404
         assert "Unknown short variant" in response.json()["detail"]
 
-    def test_variant_approval_restores_candidate_without_approving_base(
+    def test_gameplay_variant_approval_restores_candidate_without_approving_base(
         self, test_client, monkeypatch
     ):
+        variant_id = "minecraft_parkour_v1"
         client, episodes_dir = test_client
         ep_dir = _create_episode(episodes_dir, "ep_001")
         clip = dict(
@@ -1401,7 +1452,7 @@ class TestClipMutation:
             selection_status="selected",
             approved_revision="sha256:base-copy",
             approved_render_fingerprint="sha256:base-render",
-            distribution_variant_id="background_motion_v1",
+            distribution_variant_id=variant_id,
         )
         _add_clips(episodes_dir, "ep_001", [clip, SAMPLE_CLIPS[1]])
         updated = client.patch(
@@ -1459,11 +1510,11 @@ class TestClipMutation:
         )
 
         stale = client.post(
-            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
+            f"/api/episodes/ep_001/clips/clip_01/variants/{variant_id}/approve",
             json={"expected_revision": "sha256:stale"},
         )
         conflicted = client.post(
-            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
+            f"/api/episodes/ep_001/clips/clip_01/variants/{variant_id}/approve",
             json={"expected_revision": revision},
         )
 
@@ -1490,7 +1541,7 @@ class TestClipMutation:
             save_with_unrelated_edit,
         )
         approved = client.post(
-            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/approve",
+            f"/api/episodes/ep_001/clips/clip_01/variants/{variant_id}/approve",
             json={"expected_revision": revision},
         )
 
@@ -1500,10 +1551,11 @@ class TestClipMutation:
         stored = json.loads((ep_dir / "clips.json").read_text())["clips"][0]
         assert stored["status"] == "approved"
         assert stored["selection_status"] == "selected"
-        assert stored["distribution_variant_id"] == "background_motion_v1"
+        assert stored["distribution_variant_id"] == variant_id
         assert stored["metadata"] == concurrent["metadata"]
         assert "approved_revision" not in stored
         assert "approved_render_fingerprint" not in stored
+        assert saved[-1][-1] == variant_id
         other = json.loads((ep_dir / "clips.json").read_text())["clips"][1]
         assert other["title"] == "Concurrent unrelated title"
 

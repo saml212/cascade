@@ -9,11 +9,25 @@ import pytest
 from agents.qa import clip_review_revision, short_distribution_state
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
+    BACKGROUND_VARIANT_IDS,
+    DEFAULT_BACKGROUND_ASSET_ID,
+    GTA_DRIVING_ASSET_ID,
+    GTA_DRIVING_VARIANT_ID,
+    MINECRAFT_PARKOUR_ASSET_ID,
+    MINECRAFT_PARKOUR_VARIANT_ID,
+    SATISFYING_BACKGROUND_ASSET_ID,
+    SATISFYING_VARIANT_ID,
+    SUBWAY_SURFERS_ASSET_ID,
+    SUBWAY_SURFERS_VARIANT_ID,
     background_variant_fingerprint,
+    background_variant_label,
+    background_variant_output,
     background_variant_state,
+    default_background_asset_id,
     file_content_identity,
     load_background_asset,
     record_background_variant,
+    require_background_variant_asset,
     save_background_variant_approval,
     variant_record,
 )
@@ -82,6 +96,58 @@ def _record(tmp_path, monkeypatch):
         },
     )
     return episode_dir, base_record, encoding, record, output
+
+
+@pytest.mark.parametrize(
+    ("variant_id", "asset_id", "label"),
+    (
+        (
+            MINECRAFT_PARKOUR_VARIANT_ID,
+            MINECRAFT_PARKOUR_ASSET_ID,
+            "Minecraft parkour",
+        ),
+        (
+            SUBWAY_SURFERS_VARIANT_ID,
+            SUBWAY_SURFERS_ASSET_ID,
+            "Subway Surfers",
+        ),
+        (GTA_DRIVING_VARIANT_ID, GTA_DRIVING_ASSET_ID, "GTA driving"),
+    ),
+)
+def test_gameplay_variants_bind_stable_asset_identity(variant_id, asset_id, label):
+    assert default_background_asset_id(variant_id) == asset_id
+    assert background_variant_label(variant_id) == label
+    require_background_variant_asset(variant_id, asset_id)
+    with pytest.raises(KeyError, match=f"{variant_id} requires {asset_id}"):
+        require_background_variant_asset(variant_id, "another_asset")
+
+
+def test_variant_artifact_paths_are_isolated(tmp_path):
+    outputs = {
+        variant_id: background_variant_output(tmp_path, "clip_01", variant_id)
+        for variant_id in BACKGROUND_VARIANT_IDS
+    }
+
+    assert len(set(outputs.values())) == len(BACKGROUND_VARIANT_IDS)
+    assert outputs[BACKGROUND_VARIANT_ID] == (
+        tmp_path / "short_variants" / "background_motion_v1" / "clip_01.mp4"
+    )
+    assert outputs[SATISFYING_VARIANT_ID] == (
+        tmp_path / "short_variants" / "satisfying_motion_v1" / "clip_01.mp4"
+    )
+    assert (
+        default_background_asset_id(BACKGROUND_VARIANT_ID)
+        == DEFAULT_BACKGROUND_ASSET_ID
+    )
+    assert (
+        default_background_asset_id(SATISFYING_VARIANT_ID)
+        == SATISFYING_BACKGROUND_ASSET_ID
+    )
+    assert outputs[MINECRAFT_PARKOUR_VARIANT_ID].parent.name == (
+        MINECRAFT_PARKOUR_VARIANT_ID
+    )
+    assert outputs[SUBWAY_SURFERS_VARIANT_ID].parent.name == SUBWAY_SURFERS_VARIANT_ID
+    assert outputs[GTA_DRIVING_VARIANT_ID].parent.name == GTA_DRIVING_VARIANT_ID
 
 
 def test_asset_verification_hashes_content_and_rejects_escape(tmp_path, monkeypatch):

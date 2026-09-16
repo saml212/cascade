@@ -50,9 +50,9 @@ from lib.ffprobe import media_fingerprint, probe
 from lib.paths import get_episodes_dir
 from lib.short_distribution import PLATFORM_COPY_FIELDS, SHORT_PLATFORM_SPECS
 from lib.short_variants import (
-    BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
+    SATISFYING_VARIANT_ID,
     background_variant_approval_state,
     background_variant_label,
     background_variant_state,
@@ -827,7 +827,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 variant_record, variant_render, variant_revision
             )
             variant_states[variant_id] = (variant_render, variant_approval)
-            if variant_id != BACKGROUND_VARIANT_ID and not variant_record:
+            if variant_id == SATISFYING_VARIANT_ID and not variant_record:
                 continue
             variant_asset = variant_record.get("asset")
             variant_asset_id = (
