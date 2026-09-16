@@ -1842,7 +1842,11 @@ async def _run_clip_render_operation(
                         load_config(),
                         clip_id,
                         variant_id,
-                        asset_id or default_background_asset_id(variant_id),
+                        (
+                            default_background_asset_id(variant_id)
+                            if asset_id is None
+                            else asset_id
+                        ),
                     )
                 else:
                     operation = (

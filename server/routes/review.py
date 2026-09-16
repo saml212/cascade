@@ -854,6 +854,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "label": background_variant_label(variant_id),
                 "asset_id": variant_asset_id,
                 "asset_ids": variant_asset_ids,
+                "asset_free": not variant_asset_ids,
                 "render": variant_render,
                 "approval": variant_approval,
                 "render_job": render_job_state(

@@ -23,12 +23,16 @@ MINECRAFT_PARKOUR_VARIANT_ID = "minecraft_parkour_v1"
 SUBWAY_SURFERS_VARIANT_ID = "subway_surfers_v1"
 GTA_DRIVING_VARIANT_ID = "gta_driving_v1"
 GAMEPLAY_SURROUND_VARIANT_ID = "gameplay_surround_v1"
+SPEAKER_PANELS_VARIANT_ID = "speaker_panels_v1"
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 GAMEPLAY_SURROUND_VARIANT_MODE = "podcast_gameplay_surround_v1"
 GAMEPLAY_SURROUND_LAYOUT_VERSION = "gameplay-surround/v1"
 GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION = "source-speaker-panel/v1"
-GAMEPLAY_SURROUND_CAPTION_CONTEXT_VERSION = "speaker-panel-effective/v1"
+SPEAKER_PANELS_VARIANT_MODE = "podcast_speaker_panels_v1"
+SPEAKER_PANELS_LAYOUT_VERSION = "speaker-panels/v1"
+SPEAKER_PANEL_CAPTION_CONTEXT_VERSION = "speaker-panel-effective/v1"
+GAMEPLAY_SURROUND_CAPTION_CONTEXT_VERSION = SPEAKER_PANEL_CAPTION_CONTEXT_VERSION
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
 MINECRAFT_PARKOUR_ASSET_ID = "spicy_sauce_minecraft_12_v1"
@@ -56,6 +60,18 @@ GAMEPLAY_SURROUND_RENDER_PLAN = {
     "brand_font_size": 36,
     "brand_y": 1286,
 }
+SPEAKER_PANELS_RENDER_PLAN = {
+    "canvas": [1080, 1920],
+    "header_height": 72,
+    "panels_height": 1776,
+    "footer_height": 72,
+    "panel_width": 1080,
+    "panel_border": 6,
+    "title": "THE LOCAL PODCAST",
+    "title_font_size": 28,
+    "brand": "thelocalpod.link",
+    "brand_font_size": 26,
+}
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
@@ -67,6 +83,7 @@ _VARIANT_LABELS = {
     SUBWAY_SURFERS_VARIANT_ID: "Subway Surfers",
     GTA_DRIVING_VARIANT_ID: "GTA driving",
     GAMEPLAY_SURROUND_VARIANT_ID: "Gameplay surround",
+    SPEAKER_PANELS_VARIANT_ID: "Clean speaker panels",
 }
 _VARIANT_ASSETS = {
     BACKGROUND_VARIANT_ID: DEFAULT_BACKGROUND_ASSET_ID,
@@ -75,8 +92,12 @@ _VARIANT_ASSETS = {
     SUBWAY_SURFERS_VARIANT_ID: SUBWAY_SURFERS_ASSET_ID,
     GTA_DRIVING_VARIANT_ID: GTA_DRIVING_ASSET_ID,
     GAMEPLAY_SURROUND_VARIANT_ID: GAMEPLAY_SURROUND_ASSET_SET_ID,
+    SPEAKER_PANELS_VARIANT_ID: None,
 }
 BACKGROUND_VARIANT_IDS = tuple(_VARIANT_LABELS)
+SPEAKER_PANEL_VARIANT_IDS = frozenset(
+    {GAMEPLAY_SURROUND_VARIANT_ID, SPEAKER_PANELS_VARIANT_ID}
+)
 
 _ASSET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -105,14 +126,18 @@ def background_variant_label(variant_id: str) -> str:
     return _VARIANT_LABELS[variant_id]
 
 
-def default_background_asset_id(variant_id: str) -> str:
+def default_background_asset_id(variant_id: str) -> str | None:
     require_background_variant(variant_id)
     return _VARIANT_ASSETS[variant_id]
 
 
-def require_background_variant_asset(variant_id: str, asset_id: str) -> None:
+def require_background_variant_asset(variant_id: str, asset_id: str | None) -> None:
     require_background_variant(variant_id)
     expected_asset_id = _VARIANT_ASSETS[variant_id]
+    if expected_asset_id is None:
+        if asset_id is not None:
+            raise KeyError(f"{variant_id} does not use a background asset")
+        return
     if variant_id != BACKGROUND_VARIANT_ID and asset_id != expected_asset_id:
         raise KeyError(f"{variant_id} requires {expected_asset_id}")
 
@@ -120,6 +145,8 @@ def require_background_variant_asset(variant_id: str, asset_id: str) -> None:
 def background_variant_asset_ids(variant_id: str) -> tuple[str, ...]:
     """Return the immutable media asset IDs required by a variant."""
     require_background_variant(variant_id)
+    if variant_id == SPEAKER_PANELS_VARIANT_ID:
+        return ()
     if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
         return tuple(asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS)
     return (_VARIANT_ASSETS[variant_id],)
@@ -314,9 +341,11 @@ def load_background_asset(asset_id: str, *, verify_content: bool = False) -> dic
 
 def load_background_variant_asset(
     variant_id: str, *, verify_content: bool = False
-) -> dict:
+) -> dict | None:
     """Load the fixed asset, or fixed multi-asset set, required by a variant."""
     require_background_variant(variant_id)
+    if variant_id == SPEAKER_PANELS_VARIANT_ID:
+        return None
     if variant_id != GAMEPLAY_SURROUND_VARIANT_ID:
         return load_background_asset(
             default_background_asset_id(variant_id), verify_content=verify_content
@@ -355,7 +384,11 @@ def _asset_record(asset: dict, *, include_provenance: bool) -> dict:
     return recorded
 
 
-def _variant_asset_record(asset: dict, *, include_provenance: bool) -> dict:
+def _variant_asset_record(
+    asset: dict | None, *, include_provenance: bool
+) -> dict | None:
+    if asset is None:
+        return None
     if asset.get("asset_id") != GAMEPLAY_SURROUND_ASSET_SET_ID:
         return _asset_record(asset, include_provenance=include_provenance)
     assets = asset.get("assets")
@@ -378,7 +411,9 @@ def _variant_asset_record(asset: dict, *, include_provenance: bool) -> dict:
     }
 
 
-def _recorded_asset_identity(recorded: dict) -> dict:
+def _recorded_asset_identity(recorded: dict | None) -> dict | None:
+    if recorded is None:
+        return None
     asset_id = recorded.get("asset_id")
     if asset_id != GAMEPLAY_SURROUND_ASSET_SET_ID:
         return {
@@ -425,22 +460,22 @@ def _recorded_asset_identity(recorded: dict) -> dict:
 
 
 def _variant_layout(variant_id: str) -> str:
-    return (
-        GAMEPLAY_SURROUND_LAYOUT_VERSION
-        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
-        else BACKGROUND_LAYOUT_VERSION
-    )
+    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        return GAMEPLAY_SURROUND_LAYOUT_VERSION
+    if variant_id == SPEAKER_PANELS_VARIANT_ID:
+        return SPEAKER_PANELS_LAYOUT_VERSION
+    return BACKGROUND_LAYOUT_VERSION
 
 
 def _variant_mode(variant_id: str) -> str:
-    return (
-        GAMEPLAY_SURROUND_VARIANT_MODE
-        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
-        else BACKGROUND_VARIANT_MODE
-    )
+    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        return GAMEPLAY_SURROUND_VARIANT_MODE
+    if variant_id == SPEAKER_PANELS_VARIANT_ID:
+        return SPEAKER_PANELS_VARIANT_MODE
+    return BACKGROUND_VARIANT_MODE
 
 
-def gameplay_surround_caption_context_revision(
+def speaker_panel_caption_context_revision(
     episode_dir: Path,
     *,
     episode: dict | None = None,
@@ -482,7 +517,7 @@ def gameplay_surround_caption_context_revision(
         else []
     )
     state = {
-        "version": GAMEPLAY_SURROUND_CAPTION_CONTEXT_VERSION,
+        "version": SPEAKER_PANEL_CAPTION_CONTEXT_VERSION,
         "speaker_targets": [
             {"asr_speaker": source, "target": target}
             for source, target in sorted(speaker_targets.items())
@@ -492,8 +527,20 @@ def gameplay_surround_caption_context_revision(
     return _json_revision(state)
 
 
+gameplay_surround_caption_context_revision = speaker_panel_caption_context_revision
+
+
+def require_speaker_panel_caption_context_revision(value: object) -> str:
+    """Require the effective context bound to a speaker-panel render."""
+    revision = str(value or "")
+    if not _SHA256.fullmatch(revision):
+        raise ValueError(
+            "Speaker-panel variant requires a valid caption context revision"
+        )
+    return revision
+
+
 def require_gameplay_caption_context_revision(value: object) -> str:
-    """Require the effective caption context bound to a gameplay render."""
     revision = str(value or "")
     if not _SHA256.fullmatch(revision):
         raise ValueError("Gameplay surround requires a valid caption context revision")
@@ -503,13 +550,16 @@ def require_gameplay_caption_context_revision(value: object) -> str:
 def background_variant_fingerprint(
     base_record: dict,
     base_identity: dict,
-    asset: dict,
+    asset: dict | None,
     encoding: dict,
     *,
     variant_id: str = BACKGROUND_VARIANT_ID,
     caption_context_revision: str | None = None,
 ) -> str:
-    require_background_variant_asset(variant_id, str(asset.get("asset_id", "")))
+    if variant_id != SPEAKER_PANELS_VARIANT_ID and not isinstance(asset, dict):
+        raise TypeError("The short variant requires an asset record")
+    asset_id = asset.get("asset_id") if isinstance(asset, dict) else None
+    require_background_variant_asset(variant_id, asset_id)
     state = {
         "variant_id": variant_id,
         "layout": _variant_layout(variant_id),
@@ -520,14 +570,20 @@ def background_variant_fingerprint(
         "asset": _variant_asset_record(asset, include_provenance=False),
         "encoding": encoding,
     }
-    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
-        caption_context_revision = require_gameplay_caption_context_revision(
-            caption_context_revision
+    if variant_id in SPEAKER_PANEL_VARIANT_IDS:
+        caption_context_revision = (
+            require_gameplay_caption_context_revision(caption_context_revision)
+            if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+            else require_speaker_panel_caption_context_revision(
+                caption_context_revision
+            )
         )
         state["caption_policy"] = {
             "version": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
             "context_revision": caption_context_revision,
         }
+    if variant_id == SPEAKER_PANELS_VARIANT_ID:
+        state["render_plan"] = SPEAKER_PANELS_RENDER_PLAN
     return _json_revision(state)
 
 
@@ -552,12 +608,15 @@ def record_background_variant(
     media: dict,
     base_record: dict,
     base_identity: dict,
-    asset: dict,
+    asset: dict | None,
     encoding: dict,
     captions: dict,
     variant_id: str = BACKGROUND_VARIANT_ID,
 ) -> dict:
-    require_background_variant_asset(variant_id, str(asset.get("asset_id", "")))
+    if variant_id != SPEAKER_PANELS_VARIANT_ID and not isinstance(asset, dict):
+        raise TypeError("The short variant requires an asset record")
+    asset_id = asset.get("asset_id") if isinstance(asset, dict) else None
+    require_background_variant_asset(variant_id, asset_id)
     output = background_variant_output(episode_dir, clip_id, variant_id)
     output_content = file_content_identity(output)
     output_identity = output_content["scan_identity"]
@@ -574,6 +633,11 @@ def record_background_variant(
             "scan_identity": base_identity,
         },
         "asset": _variant_asset_record(asset, include_provenance=True),
+        **(
+            {"render_plan": SPEAKER_PANELS_RENDER_PLAN}
+            if variant_id == SPEAKER_PANELS_VARIANT_ID
+            else {}
+        ),
         "encoding": encoding,
         "captions": captions,
         "output": {
@@ -612,12 +676,18 @@ def background_variant_state(
             recorded_asset = record.get("asset")
             recorded_output = record.get("output")
             recorded_layout = record.get("layout_version")
+            asset_free = variant_id == SPEAKER_PANELS_VARIANT_ID
             if (
                 record.get("variant_id") != variant_id
+                or (asset_free and "asset" not in record)
                 or not isinstance(recorded_layout, str)
                 or record.get("encoding") != encoding
                 or not isinstance(recorded_base, dict)
-                or not isinstance(recorded_asset, dict)
+                or (
+                    recorded_asset is not None
+                    if asset_free
+                    else not isinstance(recorded_asset, dict)
+                )
                 or not isinstance(recorded_output, dict)
                 or not _SHA256.fullmatch(
                     str(recorded_output.get("content_revision", ""))
@@ -636,18 +706,24 @@ def background_variant_state(
                         "re-render this variant."
                     )
                 raise TypeError("The variant manifest is malformed")
-            asset_id = recorded_asset.get("asset_id")
-            if not isinstance(asset_id, str):
+            asset_id = (
+                recorded_asset.get("asset_id")
+                if isinstance(recorded_asset, dict)
+                else None
+            )
+            if not asset_free and not isinstance(asset_id, str):
                 raise TypeError("The variant manifest has no asset identity")
             require_background_variant_asset(variant_id, asset_id)
             asset = (
-                load_background_variant_asset(variant_id)
+                None
+                if asset_free
+                else load_background_variant_asset(variant_id)
                 if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
-                else load_background_asset(asset_id)
+                else load_background_asset(str(asset_id))
             )
             caption_context_revision = (
-                gameplay_surround_caption_context_revision(episode_dir)
-                if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                speaker_panel_caption_context_revision(episode_dir)
+                if variant_id in SPEAKER_PANEL_VARIANT_IDS
                 else None
             )
             recorded_captions = record.get("captions")
@@ -662,9 +738,9 @@ def background_variant_state(
                 stale_detail = (
                     "The canonical base short changed after this variant was rendered."
                 )
-            elif _variant_asset_record(
-                asset, include_provenance=False
-            ) != _recorded_asset_identity(recorded_asset):
+            elif _variant_asset_record(asset, include_provenance=False) != (
+                _recorded_asset_identity(recorded_asset)
+            ):
                 stale_detail = (
                     "A gameplay surround asset or its render plan changed after "
                     "this variant was rendered."
@@ -672,7 +748,7 @@ def background_variant_state(
                     else "The background asset changed after this variant was rendered."
                 )
             elif (
-                variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                variant_id in SPEAKER_PANEL_VARIANT_IDS
                 and recorded_caption_context != caption_context_revision
             ):
                 stale_detail = (

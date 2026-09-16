@@ -62,18 +62,22 @@ from lib.short_variants import (
     GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
     GAMEPLAY_SURROUND_VARIANT_ID,
+    SPEAKER_PANEL_VARIANT_IDS,
+    SPEAKER_PANELS_RENDER_PLAN,
+    SPEAKER_PANELS_VARIANT_ID,
     background_variant_fingerprint,
     background_variant_output,
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
-    gameplay_surround_caption_context_revision,
     load_background_asset,
     load_background_variant_asset,
     record_background_variant,
     require_background_variant,
     require_background_variant_asset,
     require_gameplay_caption_context_revision,
+    require_speaker_panel_caption_context_revision,
+    speaker_panel_caption_context_revision,
 )
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
@@ -125,7 +129,9 @@ class ShortsRenderAgent(BaseAgent):
         variant_id: str = BACKGROUND_VARIANT_ID,
     ) -> dict:
         """Compose one optional motion variant from a current canonical short."""
-        selected_asset_id = asset_id or default_background_asset_id(variant_id)
+        selected_asset_id = (
+            default_background_asset_id(variant_id) if asset_id is None else asset_id
+        )
         require_background_variant_asset(variant_id, selected_asset_id)
         clips = self.load_json("clips.json").get("clips", [])
         clip = next((item for item in clips if item.get("id") == clip_id), None)
@@ -192,11 +198,13 @@ class ShortsRenderAgent(BaseAgent):
         if base_identity is None:
             raise OSError("Canonical short changed while its identity was read")
         asset = (
-            load_background_variant_asset(variant_id, verify_content=True)
+            None
+            if variant_id == SPEAKER_PANELS_VARIANT_ID
+            else load_background_variant_asset(variant_id, verify_content=True)
             if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
             else load_background_asset(asset_id, verify_content=True)
         )
-        media_assets = asset.get("assets", [asset])
+        media_assets = asset.get("assets", [asset]) if asset else []
         for media_asset in media_assets:
             asset_probe = ffprobe(media_asset["path"])
             if not any(
@@ -219,13 +227,13 @@ class ShortsRenderAgent(BaseAgent):
         encoding = get_video_encoding_policy(self.config, "shorts")
         diarized = None
         caption_context_revision = None
-        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        if variant_id in SPEAKER_PANEL_VARIANT_IDS:
             diarized = current_diarized_transcript(
                 self.episode_dir, episode, self.config
             )
             if not diarized:
                 raise ValueError("Current transcript is required for variant captions")
-            caption_context_revision = gameplay_surround_caption_context_revision(
+            caption_context_revision = speaker_panel_caption_context_revision(
                 self.episode_dir,
                 episode=episode,
                 diarized=diarized,
@@ -246,10 +254,14 @@ class ShortsRenderAgent(BaseAgent):
             encoding=encoding,
             variant_id=variant_id,
         )
+        recorded_asset = current_record.get("asset")
+        recorded_asset_id = (
+            recorded_asset.get("asset_id") if isinstance(recorded_asset, dict) else None
+        )
         if (
             current_state["current"]
             and current_record.get("fingerprint") == fingerprint
-            and current_record.get("asset", {}).get("asset_id") == asset_id
+            and recorded_asset_id == asset_id
         ):
             return self._variant_result(output, current_record, reused=True)
 
@@ -519,6 +531,71 @@ class ShortsRenderAgent(BaseAgent):
             check=True,
         )
 
+    def _compose_speaker_panels_variant(
+        self,
+        podcast_video: Path,
+        base_short: Path,
+        caption_path: Path,
+        output: Path,
+        fps: str,
+        encoder_args: list[str],
+    ) -> None:
+        plan = SPEAKER_PANELS_RENDER_PLAN
+        width, _ = plan["canvas"]
+        header_h = plan["header_height"]
+        panels_h = plan["panels_height"]
+        footer_h = plan["footer_height"]
+        subtitle_filter = f"subtitles='{escape_srt_path(caption_path)}'"
+        graph = (
+            f"[0:v]scale={width}:{panels_h},setsar=1,"
+            "tpad=stop_mode=clone:stop_duration=0.25[podcast];"
+            f"color=c=0x10151d:s={width}x{header_h}:r={fps},"
+            f"drawtext=text='{plan['title']}':fontcolor=white:"
+            f"fontsize={plan['title_font_size']}:x=(w-text_w)/2:"
+            "y=(h-text_h)/2[header];"
+            f"color=c=0x10151d:s={width}x{footer_h}:r={fps},"
+            f"drawtext=text='{plan['brand']}':fontcolor=white@0.9:"
+            f"fontsize={plan['brand_font_size']}:x=(w-text_w)/2:"
+            "y=(h-text_h)/2[footer];"
+            "[header][podcast][footer]vstack=inputs=3[canvas];"
+            f"[canvas]{subtitle_filter},format=yuv420p[variant]"
+        )
+        self._run_ffmpeg(
+            [
+                ffmpeg_executable(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(podcast_video),
+                "-i",
+                str(base_short),
+                "-filter_complex",
+                graph,
+                "-map",
+                "[variant]",
+                "-map",
+                "1:a:0",
+                *encoder_args,
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-shortest",
+                *get_color_metadata_args(),
+                "-use_editlist",
+                "0",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
     def _finish_background_variant(
         self,
         podcast_video: Path,
@@ -537,6 +614,15 @@ class ShortsRenderAgent(BaseAgent):
                 self._compose_gameplay_surround_variant(
                     podcast_video,
                     asset["assets"],
+                    base_path,
+                    caption_path,
+                    staged,
+                    fps,
+                    encoder_args,
+                )
+            elif background["variant_id"] == SPEAKER_PANELS_VARIANT_ID:
+                self._compose_speaker_panels_variant(
+                    podcast_video,
                     base_path,
                     caption_path,
                     staged,
@@ -570,7 +656,7 @@ class ShortsRenderAgent(BaseAgent):
             }
             if scan_identity(base_path) != background["base_identity"]:
                 raise RuntimeError("Canonical short changed during variant render")
-            for media_asset in asset.get("assets", [asset]):
+            for media_asset in asset.get("assets", [asset]) if asset else []:
                 if (
                     file_content_identity(
                         media_asset["path"], media_asset["content_revision"]
@@ -582,14 +668,22 @@ class ShortsRenderAgent(BaseAgent):
 
     @staticmethod
     def _variant_result(output: Path, record: dict, *, reused: bool) -> dict:
-        recorded_asset = record.get("asset", {})
+        recorded_asset = record.get("asset")
         return {
             "clip_id": output.stem,
             "variant_id": record.get("variant_id"),
-            "asset_id": recorded_asset.get("asset_id"),
+            "asset_id": (
+                recorded_asset.get("asset_id")
+                if isinstance(recorded_asset, dict)
+                else None
+            ),
             "asset_ids": [
                 item.get("asset_id")
-                for item in recorded_asset.get("assets", [])
+                for item in (
+                    recorded_asset.get("assets", [])
+                    if isinstance(recorded_asset, dict)
+                    else []
+                )
                 if isinstance(item, dict)
             ],
             "output_path": str(output),
@@ -881,11 +975,21 @@ class ShortsRenderAgent(BaseAgent):
         segment_document=None,
     ) -> dict:
         """Render one clip; positional arguments remain compatible with chat actions."""
+        speaker_panel_variant = bool(
+            background and background.get("variant_id") in SPEAKER_PANEL_VARIANT_IDS
+        )
         gameplay_surround = bool(
             background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID
         )
+        speaker_panels = bool(
+            background and background.get("variant_id") == SPEAKER_PANELS_VARIANT_ID
+        )
         if gameplay_surround:
             require_gameplay_caption_context_revision(
+                background.get("caption_context_revision")
+            )
+        elif speaker_panels:
+            require_speaker_panel_caption_context_revision(
                 background.get("caption_context_revision")
             )
         episode = episode or self.load_json("episode.json")
@@ -923,9 +1027,12 @@ class ShortsRenderAgent(BaseAgent):
         caption_path = Path(caption_path).with_suffix(".ass")
         caption_path.parent.mkdir(parents=True, exist_ok=True)
         caption_options = {}
-        if gameplay_surround:
-            speaker_placements, fallback_placement = (
-                self._gameplay_surround_caption_placements(src_w, src_h, crop_config)
+        if speaker_panel_variant:
+            speaker_placements, fallback_placement = self._speaker_panel_placements(
+                src_w,
+                src_h,
+                crop_config,
+                variant_id=background["variant_id"],
             )
             caption_options = {
                 "speaker_targets": resolve_caption_speaker_targets(
@@ -981,11 +1088,19 @@ class ShortsRenderAgent(BaseAgent):
                 filters = []
                 if lut_filter:
                     filters.append(lut_filter)
-                if gameplay_surround:
-                    crop_filter = self._get_gameplay_surround_podcast_filter_no_subs(
-                        src_w,
-                        src_h,
-                        crop_config,
+                if speaker_panel_variant:
+                    crop_filter = (
+                        self._get_gameplay_surround_podcast_filter_no_subs(
+                            src_w,
+                            src_h,
+                            crop_config,
+                        )
+                        if gameplay_surround
+                        else self._get_speaker_panels_filter_no_subs(
+                            src_w,
+                            src_h,
+                            crop_config,
+                        )
                     )
                 elif background:
                     crop_filter = self._get_background_crop_filter_no_subs(
@@ -1004,7 +1119,7 @@ class ShortsRenderAgent(BaseAgent):
                         three_person_stack=three_person_stack_enabled,
                     )
                 filters.append(crop_filter)
-                if not gameplay_surround and "Dialogue:" in segment_ass.read_text():
+                if not speaker_panel_variant and "Dialogue:" in segment_ass.read_text():
                     filters.append(f"subtitles='{escape_srt_path(segment_ass)}'")
                 segment_path = scratch / f"segment_{index:03d}.mp4"
                 render_video_segment(
@@ -1082,12 +1197,12 @@ class ShortsRenderAgent(BaseAgent):
                     "burned_in": True,
                     **(
                         {"placement_policy": (GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION)}
-                        if gameplay_surround
+                        if speaker_panel_variant
                         else {}
                     ),
                     **(
                         {"context_revision": background["caption_context_revision"]}
-                        if gameplay_surround
+                        if speaker_panel_variant
                         else {}
                     ),
                 },
@@ -1218,25 +1333,32 @@ class ShortsRenderAgent(BaseAgent):
                 margin_r=300,
                 margin_v=BACKGROUND_CAPTION_MARGIN_V,
             )
+        if background and background.get("variant_id") == SPEAKER_PANELS_VARIANT_ID:
+            return CaptionStyle(font_size=64, margin_l=60, margin_r=60)
         if background:
             return CaptionStyle(margin_v=BACKGROUND_CAPTION_MARGIN_V)
         return CaptionStyle()
 
-    def _gameplay_surround_panel_rows(
-        self, src_w: int, src_h: int, crop_config: dict
+    def _speaker_panel_rows(
+        self,
+        src_w: int,
+        src_h: int,
+        crop_config: dict,
+        panel_width: int,
+        panel_height: int,
     ) -> list[tuple[int, int, int | None, int | None, int | None, int | None]]:
-        """Return podcast-column rows in the compositor's spatial order."""
+        """Return speaker rows in the compositor's physical left-to-right order."""
         speakers = crop_config.get("speakers", [])
         if len(speakers) > 3:
             raise ValueError(
-                "Gameplay surround needs a reviewed layout for more than 3 speakers"
+                "Speaker panels need a reviewed layout for more than 3 speakers"
             )
         count = len(speakers)
         if not count:
             return []
-        base_height = (1144 // count) // 2 * 2
+        base_height = (panel_height // count) // 2 * 2
         target_heights = [base_height] * count
-        target_heights[-1] += 1144 - sum(target_heights)
+        target_heights[-1] += panel_height - sum(target_heights)
         if count == 1:
             return [(0, target_heights[0], None, None, None, None)]
 
@@ -1253,7 +1375,7 @@ class ShortsRenderAgent(BaseAgent):
             _, _, anchor_w, _ = compute_crop(
                 src_w, src_h, center_x, center_y, zoom, "speaker"
             )
-            target_ratio = 540 / target_h
+            target_ratio = panel_width / target_h
             viewport_w = min(float(src_w), float(anchor_w))
             viewport_h = viewport_w / target_ratio
             if viewport_h > src_h:
@@ -1279,64 +1401,138 @@ class ShortsRenderAgent(BaseAgent):
             )
         return rows
 
+    def _gameplay_surround_panel_rows(
+        self, src_w: int, src_h: int, crop_config: dict
+    ) -> list[tuple[int, int, int | None, int | None, int | None, int | None]]:
+        plan = GAMEPLAY_SURROUND_RENDER_PLAN
+        return self._speaker_panel_rows(
+            src_w,
+            src_h,
+            crop_config,
+            plan["podcast_width"],
+            plan["upper_height"] - plan["podcast_header_height"],
+        )
+
     def _gameplay_surround_caption_placements(
         self, src_w: int, src_h: int, crop_config: dict
     ) -> tuple[dict[str, CaptionPlacement], CaptionPlacement]:
+        return self._speaker_panel_placements(
+            src_w,
+            src_h,
+            crop_config,
+            variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        )
+
+    def _speaker_panel_placements(
+        self,
+        src_w: int,
+        src_h: int,
+        crop_config: dict,
+        *,
+        variant_id: str,
+    ) -> tuple[dict[str, CaptionPlacement], CaptionPlacement]:
         """Place known speakers in their row and unknown speech in the header."""
-        plan = GAMEPLAY_SURROUND_RENDER_PLAN
-        x = plan["left_width"] + plan["podcast_width"] // 2
-        cursor = plan["podcast_header_height"]
+        gameplay = variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        plan = GAMEPLAY_SURROUND_RENDER_PLAN if gameplay else SPEAKER_PANELS_RENDER_PLAN
+        width = plan["podcast_width"] if gameplay else plan["panel_width"]
+        height = (
+            plan["upper_height"] - plan["podcast_header_height"]
+            if gameplay
+            else plan["panels_height"]
+        )
+        header_h = plan["podcast_header_height"] if gameplay else plan["header_height"]
+        left = plan["left_width"] if gameplay else 0
+        x = left + width // 2
+        cursor = header_h
         placements = {}
-        for index, height, *_ in self._gameplay_surround_panel_rows(
-            src_w, src_h, crop_config
-        ):
-            inset = min(136, height // 4)
+        rows = self._speaker_panel_rows(src_w, src_h, crop_config, width, height)
+        for index, row_height, *_ in rows:
+            visible_top = cursor
+            visible_height = row_height
+            if not gameplay and len(rows) == 1:
+                scale = min(width / src_w, row_height / src_h)
+                visible_height = min(row_height, max(2, int(src_h * scale)))
+                visible_top += (row_height - visible_height) // 2
+            inset = min(136, visible_height // 4)
             placements[f"speaker_{index}"] = CaptionPlacement(
                 x=x,
-                y=cursor + height - inset,
+                y=visible_top + visible_height - inset,
             )
-            cursor += height
+            cursor += row_height
         fallback = CaptionPlacement(
             x=x,
-            y=plan["podcast_header_height"] // 2,
+            y=header_h // 2,
             alignment=5,
-            font_size=24,
-            background_box=(
-                plan["left_width"],
-                0,
-                plan["podcast_width"],
-                plan["podcast_header_height"],
-            ),
+            font_size=24 if gameplay else 28,
+            background_box=(left, 0, width, header_h),
         )
         return placements, fallback
 
     def _get_gameplay_surround_podcast_filter_no_subs(
         self, src_w: int, src_h: int, crop_config: dict
     ) -> str:
-        """Show every configured speaker in the narrow center podcast column."""
+        plan = GAMEPLAY_SURROUND_RENDER_PLAN
+        return self._speaker_panels_filter_no_subs(
+            src_w,
+            src_h,
+            crop_config,
+            plan["podcast_width"],
+            plan["upper_height"] - plan["podcast_header_height"],
+            plan["panel_border"],
+        )
+
+    def _get_speaker_panels_filter_no_subs(
+        self, src_w: int, src_h: int, crop_config: dict
+    ) -> str:
+        plan = SPEAKER_PANELS_RENDER_PLAN
+        return self._speaker_panels_filter_no_subs(
+            src_w,
+            src_h,
+            crop_config,
+            plan["panel_width"],
+            plan["panels_height"],
+            plan["panel_border"],
+        )
+
+    def _speaker_panels_filter_no_subs(
+        self,
+        src_w: int,
+        src_h: int,
+        crop_config: dict,
+        panel_width: int,
+        panel_height: int,
+        panel_border: int,
+    ) -> str:
+        """Show every configured speaker in a fixed-width vertical panel stack."""
         speakers = crop_config.get("speakers", [])
         if not speakers:
             return (
-                "scale=540:1144:force_original_aspect_ratio=decrease:"
+                f"scale={panel_width}:{panel_height}:"
+                "force_original_aspect_ratio=decrease:"
                 "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
-                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+                f"pad={panel_width}:{panel_height}:(ow-iw)/2:(oh-ih)/2:black,"
+                "format=yuv420p"
             )
 
         count = len(speakers)
         if count == 1:
             return (
-                "scale=540:1144:force_original_aspect_ratio=decrease:"
+                f"scale={panel_width}:{panel_height}:"
+                "force_original_aspect_ratio=decrease:"
                 "flags=lanczos+accurate_rnd+full_chroma_int:sws_dither=ed:param0=5,"
-                "pad=540:1144:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+                f"pad={panel_width}:{panel_height}:(ow-iw)/2:(oh-ih)/2:black,"
+                "format=yuv420p"
             )
-        rows = self._gameplay_surround_panel_rows(src_w, src_h, crop_config)
+        rows = self._speaker_panel_rows(
+            src_w, src_h, crop_config, panel_width, panel_height
+        )
         target_heights = [row[1] for row in rows]
         panels = []
         labels = []
         for row, (index, target_h, width, height, x, y) in enumerate(rows):
             panels.append(
                 f"[surround{index}]crop={width}:{height}:{x}:{y},"
-                f"{get_scale_filter(540, target_h)},format=yuv420p[row{row}]"
+                f"{get_scale_filter(panel_width, target_h)},format=yuv420p[row{row}]"
             )
             labels.append(f"[row{row}]")
         separators = []
@@ -1344,7 +1540,9 @@ class ShortsRenderAgent(BaseAgent):
         for height in target_heights[:-1]:
             cursor += height
             separators.append(
-                f"drawbox=x=0:y={cursor - 3}:w=540:h=6:color=black@0.85:t=fill"
+                f"drawbox=x=0:y={cursor - panel_border // 2}:w={panel_width}:"
+                f"h={panel_border}:"
+                "color=black@0.85:t=fill"
             )
         chain = (
             f"split={count}"
@@ -1569,7 +1767,9 @@ def render_single_clip_variant(
 ) -> dict:
     """Render one supported optional short without changing the canonical short."""
     require_background_variant(variant_id)
-    selected_asset_id = asset_id or default_background_asset_id(variant_id)
+    selected_asset_id = (
+        default_background_asset_id(variant_id) if asset_id is None else asset_id
+    )
     require_background_variant_asset(variant_id, selected_asset_id)
     return ShortsRenderAgent(episode_dir, config).render_background_variant(
         clip_id, selected_asset_id, variant_id

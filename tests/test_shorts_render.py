@@ -15,7 +15,12 @@ from agents.shorts_render import (
     render_single_clip,
     repair_single_clip_audio,
 )
-from lib.ass import DEFAULT_MARGIN_V, build_ass, generate_ass_from_diarized
+from lib.ass import (
+    DEFAULT_MARGIN_V,
+    build_ass,
+    generate_ass_from_diarized,
+    resolve_caption_speaker_targets,
+)
 from lib.delivery_video import (
     audio_packet_signature,
     ffmpeg_executable,
@@ -23,7 +28,12 @@ from lib.delivery_video import (
 )
 from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import probe as ffprobe_probe
-from lib.short_variants import CONTAIN_BLUR_FIT_MODE, GAMEPLAY_SURROUND_VARIANT_ID
+from lib.short_variants import (
+    CONTAIN_BLUR_FIT_MODE,
+    GAMEPLAY_SURROUND_VARIANT_ID,
+    SPEAKER_PANELS_RENDER_PLAN,
+    SPEAKER_PANELS_VARIANT_ID,
+)
 from lib.timeline import Timeline
 
 
@@ -421,8 +431,327 @@ def test_gameplay_surround_captions_stay_inside_center_column(
     assert ",2,300,300,840,1" in style_line
 
 
-def test_gameplay_render_requires_caption_context_before_writing(
+@pytest.mark.parametrize(
+    ("center_xs", "expected_order", "expected_y", "row_height"),
+    (
+        ([900], [0], None, 1776),
+        ([1400, 400], [1, 0], {"speaker_1": 824, "speaker_0": 1712}, 888),
+        (
+            [400, 900, 1500],
+            [0, 1, 2],
+            {"speaker_0": 528, "speaker_1": 1120, "speaker_2": 1712},
+            592,
+        ),
+    ),
+)
+def test_clean_speaker_panels_use_full_width_physical_rows(
+    tmp_episode_dir,
+    sample_config,
+    center_xs,
+    expected_order,
+    expected_y,
+    row_height,
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {
+                "label": label,
+                "center_x": center_x,
+                "center_y": 540,
+                "longform_center_x": center_x,
+                "longform_center_y": 540,
+                "zoom": 1,
+                "longform_zoom": 1,
+            }
+            for label, center_x in zip(
+                ("Host", "Ty", "Garrett"), center_xs, strict=False
+            )
+        ]
+    }
+
+    rows = agent._speaker_panel_rows(
+        1920,
+        1080,
+        crop_config,
+        SPEAKER_PANELS_RENDER_PLAN["panel_width"],
+        SPEAKER_PANELS_RENDER_PLAN["panels_height"],
+    )
+    placements, fallback = agent._speaker_panel_placements(
+        1920,
+        1080,
+        crop_config,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    video_filter = agent._get_speaker_panels_filter_no_subs(1920, 1080, crop_config)
+
+    assert [row[0] for row in rows] == expected_order
+    assert all(row[1] == row_height for row in rows)
+    assert all(placement.x == 540 for placement in placements.values())
+    if expected_y is None:
+        picture_top = 72 + (1776 - 608) // 2
+        picture_bottom = picture_top + 608
+        assert picture_top < placements["speaker_0"].y < picture_bottom
+    else:
+        assert {
+            speaker: placement.y for speaker, placement in placements.items()
+        } == expected_y
+    assert fallback.background_box == (0, 0, 1080, 72)
+    assert f"scale=1080:{row_height}" in video_filter
+    assert "scale=540" not in video_filter
+    assert "SUBWAY" not in video_filter
+    assert "MINECRAFT" not in video_filter
+
+
+def test_clean_speaker_panel_bindings_keep_host_ty_garrett_rows(
     tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    crop_config = {
+        "speakers": [
+            {"label": "Host", "track": 1, "longform_center_x": 400},
+            {"label": "Ty", "track": 2, "longform_center_x": 900},
+            {"label": "Garrett", "track": 3, "longform_center_x": 1500},
+        ]
+    }
+    diarized = {
+        "clock": "source",
+        "speaker_map": [
+            {"index": 0, "target_speaker": "speaker_0"},
+            {"index": 1, "target_speaker": "speaker_1"},
+            {"index": 3, "target_speaker": "speaker_1"},
+            {"index": 2, "target_speaker": "speaker_2"},
+        ],
+    }
+    segment_document = {"clock": "source", "track_mapping": []}
+
+    targets = resolve_caption_speaker_targets(diarized, segment_document, crop_config)
+    placements, _ = agent._speaker_panel_placements(
+        1920,
+        1080,
+        crop_config,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+
+    assert targets == {
+        0: "speaker_0",
+        1: "speaker_1",
+        2: "speaker_2",
+        3: "speaker_1",
+    }
+    assert placements[targets[0]].y == 528
+    assert placements[targets[1]].y == placements[targets[3]].y == 1120
+    assert placements[targets[2]].y == 1712
+
+
+def test_clean_speaker_panel_compositor_has_no_asset_inputs_or_labels(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    commands = []
+    agent._run_ffmpeg = lambda command, **_kwargs: commands.append(command)
+
+    agent._compose_speaker_panels_variant(
+        tmp_episode_dir / "podcast.mp4",
+        tmp_episode_dir / "base.mp4",
+        tmp_episode_dir / "captions.ass",
+        tmp_episode_dir / "variant.mp4",
+        "30/1",
+        ["-c:v", "libx264"],
+    )
+
+    command = commands[0]
+    graph = command[command.index("-filter_complex") + 1]
+    assert command.count("-i") == 2
+    assert "-stream_loop" not in command
+    assert command[command.index("-map") + 1] == "[variant]"
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert "THE LOCAL PODCAST" in graph
+    assert "thelocalpod.link" in graph
+    assert "SUBWAY SURFERS" not in graph
+    assert "GTA DRIVING" not in graph
+    assert "MINECRAFT PARKOUR" not in graph
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_clean_speaker_panel_pixels_follow_speaker_and_neutral_header(
+    tmp_episode_dir, sample_config
+):
+    ffmpeg = ffmpeg_executable()
+    podcast = tmp_episode_dir / "speaker-rows.mp4"
+    base = tmp_episode_dir / "base-panels.mp4"
+    captions = tmp_episode_dir / "speaker-panels.ass"
+    output = tmp_episode_dir / "speaker-panels.mp4"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=1080x592:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:size=1080x592:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=green:size=1080x592:rate=30:duration=3",
+            "-filter_complex",
+            "[0:v][1:v][2:v]vstack=inputs=3,format=yuv420p[rows]",
+            "-map",
+            "[rows]",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-y",
+            str(podcast),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=1080x1920:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3.05",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-y",
+            str(base),
+        ],
+        check=True,
+    )
+
+    crop_config = {
+        "speakers": [
+            {"label": "Host", "longform_center_x": 400},
+            {"label": "Ty", "longform_center_x": 900},
+            {"label": "Garrett", "longform_center_x": 1500},
+        ]
+    }
+    diarized = {
+        "clock": "source",
+        "speaker_map": [
+            {"index": 0, "target_speaker": "speaker_0"},
+            {"index": 1, "target_speaker": "speaker_1"},
+            {"index": 9, "target_speaker": "BOTH"},
+        ],
+        "utterances": [
+            {
+                "speaker": 0,
+                "words": [{"word": "HOST", "start": 0.1, "end": 0.5, "speaker": 0}],
+            },
+            {
+                "speaker": 1,
+                "words": [{"word": "TY", "start": 1.0, "end": 1.4, "speaker": 1}],
+            },
+            {
+                "speaker": 9,
+                "words": [
+                    {
+                        "word": "UNKNOWN",
+                        "start": 2.0,
+                        "end": 2.4,
+                        "speaker": 9,
+                    }
+                ],
+            },
+        ],
+    }
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    placements, fallback = agent._speaker_panel_placements(
+        1920,
+        1080,
+        crop_config,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    generate_ass_from_diarized(
+        diarized,
+        0,
+        3,
+        captions,
+        agent._caption_style({"variant_id": SPEAKER_PANELS_VARIANT_ID}),
+        speaker_targets=resolve_caption_speaker_targets(
+            diarized, {"clock": "source", "track_mapping": []}, crop_config
+        ),
+        speaker_placements=placements,
+        fallback_placement=fallback,
+    )
+    agent._compose_speaker_panels_variant(
+        podcast,
+        base,
+        captions,
+        output,
+        "30/1",
+        ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0"],
+    )
+
+    stream = next(
+        item
+        for item in ffprobe_probe(output)["streams"]
+        if item["codec_type"] == "video"
+    )
+    assert (stream["width"], stream["height"]) == (1080, 1920)
+    assert audio_packet_signature(output) == audio_packet_signature(base)
+    top = _sample_rgb(ffmpeg, output, 100, 300)
+    middle = _sample_rgb(ffmpeg, output, 100, 900)
+    bottom = _sample_rgb(ffmpeg, output, 100, 1500)
+    assert top[2] > top[0] + 80 and top[2] > top[1] + 80
+    assert middle[0] > middle[1] + 80 and middle[0] > middle[2] + 80
+    assert bottom[1] > bottom[0] + 40 and bottom[1] > bottom[2] + 40
+
+    def region(timestamp, crop):
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-ss",
+                str(timestamp),
+                "-i",
+                str(output),
+                "-vf",
+                f"crop={crop},format=rgb24",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return result.stdout
+
+    header_at_host = region(0.3, "1080:72:0:0")
+    assert header_at_host == region(1.2, "1080:72:0:0")
+    assert header_at_host != region(2.2, "1080:72:0:0")
+    assert region(0.3, "1080:592:0:72") != region(1.2, "1080:592:0:72")
+    assert region(0.3, "1080:592:0:664") != region(1.2, "1080:592:0:664")
+    assert region(0.3, "1080:592:0:1256") == region(1.2, "1080:592:0:1256")
+
+
+@pytest.mark.parametrize(
+    "variant_id", (GAMEPLAY_SURROUND_VARIANT_ID, SPEAKER_PANELS_VARIANT_ID)
+)
+def test_speaker_panel_render_requires_caption_context_before_writing(
+    tmp_episode_dir, sample_config, variant_id
 ):
     audio = tmp_episode_dir / "audio.wav"
     audio.write_bytes(b"audio")
@@ -445,7 +774,7 @@ def test_gameplay_render_requires_caption_context_before_writing(
             timeline=Timeline(1, [(0, 1)]),
             diarized={"utterances": []},
             episode={},
-            background={"variant_id": GAMEPLAY_SURROUND_VARIANT_ID},
+            background={"variant_id": variant_id},
         )
 
 

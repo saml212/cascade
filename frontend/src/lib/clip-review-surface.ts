@@ -8,15 +8,24 @@ import type {
 } from './api';
 import type { StatusDescriptor } from './format';
 
-export type ClipReviewSurface = 'base' | 'background' | 'gameplay';
-export type ClipVariantId = 'background_motion_v1' | 'gameplay_surround_v1';
+export type ClipReviewSurface = 'base' | 'background' | 'gameplay' | 'panels';
+export type ClipVariantId =
+  | 'background_motion_v1'
+  | 'gameplay_surround_v1'
+  | 'speaker_panels_v1';
 
 function isClipVariantId(value: unknown): value is ClipVariantId {
-  return value === 'background_motion_v1' || value === 'gameplay_surround_v1';
+  return (
+    value === 'background_motion_v1' ||
+    value === 'gameplay_surround_v1' ||
+    value === 'speaker_panels_v1'
+  );
 }
 
 function variantSurface(variantId: ClipVariantId): ClipReviewSurface {
-  return variantId === 'gameplay_surround_v1' ? 'gameplay' : 'background';
+  if (variantId === 'gameplay_surround_v1') return 'gameplay';
+  if (variantId === 'speaker_panels_v1') return 'panels';
+  return 'background';
 }
 
 export function clipVariantForSurface(
@@ -25,6 +34,7 @@ export function clipVariantForSurface(
 ): ShortVariantReview | undefined {
   if (surface === 'background') return review.variants?.background_motion_v1;
   if (surface === 'gameplay') return review.variants?.gameplay_surround_v1;
+  if (surface === 'panels') return review.variants?.speaker_panels_v1;
   return undefined;
 }
 
@@ -61,7 +71,9 @@ export function clipVersionState(
       variant.label ||
       (variant.id === 'gameplay_surround_v1'
         ? 'Gameplay surround'
-        : 'Motion background'),
+        : variant.id === 'speaker_panels_v1'
+          ? 'Clean speaker panels'
+          : 'Motion background'),
     render: variant.render,
     approval: variant.approval,
   };
@@ -143,9 +155,9 @@ export function distributionVersionLabel(
   variantId: unknown
 ): string {
   if (isClipVariantId(version) && variantId === version) {
-    return version === 'gameplay_surround_v1'
-      ? 'Gameplay surround'
-      : 'Motion background';
+    if (version === 'gameplay_surround_v1') return 'Gameplay surround';
+    if (version === 'speaker_panels_v1') return 'Clean speaker panels';
+    return 'Motion background';
   }
   if ((version == null || version === 'base') && variantId == null) return 'Base';
   return 'Unknown version';

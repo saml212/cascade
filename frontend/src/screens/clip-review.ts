@@ -1020,7 +1020,7 @@ function clipExpanded(
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
-  const variantSurfaces = (['background', 'gameplay'] as const).filter(
+  const variantSurfaces = (['background', 'gameplay', 'panels'] as const).filter(
     (candidate) => Boolean(clipVariantForSurface(review, candidate))
   );
   const availableSurfaces = new Set<ClipReviewSurface>([
@@ -1091,7 +1091,7 @@ function renderReviewChoice(
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
   const base = review.render;
-  const variantSurfaces = (['background', 'gameplay'] as const).filter(
+  const variantSurfaces = (['background', 'gameplay', 'panels'] as const).filter(
     (candidate) => Boolean(clipVariantForSurface(review, candidate))
   );
   if (variantSurfaces.length === 0) {
@@ -1320,7 +1320,7 @@ function renderChoiceActions(
     approvalFeedback,
     reload
   );
-  const variants = (['background', 'gameplay'] as const).flatMap(
+  const variants = (['background', 'gameplay', 'panels'] as const).flatMap(
     (candidate) => {
       const variant = clipVariantForSurface(review, candidate);
       return variant
@@ -1403,7 +1403,7 @@ function renderVariantActions(
                 episodeId,
                 clipId,
                 variant.id,
-                variant.asset_id
+                variant.asset_id ?? undefined
               );
               showToast(
                 `${label} rendered. Review it before approval.`,
@@ -1435,11 +1435,14 @@ function renderVariantActions(
     h(
       'span',
       { class: 'text-body-sm text-ink-tertiary' },
-      `Uses ${(
-        variant.asset_ids?.length ? variant.asset_ids : [variant.asset_id]
-      )
-        .map((assetId) => assetId.replaceAll('_', ' '))
-        .join(', ')}. Base approval and delivery stay separate.`
+      variant.asset_free
+        ? 'Podcast-only speaker panels. Base approval and delivery stay separate.'
+        : `Uses ${(
+            variant.asset_ids?.length ? variant.asset_ids : [variant.asset_id]
+          )
+            .filter((assetId): assetId is string => Boolean(assetId))
+            .map((assetId) => assetId.replaceAll('_', ' '))
+            .join(', ')}. Base approval and delivery stay separate.`
     )
   );
 }

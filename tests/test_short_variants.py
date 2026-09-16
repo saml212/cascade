@@ -25,8 +25,12 @@ from lib.short_variants import (
     MINECRAFT_PARKOUR_VARIANT_ID,
     SATISFYING_BACKGROUND_ASSET_ID,
     SATISFYING_VARIANT_ID,
+    SPEAKER_PANELS_LAYOUT_VERSION,
+    SPEAKER_PANELS_RENDER_PLAN,
+    SPEAKER_PANELS_VARIANT_ID,
     SUBWAY_SURFERS_ASSET_ID,
     SUBWAY_SURFERS_VARIANT_ID,
+    background_variant_asset_ids,
     background_variant_fingerprint,
     background_variant_label,
     background_variant_output,
@@ -39,6 +43,8 @@ from lib.short_variants import (
     record_background_variant,
     require_background_variant_asset,
     save_background_variant_approval,
+    selected_short_variant_id,
+    speaker_panel_caption_context_revision,
     variant_record,
 )
 from lib.timeline import Timeline
@@ -258,6 +264,42 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
         caption_context_revision=caption_context_revision,
     )
+    asset_keys = (
+        "asset_id",
+        "content_revision",
+        "manifest_revision",
+        "scan_identity",
+        "playback_start_seconds",
+        "focus_x",
+        "focus_y",
+        "fit_mode",
+        "role",
+    )
+    expected_state = {
+        "variant_id": GAMEPLAY_SURROUND_VARIANT_ID,
+        "layout": GAMEPLAY_SURROUND_LAYOUT_VERSION,
+        "base": {
+            "render_fingerprint": base_record["fingerprint"],
+            "scan_identity": base_identity,
+        },
+        "asset": {
+            "asset_id": GAMEPLAY_SURROUND_ASSET_SET_ID,
+            "assets": [
+                {key: item[key] for key in asset_keys if key in item}
+                for item in asset_set["assets"]
+            ],
+            "render_plan": GAMEPLAY_SURROUND_RENDER_PLAN,
+        },
+        "encoding": encoding,
+        "caption_policy": {
+            "version": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": caption_context_revision,
+        },
+    }
+    expected_encoded = json.dumps(
+        expected_state, sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert fingerprint == f"sha256:{hashlib.sha256(expected_encoded).hexdigest()}"
     changed_focus = deepcopy(asset_set)
     changed_focus["assets"][1]["focus_x"] = 0.625
     assert (
@@ -499,6 +541,143 @@ def test_variant_artifact_paths_are_isolated(tmp_path):
     )
     assert outputs[SUBWAY_SURFERS_VARIANT_ID].parent.name == SUBWAY_SURFERS_VARIANT_ID
     assert outputs[GTA_DRIVING_VARIANT_ID].parent.name == GTA_DRIVING_VARIANT_ID
+    assert outputs[SPEAKER_PANELS_VARIANT_ID] == (
+        tmp_path / "short_variants" / SPEAKER_PANELS_VARIANT_ID / "clip_01.mp4"
+    )
+
+
+def test_speaker_panels_are_asset_free_and_bind_effective_context(
+    tmp_path, monkeypatch
+):
+    episode_dir = tmp_path / "episode"
+    base = episode_dir / "shorts" / "clip_01.mp4"
+    output = background_variant_output(
+        episode_dir, "clip_01", SPEAKER_PANELS_VARIANT_ID
+    )
+    captions = (
+        episode_dir
+        / "subtitles"
+        / "short_variants"
+        / SPEAKER_PANELS_VARIANT_ID
+        / "clip_01.ass"
+    )
+    for path, content in (
+        (base, b"base"),
+        (output, b"speaker panels"),
+        (captions, b"captions"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    _write_gameplay_caption_context(episode_dir)
+    context_revision = speaker_panel_caption_context_revision(episode_dir)
+    base_record = {"fingerprint": "sha256:base"}
+    base_identity = file_content_identity(base)["scan_identity"]
+    encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
+
+    assert default_background_asset_id(SPEAKER_PANELS_VARIANT_ID) is None
+    assert (
+        selected_short_variant_id(
+            {"distribution_variant_id": SPEAKER_PANELS_VARIANT_ID}
+        )
+        == SPEAKER_PANELS_VARIANT_ID
+    )
+    assert background_variant_asset_ids(SPEAKER_PANELS_VARIANT_ID) == ()
+    assert load_background_variant_asset(SPEAKER_PANELS_VARIANT_ID) is None
+    require_background_variant_asset(SPEAKER_PANELS_VARIANT_ID, None)
+    with pytest.raises(KeyError, match="does not use a background asset"):
+        require_background_variant_asset(SPEAKER_PANELS_VARIANT_ID, "motion")
+
+    fingerprint = background_variant_fingerprint(
+        base_record,
+        base_identity,
+        None,
+        encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+        caption_context_revision=context_revision,
+    )
+    record = record_background_variant(
+        episode_dir,
+        "clip_01",
+        fingerprint=fingerprint,
+        timeline=Timeline.from_edits(1),
+        media={"duration_seconds": 1, "width": 1080, "height": 1920},
+        base_record=base_record,
+        base_identity=base_identity,
+        asset=None,
+        encoding=encoding,
+        captions={
+            "path": str(captions.relative_to(episode_dir)),
+            "format": "ass",
+            "burned_in": True,
+            "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": context_revision,
+        },
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert record["asset"] is None
+    assert record["render_plan"] == SPEAKER_PANELS_RENDER_PLAN
+    assert record["layout_version"] == SPEAKER_PANELS_LAYOUT_VERSION
+
+    monkeypatch.setenv(
+        "CASCADE_BACKGROUND_ASSETS_DIR", str(tmp_path / "missing-assets")
+    )
+    _, current = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert current["current"] is True
+
+    manifest_path = output.with_suffix(".json")
+    malformed = json.loads(manifest_path.read_text())
+    malformed.pop("asset")
+    manifest_path.write_text(json.dumps(malformed))
+    _, missing_null_marker = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert missing_null_marker["current"] is False
+    assert "manifest is malformed" in missing_null_marker["detail"]
+    manifest_path.write_text(json.dumps(record))
+
+    episode_path = episode_dir / "episode.json"
+    episode = json.loads(episode_path.read_text())
+    episode["crop_config"]["speakers"][0]["longform_center_x"] = 1700
+    episode_path.write_text(json.dumps(episode))
+    _, moved = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert moved["current"] is False
+    assert "speaker bindings or panel anchors changed" in moved["detail"]
+
+    from lib import short_variants as short_variants_module
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(
+            short_variants_module,
+            "SPEAKER_PANELS_RENDER_PLAN",
+            {**SPEAKER_PANELS_RENDER_PLAN, "panel_border": 8},
+        )
+        assert (
+            background_variant_fingerprint(
+                base_record,
+                base_identity,
+                None,
+                encoding,
+                variant_id=SPEAKER_PANELS_VARIANT_ID,
+                caption_context_revision=context_revision,
+            )
+            != fingerprint
+        )
 
 
 def test_asset_verification_hashes_content_and_rejects_escape(tmp_path, monkeypatch):

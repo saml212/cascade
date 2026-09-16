@@ -154,6 +154,39 @@ test('uses the gameplay surround variant as the review and distribution identity
   );
 });
 
+test('uses clean speaker panels as an independent review and distribution identity', () => {
+  const review = reviewState();
+  const revision = 'sha256:speaker-panels-copy';
+  review.variants.speaker_panels_v1 = {
+    id: 'speaker_panels_v1',
+    label: 'Clean speaker panels',
+    asset_id: null,
+    asset_ids: [],
+    asset_free: true,
+    render: { current: true, playable: true },
+    approval: { status: 'current', current: true, revision },
+  };
+  review.distribution = {
+    ...review.distribution,
+    version: 'speaker_panels_v1',
+    variant_id: 'speaker_panels_v1',
+    label: 'Clean speaker panels',
+    revision,
+  };
+
+  assert.equal(clipDistributionReady(review), true);
+  assert.equal(clipDistributionLabel(review), 'Clean speaker panels');
+  assert.equal(selectedDistributionVersion(review).surface, 'panels');
+  assert.equal(
+    clipVersionState(review, 'panels').variantId,
+    'speaker_panels_v1'
+  );
+  assert.equal(
+    distributionVersionLabel('speaker_panels_v1', 'speaker_panels_v1'),
+    'Clean speaker panels'
+  );
+});
+
 test('keeps a selected legacy variant distinct while exposing gameplay review', () => {
   const review = reviewState({
     distributionVersion: 'background_motion_v1',

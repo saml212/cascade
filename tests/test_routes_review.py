@@ -378,6 +378,7 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
         GTA_DRIVING_VARIANT_ID,
         MINECRAFT_PARKOUR_ASSET_ID,
         MINECRAFT_PARKOUR_VARIANT_ID,
+        SPEAKER_PANELS_VARIANT_ID,
         SUBWAY_SURFERS_ASSET_ID,
         SUBWAY_SURFERS_VARIANT_ID,
     )
@@ -413,6 +414,7 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
             "Gameplay surround",
             GAMEPLAY_SURROUND_ASSET_SET_ID,
         ),
+        SPEAKER_PANELS_VARIANT_ID: ("Clean speaker panels", None),
     }
     for variant_id, (label, asset_id) in expected.items():
         assert variants[variant_id]["label"] == label
@@ -421,6 +423,8 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
     assert variants[GAMEPLAY_SURROUND_VARIANT_ID]["asset_ids"] == [
         asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS
     ]
+    assert variants[SPEAKER_PANELS_VARIANT_ID]["asset_ids"] == []
+    assert variants[SPEAKER_PANELS_VARIANT_ID]["asset_free"] is True
     assert "satisfying_motion_v1" not in variants
 
 

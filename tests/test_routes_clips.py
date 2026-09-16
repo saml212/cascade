@@ -1387,9 +1387,10 @@ class TestClipMutation:
             ("subway_surfers_v1", "orbitalncg_subway_surfers_12_v1"),
             ("gta_driving_v1", "orbitalncg_gta_driving_15_v1"),
             ("gameplay_surround_v1", "gameplay_surround_assets_v1"),
+            ("speaker_panels_v1", None),
         ),
     )
-    def test_gameplay_variant_render_uses_bound_asset_and_job_identity(
+    def test_variant_render_uses_bound_asset_and_job_identity(
         self, test_client, monkeypatch, variant_id, asset_id
     ):
         client, episodes_dir = test_client
@@ -1444,10 +1445,12 @@ class TestClipMutation:
         assert response.status_code == 404
         assert "Unknown short variant" in response.json()["detail"]
 
-    def test_gameplay_variant_approval_restores_candidate_without_approving_base(
-        self, test_client, monkeypatch
+    @pytest.mark.parametrize(
+        "variant_id", ("minecraft_parkour_v1", "speaker_panels_v1")
+    )
+    def test_variant_approval_restores_candidate_without_approving_base(
+        self, test_client, monkeypatch, variant_id
     ):
-        variant_id = "minecraft_parkour_v1"
         client, episodes_dir = test_client
         ep_dir = _create_episode(episodes_dir, "ep_001")
         clip = dict(
