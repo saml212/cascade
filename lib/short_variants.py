@@ -36,6 +36,8 @@ GAMEPLAY_SURROUND_ASSETS = (
     ("gta", GTA_DRIVING_ASSET_ID),
     ("minecraft", MINECRAFT_PARKOUR_ASSET_ID),
 )
+CONTAIN_BLUR_FIT_MODE = "contain_blur_v1"
+BACKGROUND_FIT_MODES = frozenset({"crop", "stretch", CONTAIN_BLUR_FIT_MODE})
 GAMEPLAY_SURROUND_RENDER_PLAN = {
     "canvas": [1080, 1920],
     "upper_height": 1216,
@@ -220,7 +222,14 @@ def _asset_file(manifest_path: Path, manifest: dict, root: Path) -> Path:
 
 
 def load_background_asset(asset_id: str, *, verify_content: bool = False) -> dict:
-    """Resolve one explicitly identified local asset and its checked provenance."""
+    """Resolve one explicitly identified local asset and its checked provenance.
+
+    Gameplay-surround asset manifests may omit ``fit_mode`` for the default
+    aspect-fill crop. Their panels may select ``crop``, ``stretch``, or
+    ``contain_blur_v1``. The latter keeps the complete source frame proportional
+    over a darkened, blurred aspect-fill copy so a narrow panel has no empty
+    bars.
+    """
     if not _ASSET_ID.fullmatch(asset_id):
         raise KeyError(f"Unknown background asset: {asset_id}")
     root = background_assets_dir().resolve(strict=True)
@@ -285,7 +294,7 @@ def load_background_asset(asset_id: str, *, verify_content: bool = False) -> dic
         playback[key] = float(value)
     fit_mode = manifest.get("fit_mode")
     if fit_mode is not None:
-        if fit_mode not in {"crop", "stretch"}:
+        if fit_mode not in BACKGROUND_FIT_MODES:
             raise ValueError("Background asset manifest has invalid fit_mode")
         playback["fit_mode"] = fit_mode
     return {

@@ -53,6 +53,7 @@ from lib.loudness import (
 )
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
+    CONTAIN_BLUR_FIT_MODE,
     GAMEPLAY_SURROUND_RENDER_PLAN,
     GAMEPLAY_SURROUND_VARIANT_ID,
     background_variant_fingerprint,
@@ -380,12 +381,36 @@ class ShortsRenderAgent(BaseAgent):
             focus_y = float(asset.get("focus_y", 0.5))
             return f"crop={width}:{height}:(iw-ow)*{focus_x:.6f}:(ih-oh)*{focus_y:.6f}"
 
-        def panel_fit(asset: dict, width: int, height: int) -> str:
-            if asset.get("fit_mode", "crop") == "stretch":
-                return f"scale={width}:{height}"
+        def panel_fit(
+            input_index: int,
+            asset: dict,
+            width: int,
+            height: int,
+            fit_label: str,
+        ) -> str:
+            source = f"[{input_index}:v]{playback_filter(asset)}"
+            fit_mode = asset.get("fit_mode", "crop")
+            if fit_mode == "stretch":
+                return f"{source}scale={width}:{height}[{fit_label}]"
+            if fit_mode == CONTAIN_BLUR_FIT_MODE:
+                return (
+                    f"{source}split=2[{fit_label}_fill_source]"
+                    f"[{fit_label}_full_source];"
+                    f"[{fit_label}_fill_source]scale={width}:{height}:"
+                    "force_original_aspect_ratio=increase,"
+                    f"{focus_crop(asset, width, height)},gblur=sigma=20,"
+                    "eq=brightness=-0.12:saturation=0.75,setsar=1"
+                    f"[{fit_label}_fill];"
+                    f"[{fit_label}_full_source]scale={width}:{height}:"
+                    "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                    f"setsar=1[{fit_label}_full];"
+                    f"[{fit_label}_fill][{fit_label}_full]"
+                    f"overlay=(W-w)/2:(H-h)/2[{fit_label}]"
+                )
             return (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"{focus_crop(asset, width, height)}"
+                f"{source}scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"{focus_crop(asset, width, height)}[{fit_label}]"
             )
 
         graph = (
@@ -395,16 +420,16 @@ class ShortsRenderAgent(BaseAgent):
             "drawtext=text='THE LOCAL PODCAST':fontcolor=white:fontsize=28:"
             "x=(w-text_w)/2:y=(h-text_h)/2[header];"
             "[header][podcast]vstack=inputs=2[center];"
-            f"[1:v]{playback_filter(subway)}"
-            f"{panel_fit(subway, side_w, upper_h)},fps={fps},setsar=1,"
+            f"{panel_fit(1, subway, side_w, upper_h, 'subway_fit')};"
+            f"[subway_fit]fps={fps},setsar=1,"
             "drawtext=text='SUBWAY SURFERS':fontcolor=white:fontsize=22:"
             "x=(w-text_w)/2:y=24:box=1:boxcolor=black@0.62:boxborderw=8[left];"
-            f"[2:v]{playback_filter(gta)}"
-            f"{panel_fit(gta, side_w, upper_h)},fps={fps},setsar=1,"
+            f"{panel_fit(2, gta, side_w, upper_h, 'gta_fit')};"
+            f"[gta_fit]fps={fps},setsar=1,"
             "drawtext=text='GTA DRIVING':fontcolor=white:fontsize=22:"
             "x=(w-text_w)/2:y=24:box=1:boxcolor=black@0.62:boxborderw=8[right];"
-            f"[3:v]{playback_filter(minecraft)}"
-            f"{panel_fit(minecraft, 1080, bottom_h)},fps={fps},setsar=1,"
+            f"{panel_fit(3, minecraft, 1080, bottom_h, 'minecraft_fit')};"
+            f"[minecraft_fit]fps={fps},setsar=1,"
             "drawtext=text='MINECRAFT PARKOUR':fontcolor=white:fontsize=24:"
             "x=24:y=24:box=1:boxcolor=black@0.62:boxborderw=8[bottom];"
             "[left][center][right]hstack=inputs=3[upper];"

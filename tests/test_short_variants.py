@@ -11,6 +11,7 @@ from agents.qa import clip_review_revision, short_distribution_state
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
+    CONTAIN_BLUR_FIT_MODE,
     DEFAULT_BACKGROUND_ASSET_ID,
     GAMEPLAY_SURROUND_ASSET_SET_ID,
     GAMEPLAY_SURROUND_LAYOUT_VERSION,
@@ -219,7 +220,7 @@ def test_gameplay_surround_fingerprint_and_currentness_bind_each_asset(
         != fingerprint
     )
     changed_fit = deepcopy(asset_set)
-    changed_fit["assets"][0]["fit_mode"] = "crop"
+    changed_fit["assets"][0]["fit_mode"] = CONTAIN_BLUR_FIT_MODE
     assert (
         background_variant_fingerprint(
             base_record,
@@ -367,6 +368,27 @@ def test_asset_manifest_rejects_unknown_fit_mode(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="invalid fit_mode"):
         load_background_asset("motion_v1")
+
+
+@pytest.mark.parametrize("fit_mode", ["crop", "stretch", CONTAIN_BLUR_FIT_MODE])
+def test_asset_manifest_accepts_supported_fit_modes(tmp_path, monkeypatch, fit_mode):
+    root = tmp_path / "assets"
+    root.mkdir()
+    media = root / "motion.mp4"
+    media.write_bytes(b"silent motion")
+    (root / "motion.json").write_text(
+        json.dumps(
+            {
+                "asset_id": "motion_v1",
+                "file": media.name,
+                "sha256": hashlib.sha256(media.read_bytes()).hexdigest(),
+                "fit_mode": fit_mode,
+            }
+        )
+    )
+    monkeypatch.setenv("CASCADE_BACKGROUND_ASSETS_DIR", str(root))
+
+    assert load_background_asset("motion_v1")["fit_mode"] == fit_mode
 
 
 def test_same_path_variant_replacement_is_stale_and_cannot_be_approved(

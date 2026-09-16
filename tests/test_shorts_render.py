@@ -23,7 +23,7 @@ from lib.delivery_video import (
 )
 from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import probe as ffprobe_probe
-from lib.short_variants import GAMEPLAY_SURROUND_VARIANT_ID
+from lib.short_variants import CONTAIN_BLUR_FIT_MODE, GAMEPLAY_SURROUND_VARIANT_ID
 from lib.timeline import Timeline
 
 
@@ -416,7 +416,6 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     output = tmp_episode_dir / "surround.mp4"
     for path, color, size in (
         (podcast, "yellow", "540x1144"),
-        (subway, "blue", "160x284"),
         (gta, "red", "160x284"),
         (minecraft, "green", "320x180"),
     ):
@@ -449,6 +448,29 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
             "-f",
             "lavfi",
             "-i",
+            "color=blue:size=160x284:rate=30:duration=1",
+            "-vf",
+            "drawbox=x=50:y=112:w=60:h=60:color=white:t=fill",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+            str(subway),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
             "color=black:size=1080x1920:rate=30:duration=1",
             "-f",
             "lavfi",
@@ -467,7 +489,11 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     )
     generate_ass_from_diarized({"utterances": []}, 0, 1, captions)
     assets = [
-        {"role": "subway", "path": subway},
+        {
+            "role": "subway",
+            "path": subway,
+            "fit_mode": CONTAIN_BLUR_FIT_MODE,
+        },
         {"role": "gta", "path": gta},
         {"role": "minecraft", "path": minecraft},
     ]
@@ -501,11 +527,17 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     assert (stream["width"], stream["height"]) == (1080, 1920)
     assert audio_packet_signature(output) == audio_packet_signature(base)
 
-    left = _sample_rgb(ffmpeg, output, 100, 600)
+    # A vertical stretch makes the square cover both blue checkpoints.
+    subway_marker = _sample_rgb(ffmpeg, output, 135, 608)
+    subway_above = _sample_rgb(ffmpeg, output, 135, 500)
+    subway_below = _sample_rgb(ffmpeg, output, 135, 716)
     center = _sample_rgb(ffmpeg, output, 540, 600)
     right = _sample_rgb(ffmpeg, output, 980, 600)
     bottom = _sample_rgb(ffmpeg, output, 540, 1500)
-    assert left[2] > left[0] + 80 and left[2] > left[1] + 80
+    assert min(subway_marker) > 200
+    for blue_pixel in (subway_above, subway_below):
+        assert blue_pixel[2] > blue_pixel[0] + 80
+        assert blue_pixel[2] > blue_pixel[1] + 80
     assert center[0] > 180 and center[1] > 180 and center[2] < 80
     assert right[0] > right[1] + 80 and right[0] > right[2] + 80
     assert bottom[1] > bottom[0] + 40 and bottom[1] > bottom[2] + 40
