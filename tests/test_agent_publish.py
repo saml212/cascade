@@ -319,6 +319,23 @@ class TestSafetyGate:
         assert result["shorts_submitted"] == 1
         assert result["shorts_failed"] == 0
 
+    def test_required_destination_variant_blocks_legacy_short_publish(
+        self, env, episode_dir
+    ):
+        config = _publish_config()
+        config["platforms"]["x"]["required_short_variant_id"] = "satisfying_motion_v1"
+        _seed_episode(episode_dir, config=config)
+
+        with (
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(
+                RuntimeError, match="Submit a separate x destination request"
+            ),
+        ):
+            _make_agent(episode_dir, config).execute()
+
+        run.assert_not_called()
+
     def test_destination_change_after_approval_is_blocked(self, env, episode_dir):
         config = _publish_config()
         _seed_episode(episode_dir, config=config)
@@ -2376,6 +2393,79 @@ class TestShortDestinationRequests:
                 for index in range(clip_count)
             ],
         )
+
+    def test_required_variant_override_is_allowed_for_x_preview(
+        self, env, episode_dir, monkeypatch
+    ):
+        config = _destination_config()
+        required_variant = "satisfying_motion_v1"
+        config["platforms"]["x"]["required_short_variant_id"] = required_variant
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        data = agent._inputs()
+        effective = {
+            **data["short_versions"]["clip_0"],
+            "version": required_variant,
+            "variant_id": required_variant,
+        }
+        monkeypatch.setattr(
+            agent,
+            "_destination_versions",
+            lambda _data, _overrides: {"clip_0": effective},
+        )
+        request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_A,
+            destinations=["x"],
+            clip_ids=["clip_0"],
+        )
+        request["variant_overrides"] = {"clip_0": required_variant}
+
+        plan = agent._destination_plan(data, request)
+
+        assert plan["targets"][0]["variant_id"] == required_variant
+        assert plan["variant_overrides"] == {"clip_0": required_variant}
+
+    @pytest.mark.parametrize("destinations", (["x"], ["youtube", "x"]))
+    def test_wrong_required_variant_is_rejected_before_destination_preflight(
+        self, env, episode_dir, monkeypatch, destinations
+    ):
+        config = _destination_config()
+        config["platforms"]["x"]["required_short_variant_id"] = "satisfying_motion_v1"
+        self._seed(episode_dir, config)
+        agent = _make_agent(episode_dir, config)
+        data = agent._inputs()
+        wrong = {
+            **data["short_versions"]["clip_0"],
+            "version": "minecraft_parkour_v1",
+            "variant_id": "minecraft_parkour_v1",
+        }
+        monkeypatch.setattr(
+            agent,
+            "_destination_versions",
+            lambda _data, _overrides: {"clip_0": wrong},
+        )
+        monkeypatch.setattr(
+            agent,
+            "_occupied_schedule",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("provider preflight must not run")
+            ),
+        )
+        request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_A,
+            destinations=destinations,
+            clip_ids=["clip_0"],
+        )
+        request["variant_overrides"] = {"clip_0": "minecraft_parkour_v1"}
+
+        with pytest.raises(
+            RuntimeError, match="Submit a separate x destination request"
+        ):
+            agent._destination_plan(data, request)
 
     def test_legacy_history_acknowledgement_requires_explicit_subset(
         self, episode_dir, monkeypatch

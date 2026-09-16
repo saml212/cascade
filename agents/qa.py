@@ -58,6 +58,7 @@ from lib.short_variants import (
     background_variant_label,
     background_variant_output,
     background_variant_state,
+    require_background_variant,
     selected_short_variant_id,
     variant_record,
 )
@@ -94,6 +95,32 @@ def youtube_made_for_kids(config: dict) -> bool:
             "platforms.youtube.self_declared_made_for_kids must be true or false"
         )
     return value
+
+
+def required_short_variants(
+    config: dict, destinations: list[str] | tuple[str, ...]
+) -> dict[str, str]:
+    """Return configured per-destination short artifact requirements."""
+    platforms = config.get("platforms", {})
+    required = {}
+    for destination in destinations:
+        value = platforms.get(destination, {}).get("required_short_variant_id")
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise TypeError(
+                f"platforms.{destination}.required_short_variant_id must be a "
+                "non-empty variant ID"
+            )
+        try:
+            require_background_variant(value)
+        except KeyError as exc:
+            raise ValueError(
+                f"platforms.{destination}.required_short_variant_id names an "
+                f"unknown short variant: {value}"
+            ) from exc
+        required[destination] = value
+    return required
 
 
 def normalize_podcast_explicit(value: object) -> str | None:
@@ -358,6 +385,9 @@ def _upload_post_plan(
     )
     if "youtube" in destinations:
         plan["youtube"] = {"self_declared_made_for_kids": youtube_made_for_kids(config)}
+    required_variants = required_short_variants(config, destinations)
+    if required_variants:
+        plan["required_short_variants"] = required_variants
     expansion = {}
     for destination in destinations:
         spec = SHORT_PLATFORM_SPECS[destination]

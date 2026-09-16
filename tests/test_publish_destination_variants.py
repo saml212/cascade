@@ -140,6 +140,24 @@ def test_variant_currentness_uses_the_frozen_approval_metadata(tmp_path, monkeyp
     assert data["short_versions"]["clip_04"]["variant_id"] == "background_motion_v1"
 
 
+def test_required_variant_does_not_affect_other_destinations_or_absent_policy(tmp_path):
+    versions = {"clip_04": {"variant_id": "minecraft_parkour_v1"}}
+    configured = PublishAgent(
+        tmp_path,
+        {
+            "platforms": {
+                "x": {"required_short_variant_id": "satisfying_motion_v1"},
+            }
+        },
+    )
+    configured._enforce_required_short_variants(
+        ["clip_04"], versions, ["youtube", "tiktok"]
+    )
+    PublishAgent(tmp_path, {})._enforce_required_short_variants(
+        ["clip_04"], versions, ["x"]
+    )
+
+
 def test_immediate_destination_uses_override_media_without_schedule_fields(
     tmp_path, monkeypatch
 ):

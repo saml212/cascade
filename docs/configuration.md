@@ -20,6 +20,15 @@ submitting an explicit destination subset. Existing destination receipts remain
 immutable, and later disjoint subsets publish only destinations still missing for
 the same selected media.
 
+`platforms.<destination>.required_short_variant_id` optionally requires one
+reviewed short variant for that destination. Cascade rejects a preview or short
+submission whose effective clip versions do not match. When a destination needs
+a different artifact from the global selection, preview it as a separate
+destination request and map each clip ID in `variant_overrides`; Cascade does not
+split a multi-destination request automatically. Changing this setting changes
+the release revision for an enabled destination and requires refreshed publish
+approval.
+
 `podcast.links.episode_url_template` optionally selects the human-facing episode
 URL used in new short-form copy. It must be an HTTPS URL containing exactly one
 `{episode_id}` placeholder; Cascade URL-encodes the ID before substitution. When

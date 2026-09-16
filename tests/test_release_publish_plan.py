@@ -85,6 +85,57 @@ def test_upload_post_destination_and_account_change_release_revision(tmp_path):
     )
 
 
+def test_required_short_variant_is_bound_to_release_plan(tmp_path):
+    config = _config()
+    config["platforms"]["x"]["enabled"] = True
+    episode = _episode()
+    environment = {"UPLOAD_POST_USER": "account-a"}
+    original = release_revision(
+        tmp_path, episode, config=config, environment=environment
+    )
+
+    config["platforms"]["x"]["required_short_variant_id"] = "satisfying_motion_v1"
+    plan = current_publish_plan(config, episode, environment=environment)
+
+    assert plan["upload_post"]["required_short_variants"] == {
+        "x": "satisfying_motion_v1"
+    }
+    assert (
+        release_revision(tmp_path, episode, config=config, environment=environment)
+        != original
+    )
+
+
+def test_absent_required_short_variant_preserves_publish_plan_shape():
+    plan = current_publish_plan(
+        _config(), _episode(), environment={"UPLOAD_POST_USER": "account-a"}
+    )
+
+    assert "required_short_variants" not in plan["upload_post"]
+
+
+def test_required_short_variant_must_be_a_trimmed_nonempty_id():
+    config = _config()
+    config["platforms"]["x"] = {
+        "enabled": True,
+        "required_short_variant_id": " speaker_panels_v1 ",
+    }
+
+    with pytest.raises(TypeError, match="required_short_variant_id"):
+        current_publish_plan(config, _episode(), environment={})
+
+
+def test_required_short_variant_must_name_a_supported_variant():
+    config = _config()
+    config["platforms"]["x"] = {
+        "enabled": True,
+        "required_short_variant_id": "unknown_variant",
+    }
+
+    with pytest.raises(ValueError, match="unknown short variant"):
+        current_publish_plan(config, _episode(), environment={})
+
+
 def test_disabled_expansion_destinations_do_not_change_existing_publish_plan(tmp_path):
     config = _config()
     episode = _episode()

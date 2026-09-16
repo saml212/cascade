@@ -111,6 +111,7 @@ link_to_longform = true                   # "Link in bio" CTA
 [platforms.x]
 enabled = false
 require_approval = true
+# required_short_variant_id = "speaker_panels_v1" # Force X to use this reviewed variant
 
 # Additional short destinations are opt-in. Use the stable account username from
 # Upload-Post's profile detail API, not a display name or public handle. Cascade

@@ -27,6 +27,7 @@ from agents.qa import (
     publication_identity,
     quality_snapshot,
     release_metadata_issues,
+    required_short_variants,
     short_distribution_state,
     youtube_made_for_kids,
 )
@@ -1834,6 +1835,27 @@ class PublishAgent(BaseAgent):
             versions[clip_id] = version
         return versions
 
+    def _enforce_required_short_variants(
+        self, clip_ids, short_versions, destinations
+    ) -> None:
+        for destination, required_variant_id in required_short_variants(
+            self.config, destinations
+        ).items():
+            mismatched = [
+                clip_id
+                for clip_id in clip_ids
+                if short_versions.get(clip_id, {}).get("variant_id")
+                != required_variant_id
+            ]
+            if mismatched:
+                raise RuntimeError(
+                    f"{destination} requires short variant {required_variant_id} for "
+                    f"clips: {', '.join(mismatched)}. Submit a separate {destination} "
+                    "destination request with clip_ids and variant_overrides mapping "
+                    f"each listed clip ID to {required_variant_id}; no shorts were "
+                    "submitted"
+                )
+
     @staticmethod
     def _validated_variant_overrides(data, value):
         overrides = value.get("variant_overrides", {})
@@ -1924,6 +1946,9 @@ class PublishAgent(BaseAgent):
         if not set(copy_overrides) <= set(selected_ids):
             raise RuntimeError("copy_overrides must name selected clips")
         effective_versions = self._destination_versions(data, overrides)
+        self._enforce_required_short_variants(
+            selected_ids, effective_versions, destinations
+        )
         hub_url = episode_hub_url(self.config, self.episode_dir.name)
         if set(destinations) - {"x"} and not hub_url:
             raise RuntimeError("An HTTPS exact-episode hub URL is required")
@@ -2695,6 +2720,9 @@ class PublishAgent(BaseAgent):
     ):
         previous = previous if isinstance(previous, list) else []
         destination_targets = destination_targets or {}
+        self._enforce_required_short_variants(
+            [str(clip.get("id", "")) for clip in clips], short_versions, platforms
+        )
         results = []
         pending = []
         for clip in clips:
