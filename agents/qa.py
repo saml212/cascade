@@ -67,6 +67,8 @@ from lib.transcript_search import clip_boundary_evidence
 
 QUALITY_SCHEMA = "cascade.release-quality/v1"
 PUBLISH_PLAN_SCHEMA = "cascade.publish-plan/v2"
+LONGFORM_PUBLISH_PLAN_SCHEMA = "cascade.longform-publish-plan/v1"
+LONGFORM_PUBLISH_APPROVAL_SCHEMA = "cascade.longform-publish-approval/v1"
 SHORT_COPY_SCHEMA = "cascade.short-copy/v1"
 QUALITY_REPORT_PATH = Path("qa/qa.json")
 AUDIO_REPORT_PATH = Path("qa/audio-quality.json")
@@ -2147,6 +2149,184 @@ def quality_snapshot(
                 if audio_selection
                 else None
             ),
+        },
+    }
+
+
+_SHORT_ONLY_RELEASE_BLOCKERS = frozenset(
+    {
+        "clips_missing",
+        "clips_pending_review",
+        "approved_shorts_missing",
+        "clip_approval_missing_or_stale",
+        "approved_clip_copy_missing",
+    }
+)
+
+
+def longform_publication_snapshot(
+    episode_dir: str | Path,
+    *,
+    config: dict | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> dict:
+    """Return a revision-bound gate that can authorize only full episodes.
+
+    The regular release gate remains authoritative for aggregate publication. This
+    scoped gate deliberately omits clip review, render, approval, and copy blockers,
+    while retaining current QA, editorial approval, canonical delivery media,
+    longform copy, and exact destination configuration.
+    """
+    episode_dir = Path(episode_dir)
+    if config is None:
+        from agents.pipeline import load_config
+
+        config = load_config()
+    environment = os.environ if environment is None else environment
+    episode = _load_json(episode_dir / "episode.json")
+    base = quality_snapshot(
+        episode_dir,
+        include_findings=False,
+        config=config,
+        environment=environment,
+    )
+    quality = base.get("quality", {})
+    editorial = base.get("approvals", {}).get("editorial", {})
+    release_gate = base.get("release_gate", {})
+    metadata = canonical_release_metadata(episode_dir, episode).get("longform", {})
+    aggregate_plan = release_gate.get("publish_plan", {})
+    upload_plan = aggregate_plan.get("upload_post", {})
+    youtube_enabled = "youtube" in upload_plan.get("destinations", [])
+    plan = {
+        "schema": LONGFORM_PUBLISH_PLAN_SCHEMA,
+        "youtube": {
+            "enabled": youtube_enabled,
+            "account_identity": upload_plan.get("account_identity"),
+            "youtube": upload_plan.get("youtube", {}),
+        },
+        "video_podcast_rss": aggregate_plan.get(
+            "video_podcast_rss", {"enabled": False, "format": "video"}
+        ),
+    }
+
+    prerequisites = [
+        dict(blocker)
+        for blocker in release_gate.get("blockers", [])
+        if blocker.get("code")
+        not in _SHORT_ONLY_RELEASE_BLOCKERS | {"publish_approval_missing_or_stale"}
+    ]
+
+    enabled = [
+        name
+        for name, value in plan.items()
+        if name != "schema" and value.get("enabled")
+    ]
+    if not enabled:
+        prerequisites.append(
+            {
+                "code": "longform_destinations_missing",
+                "severity": "error",
+                "message": "No full-episode publication destination is enabled.",
+            }
+        )
+
+    youtube = plan["youtube"]
+    if youtube.get("enabled") and not youtube.get("account_identity"):
+        prerequisites.append(
+            {
+                "code": "youtube_destination_not_configured",
+                "severity": "error",
+                "message": "Upload-Post user is required for YouTube.",
+            }
+        )
+    video_plan = plan["video_podcast_rss"]
+    if video_plan.get("enabled"):
+        missing = [
+            field
+            for field in (
+                "account_identity",
+                "destination_configured",
+                "channel_configured",
+                "episode_configured",
+            )
+            if not video_plan.get(field)
+        ]
+        if missing:
+            prerequisites.append(
+                {
+                    "code": "video_podcast_rss_not_configured",
+                    "severity": "error",
+                    "message": (
+                        "video_podcast_rss is missing required configuration: "
+                        + ", ".join(missing)
+                        + "."
+                    ),
+                    "fields": missing,
+                }
+            )
+
+    render_record = read_render_manifest(episode_dir).get("longform", {})
+    revision_payload = {
+        "schema": LONGFORM_PUBLISH_APPROVAL_SCHEMA,
+        "episode_id": episode.get("episode_id", episode_dir.name),
+        "editorial_revision": editorial.get("revision"),
+        "quality_revision": quality.get("current_revision"),
+        "qa_report_revision": quality.get("report_revision"),
+        "render": render_record,
+        "upload_video": _file_signature(episode_dir / "upload_video.mp4"),
+        "metadata": metadata,
+        "publish_plan": plan,
+    }
+    encoded = json.dumps(
+        revision_payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    revision = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+    approval = episode.get("longform_publish_approval")
+    approval_current = bool(
+        isinstance(approval, dict)
+        and approval.get("schema") == LONGFORM_PUBLISH_APPROVAL_SCHEMA
+        and approval.get("revision") == revision
+    )
+    blockers = list(prerequisites)
+    if not approval_current:
+        blockers.append(
+            {
+                "code": "longform_publish_approval_missing_or_stale",
+                "severity": "error",
+                "message": (
+                    "Explicit longform-only publish approval is required for this "
+                    "revision."
+                ),
+            }
+        )
+    status = (
+        "blocked"
+        if prerequisites
+        else "ready"
+        if approval_current
+        else "awaiting_publish_approval"
+    )
+    return {
+        "schema": LONGFORM_PUBLISH_APPROVAL_SCHEMA,
+        "episode_id": episode.get("episode_id", episode_dir.name),
+        "status": status,
+        "safe": status == "ready",
+        "can_approve": not prerequisites,
+        "revision": revision,
+        "source_release_revision": release_gate.get("revision"),
+        "editorial_revision": editorial.get("revision"),
+        "quality_revision": quality.get("current_revision"),
+        "publish_plan": plan,
+        "enabled_destinations": enabled,
+        "blockers": blockers,
+        "approval": {
+            "current": approval_current,
+            "revision": revision,
+            "approved_at": approval.get("approved_at")
+            if isinstance(approval, dict)
+            else None,
+            "actor": approval.get("actor") if isinstance(approval, dict) else None,
+            "reason": approval.get("reason") if isinstance(approval, dict) else None,
         },
     }
 

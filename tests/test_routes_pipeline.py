@@ -1297,3 +1297,141 @@ class TestRunSingleAgent:
         asyncio.run(exercise())
         assert "ep_001" not in pipeline._running
         assert "ep_001" not in pipeline._cancel_requested
+
+
+def _longform_gate(*, safe=False, can_approve=True):
+    blockers = []
+    if not safe:
+        blockers.append(
+            {
+                "code": "longform_publish_approval_missing_or_stale",
+                "message": "Scoped approval required",
+            }
+        )
+    return {
+        "schema": "cascade.longform-publish-approval/v1",
+        "episode_id": "ep_001",
+        "status": "ready" if safe else "awaiting_publish_approval",
+        "safe": safe,
+        "can_approve": can_approve,
+        "revision": "sha256:longform-release",
+        "source_release_revision": "sha256:aggregate-release",
+        "editorial_revision": "sha256:editorial",
+        "quality_revision": "sha256:quality",
+        "publish_plan": {
+            "schema": "cascade.longform-publish-plan/v1",
+            "youtube": {"enabled": True, "destination_configured": True},
+            "podcast_rss": {"enabled": False},
+            "video_podcast_rss": {
+                "enabled": True,
+                "format": "video",
+                "destination_configured": True,
+                "channel_configured": True,
+                "episode_configured": True,
+            },
+        },
+        "enabled_destinations": ["youtube", "video_podcast_rss"],
+        "blockers": blockers,
+        "approval": {"current": safe, "revision": "sha256:longform-release"},
+    }
+
+
+class TestLongformPublicationRoutes:
+    def test_get_exposes_exact_readiness_revision(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        gate = _longform_gate()
+        with (
+            patch(
+                "server.routes.pipeline.longform_publication_snapshot",
+                return_value=gate,
+            ),
+            patch("agents.pipeline.load_config", return_value={}),
+        ):
+            response = client.get("/api/episodes/ep_001/longform-publication")
+
+        assert response.status_code == 200
+        assert response.json()["revision"] == "sha256:longform-release"
+        assert response.json()["can_approve"] is True
+        assert response.json()["safe"] is False
+
+    def test_approval_is_scoped_and_does_not_create_global_approval(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        with (
+            patch(
+                "server.routes.pipeline.longform_publication_snapshot",
+                side_effect=[_longform_gate(), _longform_gate(safe=True)],
+            ),
+            patch("agents.pipeline.load_config", return_value={}),
+        ):
+            response = client.post(
+                "/api/episodes/ep_001/longform-publication/approve",
+                json={
+                    "expected_revision": "sha256:longform-release",
+                    "actor": "operator",
+                    "reason": "Approved corrected full episode",
+                },
+            )
+
+        assert response.status_code == 200
+        stored = json.loads((episode_dir / "episode.json").read_text())
+        assert "publish_approval" not in stored
+        assert stored["longform_publish_approval"] == {
+            "schema": "cascade.longform-publish-approval/v1",
+            "revision": "sha256:longform-release",
+            "approved_at": stored["longform_publish_approval"]["approved_at"],
+            "actor": "operator",
+            "reason": "Approved corrected full episode",
+            "plan": _longform_gate()["publish_plan"],
+        }
+
+    def test_publish_dispatches_only_scoped_agents(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        with (
+            patch(
+                "server.routes.pipeline.longform_publication_snapshot",
+                return_value=_longform_gate(safe=True),
+            ),
+            patch("agents.pipeline.load_config", return_value={}),
+            patch("server.routes.pipeline._start_pipeline_thread") as start,
+        ):
+            response = client.post(
+                "/api/episodes/ep_001/longform-publication/publish",
+                json={
+                    "expected_revision": "sha256:longform-release",
+                    "destinations": ["youtube", "video_podcast_rss"],
+                },
+            )
+
+        assert response.status_code == 202
+        agents = start.call_args.args[2]
+        assert agents == ["longform_publish", "longform_video_feed"]
+        assert "publish" not in agents
+        assert "video_feed" not in agents
+
+    def test_global_approval_cannot_authorize_scoped_publish(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        episode["publish_approval"] = {"revision": "sha256:aggregate-release"}
+        (episode_dir / "episode.json").write_text(json.dumps(episode))
+        with (
+            patch(
+                "server.routes.pipeline.longform_publication_snapshot",
+                return_value=_longform_gate(safe=False),
+            ),
+            patch("agents.pipeline.load_config", return_value={}),
+            patch("server.routes.pipeline._start_pipeline_thread") as start,
+        ):
+            response = client.post(
+                "/api/episodes/ep_001/longform-publication/publish",
+                json={
+                    "expected_revision": "sha256:longform-release",
+                    "destinations": ["youtube"],
+                },
+            )
+
+        assert response.status_code == 409
+        start.assert_not_called()

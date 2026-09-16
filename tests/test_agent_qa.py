@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agents.qa import QAAgent
+from agents.qa import QAAgent, longform_publication_snapshot
 from lib.audio_qa import AUDIO_FINDING_REVIEWS_PATH, AUDIO_FINDING_REVIEWS_SCHEMA
 
 
@@ -548,3 +548,101 @@ class TestQAAgent:
         assert result["selected_master_output_continuity"] == raw_continuity
         saved = json.loads((tmp_episode_dir / "qa" / "qa.json").read_text())
         assert saved["selected_master_output_continuity"] == raw_continuity
+
+
+def test_longform_gate_ignores_only_short_blockers(tmp_episode_dir):
+    episode_path = tmp_episode_dir / "episode.json"
+    episode = {
+        "episode_id": tmp_episode_dir.name,
+        "title": "Corrected episode",
+        "description": "Corrected description",
+    }
+    episode_path.write_text(json.dumps(episode))
+    (tmp_episode_dir / "upload_video.mp4").write_bytes(b"corrected video")
+    aggregate = {
+        "quality": {
+            "status": "passed",
+            "current_revision": "sha256:quality",
+            "report_revision": "sha256:quality",
+        },
+        "release_gate": {
+            "safe": False,
+            "revision": "sha256:aggregate",
+            "blockers": [
+                {
+                    "code": "approved_shorts_missing",
+                    "message": "Ten approved shorts are stale.",
+                },
+                {
+                    "code": "publish_approval_missing_or_stale",
+                    "message": "Global approval required.",
+                },
+            ],
+            "publish_plan": {
+                "upload_post": {
+                    "destinations": ["youtube", "tiktok"],
+                    "account_identity": "sha256:user",
+                    "youtube": {"self_declared_made_for_kids": False},
+                },
+                "video_podcast_rss": {"enabled": False, "format": "video"},
+            },
+        },
+        "approvals": {"editorial": {"current": True, "revision": "sha256:editorial"}},
+    }
+
+    with patch("agents.qa.quality_snapshot", return_value=aggregate):
+        awaiting = longform_publication_snapshot(tmp_episode_dir, config={})
+        episode["longform_publish_approval"] = {
+            "schema": "cascade.longform-publish-approval/v1",
+            "revision": awaiting["revision"],
+        }
+        episode_path.write_text(json.dumps(episode))
+        approved = longform_publication_snapshot(tmp_episode_dir, config={})
+
+    assert awaiting["can_approve"] is True
+    assert awaiting["safe"] is False
+    assert approved["safe"] is True
+    assert aggregate["release_gate"]["safe"] is False
+
+
+def test_longform_gate_keeps_nonshort_delivery_blockers(tmp_episode_dir):
+    (tmp_episode_dir / "episode.json").write_text(
+        json.dumps(
+            {
+                "episode_id": tmp_episode_dir.name,
+                "title": "Corrected episode",
+                "description": "Corrected description",
+            }
+        )
+    )
+    aggregate = {
+        "quality": {
+            "status": "passed",
+            "current_revision": "sha256:quality",
+            "report_revision": "sha256:quality",
+        },
+        "release_gate": {
+            "safe": False,
+            "revision": "sha256:aggregate",
+            "blockers": [
+                {
+                    "code": "release_video_invalid",
+                    "message": "Canonical video is stale.",
+                }
+            ],
+            "publish_plan": {
+                "upload_post": {
+                    "destinations": ["youtube"],
+                    "account_identity": "sha256:user",
+                },
+                "video_podcast_rss": {"enabled": False},
+            },
+        },
+        "approvals": {"editorial": {"current": True, "revision": "sha256:editorial"}},
+    }
+
+    with patch("agents.qa.quality_snapshot", return_value=aggregate):
+        gate = longform_publication_snapshot(tmp_episode_dir, config={})
+
+    assert gate["can_approve"] is False
+    assert "release_video_invalid" in {item["code"] for item in gate["blockers"]}

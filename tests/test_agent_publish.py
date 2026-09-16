@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agents.publish import PublishAgent
+from agents.publish import LongformPublishAgent, PublishAgent
 from agents.qa import (
     clip_review_revision,
     editorial_revision,
@@ -3758,3 +3758,147 @@ class TestExpandedShortDestinations:
         assert file_forms == [f"video=@{path}"]
         assert "title=@/private/not-a-file" in text_forms
         assert "threads_title=</private/not-a-file" in text_forms
+
+
+def _scoped_longform_gate():
+    return {
+        "safe": True,
+        "revision": "sha256:scoped",
+        "source_release_revision": "sha256:aggregate",
+        "editorial_revision": "sha256:new-editorial",
+        "quality_revision": "sha256:new-quality",
+        "publish_plan": {"youtube": {"enabled": True, "destination_configured": True}},
+        "blockers": [],
+    }
+
+
+def test_longform_only_agent_never_publishes_shorts_and_keeps_history(episode_dir, env):
+    episode = {
+        "episode_id": "ep_test",
+        "title": "Corrected Arnold episode",
+        "description": "Corrected full episode",
+        "youtube_longform_url": "https://youtu.be/old-arnold",
+        "youtube_longform_url_source": "upload_post_receipt",
+        "youtube_longform_url_editorial_revision": "sha256:old-editorial",
+        "youtube_longform_url_external_id": publication_identity(
+            "ep_test", "sha256:old-editorial", "longform"
+        ),
+    }
+    _write_json(episode_dir / "episode.json", episode)
+    (episode_dir / "upload_video.mp4").write_bytes(b"corrected video")
+    old_longform = {
+        "status": "published",
+        "external_id": publication_identity(
+            "ep_test", "sha256:old-editorial", "longform"
+        ),
+        "job_id": "old-job",
+        "youtube_longform_url": "https://youtu.be/old-arnold",
+    }
+    old_shorts = [
+        {
+            "clip_id": f"clip_{index:02d}",
+            "status": "submitted",
+            "destination_request_id": f"request-{index}",
+        }
+        for index in range(30)
+    ]
+    _write_json(
+        episode_dir / "publish.json",
+        {"longform": old_longform, "shorts": old_shorts},
+    )
+    agent = LongformPublishAgent(episode_dir, _publish_config())
+    new_receipt = {
+        "status": "submitted",
+        "external_id": publication_identity(
+            "ep_test", "sha256:new-editorial", "longform"
+        ),
+        "job_id": "new-job",
+    }
+
+    with (
+        patch(
+            "agents.publish.longform_publication_snapshot",
+            side_effect=[_scoped_longform_gate(), _scoped_longform_gate()],
+        ),
+        patch(
+            "agents.publish.current_funnel_urls",
+            return_value={"youtube": "", "spotify": ""},
+        ),
+        patch.object(agent, "_publish_longform", return_value=new_receipt) as publish,
+        patch.object(agent, "_publish_shorts") as publish_shorts,
+    ):
+        result = agent.execute()
+
+    publish_shorts.assert_not_called()
+    assert publish.call_args.args[2] == old_longform
+    assert publish.call_args.args[6] == ""
+    assert publish.call_args.kwargs == {"approval_scope": "longform"}
+    assert result["shorts"] == old_shorts
+    assert result["longform_history"] == [{**old_longform, "historical_receipt": True}]
+    assert result["longform"] == new_receipt
+
+
+def test_corrected_identity_does_not_reuse_old_longform_receipt(episode_dir, env):
+    (episode_dir / "upload_video.mp4").write_bytes(b"corrected video")
+    agent = LongformPublishAgent(episode_dir, _publish_config())
+    old = {
+        "status": "unknown",
+        "external_id": publication_identity(
+            "ep_test", "sha256:old-editorial", "longform"
+        ),
+    }
+    submitted = {
+        "status": "submitted",
+        "external_id": publication_identity(
+            "ep_test", "sha256:new-editorial", "longform"
+        ),
+    }
+    with (
+        patch.object(agent, "_verified_longform_transport", return_value=None),
+        patch.object(agent, "_submit", return_value=submitted) as submit,
+    ):
+        result = agent._publish_longform(
+            {},
+            {"title": "Corrected", "description": "Corrected episode"},
+            old,
+            "sha256:aggregate",
+            "sha256:new-editorial",
+            "sha256:new-quality",
+            "",
+            ["youtube"],
+            "key",
+            "user",
+            approval_scope="longform",
+        )
+
+    submit.assert_called_once()
+    assert result["external_id"] == submitted["external_id"]
+
+
+def test_scoped_unknown_receipt_is_reused_without_resubmission(episode_dir, env):
+    (episode_dir / "upload_video.mp4").write_bytes(b"corrected video")
+    agent = LongformPublishAgent(episode_dir, _publish_config())
+    identity = publication_identity("ep_test", "sha256:new-editorial", "longform")
+    previous = {"status": "unknown", "external_id": identity, "job_id": "job"}
+    with (
+        patch.object(agent, "_verified_longform_transport") as transport,
+        patch.object(agent, "_submit") as submit,
+    ):
+        result = agent._publish_longform(
+            {},
+            {"title": "Corrected", "description": "Corrected episode"},
+            previous,
+            "sha256:aggregate",
+            "sha256:new-editorial",
+            "sha256:new-quality",
+            "",
+            ["youtube"],
+            "key",
+            "user",
+            approval_scope="longform",
+        )
+
+    transport.assert_not_called()
+    submit.assert_not_called()
+    assert result["status"] == "unknown"
+    assert result["reused_receipt"] is True

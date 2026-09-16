@@ -150,6 +150,8 @@ class TestExplicitPublicationAgents:
             "podcast_feed",
             "video_feed",
             "publish",
+            "longform_video_feed",
+            "longform_publish",
         }
 
 
@@ -241,7 +243,7 @@ class TestAgentRegistry:
         assert len(AGENT_REGISTRY) == len(PIPELINE_ORDER)
 
     def test_pipeline_order_has_14_agents(self):
-        assert len(PIPELINE_ORDER) == 15
+        assert len(PIPELINE_ORDER) == 17
 
 
 class TestPipelinePauseAtCropSetup:

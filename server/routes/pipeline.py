@@ -6,7 +6,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
@@ -14,8 +14,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agents.qa import (
+    LONGFORM_PUBLISH_APPROVAL_SCHEMA,
     current_funnel_urls_for_episode,
     editorial_revision,
+    longform_publication_snapshot,
     quality_snapshot,
 )
 from lib.atomic_write import atomic_write_json
@@ -149,6 +151,21 @@ class ApproveLongformRequest(BaseModel):
 
 class ApprovePublishRequest(BaseModel):
     start_publication: bool = True
+
+
+class ApproveLongformPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(min_length=1)
+    actor: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class PublishLongformRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(min_length=1)
+    destinations: list[Literal["youtube", "video_podcast_rss"]] = Field(min_length=1)
 
 
 # ── Response models ─────────────────────────────────────────────────────────
@@ -614,6 +631,129 @@ async def approve_longform(
         "status": "approved",
         "episode_id": episode_id,
         "production_started": request.continue_production,
+    }
+
+
+@router.get("/{episode_id}/longform-publication")
+async def get_longform_publication(episode_id: str) -> dict:
+    """Inspect the scoped full-episode gate without changing release state."""
+    from agents.pipeline import load_config
+
+    episode_dir = require_episode_dir(OUTPUT_DIR, episode_id)
+    return longform_publication_snapshot(episode_dir, config=load_config())
+
+
+@router.post("/{episode_id}/longform-publication/approve")
+async def approve_longform_publication(
+    episode_id: str, request: ApproveLongformPublishRequest
+) -> dict:
+    """Record approval that can authorize only dedicated full-episode agents."""
+    from agents.pipeline import load_config
+
+    episode_dir = require_episode_dir(OUTPUT_DIR, episode_id)
+    async with _pipeline_lock:
+        current = _running.get(episode_id)
+        if current is not None and current.is_alive():
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
+        gate = longform_publication_snapshot(episode_dir, config=load_config())
+        if request.expected_revision != gate.get("revision"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Longform publication inputs changed",
+                    "expected_revision": request.expected_revision,
+                    "current_revision": gate.get("revision"),
+                },
+            )
+        if gate.get("can_approve") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Longform publication prerequisites are not satisfied",
+                    "blockers": gate.get("blockers", []),
+                },
+            )
+        episode_file = episode_dir / "episode.json"
+        episode = json.loads(episode_file.read_text())
+        episode["longform_publish_approval"] = {
+            "schema": LONGFORM_PUBLISH_APPROVAL_SCHEMA,
+            "revision": gate["revision"],
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+            "actor": request.actor,
+            "reason": request.reason,
+            "plan": gate["publish_plan"],
+        }
+        atomic_write_json(episode_file, episode)
+    return {
+        "status": "approved",
+        "episode_id": episode_id,
+        "revision": gate["revision"],
+        "safe": True,
+        "enabled_destinations": gate["enabled_destinations"],
+    }
+
+
+@router.post("/{episode_id}/longform-publication/publish", status_code=202)
+async def publish_longform(episode_id: str, request: PublishLongformRequest) -> dict:
+    """Dispatch only scoped full-episode publishers for exact destinations."""
+    from agents.pipeline import load_config
+
+    episode_dir = require_episode_dir(OUTPUT_DIR, episode_id)
+    if len(request.destinations) != len(set(request.destinations)):
+        raise HTTPException(status_code=422, detail="Destinations must be unique")
+    async with _pipeline_lock:
+        current = _running.get(episode_id)
+        if current is not None and current.is_alive():
+            raise HTTPException(
+                status_code=409, detail="Pipeline already running for this episode"
+            )
+        gate = longform_publication_snapshot(episode_dir, config=load_config())
+        if request.expected_revision != gate.get("revision"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Longform publication inputs changed",
+                    "expected_revision": request.expected_revision,
+                    "current_revision": gate.get("revision"),
+                },
+            )
+        if gate.get("safe") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Current longform-only approval is required",
+                    "blockers": gate.get("blockers", []),
+                },
+            )
+        enabled = set(gate.get("enabled_destinations", []))
+        requested = set(request.destinations)
+        if not requested <= enabled:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Destinations are outside the approved longform plan",
+                    "enabled_destinations": sorted(enabled),
+                },
+            )
+        agent_by_destination = {
+            "youtube": "longform_publish",
+            "video_podcast_rss": "longform_video_feed",
+        }
+        agents = [agent_by_destination[name] for name in request.destinations]
+        episode = json.loads((episode_dir / "episode.json").read_text())
+        _start_pipeline_thread(
+            episode_id,
+            str(episode.get("source_path", "")),
+            agents,
+        )
+    return {
+        "status": "longform_publishing",
+        "episode_id": episode_id,
+        "revision": gate["revision"],
+        "destinations": request.destinations,
+        "publication_agents": agents,
     }
 
 

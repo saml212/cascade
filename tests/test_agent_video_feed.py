@@ -1,14 +1,16 @@
 """Safety and RSS contract tests for the dedicated video-feed agent."""
 
+import hashlib
 import io
 import json
+import re
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
 
-from agents.video_feed import ITUNES_NS, VideoFeedAgent
+from agents.video_feed import ITUNES_NS, LongformVideoFeedAgent, VideoFeedAgent
 
 
 def _config() -> dict:
@@ -125,6 +127,16 @@ def _remote_feed(item_xml: str) -> bytes:
     ).encode()
 
 
+def _raw_items_by_guid(feed: bytes) -> dict[str, bytes]:
+    blocks = re.findall(rb"<item(?:\s[^>]*)?>.*?</item\s*>", feed, re.DOTALL)
+    return {
+        re.search(rb"<guid(?:\s[^>]*)?>(.*?)</guid\s*>", block, re.DOTALL)
+        .group(1)
+        .decode(): block
+        for block in blocks
+    }
+
+
 def test_video_enclosure_author_guid_and_false_explicit(agent):
     inputs = _inputs(agent)
     xml, state = agent._build_feed(inputs, None)
@@ -184,6 +196,32 @@ def test_remote_history_and_existing_guid_pubdate_are_preserved(agent):
         "pub_date": "Thu, 02 Apr 2026 12:00:00 GMT",
         "replaced_existing": True,
     }
+
+
+def test_retained_item_bytes_are_unchanged(agent):
+    raw_items = "".join(
+        f"""
+        <item data-layout="preserve-{index}">
+          <title>Historical {index}</title>
+          <description>Keep spacing {index}</description>
+          <enclosure url="https://media.example/video/ep_{index}/old.mp4" length="{index + 1}" type="video/mp4" />
+          <guid isPermaLink="false">video:preserved-{index}</guid>
+          <pubDate>Wed, 0{index + 1} Apr 2026 12:00:00 GMT</pubDate>
+        </item>
+        """
+        for index in range(5)
+    )
+    remote = _remote_feed(raw_items)
+    before = _raw_items_by_guid(remote)
+
+    output, state = agent._build_feed(_inputs(agent), remote)
+    after = _raw_items_by_guid(output)
+
+    assert state["previous_item_count"] == 5
+    assert state["item_count"] == 6
+    for guid, block in before.items():
+        assert after[guid] == block
+        assert hashlib.sha256(after[guid]).digest() == hashlib.sha256(block).digest()
 
 
 def test_receipt_date_is_reused_when_remote_item_is_absent(agent):
@@ -280,6 +318,79 @@ def test_guard_failures_prevent_publication(agent, snapshot, message):
     ):
         agent._current_inputs(require_publish_approval=True)
     fingerprint.assert_not_called()
+
+
+def test_scoped_feed_never_falls_back_to_global_publish_approval(agent):
+    scoped = LongformVideoFeedAgent(agent.episode_dir, agent.config)
+    scoped_gate = {
+        "safe": False,
+        "can_approve": True,
+        "revision": "sha256:scoped",
+        "publish_plan": _snapshot()["release_gate"]["publish_plan"],
+        "blockers": [
+            {
+                "code": "longform_publish_approval_missing_or_stale",
+                "message": "Scoped approval required",
+            }
+        ],
+        "approval": {"current": False},
+    }
+    with (
+        patch("agents.video_feed.quality_snapshot", return_value=_snapshot()),
+        patch(
+            "agents.video_feed.longform_publication_snapshot",
+            return_value=scoped_gate,
+        ),
+        patch("agents.video_feed.file_fingerprint") as fingerprint,
+        pytest.raises(RuntimeError, match="longform publish approval"),
+    ):
+        scoped._current_inputs(require_publish_approval=True)
+    fingerprint.assert_not_called()
+
+
+def test_scoped_feed_reuses_receipt_pubdate_when_withdrawn_remote_is_absent(agent):
+    receipt_date = "Thu, 02 Apr 2026 12:00:00 GMT"
+    (agent.episode_dir / "video_feed.json").write_text(
+        json.dumps(
+            {
+                "schema": "cascade.video-podcast-feed/v1",
+                "status": "published",
+                "episode_id": "ep_test",
+                "episode": {"pub_date": receipt_date},
+            }
+        )
+    )
+    episode_path = agent.episode_dir / "episode.json"
+    episode = json.loads(episode_path.read_text())
+    episode["longform_publish_approval"] = {"revision": "sha256:scoped"}
+    episode_path.write_text(json.dumps(episode))
+    scoped = LongformVideoFeedAgent(agent.episode_dir, agent.config)
+    scoped_gate = {
+        "safe": True,
+        "can_approve": True,
+        "revision": "sha256:scoped",
+        "publish_plan": _snapshot()["release_gate"]["publish_plan"],
+        "blockers": [],
+        "approval": {"current": True},
+    }
+    with (
+        patch("agents.video_feed.quality_snapshot", return_value=_snapshot()),
+        patch(
+            "agents.video_feed.longform_publication_snapshot",
+            return_value=scoped_gate,
+        ),
+        patch(
+            "agents.video_feed.file_fingerprint",
+            return_value={"id": "sha256:" + "a" * 64},
+        ),
+    ):
+        inputs = scoped._current_inputs(require_publish_approval=True)
+
+    xml, state = scoped._build_feed(inputs, None)
+    item = ET.fromstring(xml).find("channel").find("item")
+    assert item.findtext("guid") == "video:ep_test"
+    assert item.findtext("pubDate") == receipt_date
+    assert state["replaced_existing"] is False
 
 
 def test_prepare_does_not_touch_audio_feed_files(agent):

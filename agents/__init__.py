@@ -12,8 +12,8 @@ from agents.metadata_gen import MetadataGenAgent
 from agents.thumbnail_gen import ThumbnailGenAgent
 from agents.qa import QAAgent
 from agents.podcast_feed import PodcastFeedAgent
-from agents.video_feed import VideoFeedAgent
-from agents.publish import PublishAgent
+from agents.video_feed import LongformVideoFeedAgent, VideoFeedAgent
+from agents.publish import LongformPublishAgent, PublishAgent
 from agents.backup import BackupAgent
 
 AGENT_REGISTRY = {
@@ -31,6 +31,8 @@ AGENT_REGISTRY = {
     "podcast_feed": PodcastFeedAgent,
     "video_feed": VideoFeedAgent,
     "publish": PublishAgent,
+    "longform_publish": LongformPublishAgent,
+    "longform_video_feed": LongformVideoFeedAgent,
     "backup": BackupAgent,
 }
 
@@ -49,5 +51,7 @@ PIPELINE_ORDER = [
     "podcast_feed",
     "video_feed",
     "publish",
+    "longform_video_feed",
+    "longform_publish",
     "backup",
 ]

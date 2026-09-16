@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import copy
 import fcntl
 import hashlib
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
-from xml.dom import minidom
 from xml.etree import ElementTree as ET
 
 import boto3
@@ -22,7 +21,11 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from agents.base import BaseAgent
-from agents.qa import normalize_podcast_explicit, quality_snapshot
+from agents.qa import (
+    longform_publication_snapshot,
+    normalize_podcast_explicit,
+    quality_snapshot,
+)
 from lib.delivery_video import read_render_manifest
 from lib.ffprobe import file_fingerprint
 
@@ -33,6 +36,7 @@ VIDEO_MEDIA_PREFIX = "video"
 VIDEO_CONTENT_TYPE = "video/mp4"
 MAX_REMOTE_FEED_BYTES = 5 * 1024 * 1024
 MULTIPART_CHUNK_BYTES = 64 * 1024 * 1024
+ITEM_BLOCK_PATTERN = re.compile(rb"<item(?:\s[^>]*)?>.*?</item\s*>", re.DOTALL)
 
 ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -129,13 +133,42 @@ class VideoFeedAgent(BaseAgent):
 
     name = "video_feed"
 
-    def _current_inputs(self, *, require_publish_approval: bool) -> dict:
+    def _current_inputs(
+        self,
+        *,
+        require_publish_approval: bool,
+        approval_scope: str = "release",
+    ) -> dict:
         episode = self.load_json("episode.json")
-        snapshot = quality_snapshot(self.episode_dir, config=self.config)
-        quality = snapshot.get("quality", {})
-        gate = snapshot.get("release_gate", {})
-        approvals = snapshot.get("approvals", {})
-        artifacts = snapshot.get("artifacts", {})
+        if approval_scope == "longform":
+            gate = longform_publication_snapshot(self.episode_dir, config=self.config)
+            can_approve = gate.get("can_approve") is True
+            approval_current = gate.get("approval", {}).get("current") is True
+            quality_revision = gate.get("quality_revision")
+            editorial_revision = gate.get("editorial_revision")
+            release_revision = gate.get("source_release_revision")
+        elif approval_scope == "release":
+            snapshot = quality_snapshot(self.episode_dir, config=self.config)
+            quality = snapshot.get("quality", {})
+            gate = snapshot.get("release_gate", {})
+            approvals = snapshot.get("approvals", {})
+            artifacts = snapshot.get("artifacts", {})
+            can_approve = gate.get("can_approve_publish") is True
+            approval_current = approvals.get("publish", {}).get("current") is True
+            quality_revision = quality.get("current_revision")
+            editorial_revision = approvals.get("editorial", {}).get("revision")
+            release_revision = gate.get("revision")
+            if (
+                quality.get("status") != "passed"
+                or quality.get("report_revision") != quality_revision
+            ):
+                raise RuntimeError("Current QA report has not passed")
+            if approvals.get("editorial", {}).get("current") is not True:
+                raise RuntimeError("Current longform editorial approval is required")
+            if artifacts.get("release_video", {}).get("ready") is not True:
+                raise RuntimeError("Current canonical upload video is required")
+        else:
+            raise ValueError(f"Unknown publication approval scope: {approval_scope}")
         video_plan = gate.get("publish_plan", {}).get("video_podcast_rss", {})
 
         if video_plan.get("enabled") is not True:
@@ -148,15 +181,7 @@ class VideoFeedAgent(BaseAgent):
             raise RuntimeError("Video podcast channel metadata is incomplete")
         if not video_plan.get("episode_configured"):
             raise RuntimeError("Video podcast episode metadata is incomplete")
-        if quality.get("status") != "passed" or quality.get(
-            "report_revision"
-        ) != quality.get("current_revision"):
-            raise RuntimeError("Current QA report has not passed")
-        if approvals.get("editorial", {}).get("current") is not True:
-            raise RuntimeError("Current longform editorial approval is required")
-        if artifacts.get("release_video", {}).get("ready") is not True:
-            raise RuntimeError("Current canonical upload video is required")
-        if gate.get("can_approve_publish") is not True:
+        if not can_approve:
             reasons = "; ".join(
                 str(item.get("message", ""))
                 for item in gate.get("blockers", [])
@@ -164,15 +189,20 @@ class VideoFeedAgent(BaseAgent):
             )
             raise RuntimeError(f"Release prerequisites are not satisfied: {reasons}")
         if require_publish_approval:
-            approval = episode.get("publish_approval")
-            if (
-                approvals.get("publish", {}).get("current") is not True
-                or not isinstance(approval, dict)
-                or approval.get("revision") != gate.get("revision")
-                or gate.get("safe") is not True
+            approval_key = (
+                "longform_publish_approval"
+                if approval_scope == "longform"
+                else "publish_approval"
+            )
+            approval = episode.get(approval_key)
+            if not (
+                approval_current
+                and isinstance(approval, dict)
+                and approval.get("revision") == gate.get("revision")
+                and gate.get("safe") is True
             ):
                 raise RuntimeError(
-                    "Current revision-bound publish approval is required"
+                    f"Current revision-bound {approval_scope} publish approval is required"
                 )
 
         podcast = self.config.get("podcast", {})
@@ -248,11 +278,12 @@ class VideoFeedAgent(BaseAgent):
             "duration_seconds": round(duration),
             "render_fingerprint": render_fingerprint,
             "content_sha256": content_sha256,
-            "quality_revision": quality.get("current_revision"),
-            "editorial_revision": approvals.get("editorial", {}).get("revision"),
-            "release_revision": gate.get("revision"),
-            "publish_approval_current": approvals.get("publish", {}).get("current")
-            is True,
+            "quality_revision": quality_revision,
+            "editorial_revision": editorial_revision,
+            "release_revision": release_revision,
+            "publication_revision": gate.get("revision"),
+            "approval_scope": approval_scope,
+            "publish_approval_current": approval_current,
         }
 
     def _r2_client(self):
@@ -362,7 +393,9 @@ class VideoFeedAgent(BaseAgent):
             raise RuntimeError("Existing video feed is unexpectedly large")
         return data, str(response.get("ETag", "")).strip('"') or None
 
-    def _historical_items(self, remote_feed: bytes | None) -> list[ET.Element]:
+    def _historical_items(
+        self, remote_feed: bytes | None
+    ) -> list[tuple[ET.Element, bytes]]:
         if remote_feed is None:
             return []
         try:
@@ -372,11 +405,14 @@ class VideoFeedAgent(BaseAgent):
             raise RuntimeError("Existing video feed is malformed") from exc
         if channel is None:
             raise RuntimeError("Existing video feed has no channel")
-        items = [copy.deepcopy(item) for item in channel.findall("item")]
+        items = list(channel.findall("item"))
+        raw_items = ITEM_BLOCK_PATTERN.findall(remote_feed)
+        if len(raw_items) != len(items):
+            raise RuntimeError("Existing video feed item boundaries are ambiguous")
         guids = [str(item.findtext("guid", "")).strip() for item in items]
         if any(not guid for guid in guids) or len(set(guids)) != len(guids):
             raise RuntimeError("Existing video feed has missing or duplicate GUIDs")
-        return items
+        return list(zip(items, raw_items, strict=True))
 
     @staticmethod
     def _matches_current_item(item: ET.Element, inputs: dict) -> bool:
@@ -411,25 +447,31 @@ class VideoFeedAgent(BaseAgent):
     ) -> tuple[bytes, dict]:
         historical = self._historical_items(remote_feed)
         previous_current = next(
-            (item for item in historical if self._matches_current_item(item, inputs)),
+            (
+                item
+                for item in historical
+                if self._matches_current_item(item[0], inputs)
+            ),
             None,
         )
         retained = [
-            item for item in historical if not self._matches_current_item(item, inputs)
+            item
+            for item in historical
+            if not self._matches_current_item(item[0], inputs)
         ]
         prior_guid = (
-            str(previous_current.findtext("guid", "")).strip()
+            str(previous_current[0].findtext("guid", "")).strip()
             if previous_current is not None
             else None
         )
         prior_pub_date = (
-            previous_current.findtext("pubDate")
+            previous_current[0].findtext("pubDate")
             if previous_current is not None
             else None
         )
         current = self._current_item(inputs, guid=prior_guid, pub_date=prior_pub_date)
-        items = [current, *retained]
-        items.sort(key=_item_timestamp, reverse=True)
+        items = [(current, ET.tostring(current, encoding="utf-8")), *retained]
+        items.sort(key=lambda item: _item_timestamp(item[0]), reverse=True)
 
         rss = ET.Element("rss", {"version": "2.0"})
         channel = ET.SubElement(rss, "channel")
@@ -453,13 +495,20 @@ class VideoFeedAgent(BaseAgent):
         owner = ET.SubElement(channel, _itunes("owner"))
         _text(owner, _itunes("name"), podcast["author"])
         _text(owner, _itunes("email"), podcast["owner_email"])
-        channel.extend(items)
-
         serialized = ET.tostring(rss, encoding="utf-8")
-        pretty = minidom.parseString(serialized).toprettyxml(
-            indent="  ", encoding="UTF-8"
+        channel_end = b"</channel>"
+        if serialized.count(channel_end) != 1:
+            raise RuntimeError("Generated video feed channel is malformed")
+        before_items, after_items = serialized.split(channel_end)
+        output = b"\n".join(
+            [
+                b'<?xml version="1.0" encoding="UTF-8"?>',
+                before_items,
+                *(raw for _item, raw in items),
+                channel_end + after_items,
+            ]
         )
-        parsed = ET.fromstring(pretty)
+        parsed = ET.fromstring(output)
         output_items = parsed.find("channel").findall("item")
         output_guids = [str(item.findtext("guid", "")).strip() for item in output_items]
         if (
@@ -468,7 +517,7 @@ class VideoFeedAgent(BaseAgent):
             or len(set(output_guids)) != len(output_guids)
         ):
             raise RuntimeError("Generated video feed did not preserve unique entries")
-        return pretty, {
+        return output, {
             "previous_item_count": len(historical),
             "item_count": len(output_items),
             "guid": str(current.findtext("guid", "")),
@@ -479,6 +528,8 @@ class VideoFeedAgent(BaseAgent):
     @staticmethod
     def _identity(inputs: dict) -> tuple:
         return (
+            inputs["approval_scope"],
+            inputs["publication_revision"],
             inputs["release_revision"],
             inputs["editorial_revision"],
             inputs["quality_revision"],
@@ -501,6 +552,8 @@ class VideoFeedAgent(BaseAgent):
             "schema": VIDEO_FEED_PLAN_SCHEMA,
             "episode_id": inputs["episode_id"],
             "release_revision": inputs["release_revision"],
+            "publication_revision": inputs["publication_revision"],
+            "approval_scope": inputs["approval_scope"],
             "editorial_revision": inputs["editorial_revision"],
             "quality_revision": inputs["quality_revision"],
             "publish_approval_current": inputs["publish_approval_current"],
@@ -595,3 +648,13 @@ class VideoFeedAgent(BaseAgent):
                 published_at=datetime.now(timezone.utc).isoformat(),
             )
             return result
+
+
+class LongformVideoFeedAgent(VideoFeedAgent):
+    """Video RSS publisher authorized only by the scoped longform approval."""
+
+    def _current_inputs(self, *, require_publish_approval: bool) -> dict:
+        return super()._current_inputs(
+            require_publish_approval=require_publish_approval,
+            approval_scope="longform",
+        )

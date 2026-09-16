@@ -24,6 +24,7 @@ from agents.qa import (
     canonical_release_metadata,
     current_funnel_urls,
     episode_hub_url,
+    longform_publication_snapshot,
     publication_identity,
     quality_snapshot,
     release_metadata_issues,
@@ -2492,6 +2493,7 @@ class PublishAgent(BaseAgent):
         platforms,
         api_key,
         user,
+        approval_scope="release",
     ):
         if "youtube" not in platforms:
             return None
@@ -2549,6 +2551,7 @@ class PublishAgent(BaseAgent):
             revision,
             longform_revision,
             quality_revision,
+            approval_scope=approval_scope,
         )
         if retry_rejection and transport is None:
             return {
@@ -2610,18 +2613,29 @@ class PublishAgent(BaseAgent):
         release_revision: str,
         editorial_revision: str,
         quality_revision: str,
+        *,
+        approval_scope: str = "release",
     ) -> dict | None:
         """Use a current immutable R2 object instead of a multi-GB request body."""
         path = self.episode_dir / "video_feed.json"
         if not path.exists():
             return None
         try:
-            from agents.video_feed import VIDEO_FEED_SCHEMA, VideoFeedAgent
+            from agents.video_feed import (
+                VIDEO_FEED_SCHEMA,
+                LongformVideoFeedAgent,
+                VideoFeedAgent,
+            )
 
             receipt = json.loads(path.read_text())
             video = receipt["video"]
             remote = video["remote"]
-            agent = VideoFeedAgent(self.episode_dir, self.config)
+            agent_class = (
+                LongformVideoFeedAgent
+                if approval_scope == "longform"
+                else VideoFeedAgent
+            )
+            agent = agent_class(self.episode_dir, self.config)
             current = agent._current_inputs(require_publish_approval=True)
             live_remote = agent._head_video_object(agent._r2_client(), current)
         except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
@@ -2637,6 +2651,12 @@ class PublishAgent(BaseAgent):
             and receipt.get("editorial_revision") == editorial_revision
             and receipt.get("quality_revision") == quality_revision
             and receipt.get("publish_approval_current") is True
+            and (
+                approval_scope != "longform"
+                or receipt.get("approval_scope") == "longform"
+                and receipt.get("publication_revision")
+                == current.get("publication_revision")
+            )
             and current["release_revision"] == release_revision
             and current["editorial_revision"] == editorial_revision
             and current["quality_revision"] == quality_revision
@@ -3848,4 +3868,153 @@ class PublishAgent(BaseAgent):
             result["publish_status"] = "published"
         else:
             result["publish_status"] = "submitted"
+        return result
+
+
+class LongformPublishAgent(PublishAgent):
+    """Upload only the approved YouTube full episode and never inspect shorts."""
+
+    def execute(self) -> dict:
+        gate = longform_publication_snapshot(self.episode_dir, config=self.config)
+        if gate.get("safe") is not True:
+            reasons = "; ".join(
+                str(item.get("message", ""))
+                for item in gate.get("blockers", [])
+                if item.get("message")
+            )
+            raise RuntimeError(f"longform publication gate blocked — {reasons}")
+        youtube_plan = gate.get("publish_plan", {}).get("youtube", {})
+        if youtube_plan.get("enabled") is not True:
+            raise RuntimeError("The approved longform plan does not enable YouTube")
+
+        api_key = os.getenv("UPLOAD_POST_API_KEY")
+        user = os.getenv("UPLOAD_POST_USER", "")
+        if not api_key or not user:
+            raise RuntimeError("Upload-Post credentials are not configured")
+        episode = self.load_json("episode.json")
+        metadata = canonical_release_metadata(self.episode_dir, episode, [])
+        missing = [
+            field
+            for field in ("title", "description")
+            if not metadata.get("longform", {}).get(field)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Longform YouTube copy is missing: " + ", ".join(missing)
+            )
+        try:
+            previous = self.load_json("publish.json")
+        except FileNotFoundError:
+            previous = {}
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "Cannot inspect the current publish receipt; nothing was submitted"
+            ) from error
+        if not isinstance(previous, dict):
+            raise TypeError(
+                "Cannot inspect the current publish receipt; nothing was submitted"
+            )
+
+        longform_revision = str(gate["editorial_revision"])
+        release_revision = str(gate["source_release_revision"])
+        quality_revision = str(gate["quality_revision"])
+        funnel_urls = current_funnel_urls(
+            episode,
+            episode_dir=self.episode_dir,
+            editorial_revision_value=longform_revision,
+            quality_revision_value=quality_revision,
+        )
+        with render_output_lock(self.episode_dir / "upload_video.mp4"):
+            current = longform_publication_snapshot(
+                self.episode_dir, config=self.config
+            )
+            if current.get("safe") is not True or current.get("revision") != gate.get(
+                "revision"
+            ):
+                raise RuntimeError(
+                    "Longform media, copy, or approval changed before submission"
+                )
+            longform = self._publish_longform(
+                episode,
+                metadata["longform"],
+                previous.get("longform"),
+                release_revision,
+                longform_revision,
+                quality_revision,
+                funnel_urls["youtube"],
+                ["youtube"],
+                api_key,
+                user,
+                approval_scope="longform",
+            )
+
+        previous_shorts = previous.get("shorts", [])
+        if not isinstance(previous_shorts, list):
+            previous_shorts = []
+        result = {
+            **previous,
+            **self._result(
+                [],
+                longform,
+                ["youtube"],
+                release_revision,
+                user,
+                previous_shorts=previous_shorts,
+            ),
+            "approval_scope": "longform",
+            "longform_publication_revision": gate["revision"],
+            "shorts": previous.get("shorts", []),
+        }
+        state = longform.get("status") if isinstance(longform, dict) else "failed"
+        result["publish_status"] = state
+        for stale_field in (
+            "action_required",
+            "next_action",
+            "shorts_deferred",
+            "shorts_deferred_reason",
+            "deferred_destinations",
+        ):
+            result.pop(stale_field, None)
+        if state == "unknown":
+            result.update(
+                action_required=True,
+                next_action=(
+                    "Reconcile the saved Upload-Post request before any retry."
+                ),
+            )
+        elif state in {"failed", "partial_failure"}:
+            result.update(
+                action_required=True,
+                next_action="Resolve the saved provider failure before retrying.",
+            )
+
+        old_longform = previous.get("longform")
+        history = previous.get("longform_history", [])
+        history = (
+            [item for item in history if isinstance(item, dict)]
+            if isinstance(history, list)
+            else []
+        )
+        if (
+            isinstance(old_longform, dict)
+            and isinstance(longform, dict)
+            and old_longform.get("external_id") != longform.get("external_id")
+        ):
+            old_key = (
+                old_longform.get("external_id"),
+                old_longform.get("job_id"),
+                old_longform.get("server_request_id"),
+            )
+            if not any(
+                (
+                    item.get("external_id"),
+                    item.get("job_id"),
+                    item.get("server_request_id"),
+                )
+                == old_key
+                for item in history
+            ):
+                history.append({**old_longform, "historical_receipt": True})
+        if history:
+            result["longform_history"] = history
         return result
