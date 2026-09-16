@@ -110,6 +110,17 @@ class ScheduleCancellationRequest(ReReleaseRequest):
     expected_snapshot_revision: str = Field(min_length=1)
 
 
+class ScheduledJobCancellationPreviewRequest(BaseModel):
+    expected_external_id: str = Field(min_length=1)
+    request_id: UUID
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ScheduledJobCancellationRequest(ScheduledJobCancellationPreviewRequest):
+    expected_snapshot_revision: str = Field(min_length=1)
+
+
 def _finite_number(name: str, value: float) -> float:
     value = float(value)
     if not math.isfinite(value):
@@ -1052,7 +1063,13 @@ def _delete_upload_post_schedule(api_key: str, job_id: str) -> dict:
 
 
 def _cancellation_context(
-    episode_id: str, clip_id: str, req: ReReleaseRequest, publish: dict
+    episode_id: str,
+    clip_id: str,
+    req: ReReleaseRequest | None,
+    publish: dict,
+    *,
+    job_id: str | None = None,
+    external_id: str | None = None,
 ) -> dict:
     from agents.pipeline import load_config
     from agents.publish import (
@@ -1062,18 +1079,30 @@ def _cancellation_context(
         schedule_cancellation_provider_safe,
     )
 
-    clips, clips_file = load_clips(episode_id)
-    clip, _ = find_clip(clips, clip_id)
-    _, state = _rerelease_target(clips_file.parent, clip, req)
-    existing = clip.get(DISTRIBUTION_RELEASE_FIELD)
-    if DISTRIBUTION_RELEASE_FIELD in clip and not _valid_release_request(existing):
-        raise HTTPException(status_code=409, detail="Re-release identity is malformed.")
-    if isinstance(existing, dict) and not any(
-        receipt.get("clip_id") == clip_id
-        and receipt.get("rerelease_request_id") == existing.get("request_id")
-        for receipt in publish.get("shorts", [])
-    ):
-        raise HTTPException(status_code=409, detail="A re-release is already prepared.")
+    ep_dir = require_episode_dir(EPISODES_DIR, episode_id)
+    target = None
+    if req is not None:
+        clips, clips_file = load_clips(episode_id)
+        clip, _ = find_clip(clips, clip_id)
+        _, state = _rerelease_target(clips_file.parent, clip, req)
+        existing = clip.get(DISTRIBUTION_RELEASE_FIELD)
+        if DISTRIBUTION_RELEASE_FIELD in clip and not _valid_release_request(existing):
+            raise HTTPException(
+                status_code=409, detail="Re-release identity is malformed."
+            )
+        if isinstance(existing, dict) and not any(
+            receipt.get("clip_id") == clip_id
+            and receipt.get("rerelease_request_id") == existing.get("request_id")
+            for receipt in publish.get("shorts", [])
+        ):
+            raise HTTPException(
+                status_code=409, detail="A re-release is already prepared."
+            )
+        target = {
+            "variant_id": req.variant_id,
+            "revision": state["revision"],
+            "render_fingerprint": state["render_fingerprint"],
+        }
     profile = publish.get("profile_username")
     api_key = os.getenv("UPLOAD_POST_API_KEY", "")
     if (
@@ -1085,13 +1114,15 @@ def _cancellation_context(
         raise HTTPException(
             status_code=409, detail="Exact provider account is unavailable."
         )
-    agent = PublishAgent(clips_file.parent, load_config())
+    agent = PublishAgent(ep_dir, load_config())
     try:
         receipt, remote, history_revision = cancellable_scheduled_receipt(
             publish,
             clip_id,
             agent._remote_schedule(api_key, profile),
             profile_username=profile,
+            job_id=job_id,
+            external_id=external_id,
         )
         evidence = _upload_post_job_evidence(api_key, profile, receipt["job_id"])
         safe, reason = schedule_cancellation_provider_safe(
@@ -1101,11 +1132,6 @@ def _cancellation_context(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not safe:
         raise HTTPException(status_code=409, detail=reason)
-    target = {
-        "variant_id": req.variant_id,
-        "revision": state["revision"],
-        "render_fingerprint": state["render_fingerprint"],
-    }
     return {
         "receipt": receipt,
         "snapshot": cancellation_snapshot(
@@ -1130,15 +1156,29 @@ def _cancellation_body(req: ReReleaseRequest, revision: str) -> dict:
     }
 
 
-def _cancellation_response(episode_id: str, clip_id: str, operation: dict) -> dict:
-    target = operation["snapshot"]["target"]
+def _scheduled_job_cancellation_body(
+    req: ScheduledJobCancellationPreviewRequest, revision: str
+) -> dict:
     return {
+        "expected_external_id": req.expected_external_id,
+        "request_id": str(req.request_id),
+        "actor": req.actor.strip(),
+        "reason": req.reason.strip(),
+        "expected_snapshot_revision": revision,
+    }
+
+
+def _cancellation_response(episode_id: str, clip_id: str, operation: dict) -> dict:
+    response = {
         "status": "cancelled",
         "clip_id": clip_id,
         "operation_id": operation["operation_id"],
         "replacement_safe": True,
         "prior_receipt_preserved": True,
-        "next": {
+    }
+    target = operation["snapshot"].get("target")
+    if isinstance(target, dict):
+        response["next"] = {
             "method": "POST",
             "path": f"/api/episodes/{episode_id}/clips/{clip_id}/re-release",
             "body": {
@@ -1148,12 +1188,15 @@ def _cancellation_response(episode_id: str, clip_id: str, operation: dict) -> di
                 "actor": operation["actor"],
                 "reason": operation["reason"],
             },
-        },
-    }
+        }
+    return response
 
 
 def _preview_schedule_cancellation_locked(
-    episode_id: str, clip_id: str, req: ReReleaseRequest
+    episode_id: str,
+    clip_id: str,
+    req: ReReleaseRequest | ScheduledJobCancellationPreviewRequest,
+    job_id: str | None = None,
 ) -> dict:
     from agents.publish import publication_lock
 
@@ -1162,13 +1205,19 @@ def _preview_schedule_cancellation_locked(
     with publication_lock(EPISODES_DIR):
         ep_dir = require_episode_dir(EPISODES_DIR, episode_id)
         publish, _ = _load_cancellation_publish(ep_dir)
-        context = _cancellation_context(episode_id, clip_id, req, publish)
+        context = _cancellation_context(
+            episode_id,
+            clip_id,
+            None if job_id is not None else req,
+            publish,
+            job_id=job_id,
+            external_id=req.expected_external_id if job_id is not None else None,
+        )
         receipt, snapshot = context["receipt"], context["snapshot"]
-        return {
+        response = {
             "status": "cancellable",
             "clip_id": clip_id,
             "replacement_safe": False,
-            "target": snapshot["target"],
             "receipt": {
                 "revision": snapshot["receipt_revision"],
                 "job_id": receipt["job_id"],
@@ -1179,8 +1228,15 @@ def _preview_schedule_cancellation_locked(
             },
             "remote_job": snapshot["remote_job"],
             "snapshot_revision": snapshot["revision"],
-            "execute": _cancellation_body(req, snapshot["revision"]),
+            "execute": (
+                _scheduled_job_cancellation_body(req, snapshot["revision"])
+                if job_id is not None
+                else _cancellation_body(req, snapshot["revision"])
+            ),
         }
+        if "target" in snapshot:
+            response["target"] = snapshot["target"]
+        return response
 
 
 @router.post("/{clip_id}/schedule-cancellation/preview")
@@ -1192,8 +1248,30 @@ async def preview_schedule_cancellation(
     )
 
 
+@router.post("/{clip_id}/scheduled-jobs/{job_id}/cancellation/preview")
+async def preview_scheduled_job_cancellation(
+    episode_id: str,
+    clip_id: str,
+    job_id: str,
+    req: ScheduledJobCancellationPreviewRequest,
+) -> dict:
+    return await asyncio.to_thread(
+        _preview_schedule_cancellation_locked,
+        episode_id,
+        clip_id,
+        req,
+        job_id,
+    )
+
+
 def _post_delete_cancellation(
-    ep_dir: Path, publish: dict, receipts: list[dict], index: int, api_key: str
+    ep_dir: Path,
+    publish: dict,
+    receipts: list[dict],
+    index: int,
+    api_key: str,
+    *,
+    persist_failed_check: bool = True,
 ) -> dict:
     from agents.pipeline import load_config
     from agents.publish import PublishAgent, schedule_cancellation_provider_safe
@@ -1222,14 +1300,17 @@ def _post_delete_cancellation(
         )
     except (RuntimeError, ValueError) as exc:
         absent, safe, reason = False, False, str(exc)
-    operation["post_delete"] = {
+    post_delete = {
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "calendar": calendar,
         "evidence": evidence,
     }
     if not absent or not safe:
-        atomic_write_json(ep_dir / "publish.json", publish)
+        if persist_failed_check:
+            operation["post_delete"] = post_delete
+            atomic_write_json(ep_dir / "publish.json", publish)
         raise HTTPException(status_code=409, detail=reason or "Job remains scheduled.")
+    operation["post_delete"] = post_delete
     completed = datetime.now(timezone.utc).isoformat()
     destinations = {
         platform: {"state": "cancelled"} for platform in original["platforms"]
@@ -1256,138 +1337,271 @@ def _post_delete_cancellation(
     return receipts[index]
 
 
+def _cancellation_inputs_match(
+    receipt: dict,
+    operation: dict,
+    req: ScheduleCancellationRequest | ScheduledJobCancellationRequest,
+    *,
+    schema: str,
+    actor: str,
+    reason: str,
+    job_id: str | None,
+) -> bool:
+    if (
+        operation.get("schema"),
+        operation.get("actor"),
+        operation.get("reason"),
+        operation.get("snapshot", {}).get("revision"),
+    ) != (schema, actor, reason, req.expected_snapshot_revision):
+        return False
+    if job_id is not None:
+        original = receipt.get("pre_cancellation_receipt", {})
+        return (original.get("job_id"), original.get("external_id")) == (
+            job_id,
+            req.expected_external_id,
+        )
+    target = operation.get("snapshot", {}).get("target", {})
+    return (target.get("variant_id"), target.get("revision")) == (
+        req.variant_id,
+        req.expected_revision,
+    )
+
+
+def _resume_cancellation_operation(
+    ep_dir: Path,
+    publish: dict,
+    receipt: dict,
+    operation: dict,
+    *,
+    exact_job: bool,
+) -> bool:
+    if operation["state"] not in {"delete_started", "outcome_uncertain"}:
+        if operation["state"] != "delete_confirmed":
+            raise HTTPException(
+                status_code=409,
+                detail="Prior outcome is unresolved; do not send another DELETE.",
+            )
+        return False
+    if not exact_job:
+        raise HTTPException(
+            status_code=409,
+            detail="Prior outcome is unresolved; do not send another DELETE.",
+        )
+    if operation["state"] == "delete_started":
+        operation.update(state="outcome_uncertain")
+        operation["delete"] = {
+            "job_id": receipt["pre_cancellation_receipt"]["job_id"],
+            "attempted_at": operation["started_at"],
+            "error": "Delete outcome unknown after durable marker",
+        }
+        atomic_write_json(ep_dir / "publish.json", publish)
+    return True
+
+
+def _start_cancellation_operation(
+    episode_id: str,
+    clip_id: str,
+    req: ScheduleCancellationRequest | ScheduledJobCancellationRequest,
+    job_id: str | None,
+    schema: str,
+    ep_dir: Path,
+    publish: dict,
+    receipts: list[dict],
+) -> tuple[int, dict, bool]:
+    exact_job = job_id is not None
+    context = _cancellation_context(
+        episode_id,
+        clip_id,
+        None if exact_job else req,
+        publish,
+        job_id=job_id,
+        external_id=req.expected_external_id if exact_job else None,
+    )
+    snapshot, receipt = context["snapshot"], context["receipt"]
+    if req.expected_snapshot_revision != snapshot["revision"]:
+        raise HTTPException(status_code=409, detail="Snapshot changed; preview again.")
+    if not exact_job:
+        current_clips, _ = load_clips(episode_id)
+        current_clip, _ = find_clip(current_clips, clip_id)
+        _, current_target = _rerelease_target(ep_dir, current_clip, req)
+        if any(
+            current_target.get(key) != snapshot["target"].get(key)
+            for key in ("variant_id", "revision", "render_fingerprint")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The target changed during provider verification; preview again.",
+            )
+    index = receipts.index(receipt)
+    original = copy.deepcopy(receipt)
+    operation = {
+        "schema": schema,
+        "operation_id": str(req.request_id),
+        "clip_id": clip_id,
+        "actor": req.actor.strip(),
+        "reason": req.reason.strip(),
+        "state": "delete_started",
+        "snapshot": snapshot,
+        "pre_delete": context["pre_delete"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    receipts[index] = {
+        **receipt,
+        "pre_cancellation_receipt": original,
+        "schedule_cancellation": operation,
+    }
+    publish["shorts"] = receipts
+    atomic_write_json(ep_dir / "publish.json", publish)
+    outcome = _delete_upload_post_schedule(context["api_key"], original["job_id"])
+    operation["delete"] = {
+        "job_id": original["job_id"],
+        "attempted_at": datetime.now(timezone.utc).isoformat(),
+        **outcome,
+    }
+    confirmed = (
+        outcome.get("http_status") == 200
+        and isinstance(outcome.get("response"), dict)
+        and outcome["response"].get("success") is True
+    )
+    if not confirmed:
+        operation["state"] = "outcome_uncertain"
+        atomic_write_json(ep_dir / "publish.json", publish)
+        if not exact_job:
+            raise HTTPException(
+                status_code=409,
+                detail="Cancellation is unconfirmed; do not send another DELETE.",
+            )
+        return index, operation, True
+    operation.update(state="delete_confirmed")
+    operation["delete"]["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_write_json(ep_dir / "publish.json", publish)
+    return index, operation, False
+
+
+def _existing_cancellation(receipts: list[dict], request_id: UUID):
+    matches = [
+        (index, receipt, receipt.get("schedule_cancellation"))
+        for index, receipt in enumerate(receipts)
+        if isinstance(receipt.get("schedule_cancellation"), dict)
+        and receipt["schedule_cancellation"].get("operation_id") == str(request_id)
+    ]
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="Cancellation ID is duplicated.")
+    return matches[0] if matches else None
+
+
+def _complete_cancellation(
+    episode_id: str,
+    clip_id: str,
+    ep_dir: Path,
+    publish: dict,
+    receipts: list[dict],
+    index: int,
+    operation: dict,
+    *,
+    reconciling_uncertain: bool,
+) -> dict:
+    from agents.publish import validated_schedule_cancellation
+
+    api_key = os.getenv("UPLOAD_POST_API_KEY", "")
+    profile = os.getenv("UPLOAD_POST_USER", "")
+    if not api_key or profile != operation["snapshot"]["profile_username"]:
+        raise HTTPException(
+            status_code=409,
+            detail="The exact Upload-Post account is unavailable.",
+        )
+    receipt = _post_delete_cancellation(
+        ep_dir,
+        publish,
+        receipts,
+        index,
+        api_key,
+        persist_failed_check=not reconciling_uncertain,
+    )
+    operation = validated_schedule_cancellation(receipt)
+    if operation is None:
+        raise HTTPException(status_code=409, detail="Cancellation proof is invalid.")
+    return _cancellation_response(episode_id, clip_id, operation)
+
+
 def _cancel_schedule_locked(
-    episode_id: str, clip_id: str, req: ScheduleCancellationRequest
+    episode_id: str,
+    clip_id: str,
+    req: ScheduleCancellationRequest | ScheduledJobCancellationRequest,
+    job_id: str | None = None,
 ) -> dict:
     from agents.publish import (
+        EXACT_SCHEDULE_CANCELLATION_SCHEMA,
         SCHEDULE_CANCELLATION_SCHEMA,
         publication_lock,
         validated_schedule_cancellation,
     )
 
+    exact_job = job_id is not None
+    schema = (
+        EXACT_SCHEDULE_CANCELLATION_SCHEMA
+        if exact_job
+        else SCHEDULE_CANCELLATION_SCHEMA
+    )
     actor, reason = req.actor.strip(), req.reason.strip()
     if not actor or len(reason) < 3:
         raise HTTPException(status_code=422, detail="Actor and reason are required.")
     with publication_lock(EPISODES_DIR):
+        reconciling_uncertain = False
         ep_dir = require_episode_dir(EPISODES_DIR, episode_id)
         publish, receipts = _load_cancellation_publish(ep_dir)
-        matches = [
-            (index, receipt, receipt.get("schedule_cancellation"))
-            for index, receipt in enumerate(receipts)
-            if isinstance(receipt.get("schedule_cancellation"), dict)
-            and receipt["schedule_cancellation"].get("operation_id")
-            == str(req.request_id)
-        ]
-        if len(matches) > 1:
-            raise HTTPException(
-                status_code=409, detail="Cancellation ID is duplicated."
-            )
-        if matches:
-            index, receipt, operation = matches[0]
+        existing = _existing_cancellation(receipts, req.request_id)
+        if existing:
+            index, receipt, operation = existing
             if receipt.get("clip_id") != clip_id or operation.get("clip_id") != clip_id:
                 raise HTTPException(
                     status_code=409,
                     detail="Cancellation ID belongs to a different clip.",
                 )
-            target = operation.get("snapshot", {}).get("target", {})
-            if validated_schedule_cancellation(receipt) is None or (
-                operation.get("actor"),
-                operation.get("reason"),
-                operation.get("snapshot", {}).get("revision"),
-                target.get("variant_id"),
-                target.get("revision"),
-            ) != (
-                actor,
-                reason,
-                req.expected_snapshot_revision,
-                req.variant_id,
-                req.expected_revision,
+            if validated_schedule_cancellation(
+                receipt
+            ) is None or not _cancellation_inputs_match(
+                receipt,
+                operation,
+                req,
+                schema=schema,
+                actor=actor,
+                reason=reason,
+                job_id=job_id,
             ):
                 raise HTTPException(
                     status_code=409, detail="Cancellation inputs changed."
                 )
             if operation["state"] == "cancelled":
                 return _cancellation_response(episode_id, clip_id, operation)
-            if operation["state"] != "delete_confirmed":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Prior outcome is unresolved; do not send another DELETE.",
-                )
+            reconciling_uncertain = _resume_cancellation_operation(
+                ep_dir,
+                publish,
+                receipt,
+                operation,
+                exact_job=exact_job,
+            )
         else:
-            context = _cancellation_context(episode_id, clip_id, req, publish)
-            snapshot, receipt = context["snapshot"], context["receipt"]
-            if req.expected_snapshot_revision != snapshot["revision"]:
-                raise HTTPException(
-                    status_code=409, detail="Snapshot changed; preview again."
-                )
-            current_clips, _ = load_clips(episode_id)
-            current_clip, _ = find_clip(current_clips, clip_id)
-            _, current_target = _rerelease_target(ep_dir, current_clip, req)
-            if any(
-                current_target.get(key) != snapshot["target"].get(key)
-                for key in ("variant_id", "revision", "render_fingerprint")
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="The target changed during provider verification; preview again.",
-                )
-            index = receipts.index(receipt)
-            original = copy.deepcopy(receipt)
-            operation = {
-                "schema": SCHEDULE_CANCELLATION_SCHEMA,
-                "operation_id": str(req.request_id),
-                "clip_id": clip_id,
-                "actor": actor,
-                "reason": reason,
-                "state": "delete_started",
-                "snapshot": snapshot,
-                "pre_delete": context["pre_delete"],
-                "started_at": datetime.now(timezone.utc).isoformat(),
-            }
-            receipts[index] = {
-                **receipt,
-                "pre_cancellation_receipt": original,
-                "schedule_cancellation": operation,
-            }
-            publish["shorts"] = receipts
-            atomic_write_json(ep_dir / "publish.json", publish)
-            outcome = _delete_upload_post_schedule(
-                context["api_key"], original["job_id"]
+            index, operation, reconciling_uncertain = _start_cancellation_operation(
+                episode_id,
+                clip_id,
+                req,
+                job_id,
+                schema,
+                ep_dir,
+                publish,
+                receipts,
             )
-            operation["delete"] = {
-                "job_id": original["job_id"],
-                "attempted_at": datetime.now(timezone.utc).isoformat(),
-                **outcome,
-            }
-            confirmed = (
-                outcome.get("http_status") == 200
-                and isinstance(outcome.get("response"), dict)
-                and outcome["response"].get("success") is True
-            )
-            if not confirmed:
-                operation["state"] = "outcome_uncertain"
-                atomic_write_json(ep_dir / "publish.json", publish)
-                raise HTTPException(
-                    status_code=409,
-                    detail="Cancellation is unconfirmed; do not send another DELETE.",
-                )
-            operation.update(state="delete_confirmed")
-            operation["delete"]["confirmed_at"] = datetime.now(timezone.utc).isoformat()
-            atomic_write_json(ep_dir / "publish.json", publish)
-        api_key = os.getenv("UPLOAD_POST_API_KEY", "")
-        profile = os.getenv("UPLOAD_POST_USER", "")
-        if not api_key or profile != operation["snapshot"]["profile_username"]:
-            raise HTTPException(
-                status_code=409,
-                detail="The exact Upload-Post account is unavailable.",
-            )
-        receipt = _post_delete_cancellation(ep_dir, publish, receipts, index, api_key)
-        operation = validated_schedule_cancellation(receipt)
-        if operation is None:
-            raise HTTPException(
-                status_code=409, detail="Cancellation proof is invalid."
-            )
-        return _cancellation_response(episode_id, clip_id, operation)
+        return _complete_cancellation(
+            episode_id,
+            clip_id,
+            ep_dir,
+            publish,
+            receipts,
+            index,
+            operation,
+            reconciling_uncertain=reconciling_uncertain,
+        )
 
 
 @router.post("/{clip_id}/schedule-cancellation")
@@ -1395,6 +1609,18 @@ async def cancel_clip_schedule(
     episode_id: str, clip_id: str, req: ScheduleCancellationRequest
 ) -> dict:
     return await asyncio.to_thread(_cancel_schedule_locked, episode_id, clip_id, req)
+
+
+@router.post("/{clip_id}/scheduled-jobs/{job_id}/cancellation")
+async def cancel_scheduled_job(
+    episode_id: str,
+    clip_id: str,
+    job_id: str,
+    req: ScheduledJobCancellationRequest,
+) -> dict:
+    return await asyncio.to_thread(
+        _cancel_schedule_locked, episode_id, clip_id, req, job_id
+    )
 
 
 @router.post("/{clip_id}/reject")

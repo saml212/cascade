@@ -44,6 +44,54 @@ def _remote_job():
     }
 
 
+def _receipt_for(job_id, external_id, platform):
+    return {
+        **_receipt(),
+        "platforms": [platform],
+        "request_id": external_id,
+        "external_id": external_id,
+        "job_id": job_id,
+    }
+
+
+def _remote_job_for(receipt):
+    return {
+        **_remote_job(),
+        "job_id": receipt["job_id"],
+        "external_id": receipt["external_id"],
+        "platforms": receipt["platforms"],
+        "fields": {"external_id": receipt["external_id"]},
+    }
+
+
+def _queued_evidence_for(receipt):
+    rows = [
+        {
+            "job_id": receipt["job_id"],
+            "external_id": receipt["external_id"],
+            "profile_username": "up",
+            "platform": platform,
+            "is_scheduled": True,
+            "upload_status": "queued",
+            "success": None,
+            "post_url": None,
+            "run_date": "2099-01-05T17:00:00",
+        }
+        for platform in receipt["platforms"]
+    ]
+    return {
+        "status_not_found": False,
+        "status": {
+            "job_id": receipt["job_id"],
+            "external_id": receipt["external_id"],
+            "profile_username": "up",
+            "status": "queued",
+            "success": None,
+        },
+        "history": {"in_progress": rows, "history": []},
+    }
+
+
 def _queued_evidence(*, state="queued", success=None):
     rows = [
         {
@@ -327,6 +375,162 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
         ]
         is None
     )
+
+
+def test_exact_job_cancellation_handles_three_jobs_without_replacement(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    receipts = [
+        _receipt_for("job-youtube", "external-youtube", "youtube"),
+        _receipt_for("job-instagram", "external-instagram", "instagram"),
+        _receipt_for("job-x", "external-x", "x"),
+    ]
+    (episode_dir / "publish.json").write_text(
+        json.dumps({"profile_username": "up", "shorts": receipts})
+    )
+    monkeypatch.setenv("UPLOAD_POST_API_KEY", "secret")
+    monkeypatch.setenv("UPLOAD_POST_USER", "up")
+
+    from agents.publish import PublishAgent
+    from server.routes import clips
+
+    deleted = set()
+    delete_calls = []
+    by_job = {receipt["job_id"]: receipt for receipt in receipts}
+    monkeypatch.setattr(
+        PublishAgent,
+        "_remote_schedule",
+        lambda *_args: [
+            _remote_job_for(receipt)
+            for receipt in receipts
+            if receipt["job_id"] not in deleted
+        ],
+    )
+    monkeypatch.setattr(
+        clips,
+        "_upload_post_job_evidence",
+        lambda _api_key, _profile, job_id: (
+            _absent_evidence()
+            if job_id in deleted
+            else _queued_evidence_for(by_job[job_id])
+        ),
+    )
+
+    def delete(_api_key, job_id):
+        delete_calls.append(job_id)
+        deleted.add(job_id)
+        return {
+            "http_status": 200,
+            "response": {"success": True, "message": f"Job {job_id} cancelled"},
+        }
+
+    monkeypatch.setattr(clips, "_delete_upload_post_schedule", delete)
+
+    last_execute = None
+    for index, receipt in enumerate(receipts, start=1):
+        path = (
+            "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/"
+            f"{receipt['job_id']}/cancellation"
+        )
+        request = {
+            "expected_external_id": receipt["external_id"],
+            "request_id": f"00000000-0000-4000-8000-{index:012d}",
+            "actor": "release-operator",
+            "reason": "Remove the rejected queued creative",
+        }
+        preview = client.post(f"{path}/preview", json=request)
+        assert preview.status_code == 200
+        assert preview.json()["receipt"]["job_id"] == receipt["job_id"]
+        last_execute = preview.json()["execute"]
+        cancelled = client.post(path, json=last_execute)
+        assert cancelled.status_code == 200
+        assert cancelled.json()["prior_receipt_preserved"] is True
+        assert "next" not in cancelled.json()
+
+    assert delete_calls == [receipt["job_id"] for receipt in receipts]
+    stored = json.loads((episode_dir / "publish.json").read_text())["shorts"]
+    from agents.publish import (
+        EXACT_SCHEDULE_CANCELLATION_SCHEMA,
+        short_rerelease_state,
+        validated_schedule_cancellation,
+    )
+
+    assert all(receipt["status"] == "cancelled" for receipt in stored)
+    assert all(
+        receipt["pre_cancellation_receipt"]["scheduled"] is True
+        and validated_schedule_cancellation(receipt)["schema"]
+        == EXACT_SCHEDULE_CANCELLATION_SCHEMA
+        for receipt in stored
+    )
+    eligibility = short_rerelease_state(
+        {"shorts": stored}, "clip_01", profile_username="up"
+    )
+    assert eligibility["allowed"] is True
+    assert eligibility["cancellation_request"] is None
+
+    repeated = client.post(
+        "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/job-x/cancellation",
+        json=last_execute,
+    )
+    assert repeated.status_code == 200
+    assert delete_calls == [receipt["job_id"] for receipt in receipts]
+
+
+def test_exact_job_preview_rejects_wrong_external_id(test_client, monkeypatch):
+    client, _episode_dir, _original, deleted, _request = _setup(
+        test_client, monkeypatch
+    )
+    response = client.post(
+        "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/job-old/cancellation/preview",
+        json={
+            "expected_external_id": "different-external-id",
+            "request_id": REQUEST_ID,
+            "actor": "release-operator",
+            "reason": "Remove the rejected queued creative",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "exact scheduled receipt" in response.json()["detail"]
+    assert deleted["calls"] == 0
+
+
+def test_exact_job_reconciles_ambiguous_delete_without_retrying_it(
+    test_client, monkeypatch
+):
+    client, episode_dir, original, deleted, _request = _setup(test_client, monkeypatch)
+    from server.routes import clips
+
+    def ambiguous(_api_key, _job_id):
+        deleted["calls"] += 1
+        deleted["value"] = True
+        return {"error": "connection reset after request"}
+
+    monkeypatch.setattr(clips, "_delete_upload_post_schedule", ambiguous)
+    path = "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/job-old/cancellation"
+    preview = client.post(
+        f"{path}/preview",
+        json={
+            "expected_external_id": original["external_id"],
+            "request_id": REQUEST_ID,
+            "actor": "release-operator",
+            "reason": "Remove the rejected queued creative",
+        },
+    ).json()
+    cancelled = client.post(path, json=preview["execute"])
+
+    assert cancelled.status_code == 200
+    assert deleted["calls"] == 1
+    stored = json.loads((episode_dir / "publish.json").read_text())["shorts"][0]
+    assert stored["status"] == "cancelled"
+    assert stored["schedule_cancellation"]["delete"]["error"] == (
+        "connection reset after request"
+    )
+    repeated = client.post(path, json=preview["execute"])
+    assert repeated.status_code == 200
+    assert deleted["calls"] == 1
 
 
 def test_legacy_ack_keeps_exact_cancelled_schedule_request(test_client, monkeypatch):

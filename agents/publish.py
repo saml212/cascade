@@ -61,6 +61,7 @@ LINKEDIN_PAGES_URL = "https://api.upload-post.com/api/uploadposts/linkedin/pages
 LINKEDIN_PAGE_PIN_URL = f"{PROFILE_URL}/linkedin-page"
 PINTEREST_BOARD_URL = "https://api.upload-post.com/api/uploadposts/pinterest/boards"
 SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v1"
+EXACT_SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v2"
 SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v1"
 EXPANDED_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v2"
 ARTIFACT_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v3"
@@ -535,15 +536,20 @@ def _matches_exact_receipt(receipt: dict, expected: dict) -> bool:
 
 
 def cancellation_snapshot(
-    receipt: dict, history_revision: str, profile: str, target: dict, remote_job: dict
+    receipt: dict,
+    history_revision: str,
+    profile: str,
+    target: dict | None,
+    remote_job: dict,
 ) -> dict:
     snapshot = {
         "receipt_revision": _document_revision(receipt),
         "history_revision": history_revision,
         "profile_username": profile,
-        "target": target,
         "remote_job": remote_job,
     }
+    if target is not None:
+        snapshot["target"] = target
     return {**snapshot, "revision": _document_revision(snapshot)}
 
 
@@ -635,6 +641,7 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
     original = receipt.get("pre_cancellation_receipt")
     if not isinstance(operation, dict) or not isinstance(original, dict):
         return None
+    schema = operation.get("schema")
     snapshot = operation.get("snapshot")
     target = snapshot.get("target") if isinstance(snapshot, dict) else None
     remote = snapshot.get("remote_job") if isinstance(snapshot, dict) else None
@@ -668,12 +675,16 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
         expected_keys = expected_keys | {"post_delete"}
     if not (
         _has_exact_keys(operation, expected_keys)
-        and _has_exact_keys(target, {"variant_id", "revision", "render_fingerprint"})
         and _has_exact_keys(operation.get("pre_delete"), {"checked_at", "evidence"})
+        and (
+            _has_exact_keys(target, {"variant_id", "revision", "render_fingerprint"})
+            if schema == SCHEDULE_CANCELLATION_SCHEMA
+            else target is None
+        )
     ):
         return None
     if not (
-        operation.get("schema") == SCHEDULE_CANCELLATION_SCHEMA
+        schema in {SCHEDULE_CANCELLATION_SCHEMA, EXACT_SCHEDULE_CANCELLATION_SCHEMA}
         and all(
             isinstance(operation.get(key), str) and operation[key]
             for key in ("operation_id", "clip_id", "actor", "reason", "started_at")
@@ -705,12 +716,20 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
             target,
             remote,
         )
-        and isinstance(target, dict)
-        and "variant_id" in target
-        and (target["variant_id"] is None or isinstance(target["variant_id"], str))
-        and all(
-            isinstance(target.get(key), str) and target[key]
-            for key in ("revision", "render_fingerprint")
+        and (
+            schema == EXACT_SCHEDULE_CANCELLATION_SCHEMA
+            or (
+                isinstance(target, dict)
+                and "variant_id" in target
+                and (
+                    target["variant_id"] is None
+                    or isinstance(target["variant_id"], str)
+                )
+                and all(
+                    isinstance(target.get(key), str) and target[key]
+                    for key in ("revision", "render_fingerprint")
+                )
+            )
         )
         and _matching_schedule_row(original, remote, snapshot["profile_username"])
         and isinstance(operation.get("pre_delete"), dict)
@@ -742,28 +761,29 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
         and deletion["attempted_at"]
     ):
         return None
+    error_shape = (
+        _has_exact_keys(deletion, {"job_id", "attempted_at", "error"})
+        and isinstance(deletion.get("error"), str)
+        and bool(deletion["error"])
+    )
+    response_keys = {"job_id", "attempted_at", "http_status"}
+    if "response" in deletion:
+        response_keys.add("response")
+    response_shape = (
+        _has_exact_keys(deletion, response_keys)
+        and isinstance(deletion.get("http_status"), int)
+        and not isinstance(deletion.get("http_status"), bool)
+        and ("response" not in deletion or isinstance(deletion["response"], dict))
+        and not (
+            deletion["http_status"] == 200
+            and isinstance(deletion.get("response"), dict)
+            and deletion["response"].get("success") is True
+        )
+    )
+    uncertain_deletion = error_shape or response_shape
     if state == "outcome_uncertain":
-        error_shape = (
-            _has_exact_keys(deletion, {"job_id", "attempted_at", "error"})
-            and isinstance(deletion.get("error"), str)
-            and bool(deletion["error"])
-        )
-        response_keys = {"job_id", "attempted_at", "http_status"}
-        if "response" in deletion:
-            response_keys.add("response")
-        response_shape = (
-            _has_exact_keys(deletion, response_keys)
-            and isinstance(deletion.get("http_status"), int)
-            and not isinstance(deletion.get("http_status"), bool)
-            and ("response" not in deletion or isinstance(deletion["response"], dict))
-            and not (
-                deletion["http_status"] == 200
-                and isinstance(deletion.get("response"), dict)
-                and deletion["response"].get("success") is True
-            )
-        )
-        return operation if error_shape or response_shape else None
-    if not (
+        return operation if uncertain_deletion else None
+    confirmed_deletion = (
         _has_exact_keys(
             deletion,
             {"job_id", "attempted_at", "http_status", "response", "confirmed_at"},
@@ -773,6 +793,11 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
         and deletion["response"].get("success") is True
         and isinstance(deletion.get("confirmed_at"), str)
         and deletion["confirmed_at"]
+    )
+    if not confirmed_deletion and not (
+        state == "cancelled"
+        and schema == EXACT_SCHEDULE_CANCELLATION_SCHEMA
+        and uncertain_deletion
     ):
         return None
     if state == "delete_confirmed" and "post_delete" not in operation:
@@ -1181,8 +1206,12 @@ def short_rerelease_state(
     consumed = {receipt.get("rerelease_request_id") for receipt in receipts}
     for receipt in receipts:
         operation = validated_schedule_cancellation(receipt)
-        if operation and operation["operation_id"] not in consumed:
-            target = operation["snapshot"]["target"]
+        target = operation.get("snapshot", {}).get("target") if operation else None
+        if (
+            operation
+            and isinstance(target, dict)
+            and operation["operation_id"] not in consumed
+        ):
             request = {
                 "request_id": operation["operation_id"],
                 "actor": operation["actor"],
@@ -1349,13 +1378,16 @@ def cancellable_scheduled_receipt(
     remote_schedule: object,
     *,
     profile_username: str,
+    job_id: str | None = None,
+    external_id: str | None = None,
     now: datetime | None = None,
 ) -> tuple[dict, dict, str]:
-    """Resolve one future local receipt and its exact provider calendar row."""
+    """Resolve one future receipt, optionally by exact provider identity."""
     if (
         not profile_username
         or not isinstance(remote_schedule, list)
         or any(not isinstance(item, dict) for item in remote_schedule)
+        or (job_id is None) != (external_id is None)
     ):
         raise ValueError("Upload-Post schedule or profile cannot be verified")
     receipts = [
@@ -1372,9 +1404,14 @@ def cancellable_scheduled_receipt(
     candidates = [
         receipt
         for receipt in pending
-        if receipt.get("scheduled") is True and "schedule_cancellation" not in receipt
+        if receipt.get("scheduled") is True
+        and "schedule_cancellation" not in receipt
+        and (job_id is None or receipt.get("job_id") == job_id)
+        and (external_id is None or receipt.get("external_id") == external_id)
     ]
-    if len(pending) != 1 or len(candidates) != 1:
+    if job_id is not None and len(candidates) != 1:
+        raise ValueError("The exact scheduled receipt could not be resolved")
+    if job_id is None and (len(candidates) != 1 or len(pending) != 1):
         raise ValueError("The clip has no single cancellable scheduled receipt")
     receipt = candidates[0]
     platforms = receipt.get("platforms")
