@@ -512,7 +512,12 @@ async def save_delivery_trim(episode_id: str, request: DeliveryTrimRequest) -> d
     return status
 
 
-@router.post("/{episode_id}/delivery/prepare", deprecated=True)
+@router.post(
+    "/{episode_id}/delivery/prepare",
+    deprecated=True,
+    status_code=409,
+    responses={409: {"description": "Audio-only podcast preparation is retired."}},
+)
 async def prepare_delivery(episode_id: str) -> dict:
     _episode_dir(episode_id)
     raise HTTPException(
