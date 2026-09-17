@@ -257,10 +257,14 @@ def current_delivery_video_fields(
 def _recover_current_video_status(
     status: dict, episode_dir: Path, episode: dict, config: dict
 ) -> None:
-    """Populate missing delivery state only from a fully current render record."""
-    if status.get("video_status") is not None:
+    """Expose a current proven render without disturbing active preparation."""
+    with _running_lock:
+        video_active = episode_dir.name in _video_running
+    if status.get("video_status") == "preparing" or video_active:
         return
-    status.update(current_delivery_video_fields(episode_dir, episode, config))
+    current = current_delivery_video_fields(episode_dir, episode, config)
+    if status.get("video_status") is None or current.get("video_status") == "ready":
+        status.update(current)
 
 
 def _video_status_fields(status: dict) -> dict:

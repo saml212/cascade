@@ -102,11 +102,28 @@ def test_status_defaults_to_not_prepared(delivery):
     assert response.json()["status"] == "not_prepared"
 
 
-def test_status_recovers_missing_video_fields_from_current_manifest(delivery):
+@pytest.mark.parametrize("cached_video_status", [None, "not_prepared"])
+def test_status_recovers_current_video_from_missing_or_stale_terminal_cache(
+    delivery, cached_video_status
+):
     _, mod, episodes_dir = delivery
     episode_dir = make_episode(episodes_dir)
     video = episode_dir / "upload_video.mp4"
     video.write_bytes(b"current render")
+    if cached_video_status is not None:
+        mod._write_status(
+            episode_dir,
+            {
+                "status": "not_prepared",
+                "error": "Podcast audio remains separately not prepared.",
+                "source_fingerprint": "podcast-audio-fingerprint",
+                "video_status": cached_video_status,
+                "video_source_fingerprint": "retired-video",
+                "video_output_stat": {"size": 1, "mtime_ns": 2},
+                "video_audio": {"status": "failed", "safe": False},
+                "video_error": "Retired video audio needs repair.",
+            },
+        )
     record = {
         "path": video.name,
         "render_mode": "speaker_cut",
@@ -137,9 +154,65 @@ def test_status_recovers_missing_video_fields_from_current_manifest(delivery):
     assert status["video_output_stat"] == mod._file_stat(video)
     assert status["video"]["render_mode"] == "speaker_cut"
     assert status["video"]["duration_seconds"] == 3590.0
+    assert status["video_audio"] == {"status": "passed", "safe": True}
+    assert status["video_error"] is None
     assert "/delivery/video?v=" in status["video_download_url"]
     write_status.assert_not_called()
-    assert not (episode_dir / "delivery.json").exists()
+    if cached_video_status is None:
+        assert not (episode_dir / "delivery.json").exists()
+    else:
+        assert status["status"] == "not_prepared"
+        assert status["error"] == "Podcast audio remains separately not prepared."
+        assert status["source_fingerprint"] == "podcast-audio-fingerprint"
+
+
+@pytest.mark.parametrize("cached_video_status", ["preparing", "not_prepared"])
+def test_status_does_not_reconcile_video_during_active_preparation(
+    delivery, cached_video_status
+):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    mod._write_status(
+        episode_dir,
+        {
+            "status": "not_prepared",
+            "video_status": cached_video_status,
+            "video_source_fingerprint": "preparation-state",
+        },
+    )
+    mod._video_running.add("ep_test")
+    try:
+        with patch.object(mod, "current_delivery_video_fields") as current_fields:
+            status = mod._refresh_status(episode_dir)
+    finally:
+        mod._video_running.discard("ep_test")
+
+    assert status["video_status"] == cached_video_status
+    assert status["video_source_fingerprint"] == "preparation-state"
+    current_fields.assert_not_called()
+
+
+def test_status_does_not_mask_interrupted_video_preparation(delivery):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    mod._write_status(
+        episode_dir,
+        {
+            "status": "not_prepared",
+            "video_status": "preparing",
+            "video_source_fingerprint": "previous-current-render",
+        },
+    )
+
+    with patch.object(mod, "current_delivery_video_fields") as current_fields:
+        status = mod._refresh_status(episode_dir)
+
+    assert status["video_status"] == "failed"
+    assert status["video_source_fingerprint"] == "previous-current-render"
+    assert status["video_error"] == (
+        "Video preparation was interrupted; start it again."
+    )
+    current_fields.assert_not_called()
 
 
 def test_status_does_not_recover_unproven_video_file(delivery):
