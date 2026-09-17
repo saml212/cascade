@@ -74,6 +74,12 @@ class TestShortDestinationPreview:
             "actor": "operator",
             "reason": "Approved motion release",
             "expected_release_revision": "sha256:release",
+            "copy_overrides": {
+                "clip_01": {
+                    "youtube": {"title": "Title", "description": "Line 1\nLine 2"},
+                    "tiktok": {"text": "Approved copy"},
+                }
+            },
         }
         with patch(
             "agents.publish.PublishAgent.preview_short_destinations",
@@ -85,6 +91,7 @@ class TestShortDestinationPreview:
         assert response.status_code == 200
         assert response.json() == {"preview_revision": "sha256:preview"}
         assert preview.call_args.args[0]["request_id"] == request["request_id"]
+        assert preview.call_args.args[0]["copy_overrides"] == request["copy_overrides"]
 
         response = client.post(
             "/api/episodes/ep_001/publish-shorts/preview",
@@ -120,6 +127,35 @@ class TestShortDestinationPreview:
             "ShortDestinationRequest"
         ]
         assert request_schema["properties"]["request_id"]["format"] == "uuid"
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("request_id", 7),
+            ("destinations", ["youtube", 7]),
+            ("clip_ids", [7]),
+            ("publish_now", 1),
+            ("variant_overrides", {"clip_01": 7}),
+            ("copy_overrides", {"clip_01": {"youtube": {"title": 7}}}),
+        ],
+    )
+    def test_rejects_coerced_wire_types(self, test_client, field, value):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        request = {
+            "destinations": ["youtube"],
+            "request_id": "e5753781-47f9-455e-9ce5-0eead48a19cd",
+            "actor": "operator",
+            "reason": "Approved motion release",
+            "expected_release_revision": "sha256:release",
+            field: value,
+        }
+
+        response = client.post(
+            "/api/episodes/ep_001/publish-shorts/preview", json=request
+        )
+
+        assert response.status_code == 422
 
 
 class TestRunPipeline:

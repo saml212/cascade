@@ -2168,12 +2168,6 @@ class PublishAgent(BaseAgent):
         return overrides
 
     def _destination_plan(self, data, value, *, inspect_remote=True):
-        contract = (
-            ShortDestinationExecution
-            if isinstance(value, dict) and "preview_revision" in value
-            else ShortDestinationRequest
-        )
-        value = self._validated_destination_request(value, contract)
         request_id = value["request_id"]
         actor, reason = value["actor"], value["reason"]
         destinations = sorted(value["destinations"])
@@ -2236,9 +2230,16 @@ class PublishAgent(BaseAgent):
                 data["api_key"], data["user"], destination_bindings
             )
 
-        schedule_by_clip = self._schedule_by_clip(
-            data["metadata"].get("schedule", []), selected_ids=set(selected_ids)
-        )
+        selected_id_set = set(selected_ids)
+        schedule_by_clip = {}
+        schedule = data["metadata"].get("schedule", [])
+        for entry in schedule if isinstance(schedule, list) else []:
+            clip_id = str(entry.get("clip_id", "")) if isinstance(entry, dict) else ""
+            if clip_id not in selected_id_set:
+                continue
+            if clip_id in schedule_by_clip:
+                raise RuntimeError(f"Schedule has duplicate entries for {clip_id}")
+            schedule_by_clip[clip_id] = entry
         missing = [
             item
             for item in selected_ids
@@ -2265,6 +2266,11 @@ class PublishAgent(BaseAgent):
                 version,
                 destinations,
             )
+            if version.get("active_for_new_writes") is not True:
+                raise RuntimeError(
+                    f"The selected short variant for {clip_id} is retired; "
+                    "nothing was submitted"
+                )
             target = ShortDeliverySpec.target_fields(clip_id, version)
             target_revision = _document_revision(target)
             identity = _destination_external_id(
@@ -2463,7 +2469,6 @@ class PublishAgent(BaseAgent):
             self._reserve_deliveries(
                 [spec for spec, _receipt in delivery_states],
                 occupied,
-                data["episode"],
                 policy=(tz_name, weekday, weekend),
                 reference=reference,
             )
@@ -2860,8 +2865,6 @@ class PublishAgent(BaseAgent):
     ):
         results = []
         pending = []
-        deliveries = [spec for spec, _receipt in delivery_states]
-        snapshots = {spec: spec.snapshot() for spec in deliveries}
         for spec, receipt in delivery_states:
             if receipt and receipt.get("status") not in {
                 "unknown",
@@ -2878,13 +2881,13 @@ class PublishAgent(BaseAgent):
         reference = self._schedule_reference(episode, tz_name)
 
         with self._schedule_lock():
-            bindings = snapshots[pending[0][0]]["target"].get(
-                "destination_bindings", {}
+            bindings = (
+                pending[0][0].snapshot()["target"].get("destination_bindings", {})
             )
             if bindings:
                 self._verify_destination_bindings(api_key, user, bindings)
             occupied = self._occupied_schedule(api_key, user)
-            current_identities = {spec.identity for spec in deliveries}
+            current_identities = {spec.identity for spec, _receipt in delivery_states}
             occupied = [
                 item
                 for item in occupied
@@ -2915,7 +2918,6 @@ class PublishAgent(BaseAgent):
             plans = self._reserve_deliveries(
                 remaining,
                 occupied,
-                episode,
                 policy=policy,
                 reference=reference,
             )
@@ -2958,9 +2960,7 @@ class PublishAgent(BaseAgent):
         command = self._base_command(
             path, upload_title, platforms, spec.identity, api_key, user, 600
         )
-        destination_bindings = (snapshot["target"] or {}).get(
-            "destination_bindings", {}
-        )
+        destination_bindings = snapshot["target"].get("destination_bindings", {})
         for platform in platforms:
             for field, value in upload_fields(platform, copy.get(platform, {})).items():
                 command += ["--form-string", f"{field}={value}"]
@@ -3463,23 +3463,6 @@ class PublishAgent(BaseAgent):
         return timezone_name, *limits
 
     @staticmethod
-    def _schedule_by_clip(schedule, *, selected_ids=None, duplicate_suffix=""):
-        mapped = {}
-        for entry in schedule if isinstance(schedule, list) else []:
-            raw_id = entry.get("clip_id") if isinstance(entry, dict) else None
-            if raw_id is None and selected_ids is None:
-                continue
-            clip_id = str(raw_id if raw_id is not None else "")
-            if selected_ids is not None and clip_id not in selected_ids:
-                continue
-            if clip_id in mapped:
-                raise RuntimeError(
-                    f"Schedule has duplicate entries for {clip_id}{duplicate_suffix}"
-                )
-            mapped[clip_id] = entry
-        return mapped
-
-    @staticmethod
     def _schedule_reference(episode, tz_name):
         value = (episode.get("publish_approval") or {}).get("approved_at")
         if not isinstance(value, str):
@@ -3505,17 +3488,13 @@ class PublishAgent(BaseAgent):
     ):
         scheduled_at = existing["scheduled_at"].astimezone(ZoneInfo(tz_name))
         destination_target = spec.snapshot()["target"]
-        if destination_target:
-            candidate = {
-                **destination_target,
-                "job_id": existing.get("job_id"),
-            }
-            if existing.get("source") != "upload-post" or not _matching_schedule_row(
-                candidate,
-                existing.get("provider_record"),
-                destination_target["destination_profile_username"],
-            ):
-                raise RuntimeError("Existing provider schedule conflicts with preview")
+        candidate = {**destination_target, "job_id": existing.get("job_id")}
+        if existing.get("source") != "upload-post" or not _matching_schedule_row(
+            candidate,
+            existing.get("provider_record"),
+            destination_target["destination_profile_username"],
+        ):
+            raise RuntimeError("Existing provider schedule conflicts with preview")
         provider_receipt = {
             "status": existing.get("status", "submitted"),
             "reused_receipt": True,
@@ -3529,13 +3508,11 @@ class PublishAgent(BaseAgent):
         self,
         deliveries,
         occupied,
-        episode,
         *,
-        policy=None,
-        reference=None,
+        policy,
+        reference,
     ):
-        tz_name, weekday_limit, weekend_limit = policy or self._short_schedule_policy()
-        reference = reference or self._schedule_reference(episode, tz_name)
+        tz_name, weekday_limit, weekend_limit = policy
         reservations = list(occupied)
         plans = []
         for spec in deliveries:

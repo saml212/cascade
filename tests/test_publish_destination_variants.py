@@ -310,7 +310,11 @@ def test_variant_currentness_uses_the_frozen_approval_metadata(tmp_path, monkeyp
     def state(_episode_dir, _episode, _config, clip, _record, metadata):
         assert clip["distribution_variant_id"] == gameplay_variant
         assert metadata is frozen
-        return {"current": True, "approval_current": True}
+        return {
+            "current": True,
+            "approval_current": True,
+            "active_for_new_writes": True,
+        }
 
     monkeypatch.setattr("agents.publish.short_distribution_state", state)
     versions = agent._destination_versions(data, {"clip_04": gameplay_variant})
