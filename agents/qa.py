@@ -58,7 +58,6 @@ from lib.short_variants import (
     RetiredShortVariantError,
     background_variant_approval_state,
     background_variant_label,
-    background_variant_output,
     background_variant_state,
     require_active_background_variant,
     selected_short_variant_id,
@@ -839,25 +838,69 @@ def _selected_short_version_inputs(
     return selected
 
 
-def short_distribution_state(
+def short_version_catalog(
     episode_dir: str | Path,
     episode: dict,
     config: dict,
     clip: dict,
     base_record: dict | None,
     metadata_entry: dict | None = None,
+    *,
+    base_render: dict | None = None,
+    encoding: dict | None = None,
+    variant_ids: tuple[str, ...] | None = None,
+    variant_state=background_variant_state,
 ) -> dict:
-    """Resolve the selected short version and its independent approval."""
     episode_dir = Path(episode_dir)
     base_record = base_record if isinstance(base_record, dict) else {}
+    if not isinstance(base_render, dict):
+        base_render = {
+            "current": bool(base_record),
+            "recorded_fingerprint": base_record.get("fingerprint"),
+            "path": f"shorts/{clip.get('id')}.mp4",
+        }
     release_request = clip.get(DISTRIBUTION_RELEASE_FIELD)
-    if not isinstance(release_request, dict):
-        release_request = None
-    base_revision = clip_review_revision(clip, base_record, metadata_entry)
+    release_request = release_request if isinstance(release_request, dict) else None
+    selection_error = None
     try:
-        variant_id = selected_short_variant_id(clip)
+        selected_variant_id = selected_short_variant_id(clip)
     except KeyError as exc:
-        return {
+        selected_variant_id = None
+        selection_error = str(exc).strip("'")
+    if variant_ids is None:
+        variant_ids = (selected_variant_id,) if selected_variant_id else ()
+    base_revision = clip_review_revision(clip, base_record, metadata_entry)
+    clip_status = clip.get("status")
+    current = bool(
+        base_render.get("current") is True
+        and clip_status == "approved"
+        and clip.get("approved_render_fingerprint")
+        == base_render.get("recorded_fingerprint")
+        and clip.get("approved_revision") == base_revision
+    )
+    status = "rejected" if clip_status == "rejected" else "unapproved"
+    if clip_status == "approved":
+        status = "current" if current else "stale"
+    state = {"status": status, "current": current, "revision": base_revision}
+    base = {"record": base_record, "render": base_render, "approval": state}
+    variants = {}
+    if variant_ids and encoding is None:
+        encoding = get_video_encoding_policy(
+            render_config_for_episode(episode, config), "shorts"
+        )
+    for variant_id in variant_ids:
+        record, render = variant_state(
+            episode_dir,
+            str(clip["id"]),
+            base_record=base_record if base_render.get("current") is True else None,
+            encoding=encoding,
+            variant_id=variant_id,
+        )
+        revision = clip_review_revision(clip, record, metadata_entry)
+        state = background_variant_approval_state(record, render, revision)
+        variants[variant_id] = {"record": record, "render": render, "approval": state}
+    if selection_error is not None:
+        selected = {
             "version": "invalid",
             "variant_id": None,
             "label": "Invalid selection",
@@ -868,61 +911,35 @@ def short_distribution_state(
             "path": None,
             "render_fingerprint": None,
             "re_release_request": release_request,
-            "detail": str(exc).strip("'"),
+            "detail": selection_error,
         }
-
-    if variant_id is None:
-        current = bool(base_record)
-        return {
-            "version": BASE_SHORT_VERSION,
-            "variant_id": None,
-            "label": "Base",
-            "current": current,
-            "approval_current": bool(
-                current
-                and clip.get("status") == "approved"
-                and clip.get("approved_render_fingerprint")
-                == base_record.get("fingerprint")
-                and clip.get("approved_revision") == base_revision
-            ),
-            "active_for_new_writes": True,
-            "revision": base_revision,
-            "path": f"shorts/{clip.get('id')}.mp4",
-            "render_fingerprint": base_record.get("fingerprint"),
+    else:
+        variant_id = selected_variant_id
+        version = base if variant_id is None else variants[variant_id]
+        active = variant_id is None or variant_id in ACTIVE_BACKGROUND_VARIANT_IDS
+        selected = {
+            "version": variant_id or BASE_SHORT_VERSION,
+            "variant_id": variant_id,
+            "label": background_variant_label(variant_id) if variant_id else "Base",
+            "current": version["render"].get("current") is True,
+            "approval_current": version["approval"].get("current") is True,
+            "active_for_new_writes": active,
+            "revision": version["approval"]["revision"],
+            "path": version["render"].get("path"),
+            "render_fingerprint": version["record"].get("fingerprint"),
             "re_release_request": release_request,
         }
+        if variant_id:
+            asset = version["record"].get("asset")
+            selected.update(
+                asset_id=(asset.get("asset_id") if isinstance(asset, dict) else None),
+                detail=version["render"].get("detail"),
+            )
+    return {"base": base, "variants": variants, "selected": selected}
 
-    encoding = get_video_encoding_policy(
-        render_config_for_episode(episode, config), "shorts"
-    )
-    record, render = background_variant_state(
-        episode_dir,
-        str(clip["id"]),
-        base_record=base_record or None,
-        encoding=encoding,
-        variant_id=variant_id,
-    )
-    revision = clip_review_revision(clip, record, metadata_entry)
-    approval = background_variant_approval_state(record, render, revision)
-    asset = record.get("asset") if isinstance(record.get("asset"), dict) else {}
-    return {
-        "version": variant_id,
-        "variant_id": variant_id,
-        "label": background_variant_label(variant_id),
-        "current": render.get("current") is True,
-        "approval_current": approval.get("current") is True,
-        "active_for_new_writes": variant_id in ACTIVE_BACKGROUND_VARIANT_IDS,
-        "revision": revision,
-        "path": str(
-            background_variant_output(
-                episode_dir, str(clip["id"]), variant_id
-            ).relative_to(episode_dir)
-        ),
-        "render_fingerprint": record.get("fingerprint"),
-        "asset_id": asset.get("asset_id"),
-        "re_release_request": release_request,
-        "detail": render.get("detail"),
-    }
+
+def short_distribution_state(*args, **kwargs) -> dict:
+    return short_version_catalog(*args, **kwargs)["selected"]
 
 
 def current_clip_boundary_evidence(

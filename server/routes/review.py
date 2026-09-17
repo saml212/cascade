@@ -20,9 +20,9 @@ from pydantic import BaseModel, Field
 from agents.pipeline import load_config
 from agents.qa import (
     canonical_release_metadata,
-    clip_review_revision,
     current_clip_boundary_evidence,
     editorial_revision,
+    short_version_catalog,
 )
 from agents.speaker_cut import current_speaker_segments
 from agents.transcribe import (
@@ -53,13 +53,11 @@ from lib.short_variants import (
     ACTIVE_BACKGROUND_VARIANT_IDS,
     BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
-    background_variant_approval_state,
     background_variant_asset_ids,
     background_variant_label,
     background_variant_state,
     default_background_asset_id,
     require_background_variant,
-    selected_short_variant_id,
 )
 from server.media_inspection import (
     InspectionTarget,
@@ -631,31 +629,6 @@ def _metadata_state(copy: dict, destinations: list[dict]) -> dict:
     }
 
 
-def _approval_state(
-    clip: dict,
-    render: dict,
-    render_record: dict,
-    metadata_entry: dict | None,
-) -> dict:
-    revision = clip_review_revision(clip, render_record, metadata_entry)
-    state = {"revision": revision}
-    if clip.get("status") == "rejected":
-        return {"status": "rejected", "current": False, **state}
-    if clip.get("status") != "approved":
-        return {"status": "unapproved", "current": False, **state}
-    if not render["current"]:
-        return {"status": "stale", "current": False, **state}
-    current = (
-        clip.get("approved_render_fingerprint") == render["recorded_fingerprint"]
-        and clip.get("approved_revision") == revision
-    )
-    return {
-        "status": "current" if current else "stale",
-        "current": current,
-        **state,
-    }
-
-
 def _expected_fingerprints(
     episode_dir: Path, episode: dict, clips: list[dict], config: dict
 ) -> tuple[str | None, dict[str, str | None]]:
@@ -804,32 +777,24 @@ def episode_review_state(episode_dir: Path) -> dict:
             ),
             episode_id,
         )
-        base_approval = _approval_state(
+        catalog = short_version_catalog(
+            episode_dir,
+            episode,
+            config,
             clip,
-            render,
             render_record,
             approval_metadata_by_id.get(clip_id),
+            base_render=render,
+            encoding=variant_encoding,
+            variant_ids=BACKGROUND_VARIANT_IDS,
+            variant_state=background_variant_state,
         )
         variants = {}
-        variant_states = {}
-        for variant_id in BACKGROUND_VARIANT_IDS:
-            variant_record, variant_render = background_variant_state(
-                episode_dir,
-                clip_id,
-                base_record=render_record if render["current"] else None,
-                encoding=variant_encoding,
-                variant_id=variant_id,
-            )
-            variant_render = _with_media_url(variant_render, episode_id)
-            variant_revision = clip_review_revision(
-                clip, variant_record, approval_metadata_by_id.get(clip_id)
-            )
-            variant_approval = background_variant_approval_state(
-                variant_record, variant_render, variant_revision
-            )
-            variant_states[variant_id] = (variant_render, variant_approval)
+        for variant_id, variant in catalog["variants"].items():
+            variant_record = variant["record"]
             if variant_id not in ACTIVE_BACKGROUND_VARIANT_IDS and not variant_record:
                 continue
+            variant_render = _with_media_url(variant["render"], episode_id)
             variant_asset = variant_record.get("asset")
             variant_asset_id = (
                 variant_asset.get("asset_id")
@@ -857,59 +822,22 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "asset_free": not variant_asset_ids,
                 "active_for_new_writes": (variant_id in ACTIVE_BACKGROUND_VARIANT_IDS),
                 "render": variant_render,
-                "approval": variant_approval,
+                "approval": variant["approval"],
                 "render_job": render_job_state(
                     episode_dir,
                     variant_render_job_id(clip_id, variant_id),
                 ),
             }
         raw_release_request = clip.get(DISTRIBUTION_RELEASE_FIELD)
-        release_request = (
-            raw_release_request if isinstance(raw_release_request, dict) else None
-        )
         change_lock = (
             publication_change_lock(episode_dir, clip_id, raw_release_request)
             if DISTRIBUTION_RELEASE_FIELD in clip
             else publication_change_lock(episode_dir, clip_id)
         )
-        try:
-            selected_variant_id = selected_short_variant_id(clip)
-        except KeyError:
-            distribution = {
-                "version": "invalid",
-                "variant_id": None,
-                "label": "Invalid selection",
-                "current": False,
-                "approval_current": False,
-                "active_for_new_writes": False,
-                "revision": base_approval["revision"],
-                "re_release_request": release_request,
-                **change_lock,
-            }
-        else:
-            selected_render, selected_approval = (
-                variant_states[selected_variant_id]
-                if selected_variant_id
-                else (render, base_approval)
-            )
-            distribution = {
-                "version": selected_variant_id or "base",
-                "variant_id": selected_variant_id,
-                "label": (
-                    background_variant_label(selected_variant_id)
-                    if selected_variant_id
-                    else "Base"
-                ),
-                "current": selected_render["current"],
-                "approval_current": selected_approval["current"],
-                "active_for_new_writes": (
-                    selected_variant_id is None
-                    or selected_variant_id in ACTIVE_BACKGROUND_VARIANT_IDS
-                ),
-                "revision": selected_approval["revision"],
-                "re_release_request": release_request,
-                **change_lock,
-            }
+        distribution = dict(catalog["selected"])
+        for key in ("path", "render_fingerprint", "asset_id", "detail"):
+            distribution.pop(key, None)
+        distribution.update(change_lock)
         reviewed_clips.append(
             {
                 **clip,
@@ -917,7 +845,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "review": {
                     "selection": {"status": clip_selection_status(clip)},
                     "render": render,
-                    "approval": base_approval,
+                    "approval": catalog["base"]["approval"],
                     "distribution": distribution,
                     "metadata": _metadata_state(copy, destinations),
                     "render_job": render_job_state(episode_dir, clip_id),
