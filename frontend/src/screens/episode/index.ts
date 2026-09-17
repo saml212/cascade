@@ -528,14 +528,16 @@ function renderReview(
         ),
       ),
     ),
-    renderReleaseFacts(review, quality, schedule, context.episodeId),
+    renderReleaseFacts(review, context.errors().review, quality, schedule, context.errors().schedule, context.episodeId),
   );
 }
 
 function renderReleaseFacts(
   review: EpisodeReviewState | null,
+  reviewError: string | undefined,
   quality: QualitySnapshot | null,
   schedule: UnknownRecord | null,
+  scheduleError: string | undefined,
   episodeId: string,
 ): HTMLElement {
   const canonical = review?.longform.canonical_render;
@@ -547,6 +549,51 @@ function renderReleaseFacts(
   const approvedLongform = currentLongform && approval?.current === true;
   const providerCount = scheduleState.publicationEvidence.length;
   const queueCount = scheduleState.items.length;
+  const reviewLoaded = review !== null;
+  const longformValue = reviewLoaded
+    ? approvedLongform
+      ? 'Current render approved'
+      : currentLongform
+        ? 'Current render needs approval'
+        : canonical?.playable
+          ? 'Previous render only'
+          : 'Current render unavailable'
+    : reviewError
+      ? 'Review unavailable'
+      : 'Loading review…';
+  const longformDetail = reviewLoaded
+    ? `${canonical?.detail || 'Read from the canonical episode review projection.'}${reviewError ? ' The latest review refresh failed.' : ''}`
+    : reviewError
+      ? 'Longform review evidence could not be loaded. No unavailable-render state is inferred.'
+      : 'Loading canonical longform review evidence.';
+  const shortValue = reviewLoaded
+    ? `${ready.length} of ${selected.length} selected ready`
+    : reviewError
+      ? 'Review unavailable'
+      : 'Loading review…';
+  const shortDetail = reviewLoaded
+    ? `${
+        selected.length
+          ? 'Readiness requires the exact chosen distribution version and its current approval.'
+          : 'No clips are selected for distribution.'
+      }${reviewError ? ' The latest review refresh failed.' : ''}`
+    : reviewError
+      ? 'Short review evidence could not be loaded. No empty selection is inferred.'
+      : 'Loading current short review evidence.';
+  const scheduleValue = scheduleState.loaded
+    ? `${pluralize(queueCount, 'schedule item')} · ${pluralize(providerCount, 'record')}`
+    : scheduleError
+      ? 'Schedule unavailable'
+      : 'Loading Schedule…';
+  const scheduleDetail = !scheduleState.loaded
+    ? scheduleError
+      ? 'Queue and provider evidence could not be loaded. No empty state is inferred.'
+      : 'Loading exact queue and provider evidence from Schedule.'
+    : scheduleError
+      ? 'Showing the last loaded Schedule evidence; its latest refresh failed.'
+      : providerCount || queueCount
+        ? 'Exact provider states and URLs come from Schedule.'
+        : 'No queue or provider publication evidence is recorded in Schedule.';
 
   return h(
     'section',
@@ -566,29 +613,27 @@ function renderReleaseFacts(
       { class: 'grid grid-cols-1 lg:grid-cols-3 gap-4' },
       fact(
         'Longform proof',
-        approvedLongform
-          ? 'Current render approved'
-          : currentLongform
-            ? 'Current render needs approval'
-            : canonical?.playable
-              ? 'Previous render only'
-              : 'Current render unavailable',
-        canonical?.detail || 'Read from the canonical episode review projection.',
-        approvedLongform ? 'success' : 'warning',
+        longformValue,
+        longformDetail,
+        reviewError ? 'warning' : reviewLoaded && approvedLongform ? 'success' : reviewLoaded ? 'warning' : 'neutral',
       ),
       fact(
         'Short review readiness',
-        `${ready.length} of ${selected.length} selected ready`,
-        selected.length ? 'Readiness requires the exact chosen distribution version and its current approval.' : 'No clips are selected for distribution.',
-        selected.length > 0 && ready.length === selected.length ? 'success' : 'warning',
+        shortValue,
+        shortDetail,
+        reviewError
+          ? 'warning'
+          : reviewLoaded && selected.length > 0 && ready.length === selected.length
+            ? 'success'
+            : reviewLoaded
+              ? 'warning'
+              : 'neutral',
       ),
       fact(
         'Queue and publication evidence',
-        `${pluralize(queueCount, 'schedule item')} · ${pluralize(providerCount, 'record')}`,
-        providerCount || queueCount
-          ? 'Exact provider states and URLs come from Schedule.'
-          : 'No queue or provider publication evidence is recorded in Schedule.',
-        providerCount || queueCount ? 'neutral' : 'warning',
+        scheduleValue,
+        scheduleDetail,
+        scheduleError || (scheduleState.loaded && !providerCount && !queueCount) ? 'warning' : 'neutral',
       ),
     ),
   );
@@ -822,6 +867,9 @@ function renderPublication(context: SurfaceContext, approving: Signal<boolean>, 
   const quality = context.quality();
   const review = context.review();
   const schedule = context.schedule();
+  const projectionErrors = context.errors();
+  const scheduleError = projectionErrors.schedule;
+  const reviewError = projectionErrors.review;
   const busy = approving();
   const error = approvalError();
   const gate = quality?.release_gate;
@@ -890,7 +938,15 @@ function renderPublication(context: SurfaceContext, approving: Signal<boolean>, 
       ),
       actionLink('/schedule', 'Open Schedule and history', 'Inspect queue states, provider receipts, confirmed URLs, and failures'),
     ),
-    renderScheduleEvidence(projection.items, projection.publicationEvidence, projection.blockers, review),
+    renderScheduleEvidence(
+      projection.items,
+      projection.publicationEvidence,
+      projection.blockers,
+      projection.loaded,
+      scheduleError,
+      review,
+      reviewError,
+    ),
   );
 }
 
@@ -898,7 +954,10 @@ function renderScheduleEvidence(
   items: EpisodeScheduleItem[],
   evidence: EpisodePublicationEvidence[],
   blockers: string[],
+  loaded: boolean,
+  scheduleError: string | undefined,
   review: EpisodeReviewState | null,
+  reviewError: string | undefined,
 ): HTMLElement {
   const selected = review?.clips.filter((clip) => clip.review.selection.status === 'selected') ?? [];
   const ready = selected.filter((clip) => clipDistributionReady(clip.review));
@@ -912,9 +971,24 @@ function renderScheduleEvidence(
       h(
         'p',
         { class: 'text-body-sm text-ink-tertiary mt-1' },
-        `${ready.length} of ${selected.length} selected short versions are current and approved. Provider states below come only from Schedule.`,
+        review
+          ? `${ready.length} of ${selected.length} selected short versions are current and approved.${
+              reviewError ? ' The latest review refresh failed.' : ''
+            } Provider states below come only from Schedule.`
+          : reviewError
+            ? 'Current short review evidence is unavailable. No empty selection is inferred. Provider states below come only from Schedule.'
+            : 'Loading current short review evidence. Provider states below come only from Schedule.',
       ),
     ),
+    scheduleError
+      ? h(
+          'div',
+          { class: 'rounded-md border border-status-warning/30 bg-status-warning/10 px-4 py-3 text-body-sm text-ink-secondary' },
+          loaded ? `Showing the last loaded Schedule evidence. Refresh failed: ${scheduleError}` : `Schedule evidence is unavailable: ${scheduleError}`,
+        )
+      : !loaded
+        ? h('p', { class: 'text-body-sm text-ink-tertiary' }, 'Loading queue and provider evidence from Schedule…')
+        : null,
     blockers.length
       ? h(
           'div',
@@ -924,7 +998,9 @@ function renderScheduleEvidence(
           ...blockers.map((message) => h('p', { class: 'text-body-sm text-ink-secondary py-1' }, message)),
         )
       : null,
-    items.length
+    !loaded
+      ? null
+      : items.length
       ? h(
           'div',
           null,
@@ -932,7 +1008,9 @@ function renderScheduleEvidence(
           h('div', { class: 'divide-y divide-border-subtle' }, ...items.map(scheduleItemRow)),
         )
       : h('p', { class: 'text-body-sm text-ink-tertiary' }, 'No queue items for this episode are recorded in Schedule.'),
-    evidence.length
+    !loaded
+      ? null
+      : evidence.length
       ? h(
           'div',
           null,

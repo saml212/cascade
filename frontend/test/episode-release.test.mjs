@@ -102,6 +102,7 @@ test('schedule projection preserves only canonical evidence for one episode', ()
   };
 
   assert.deepEqual(episodeScheduleProjection(schedule, 'target'), {
+    loaded: true,
     items: [
       {
         episode_id: 'target',
@@ -118,5 +119,20 @@ test('schedule projection preserves only canonical evidence for one episode', ()
       },
     ],
     blockers: ['Current quality approval is missing.'],
+  });
+});
+
+test('schedule projection distinguishes loading from a confirmed empty response', () => {
+  assert.deepEqual(episodeScheduleProjection(null, 'target'), {
+    loaded: false,
+    items: [],
+    publicationEvidence: [],
+    blockers: [],
+  });
+  assert.deepEqual(episodeScheduleProjection({}, 'target'), {
+    loaded: true,
+    items: [],
+    publicationEvidence: [],
+    blockers: [],
   });
 });

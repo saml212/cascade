@@ -29,6 +29,7 @@ export interface EpisodePublicationEvidence extends Record<string, unknown> {
 }
 
 export interface EpisodeScheduleProjection {
+  loaded: boolean;
   items: EpisodeScheduleItem[];
   publicationEvidence: EpisodePublicationEvidence[];
   blockers: string[];
@@ -100,12 +101,12 @@ export function formatEpisodeTimestamp(value: number): string {
 }
 
 export function episodeScheduleProjection(schedule: Record<string, unknown> | null, episodeId: string): EpisodeScheduleProjection {
-  if (!schedule) return { items: [], publicationEvidence: [], blockers: [] };
+  if (!schedule) return { loaded: false, items: [], publicationEvidence: [], blockers: [] };
   const items = ((schedule.schedule as Array<Record<string, unknown>>) ?? [])
     .flatMap((day) => (Array.isArray(day.items) ? (day.items as EpisodeScheduleItem[]) : []))
     .filter((item) => item.episode_id === episodeId);
   const publicationEvidence = ((schedule.publication_evidence as EpisodePublicationEvidence[]) ?? []).filter((record) => record.episode_id === episodeId);
   const held = ((schedule.held_items as Array<Record<string, unknown>>) ?? []).find((item) => item.episode_id === episodeId);
   const blockers = Array.isArray(held?.blockers) ? held.blockers.filter((value): value is string => typeof value === 'string') : [];
-  return { items, publicationEvidence, blockers };
+  return { loaded: true, items, publicationEvidence, blockers };
 }

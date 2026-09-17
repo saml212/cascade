@@ -23,3 +23,12 @@ test('slow Schedule work stays behind local refresh and outside recurring polls'
   assert.match(episodeSource, /setTimeout\(\(\) => void refreshDelivery\(\), 2000\)/);
   assert.match(stateSource, /DETAIL_POLL_MS = 4000/);
 });
+
+test('unloaded projections do not render confirmed-empty release claims', () => {
+  assert.match(episodeSource, /reviewError\s+\? 'Review unavailable'\s+: 'Loading review…'/);
+  assert.match(episodeSource, /No empty selection is inferred/);
+  assert.match(episodeSource, /No unavailable-render state is inferred/);
+  assert.match(episodeSource, /Schedule evidence is unavailable/);
+  assert.match(episodeSource, /!loaded\s+\? null\s+: items\.length/s);
+  assert.match(episodeSource, /!loaded\s+\? null\s+: evidence\.length/s);
+});
