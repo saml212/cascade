@@ -682,6 +682,20 @@ def test_publishing_race_after_delete_stays_reconcilable_without_second_delete(
     stored = json.loads((episode_dir / "publish.json").read_text())["shorts"][0]
     assert stored["schedule_cancellation"]["state"] == "delete_confirmed"
 
+    from agents.publish import validated_schedule_cancellation
+
+    without_post_delete = json.loads(json.dumps(stored))
+    without_post_delete["schedule_cancellation"].pop("post_delete")
+    assert validated_schedule_cancellation(without_post_delete) is not None
+    for malformed in (None, "invalid", {}):
+        candidate = json.loads(json.dumps(without_post_delete))
+        candidate["schedule_cancellation"]["post_delete"] = malformed
+        assert validated_schedule_cancellation(candidate) is None
+    for malformed in ([], {}):
+        candidate = json.loads(json.dumps(stored))
+        candidate["schedule_cancellation"]["state"] = malformed
+        assert validated_schedule_cancellation(candidate) is None
+
     monkeypatch.setenv("UPLOAD_POST_USER", "different-profile")
     wrong_profile = client.post(
         "/api/episodes/ep_001/clips/clip_01/schedule-cancellation",

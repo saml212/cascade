@@ -735,6 +735,8 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
     if not isinstance(operation, dict) or not isinstance(original, dict):
         return None
     state = operation.get("state")
+    if not isinstance(state, str):
+        return None
     state_fields = _CANCELLATION_FIELDS.get(state)
     if state_fields is None:
         return None
@@ -836,10 +838,10 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
     ):
         return None
 
-    post = operation.get("post_delete")
     if state == "delete_confirmed":
-        if post is None:
+        if "post_delete" not in operation:
             return operation
+        post = operation["post_delete"]
         if not (
             _has_exact_keys(post, {"checked_at", "calendar", "evidence"})
             and isinstance(post["checked_at"], str)
@@ -854,6 +856,7 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
             return None
         return operation
 
+    post = operation.get("post_delete")
     history = original.get("status_history", [])
     event = operation.get("terminal_event")
     expected_event = {
