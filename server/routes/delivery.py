@@ -44,6 +44,12 @@ _video_running: set[str] = set()
 _running_lock = threading.Lock()
 
 
+def video_preparation_active(episode_id: str) -> bool:
+    """Return whether this process has a live video preparation worker."""
+    with _running_lock:
+        return episode_id in _video_running
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -229,9 +235,7 @@ def _recover_current_video_status(
     status: dict, episode_dir: Path, episode: dict, config: dict
 ) -> None:
     """Expose a current proven render without disturbing active preparation."""
-    with _running_lock:
-        video_active = episode_dir.name in _video_running
-    if status.get("video_status") == "preparing" or video_active:
+    if video_preparation_active(episode_dir.name):
         return
     current = current_delivery_video_fields(episode_dir, episode, config)
     if status.get("video_status") is None or current.get("video_status") == "ready":
@@ -310,9 +314,7 @@ def _refresh_status(episode_dir: Path) -> dict:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, config = {}, {}
     if status.get("video_status") == "preparing":
-        with _running_lock:
-            video_active = episode_id in _video_running
-        if not video_active:
+        if not video_preparation_active(episode_id):
             status.update(
                 video_status="failed",
                 video_error="Video preparation was interrupted; start it again.",

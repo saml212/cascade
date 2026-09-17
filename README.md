@@ -1,10 +1,10 @@
 # Cascade
 
-Podcast automation pipeline that turns raw recordings into publish-ready shorts, longform video, and an RSS podcast feed. Supports single-camera or multi-camera setups with external multi-track audio (Zoom H6E or similar).
+Podcast automation pipeline that turns raw recordings into publish-ready shorts, longform video, and an Apple video podcast RSS feed. Supports single-camera or multi-camera setups with external multi-track audio (Zoom H6E or similar).
 
 ## What It Does
 
-Cascade runs a DAG-based production pipeline:
+Cascade runs a dependency-aware agent pipeline:
 
 1. **Ingest** — Copy media from SD card(s) to SSD, validate with ffprobe, sync external audio
 2. **Stitch** — Concatenate clips via ffmpeg stream-copy
@@ -16,7 +16,7 @@ Cascade runs a DAG-based production pipeline:
 8. **Shorts Render** — 9:16 shorts with burned-in subtitles
 9. **Thumbnail Gen** — AI-generated caricature artwork via OpenAI
 10. **QA** — Validate all outputs (durations, file sizes, formats, and reviewed release copy)
-11. **Podcast Feed** — Extract audio, generate RSS, upload to Cloudflare R2
+11. **Video Feed** — Publish approved full-episode video to the Apple video podcast RSS feed in Cloudflare R2
 12. **Publish** — Distribute to YouTube, TikTok, Instagram, and more
 13. **Backup** — rsync episode to external HDD
 
@@ -165,7 +165,7 @@ All settings live in `config/config.toml`. Key sections:
 - **`[clip_mining]`** — LLM model, temperature, clip count
 - **`[schedule]`** — Shorts posting cadence, peak days, timezone
 - **`[platforms.*]`** — Per-platform publishing settings
-- **`[podcast]`** — RSS feed metadata (title, author, artwork)
+- **`[podcast]`** — Show and Apple video podcast RSS metadata (title, author, artwork)
 - **`[podcast.links]`** — Link-in-bio page URLs (see below)
 
 ## Episode Hub (Link-in-Bio)

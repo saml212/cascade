@@ -295,6 +295,74 @@ class TestListEpisodes:
         assert "video_download_url" not in delivery
         assert json.loads((ep_dir / "delivery.json").read_text()) == cached_status
 
+    @pytest.mark.parametrize(
+        ("cached_video_status", "active", "current_status", "expected_status"),
+        [
+            ("preparing", True, None, "preparing"),
+            ("preparing", False, "ready", "ready"),
+            ("preparing", False, "not_prepared", "failed"),
+            ("failed", False, "ready", "ready"),
+            ("not_prepared", False, "ready", "ready"),
+            ("failed", False, "not_prepared", "failed"),
+            ("not_prepared", False, "not_prepared", "not_prepared"),
+        ],
+        ids=[
+            "active-worker",
+            "recover-interrupted-render",
+            "interrupted-without-render",
+            "recover-from-failed-cache",
+            "recover-from-idle-cache",
+            "preserve-failed-without-render",
+            "preserve-idle-without-render",
+        ],
+    )
+    def test_list_and_detail_reconcile_cached_video_preparation_read_only(
+        self,
+        test_client,
+        cached_video_status,
+        active,
+        current_status,
+        expected_status,
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        cached_status = {
+            "status": "not_prepared",
+            "video_status": cached_video_status,
+            "video_source_fingerprint": "cached-preparation",
+        }
+        (ep_dir / "delivery.json").write_text(json.dumps(cached_status))
+        stored = (ep_dir / "delivery.json").read_bytes()
+        import server.routes.episodes as episodes_mod
+
+        current_fields = (
+            {"video_status": current_status}
+            if current_status != "ready"
+            else {
+                "video_status": "ready",
+                "video_source_fingerprint": "current-render",
+                "video_download_url": "/api/episodes/ep_001/delivery/video?v=current",
+            }
+        )
+        with (
+            patch.object(episodes_mod, "video_preparation_active", return_value=active),
+            patch.object(
+                episodes_mod,
+                "current_delivery_video_fields",
+                return_value=current_fields,
+            ) as current_video,
+        ):
+            listed = client.get("/api/episodes/").json()[0]["delivery"]
+            detail = client.get("/api/episodes/ep_001").json()["delivery"]
+
+        assert listed["video_status"] == expected_status
+        assert detail["video_status"] == expected_status
+        if active:
+            current_video.assert_not_called()
+        else:
+            assert current_video.call_count == 2
+        assert (ep_dir / "delivery.json").read_bytes() == stored
+
 
 class TestGetEpisode:
     def test_get_existing(self, test_client):

@@ -85,7 +85,7 @@ def test_status_defaults_to_not_prepared(delivery):
     assert response.json()["status"] == "not_prepared"
 
 
-@pytest.mark.parametrize("cached_video_status", [None, "not_prepared"])
+@pytest.mark.parametrize("cached_video_status", [None, "not_prepared", "preparing"])
 def test_status_recovers_current_video_from_missing_or_stale_terminal_cache(
     delivery, cached_video_status
 ):
@@ -107,6 +107,11 @@ def test_status_recovers_current_video_from_missing_or_stale_terminal_cache(
                 "video_error": "Retired video audio needs repair.",
             },
         )
+    stored = (
+        (episode_dir / "delivery.json").read_bytes()
+        if cached_video_status is not None
+        else None
+    )
     record = {
         "path": video.name,
         "render_mode": "speaker_cut",
@@ -144,6 +149,7 @@ def test_status_recovers_current_video_from_missing_or_stale_terminal_cache(
     if cached_video_status is None:
         assert not (episode_dir / "delivery.json").exists()
     else:
+        assert (episode_dir / "delivery.json").read_bytes() == stored
         assert status["status"] == "not_prepared"
         assert status["error"] == "Podcast audio remains separately not prepared."
         assert status["source_fingerprint"] == "podcast-audio-fingerprint"
@@ -187,7 +193,12 @@ def test_status_does_not_mask_interrupted_video_preparation(delivery):
         },
     )
 
-    with patch.object(mod, "current_delivery_video_fields") as current_fields:
+    stored = (episode_dir / "delivery.json").read_bytes()
+    with patch.object(
+        mod,
+        "current_delivery_video_fields",
+        return_value={"video_status": "not_prepared"},
+    ) as current_fields:
         status = mod._refresh_status(episode_dir)
 
     assert status["video_status"] == "failed"
@@ -195,7 +206,8 @@ def test_status_does_not_mask_interrupted_video_preparation(delivery):
     assert status["video_error"] == (
         "Video preparation was interrupted; start it again."
     )
-    current_fields.assert_not_called()
+    current_fields.assert_called_once()
+    assert (episode_dir / "delivery.json").read_bytes() == stored
 
 
 def test_status_does_not_recover_unproven_video_file(delivery):
@@ -396,9 +408,7 @@ def test_status_drops_cached_selected_audio_when_review_source_is_unavailable(
         patch.object(
             mod,
             "selected_audio_source",
-            side_effect=ValueError(
-                "Selected repair audio has changed since review"
-            ),
+            side_effect=ValueError("Selected repair audio has changed since review"),
         )
         if stale_selection
         else patch.object(mod, "selected_audio_source", return_value=None)

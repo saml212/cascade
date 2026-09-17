@@ -32,7 +32,10 @@ from lib.crop import speaker_crop_state, visual_crop_state
 from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
 from lib.ffprobe import get_dimensions
 from lib.paths import get_episodes_dir
-from server.routes.delivery import current_delivery_video_fields
+from server.routes.delivery import (
+    current_delivery_video_fields,
+    video_preparation_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +71,33 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, processing_config = {}, {}
 
-    if snapshot.get("video_status") in {None, "ready"}:
+    cached_video_status = snapshot.get("video_status")
+    video_active = cached_video_status == "preparing" and video_preparation_active(
+        ep_dir.name
+    )
+    current_video = (
+        None
+        if video_active
+        else current_delivery_video_fields(ep_dir, episode, processing_config)
+    )
+    if current_video and (
+        current_video.get("video_status") == "ready"
+        or cached_video_status in {None, "ready", "preparing"}
+    ):
         snapshot = {
             key: value
             for key, value in snapshot.items()
             if key != "video" and not key.startswith("video_")
         }
-        snapshot.update(
-            current_delivery_video_fields(ep_dir, episode, processing_config)
-        )
+        snapshot.update(current_video)
+        if (
+            cached_video_status == "preparing"
+            and current_video.get("video_status") != "ready"
+        ):
+            snapshot.update(
+                video_status="failed",
+                video_error="Video preparation was interrupted; start it again.",
+            )
     return snapshot
 
 
