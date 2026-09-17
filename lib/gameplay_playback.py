@@ -86,6 +86,11 @@ def resolve_gameplay_asset_playback(
         maximum_start_ms = non_looping_max_ms
         wrap_required = False
     elif loop_enabled:
+        if manifest_start_ms:
+            raise ValueError(
+                f"Gameplay asset {asset_id} cannot loop without re-entering "
+                "footage before its manifest start"
+            )
         maximum_start_ms = source_ms - tail_guard_ms
         if maximum_start_ms < manifest_start_ms:
             raise ValueError(
@@ -175,10 +180,17 @@ def require_resolved_gameplay_playback(asset: dict) -> None:
         )
     except ValueError as exc:
         raise ValueError("Gameplay asset playback policy has invalid timing") from exc
+    recorded_start_ms = round(recorded_start * _MILLISECONDS_PER_SECOND)
+    manifest_start_ms = round(manifest_start * _MILLISECONDS_PER_SECOND)
+    resolved_start_ms = round(resolved * _MILLISECONDS_PER_SECOND)
+    source_duration_ms = round(source_duration * _MILLISECONDS_PER_SECOND)
+    clip_duration_ms = round(clip_duration * _MILLISECONDS_PER_SECOND)
+    tail_guard_ms = round(tail_guard * _MILLISECONDS_PER_SECOND)
     if (
         recorded_start != resolved
-        or resolved < manifest_start
-        or resolved >= source_duration
+        or recorded_start_ms != resolved_start_ms
+        or resolved_start_ms < manifest_start_ms
+        or resolved_start_ms >= source_duration_ms
     ):
         raise ValueError("Gameplay asset playback start does not match its policy")
     loop_enabled = policy.get("loop_enabled")
@@ -192,14 +204,21 @@ def require_resolved_gameplay_playback(asset: dict) -> None:
         raise TypeError("Gameplay asset playback policy has no wrap decision")
     if wrap_required and not loop_enabled:
         raise ValueError("Gameplay asset playback policy wraps without loop permission")
-    if tail_guard != GAMEPLAY_PLAYBACK_TAIL_GUARD_SECONDS:
+    if tail_guard_ms != round(
+        GAMEPLAY_PLAYBACK_TAIL_GUARD_SECONDS * _MILLISECONDS_PER_SECOND
+    ):
         raise ValueError("Gameplay asset playback tail guard is out of date")
     non_looping_window_exists = (
-        manifest_start + clip_duration + tail_guard <= source_duration
+        manifest_start_ms + clip_duration_ms + tail_guard_ms <= source_duration_ms
     )
     if wrap_required == non_looping_window_exists:
         raise ValueError("Gameplay asset playback policy has an invalid wrap decision")
-    if not wrap_required and resolved + clip_duration + tail_guard > source_duration:
+    if (
+        not wrap_required
+        and resolved_start_ms + clip_duration_ms + tail_guard_ms > source_duration_ms
+    ):
         raise ValueError("Gameplay asset playback policy exceeds its source duration")
-    if wrap_required and resolved + tail_guard > source_duration:
+    if wrap_required and manifest_start_ms:
+        raise ValueError("Gameplay asset playback wrap crosses its manifest start")
+    if wrap_required and resolved_start_ms + tail_guard_ms > source_duration_ms:
         raise ValueError("Gameplay asset playback wrap starts beyond its source tail")

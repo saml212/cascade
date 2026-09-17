@@ -72,14 +72,33 @@ def test_short_source_fails_unless_manifest_explicitly_permits_looping():
         _resolve(_asset(playback_start_seconds=1), clip_duration=12, source_duration=10)
 
     resolved = _resolve(
-        _asset(playback_start_seconds=1, playback_loop=True),
+        _asset(playback_start_seconds=0, playback_loop=True),
         clip_duration=12,
         source_duration=10,
     )
 
     assert resolved["playback_policy"]["loop_enabled"] is True
     assert resolved["playback_policy"]["wrap_required"] is True
-    assert 1 <= resolved["playback_start_seconds"] <= 9.75
+    assert 0 <= resolved["playback_start_seconds"] <= 9.75
+
+    with pytest.raises(ValueError, match="before its manifest start"):
+        _resolve(
+            _asset(playback_start_seconds=1, playback_loop=True),
+            clip_duration=12,
+            source_duration=10,
+        )
+
+
+def test_exact_millisecond_boundary_validates_without_float_drift():
+    resolved = _resolve(
+        _asset(playback_start_seconds=506.454),
+        clip_duration=18.808,
+        source_duration=525.512,
+    )
+
+    assert resolved["playback_start_seconds"] == 506.454
+    assert resolved["playback_policy"]["wrap_required"] is False
+    require_resolved_gameplay_playback(resolved)
 
 
 @pytest.mark.parametrize(

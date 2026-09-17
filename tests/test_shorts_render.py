@@ -810,14 +810,16 @@ def test_speaker_panel_render_requires_caption_context_before_writing(
         )
 
 
-def _sample_rgb(ffmpeg: str, path, x: int, y: int) -> tuple[int, int, int]:
+def _sample_rgb(
+    ffmpeg: str, path, x: int, y: int, *, at_seconds: float = 0.4
+) -> tuple[int, int, int]:
     result = subprocess.run(
         [
             ffmpeg,
             "-v",
             "error",
             "-ss",
-            "0.4",
+            str(at_seconds),
             "-i",
             str(path),
             "-vf",
@@ -925,9 +927,18 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
             "role": "subway",
             "path": subway,
             "fit_mode": CONTAIN_BLUR_FIT_MODE,
+            "playback_policy": {"wrap_required": True},
         },
-        {"role": "gta", "path": gta},
-        {"role": "minecraft", "path": minecraft},
+        {
+            "role": "gta",
+            "path": gta,
+            "playback_policy": {"wrap_required": True},
+        },
+        {
+            "role": "minecraft",
+            "path": minecraft,
+            "playback_policy": {"wrap_required": True},
+        },
     ]
     agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
     agent._compose_gameplay_surround_variant(
@@ -966,6 +977,8 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     center = _sample_rgb(ffmpeg, output, 540, 600)
     right = _sample_rgb(ffmpeg, output, 980, 600)
     bottom = _sample_rgb(ffmpeg, output, 540, 1500)
+    right_after_wrap = _sample_rgb(ffmpeg, output, 980, 600, at_seconds=1.02)
+    bottom_after_wrap = _sample_rgb(ffmpeg, output, 540, 1500, at_seconds=1.02)
     assert min(subway_marker) > 200
     for blue_pixel in (subway_above, subway_below):
         assert blue_pixel[2] > blue_pixel[0] + 80
@@ -973,6 +986,10 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     assert center[0] > 180 and center[1] > 180 and center[2] < 80
     assert right[0] > right[1] + 80 and right[0] > right[2] + 80
     assert bottom[1] > bottom[0] + 40 and bottom[1] > bottom[2] + 40
+    assert right_after_wrap[0] > right_after_wrap[1] + 80
+    assert right_after_wrap[0] > right_after_wrap[2] + 80
+    assert bottom_after_wrap[1] > bottom_after_wrap[0] + 40
+    assert bottom_after_wrap[1] > bottom_after_wrap[2] + 40
 
 
 def test_background_caption_margin_stays_above_motion_panel():
