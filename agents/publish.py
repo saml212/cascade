@@ -185,10 +185,7 @@ def validated_short_receipts(publish: dict) -> list[dict]:
             receipt.get("status") == "intent_recorded"
             and "destination_request_id" not in receipt
         )
-        or (
-            "destination_request_id" in receipt
-            and not _destination_receipt_valid(receipt)
-        )
+        or not _destination_history_receipt_valid(receipt)
         for receipt in receipts
     ):
         raise ValueError("Publication receipt history cannot be verified")
@@ -423,6 +420,20 @@ def _destination_receipt_valid(receipt: dict) -> bool:
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
+
+
+def _destination_history_receipt_valid(receipt: dict) -> bool:
+    """Validate destination identity through an exact cancellation wrapper."""
+    if "destination_request_id" not in receipt:
+        return True
+    if _destination_receipt_valid(receipt):
+        return True
+    original = receipt.get("pre_cancellation_receipt")
+    return bool(
+        isinstance(original, dict)
+        and _destination_receipt_valid(original)
+        and validated_schedule_cancellation(receipt) is not None
+    )
 
 
 @dataclass(frozen=True)

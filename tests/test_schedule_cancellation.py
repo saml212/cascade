@@ -57,6 +57,65 @@ def _receipt_for(job_id, external_id, platform):
     }
 
 
+def _artifact_x_receipt_for(job_id, request_id):
+    from agents.publish import (
+        ARTIFACT_SHORT_DESTINATION_SCHEMA,
+        ShortDeliverySpec,
+        _destination_external_id,
+        _destination_receipt_valid,
+        _document_revision,
+    )
+    from agents.qa import SHORT_COPY_SCHEMA
+
+    version = {
+        "version": "speaker_panels_v1",
+        "variant_id": "speaker_panels_v1",
+        "render_fingerprint": f"sha256:render-{job_id}",
+        "approval_revision": f"sha256:approval-{job_id}",
+    }
+    target_revision = _document_revision(
+        ShortDeliverySpec.target_fields("clip_01", version)
+    )
+    external_id = _destination_external_id(
+        "ep_001",
+        request_id,
+        ["x"],
+        target_revision,
+        "clip_01",
+        ARTIFACT_SHORT_DESTINATION_SCHEMA,
+    )
+    copy = {"x": {"text": f"Reviewed copy for {job_id}"}}
+    receipt = {
+        "clip_id": "clip_01",
+        "status": "submitted",
+        "platforms": ["x"],
+        "request_id": external_id,
+        "external_id": external_id,
+        "idempotency_key": external_id,
+        "job_id": job_id,
+        "scheduled": True,
+        "scheduled_date": SCHEDULED_DATE,
+        "timezone": "America/Los_Angeles",
+        **version,
+        "destination_schema": ARTIFACT_SHORT_DESTINATION_SCHEMA,
+        "destination_episode_id": "ep_001",
+        "destination_profile_username": "up",
+        "destination_request_id": request_id,
+        "destination_actor": "release-operator",
+        "destination_reason": "Queue the exact reviewed X artifact",
+        "deferred_platforms": [],
+        "target_revision": target_revision,
+        "destination_copy": copy,
+        "copy_schema": SHORT_COPY_SCHEMA,
+        "copy_revision": _document_revision(copy),
+    }
+    receipt["destination_request_revision"] = _document_revision(
+        ShortDeliverySpec.request_fields(receipt)
+    )
+    assert _destination_receipt_valid(receipt)
+    return receipt
+
+
 def _remote_job_for(receipt):
     return {
         **_remote_job(),
@@ -516,6 +575,112 @@ def test_exact_job_cancellation_handles_three_jobs_without_replacement(
     )
     assert repeated.status_code == 200
     assert delete_calls == [receipt["job_id"] for receipt in receipts]
+
+
+def test_exact_job_cancellation_keeps_v3_history_valid_for_next_job(
+    test_client, monkeypatch
+):
+    client, episodes_dir = test_client
+    episode_dir = _create_episode(episodes_dir, "ep_001")
+    receipts = [
+        _artifact_x_receipt_for(
+            "job-x-one", "10000000-0000-4000-8000-000000000001"
+        ),
+        _artifact_x_receipt_for(
+            "job-x-two", "10000000-0000-4000-8000-000000000002"
+        ),
+    ]
+    (episode_dir / "publish.json").write_text(
+        json.dumps({"profile_username": "up", "shorts": receipts})
+    )
+    monkeypatch.setenv("UPLOAD_POST_API_KEY", "secret")
+    monkeypatch.setenv("UPLOAD_POST_USER", "up")
+
+    from agents.publish import (
+        PublishAgent,
+        validated_schedule_cancellation,
+        validated_short_receipts,
+    )
+    from server.routes import clips
+
+    deleted = set()
+    by_job = {receipt["job_id"]: receipt for receipt in receipts}
+    monkeypatch.setattr(
+        PublishAgent,
+        "_remote_schedule",
+        lambda *_args: [
+            _remote_job_for(receipt)
+            for receipt in receipts
+            if receipt["job_id"] not in deleted
+        ],
+    )
+    monkeypatch.setattr(
+        clips,
+        "_upload_post_job_evidence",
+        lambda _api_key, _profile, job_id: (
+            _absent_evidence()
+            if job_id in deleted
+            else _queued_evidence_for(by_job[job_id])
+        ),
+    )
+
+    def delete(_api_key, job_id):
+        deleted.add(job_id)
+        return {
+            "http_status": 200,
+            "response": {"success": True, "message": f"Job {job_id} cancelled"},
+        }
+
+    monkeypatch.setattr(clips, "_delete_upload_post_schedule", delete)
+    for index, receipt in enumerate(receipts, start=1):
+        path = (
+            "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/"
+            f"{receipt['job_id']}/cancellation"
+        )
+        preview = client.post(
+            f"{path}/preview",
+            json={
+                "expected_external_id": receipt["external_id"],
+                "request_id": f"20000000-0000-4000-8000-{index:012d}",
+                "actor": "release-operator",
+                "reason": "Remove the reviewed X queue item",
+            },
+        )
+        assert preview.status_code == 200
+        assert client.post(path, json=preview.json()["execute"]).status_code == 200
+        publish = json.loads((episode_dir / "publish.json").read_text())
+        validated_short_receipts(publish)
+        stored = publish["shorts"][index - 1]
+        assert stored["scheduled"] is False
+        assert stored["pre_cancellation_receipt"] == receipt
+        assert (
+            stored["destination_request_revision"]
+            == receipt["destination_request_revision"]
+        )
+
+        if index == 1:
+            from copy import deepcopy
+
+            from agents.publish import cancellation_snapshot
+
+            tampered = deepcopy(stored)
+            original = tampered["pre_cancellation_receipt"]
+            original["destination_request_revision"] = "sha256:tampered"
+            tampered["destination_request_revision"] = "sha256:tampered"
+            operation = tampered["schedule_cancellation"]
+            snapshot = operation["snapshot"]
+            operation["snapshot"] = cancellation_snapshot(
+                original,
+                snapshot["history_revision"],
+                snapshot["profile_username"],
+                None,
+                snapshot["remote_job"],
+            )
+            assert validated_schedule_cancellation(tampered) is not None
+            with pytest.raises(ValueError, match="Publication receipt history"):
+                validated_short_receipts({"shorts": [tampered]})
+
+    assert deleted == {"job-x-one", "job-x-two"}
 
 
 def test_exact_job_preview_rejects_wrong_external_id(test_client, monkeypatch):
