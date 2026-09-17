@@ -711,18 +711,6 @@ export const api = {
       body
     ),
 
-  /* Chat */
-  chatHistory: (id: string) =>
-    request<UnknownRecord[]>('GET', `/api/episodes/${id}/chat/history`),
-  chat: (id: string, message: string) =>
-    request<{ response: string; actions_taken: UnknownRecord[] }>(
-      'POST',
-      `/api/episodes/${id}/chat`,
-      { message }
-    ),
-  completeMetadata: (id: string) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/complete-metadata`),
-
   /* Edits */
   listEdits: (id: string) =>
     request<{ edits: UnknownRecord[]; count: number }>(

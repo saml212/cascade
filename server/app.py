@@ -14,7 +14,6 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.routes import (
-    chat,
     clips,
     delivery,
     edits,
@@ -55,7 +54,6 @@ app.add_middleware(
 app.include_router(episodes.router)
 app.include_router(clips.router)
 app.include_router(pipeline.router)
-app.include_router(chat.router)
 app.include_router(trim.router)
 app.include_router(schedule.router)
 app.include_router(edits.router)

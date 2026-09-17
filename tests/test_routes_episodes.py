@@ -37,10 +37,6 @@ def test_client(tmp_path, monkeypatch):
 
     importlib.reload(pipe_mod)
 
-    import server.routes.chat as chat_mod
-
-    importlib.reload(chat_mod)
-
     import server.app as app_mod
 
     importlib.reload(app_mod)
@@ -64,7 +60,7 @@ def _create_episode(episodes_dir, episode_id, extra_data=None):
         (ep_dir / sub).mkdir(exist_ok=True)
     data = {
         "episode_id": episode_id,
-        "title": "Test {}".format(episode_id),
+        "title": f"Test {episode_id}",
         "status": "ready_for_review",
         "source_path": "/tmp/source",
         "duration_seconds": 3600.0,

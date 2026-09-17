@@ -7,8 +7,6 @@ Running list of things to hand to a dev agent once the harness is built. Organiz
 - [ ] `agents/clip_miner.py` — replace Anthropic SDK call with `claude -p` subprocess. Stream-JSON output; parse clip JSON blocks from response.
 - [ ] `agents/metadata_gen.py` — same pattern. Per-platform metadata generation.
 - [ ] `agents/thumbnail_gen.py` — uses OpenAI for image, but any Claude calls in here should move too.
-- [ ] `server/routes/chat.py` — the 13-action chat agent. Biggest migration: streaming needs to work for the UI.
-- [ ] `chat.py` `auto_trim` action — currently calls Claude API; migrate.
 - [ ] Update `CLAUDE.md` "API Costs per Episode" section to reflect subscription use.
 - [ ] Remove `ANTHROPIC_API_KEY` requirement from `.env.example` once migration is complete (unless something still needs it).
 
@@ -26,11 +24,6 @@ Running list of things to hand to a dev agent once the harness is built. Organiz
 - [ ] Threshold-based auto-approval: clip_miner scores above N auto-approve, below review. Config knob in `config.toml`.
 - [ ] Bulk actions: "approve top 5 by score", "reject anything under 20s".
 - [ ] Side-by-side clip compare view.
-
-### Chat agent safety
-- [ ] `delete_clip` action requires explicit user confirmation modal.
-- [ ] `rerender_longform` shows cost/time estimate before confirming.
-- [ ] All destructive chat actions log to `chat_history.json` with a revert-hint.
 
 ### Crop setup (must stay manual, but easier)
 - [ ] Show the reference frame at a larger size — current UI makes placement fiddly.
@@ -72,6 +65,5 @@ Harness gaps discovered but not yet built:
 
 ## Questions for a future session
 
-- Is chat_history.json meant to persist forever, or rotate? Unbounded growth.
 - Does `thumbnail_gen` really need OpenAI, or can it be replaced with a local model now that image gen has improved?
 - Should `podcast_feed`, `publish`, `backup` be extracted to a separate "post-production" pipeline with its own scheduling?

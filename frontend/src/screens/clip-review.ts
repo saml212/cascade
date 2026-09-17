@@ -1,10 +1,7 @@
 /**
  * Clip Review — the editorial surface.
  *
- * Full-width page. A column of ClipCards (expand-on-click) plus a docked
- * chat input at the bottom that POSTs to /api/episodes/:id/chat. When the
- * agent executes actions that touch clip data, we reload the clip list so
- * the UI reflects the new state.
+ * Full-width page with a column of ClipCards that expand on click.
  */
 
 import { h, mount } from '../lib/dom';
@@ -224,12 +221,6 @@ async function runReviewMutation(mutation: ReviewMutation): Promise<void> {
   }
 }
 
-interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  actions?: UnknownRecord[];
-}
-
 export function ClipReview(
   target: HTMLElement,
   episodeId: string,
@@ -265,8 +256,6 @@ export function ClipReview(
     }
   };
   const loadError = signal<string | null>(null);
-  const chatMessages = signal<ChatMessage[]>([]);
-  const chatSending = signal<boolean>(false);
   let initialClipResolved = false;
   let pollTimer: number | undefined;
   let loadSequence = 0;
@@ -335,21 +324,6 @@ export function ClipReview(
     if (pollTimer != null) window.clearTimeout(pollTimer);
   });
 
-  async function loadChatHistory(): Promise<void> {
-    try {
-      const history = (await api.chatHistory(episodeId)) as Array<UnknownRecord>;
-      chatMessages.set(
-        history.map((m) => ({
-          role: (m.role as 'user' | 'assistant') ?? 'assistant',
-          content: (m.content as string) ?? '',
-          actions: m.actions_taken as UnknownRecord[] | undefined,
-        }))
-      );
-    } catch {
-      /* history endpoint may 404 on fresh episodes */
-    }
-  }
-
   async function loadSpeakerLabels(): Promise<void> {
     try {
       const transcript = await api.getTranscript(episodeId);
@@ -359,36 +333,7 @@ export function ClipReview(
     }
   }
 
-  async function sendChat(message: string): Promise<void> {
-    if (!message.trim() || chatSending.peek()) return;
-    chatMessages.set((prev) => [...prev, { role: 'user', content: message }]);
-    chatSending.set(true);
-    try {
-      const res = await api.chat(episodeId, message);
-      chatMessages.set((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: res.response,
-          actions: res.actions_taken,
-        },
-      ]);
-      if (res.actions_taken && res.actions_taken.length > 0) await load();
-    } catch (e) {
-      chatMessages.set((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: `I hit an error: ${(e as Error).message}`,
-        },
-      ]);
-    } finally {
-      chatSending.set(false);
-    }
-  }
-
   void load();
-  void loadChatHistory();
   void loadSpeakerLabels();
 
   const body = h('div');
@@ -565,8 +510,7 @@ export function ClipReview(
       'div',
       { class: 'h-full min-h-0 flex flex-col overflow-hidden' },
       renderHeader(episodeId, clips, episode, review),
-      scrollViewport,
-      renderChatDock(chatMessages, chatSending, sendChat)
+      scrollViewport
     )
   );
 }
@@ -704,18 +648,6 @@ function renderHeader(
     },
     EpisodeBackButton(episodeId),
     title,
-    Button({
-      variant: 'secondary',
-      size: 'md',
-      label: 'Complete metadata',
-      onClick: () =>
-        runReviewMutation({
-          run: () => api.completeMetadata(episodeId),
-          started: 'Auto-filling metadata…',
-          succeeded: 'Metadata complete.',
-          after: () => location.reload(),
-        }),
-    }),
     approveHost
   );
 }
@@ -732,7 +664,7 @@ function emptyClipsPanel(): HTMLElement {
     h(
       'p',
       { class: 'text-body text-ink-tertiary max-w-md mx-auto' },
-      'The clip miner runs after longform approval. Come back once it’s finished — or ask the agent below to add a manual clip.'
+      'The clip miner runs after longform approval. Come back once it’s finished, or add a manual clip through the episode workflow.'
     )
   );
 }
@@ -2212,127 +2144,4 @@ function platformEditor(
       })
     )
   );
-}
-
-/* --------------------------------- Chat dock ------------------------------ */
-
-function renderChatDock(
-  messages: Signal<ChatMessage[]>,
-  sending: Signal<boolean>,
-  send: (msg: string) => Promise<void>
-): HTMLElement {
-  const input = h('textarea', {
-    class: [
-      'flex-1 bg-transparent text-body text-ink-primary placeholder:text-ink-disabled',
-      'resize-none focus:outline-none leading-snug',
-    ].join(' '),
-    rows: '1',
-    placeholder: 'Ask the agent — "rewrite titles around the nuclear angle", "reject clips under 6", "trim clip 3 to 45s"…',
-    onkeydown: (e: KeyboardEvent) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        const el = e.target as HTMLTextAreaElement;
-        const val = el.value;
-        el.value = '';
-        send(val);
-      }
-    },
-  }) as HTMLTextAreaElement;
-
-  const log = h('div', {
-    class: 'max-h-[28vh] overflow-y-auto px-6 py-3 flex flex-col gap-3',
-  });
-
-  effect(() => {
-    const msgs = messages();
-    if (msgs.length === 0) {
-      log.replaceChildren(
-        h(
-          'p',
-          { class: 'text-body-sm text-ink-tertiary italic' },
-          'Start a conversation — the agent can retitle clips, adjust hashtags, reject clips by score, and more.'
-        )
-      );
-    } else {
-      log.replaceChildren(
-        ...msgs.slice(-20).map((m) => chatBubble(m))
-      );
-      log.scrollTop = log.scrollHeight;
-    }
-  });
-
-  const sendBtn = h('div');
-  effect(() => {
-    sendBtn.replaceChildren(
-      Button({
-        variant: 'primary',
-        size: 'md',
-        label: sending() ? 'Sending…' : 'Send',
-        loading: sending(),
-        onClick: () => {
-          const val = input.value;
-          input.value = '';
-          send(val);
-        },
-      })
-    );
-  });
-
-  return h(
-    'footer',
-    {
-      class:
-        'sticky bottom-0 z-20 border-t border-border-subtle bg-canvas/95 backdrop-blur-md',
-    },
-    log,
-    h(
-      'div',
-      {
-        class:
-          'flex items-end gap-3 px-6 py-4 border-t border-border-subtle',
-      },
-      input,
-      sendBtn
-    )
-  );
-}
-
-function chatBubble(m: ChatMessage): HTMLElement {
-  const isUser = m.role === 'user';
-  return h(
-    'div',
-    {
-      class: `flex ${isUser ? 'justify-end' : 'justify-start'}`,
-    },
-    h(
-      'div',
-      {
-        class: [
-          'max-w-[75%] px-4 py-2.5 rounded-lg text-body leading-relaxed',
-          isUser
-            ? 'bg-accent text-ink-on-accent'
-            : 'bg-surface-2 text-ink-primary border border-border-subtle',
-        ].join(' '),
-      },
-      formatChatContent(m.content),
-      m.actions && m.actions.length > 0
-        ? h(
-            'div',
-            { class: 'text-code-sm text-ink-tertiary font-mono tabular mt-2' },
-            `${pluralize(m.actions.length, 'action')} executed`
-          )
-        : null
-    )
-  );
-}
-
-function formatChatContent(content: string): HTMLElement {
-  const html = content
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code class="bg-surface-inset px-1 py-0.5 rounded text-code-sm">$1</code>')
-    .replace(/\n/g, '<br>');
-  return h('span', { html });
 }

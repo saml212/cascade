@@ -5,7 +5,7 @@ Ingests camera + multi-track audio, produces longform (16:9) + shorts (9:16) + m
 ## Architecture
 - [Pipeline & Agents](docs/architecture.md) — agent system, DAG, stage behaviors
 - [Shared Libraries](docs/libraries.md) — `lib/ffprobe`, `lib/srt`, `lib/encoding`, `lib/paths`, `lib/audio_mix`, `lib/audio_enhance`
-- [Server & Frontend](docs/server.md) — FastAPI routes, chat agent actions, vanilla JS SPA
+- [Server & Frontend](docs/server.md) — FastAPI routes and the TypeScript SPA
 
 ## Workflow
 - [Commands](docs/commands.md) — setup, CLI pipeline, tests, API endpoints

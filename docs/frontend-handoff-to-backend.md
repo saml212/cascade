@@ -8,7 +8,7 @@ The frontend rebuild in `frontend/` is done and served by `server/app.py`. The s
 
 ## Summary of what shipped
 
-The shipped frontend includes the editorial surfaces (Clip Review with 9-platform metadata accordion + chat dock, Longform Review with cut timeline and natural-language edit input) and the Crop Setup surface (video scrubber + H6E waveform verifier + Web Audio track mixer). They are wired to the existing backend contract.
+The shipped frontend includes the editorial surfaces (Clip Review with destination metadata and exact variant controls, Longform Review with explicit cut timeline controls) and the Crop Setup surface (video scrubber + H6E waveform verifier + Web Audio track mixer). They are wired to the existing backend contract. The built-in prose chat controls described in the original handoff were retired on 2026-09-17 in favor of external Codex using the canonical APIs.
 
 The typed API client lives at `frontend/src/lib/api.ts`. **Every route my UI calls is enumerated there.** If you rename or reshape any of those routes, that file is the first place to sync.
 
@@ -85,8 +85,8 @@ The typed API client lives at `frontend/src/lib/api.ts`. **Every route my UI cal
 
 ## What the frontend will NOT do (by design)
 
-- **Agent chat panel** — explicitly Phase C per the brief. The right rail reserves 380px; today it shows a live event feed. When the launcher work puts a persistent `claude /produce` subprocess behind a `POST /agent/chat` endpoint, the rail can grow a chat surface.
-- **`anthropic` SDK calls from frontend** — never. All LLM interaction routes through the backend's `/chat` action parser.
+- **Agent chat panel** — retired. The right rail remains the pipeline event feed; external Codex uses explicit backend operations.
+- **Model calls from the frontend** — never. Generation stays in pipeline agents, while external Codex uses canonical review and mutation APIs.
 - **Destructive operations without explicit confirmation** — backup requires a typed phrase; episode delete is not wired (flag to me if you want it, it's a one-line addition).
 
 ## Flows I fully dogfooded
@@ -97,7 +97,7 @@ The typed API client lives at `frontend/src/lib/api.ts`. **Every route my UI cal
 - Crop Setup for `ep_2026-03-18_204203` (H6E 3-speaker) — loads saved crops + speakers + tracks, waveform renders with 4× visibility gain, offset nudge controls
 - Clip Review metadata save: `PATCH /api/episodes/:id/clips/:clip_id/metadata` round-trips correctly (tested with a noop update + revert)
 - Schedule calendar: 7-day layout, today highlighted, 3 longforms queued render properly
-- `complete-metadata` endpoint: returns the expected `{complete, iterations, actions_taken, summary}` shape
+- Canonical clip and episode metadata PATCH routes: save and read back the exact requested fields
 
 ## Flows I wired but couldn't dogfood
 

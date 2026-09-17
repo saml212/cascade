@@ -937,7 +937,7 @@ class ShortsRenderAgent(BaseAgent):
         background=None,
         segment_document=None,
     ) -> dict:
-        """Render one clip; positional arguments remain compatible with chat actions."""
+        """Render one clip; positional arguments remain compatible with route adapters."""
         if background:
             require_active_background_variant(background.get("variant_id"))
         speaker_panel_variant = background is not None

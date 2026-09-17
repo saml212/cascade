@@ -107,21 +107,16 @@ Longer-term workstreams captured during the 2026-04-21 session. Ordered roughly 
 
 **Status:** Shipped. Continue improving individual screens through the normal backlog rather than another handoff document.
 
-### 12. Agent-inside-UI (eventual)
+### 12. External Codex control (current)
 
-**What:** Embed a chat interface inside the cascade UI so Sam talks to the /produce agent there instead of in a terminal/Claude Code session. Long-term vision.
+**What:** Codex drives Cascade through the explicit episode, review, edit, render,
+approval, and publishing APIs while the web application remains a focused manual
+review surface.
 
-**Challenges:**
-- Bootstrap problem — agent needs backend; backend is what hosts the agent UI.
-- Agent tool (subagents) traditionally comes from the Claude Code binary, not a web backend — exposing it over HTTP is a big surface.
-- Session lifecycle — how do turns persist across page reloads?
-
-**Sequencing:**
-1. Phase A (current): terminal + browser, two contexts.
-2. Phase B: native desktop wrapper (tiny macOS .app or Electron) that starts uvicorn + spawns a Claude Code subprocess on /produce + opens the browser. One double-click. Sam never sees a terminal. Cheap, huge UX win.
-3. Phase C: chat input in the cascade UI. Messages go to a server endpoint that forwards to a Claude Code process (spawned by the launcher from Phase B, persistent across UI turns). Agent output streams back to the UI. No terminal at all, no context switching. Requires a server-side session manager.
-
-**Size:** Phase B is a one-afternoon project once Phase 1-10 settle. Phase C is a meaningful build (session manager, websocket streaming, auth). Defer Phase C until the backend is fully locked-in.
+**Decision:** The embedded prose chat and its second action parser were retired on
+2026-09-17. Pipeline status stays in the Agent Panel and Event Feed. Automation
+uses the same revision-bound APIs as the UI, with durable external journals and
+readback instead of an application-local chat session.
 
 ### 13. Preview-vs-final audio parity in crop mixer
 

@@ -72,8 +72,7 @@ cp .env.example .env                               # Fill in API keys
 Local import, framing, manual metadata, audio mastering, and upload-video
 preparation do not require either key. The full automated pipeline needs
 `ANTHROPIC_API_KEY` and `DEEPGRAM_API_KEY` for its generation and transcription
-stages. Episode chat uses the installed, authenticated `claude` CLI. Publishing
-and RSS keys are only needed for those specific agents.
+stages. Publishing and RSS keys are only needed for those specific agents.
 
 The default audio mastering path uses ffmpeg and the lean dependencies in
 `requirements.txt`. DeepFilterNet restoration is optional because its PyTorch
@@ -134,7 +133,7 @@ cascade/
 │   └── srt.py       # SRT generation, parsing, and ffmpeg escaping
 ├── server/          # FastAPI app (port 8420)
 │   ├── app.py       # Entry point + static files
-│   └── routes/      # API endpoints (episodes, clips, pipeline, chat, trim, etc.)
+│   └── routes/      # API endpoints (episodes, clips, pipeline, trim, etc.)
 ├── frontend/        # TypeScript + Vite SPA; FastAPI serves frontend/dist
 ├── config/          # config.toml — all settings
 ├── tests/           # Python pytest suite

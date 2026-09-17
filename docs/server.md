@@ -2,8 +2,8 @@
 
 ## Server (`server/`)
 - FastAPI app bound to `127.0.0.1:8420` by `start.sh` (`server/app.py`).
-- Routes in `server/routes/` cover episodes, clips, pipeline control, chat, edits, delivery, scheduling, and trimming.
-- `chat.py` is the AI chat route: maintains `chat_history.json`, loads full episode context into a system prompt, parses `action` JSON blocks from the model response to execute operations (approve/reject clips, update metadata, re-render shorts, edit longform, etc.).
+- Routes in `server/routes/` cover episodes, clips, pipeline control, edits, delivery, scheduling, and trimming.
+- Cascade exposes explicit metadata, review, edit, render, approval, and publishing APIs. External Codex workflows call those contracts directly. Historical `chat_history.json` files remain episode recovery artifacts; the application does not expose or mutate them.
 - Serves the compiled `frontend/dist/` application with an SPA catch-all.
 
 ## Frontend (`frontend/`)

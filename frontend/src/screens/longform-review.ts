@@ -34,7 +34,6 @@ import { editSourceRange } from '../lib/edit-range';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/Button';
 import { EpisodeBackButton } from '../components/EpisodeBackButton';
-import { Icon } from '../components/icons';
 import { navigate } from '../lib/router';
 import { transcriptSpeakerLabels } from '../lib/speaker-labels';
 import { showToast } from '../state/ui';
@@ -135,7 +134,6 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
   const edits = signal<Edit[]>([]);
   const utterances = signal<Utterance[]>([]);
   const speakerLabels = signal<Map<number, string>>(new Map());
-  const chatSending = signal<boolean>(false);
   const loadError = signal<string | null>(null);
 
   const inPoint = signal<number | null>(null);
@@ -619,9 +617,6 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
       listHost
     );
 
-    /* ── Advanced (chat) panel ──────────────────────────────────────────── */
-    const advancedPanel = renderAdvancedPanel(episodeId, chatSending, load);
-
     return h(
       'div',
       { class: 'flex-1 flex flex-col' },
@@ -632,8 +627,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
         },
         leftPane,
         rightPane
-      ),
-      h('div', { class: 'px-8 pb-6' }, advancedPanel)
+      )
     );
   }
 
@@ -1059,86 +1053,4 @@ function buildUtteranceRow(
 
   rowRegistry.set(i, row);
   return row;
-}
-
-/* ─── Advanced (chat) panel ─────────────────────────────────────────────── */
-
-function renderAdvancedPanel(
-  episodeId: string,
-  chatSending: Signal<boolean>,
-  reload: () => Promise<void>
-): HTMLElement {
-  const input = h('textarea', {
-    class: [
-      'w-full bg-surface-2 border border-border rounded-lg px-4 py-3',
-      'text-body text-ink-primary placeholder:text-ink-disabled',
-      'resize-none focus:border-accent focus:outline-none leading-relaxed',
-    ].join(' '),
-    rows: '3',
-    placeholder:
-      'Trim the first 2 minutes. Cut the strip-club story around 42:00. Remove the coughing fit around 1:15:30.',
-  }) as HTMLTextAreaElement;
-
-  const submitHost = h('div');
-  effect(() => {
-    submitHost.replaceChildren(
-      Button({
-        variant: 'primary',
-        size: 'md',
-        label: chatSending() ? 'Working…' : 'Propose edits',
-        loading: chatSending(),
-        onClick: async () => {
-          const msg = input.value.trim();
-          if (!msg) return;
-          chatSending.set(true);
-          try {
-            const res = await api.chat(
-              episodeId,
-              `Please propose longform edits based on this request: ${msg}`
-            );
-            input.value = '';
-            if (res.actions_taken && res.actions_taken.length > 0) {
-              showToast(`${res.actions_taken.length} edit(s) added.`, 'success');
-            } else {
-              showToast(res.response.slice(0, 200));
-            }
-            await reload();
-          } catch (e) {
-            showToast((e as Error).message, 'error');
-          } finally {
-            chatSending.set(false);
-          }
-        },
-      })
-    );
-  });
-
-  return h(
-    'details',
-    { class: 'panel mt-2' },
-    h(
-      'summary',
-      {
-        class: [
-          'px-5 py-3 text-heading-sm uppercase tracking-wide text-ink-tertiary cursor-pointer',
-          'select-none flex items-center justify-between',
-          'hover:text-ink-primary transition-colors',
-          '[&::-webkit-details-marker]:hidden',
-        ].join(' '),
-      },
-      'Advanced: describe edits in plain text',
-      Icon.chevronDown({ size: 14 })
-    ),
-    h(
-      'div',
-      { class: 'px-5 pb-5 pt-3 flex flex-col gap-3 border-t border-border-subtle' },
-      h(
-        'p',
-        { class: 'text-body-sm text-ink-secondary' },
-        'Use plain language — Cascade parses it into cuts.'
-      ),
-      input,
-      h('div', { class: 'flex items-center justify-end gap-2' }, submitHost)
-    )
-  );
 }

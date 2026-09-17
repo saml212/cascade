@@ -57,8 +57,8 @@ src/
     new-episode.ts
     episode/              # detail shell + per-section renderers
     crop-setup.ts         # full-width crop + speaker / track editor
-    clip-review.ts        # editorial surface + chat dock
-    longform-review.ts    # player + cut timeline + edit input
+    clip-review.ts        # editorial review, metadata, and variant controls
+    longform-review.ts    # player + explicit cut timeline controls
     publish.ts            # platform readiness + publish CTA
     backup.ts             # dangerous-action confirmation
     schedule.ts, analytics.ts, not-found.ts

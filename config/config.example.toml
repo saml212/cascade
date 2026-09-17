@@ -76,9 +76,6 @@ title_position = "top"                   # Per-episode override: top or bottom
 [clip_mining]
 method = "llm"                            # "baseline", "transcript", or "llm"
 
-[chat]
-model = "claude-sonnet-4-20250514"
-
 [schedule]
 shorts_per_day_weekday = 1                # Mon-Thu
 shorts_per_day_weekend = 2                # Fri-Sun
