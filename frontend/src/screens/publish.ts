@@ -387,7 +387,7 @@ function renderPublishBar(
           'div',
           { class: 'text-body-sm text-ink-secondary' },
           canPublish
-            ? 'Explicit approval starts uploads to the enabled destinations.'
+            ? 'Records approval for this release. Exact destinations are scheduled separately.'
             : status.hint
         )
       ),
@@ -395,14 +395,16 @@ function renderPublishBar(
         ? Button({
             variant: 'primary',
             size: 'lg',
-            label: publishing ? 'Starting publish…' : 'Publish everywhere',
+            label: publishing ? 'Recording approval…' : 'Approve release',
             loading: publishing,
             disabled: publishing,
             onClick: async () => {
               publishingSignal.set(true);
               try {
-                await api.approvePublish(episodeId);
-                showToast('Publishing started.', 'success');
+                await api.approvePublish(episodeId, {
+                  start_publication: false,
+                });
+                showToast('Release approval recorded.', 'success');
                 navigate(`/episodes/${episodeId}`);
               } catch (error) {
                 showToast((error as Error).message, 'error');

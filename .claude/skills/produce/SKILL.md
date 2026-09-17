@@ -67,7 +67,7 @@ Local short rendering must not depend on a public YouTube URL. Do not publish a 
 
 ## External actions
 
-Publishing and destructive backup/SD cleanup require explicit authorization in the current user conversation. A request to produce, repair, render, review, or select a candidate does not authorize public posting. Before an authorized publish action, reread `GET /api/episodes/{id}/review` and `GET /api/episodes/{id}/quality`; require current render and copy revisions, approved rendered clips, and the current QA gate. Use `POST /api/episodes/{id}/approve-publish` only for that explicit action, then record platform acknowledgements and returned URLs without treating submission as confirmed publication.
+Publishing and destructive backup/SD cleanup require explicit authorization in the current user conversation. A request to produce, repair, render, review, or select a candidate does not authorize public posting. Before an authorized publish action, reread `GET /api/episodes/{id}/review` and `GET /api/episodes/{id}/quality`; require current render and copy revisions, approved rendered clips, and the current QA gate. Record approval with `POST /api/episodes/{id}/approve-publish` and `{"start_publication":false}`, preview exact destinations with `POST /api/episodes/{id}/publish-shorts/preview`, then execute the returned request unchanged through `POST /api/episodes/{id}/run-agent/publish`. Record platform acknowledgements and returned URLs without treating submission as confirmed publication.
 
 Do not create recurring producer or community jobs unless the user explicitly requests an automation. Public replies, outreach, scheduling, analytics experiments, and account changes each stay within their separately authorized scope.
 

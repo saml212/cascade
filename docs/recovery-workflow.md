@@ -328,15 +328,15 @@ POST /api/episodes/{episode_id}/publish-shorts/preview
 
 Review the exact artifact, transformed copy, profile, and date. Send the returned
 `execute` object unchanged as `publish` in
-`POST /api/episodes/{episode_id}/run-agent/publish`. Cascade saves an
+`POST /api/episodes/{episode_id}/run-agent/publish`. Empty and aggregate publish
+execution is retired for all new work. Cascade saves an
 `intent_recorded` short receipt before the first remote request. The final receipt
 keeps the request identity and lists Instagram/X as deferred.
 
 Use a new UUID and only the deferred destinations later. A disjoint wave may
 share its own still-future clip date; a past date requires a new schedule and
 fresh publish approval. An overlapping destination for the same selected
-artifact is rejected across later episode revisions. The legacy empty publish
-body is also rejected after a subset exists. Hashtags are normalized at send
+artifact is rejected across later episode revisions. Hashtags are normalized at send
 time. YouTube/TikTok copy names the show and includes a copyable exact episode
 hub URL without claiming caption links are clickable. X names the show without
 asserting an unverified bio link.

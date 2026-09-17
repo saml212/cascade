@@ -640,7 +640,7 @@ export const api = {
       `/api/episodes/${id}/approve-longform`,
       body
     ),
-  approvePublish: (id: string, body?: { start_publication?: boolean }) =>
+  approvePublish: (id: string, body: { start_publication: false }) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/approve-publish`, body),
   approveBackup: (id: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/approve-backup`),

@@ -5,6 +5,28 @@ import { importTs } from './load-ts.mjs';
 
 const { api } = await importTs(new URL('../src/lib/api.ts', import.meta.url));
 
+test('records publication approval without starting publication', async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+  globalThis.fetch = async (path, init) => {
+    captured = { path, method: init.method, body: JSON.parse(init.body) };
+    return new Response(JSON.stringify({ status: 'approved' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  try {
+    await api.approvePublish('episode-id', { start_publication: false });
+    assert.deepEqual(captured, {
+      path: '/api/episodes/episode-id/approve-publish',
+      method: 'POST',
+      body: { start_publication: false },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('sends exact revision-bound distribution selections', async () => {
   const originalFetch = globalThis.fetch;
   const captured = [];
