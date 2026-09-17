@@ -1,7 +1,7 @@
 import { h } from '../lib/dom';
 
 /**
- * 14-segment agent pipeline progress. Each segment is one of
+ * Agent pipeline progress. Each segment is one of
  * done / current / errored / queued, tinted accordingly.
  */
 interface StepProgressOptions {

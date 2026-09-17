@@ -71,4 +71,3 @@ retain the episode fragment.
 ## API Costs per Episode (current)
 - Deepgram transcription: ~$0.50 (stays on API — best-in-class STT).
 - Claude clip mining: ~$0.10-0.30 (pending migration to `claude` CLI / Max subscription).
-- Claude metadata: ~$0.10-0.20 (pending migration).

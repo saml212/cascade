@@ -206,7 +206,6 @@ The API exposes the same current link resolution at
 |---------|------|
 | Deepgram transcription | ~$0.50 |
 | Claude clip mining | ~$0.10-0.30 |
-| Claude metadata | ~$0.05-0.10 |
 
 ## License
 

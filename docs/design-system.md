@@ -223,7 +223,7 @@ Each component gets its own file in `src/components/` with a consistent API. Thi
 ### Status & signals
 
 - **StatusPill** — capsule with colored dot + label + optional ETA. Eight states: `queued`, `processing`, `awaiting_crop`, `awaiting_longform_review`, `awaiting_clip_review`, `awaiting_publish`, `live`, `error`. Each state has a fixed color, icon, and plain-English label — never raw codes.
-- **ProgressBar** — two variants: *continuous* (0–100%, used for long renders with known ETA) and *stepped* (14-segment pill representing the 14 pipeline agents, each filled/empty/current/errored). Scanline sweep on the active segment.
+- **ProgressBar** — two variants: *continuous* (0–100%, used for long renders with known ETA) and *stepped* (one segment per canonical pipeline agent, each filled/empty/current/errored). Scanline sweep on the active segment.
 - **LiveDot** — 8px amber dot with 2s breathing pulse.
 - **EventFeed** — the plain-English status stream. Each entry: timestamp (mono, tertiary), icon, sentence. Auto-scrolls; pinnable.
 

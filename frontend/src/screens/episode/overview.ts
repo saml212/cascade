@@ -313,7 +313,7 @@ function speakerCountOf(ep: Record<string, unknown>): string {
 }
 
 /**
- * Build the visible pipeline list: start with the canonical 14 stages,
+ * Build the visible pipeline list: start with the current canonical stages,
  * then append any agents that actually ran but aren't in the canonical
  * set (legacy runs, renamed agents, etc.). Dedupes repeated entries so
  * re-runs of speaker_cut + transcribe + clip_miner collapse to one pill.
