@@ -367,6 +367,138 @@ def test_receipt_artifact_current_uses_stable_media_and_rerelease_identity():
     )
 
 
+def _paired_release_request():
+    return {
+        "schema": "cascade.destination-release/v1",
+        "request_id": "replacement-pair",
+        "actor": "Release operator",
+        "reason": "Release the reviewed destination pair.",
+        "targets": [
+            {
+                "variant_id": "gameplay_surround_v1",
+                "target_revision": f"sha256:{'1' * 64}",
+                "render_fingerprint": f"sha256:{'2' * 64}",
+                "destinations": ["facebook", "instagram", "tiktok", "youtube"],
+            },
+            {
+                "variant_id": "speaker_panels_v1",
+                "target_revision": f"sha256:{'3' * 64}",
+                "render_fingerprint": f"sha256:{'4' * 64}",
+                "destinations": ["x"],
+            },
+        ],
+        "receipt_history_revision": f"sha256:{'5' * 64}",
+        "revision": f"sha256:{'6' * 64}",
+        "created_at": "2099-07-01T00:00:00+00:00",
+    }
+
+
+def _paired_variant_clip(*, clean_current=True, clean_approval_current=True):
+    request = _paired_release_request()
+    return {
+        "id": "clip_01",
+        "review": {
+            "distribution": {"re_release_request": request},
+            "variants": {
+                "speaker_panels_v1": {
+                    "render": {
+                        "current": clean_current,
+                        "fingerprint": f"sha256:{'4' * 64}",
+                    },
+                    "approval": {"current": clean_approval_current},
+                }
+            },
+        },
+    }
+
+
+def _clean_receipt():
+    request = _paired_release_request()
+    return {
+        "version": "speaker_panels_v1",
+        "variant_id": "speaker_panels_v1",
+        "render_fingerprint": f"sha256:{'4' * 64}",
+        "approval_revision": f"sha256:{'3' * 64}",
+        "rerelease_request_id": request["request_id"],
+        "rerelease_authorization_revision": request["revision"],
+    }
+
+
+def test_receipt_artifact_version_resolves_disjoint_destination_variant():
+    receipt = _clean_receipt()
+    selected = {
+        "version": "gameplay_surround_v1",
+        "variant_id": "gameplay_surround_v1",
+        "render_fingerprint": f"sha256:{'2' * 64}",
+        "current": True,
+        "re_release_request": _paired_release_request(),
+    }
+
+    version = schedule._receipt_artifact_version(
+        receipt, _paired_variant_clip(), selected
+    )
+
+    assert version == {
+        "version": "speaker_panels_v1",
+        "variant_id": "speaker_panels_v1",
+        "render_fingerprint": f"sha256:{'4' * 64}",
+        "current": True,
+        "re_release_request": _paired_release_request(),
+    }
+    assert schedule._receipt_artifact_current(receipt, version) is True
+
+
+def test_receipt_artifact_current_rejects_stale_render_with_retained_fingerprint():
+    receipt = _clean_receipt()
+    version = schedule._receipt_artifact_version(
+        receipt, _paired_variant_clip(clean_current=False), None
+    )
+
+    assert version["render_fingerprint"] == receipt["render_fingerprint"]
+    assert schedule._receipt_artifact_current(receipt, version) is False
+
+
+def test_receipt_artifact_current_does_not_conflate_copy_approval_staleness():
+    receipt = _clean_receipt()
+    version = schedule._receipt_artifact_version(
+        receipt,
+        _paired_variant_clip(clean_approval_current=False),
+        None,
+    )
+
+    assert schedule._receipt_artifact_current(receipt, version) is True
+
+
+def test_receipt_artifact_version_fails_closed_for_wrong_lineage_or_variant():
+    receipt = _clean_receipt()
+    clip = _paired_variant_clip()
+    version = schedule._receipt_artifact_version(receipt, clip, None)
+
+    assert (
+        schedule._receipt_artifact_current(
+            receipt | {"rerelease_request_id": "different-request"}, version
+        )
+        is False
+    )
+    assert (
+        schedule._receipt_artifact_version(
+            receipt
+            | {
+                "version": "unknown_v1",
+                "variant_id": "unknown_v1",
+            },
+            clip,
+            None,
+        )
+        is None
+    )
+    clip["review"]["distribution"]["re_release_request"]["targets"][1][
+        "render_fingerprint"
+    ] = f"sha256:{'7' * 64}"
+    wrong_target = schedule._receipt_artifact_version(receipt, clip, None)
+    assert schedule._receipt_artifact_current(receipt, wrong_target) is False
+
+
 def test_same_clip_destination_receipts_keep_separate_current_rows(
     tmp_path, monkeypatch
 ):
@@ -381,12 +513,20 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
             }
         ],
     )
-    identity = {
-        "version": "background_motion_v1",
-        "variant_id": "background_motion_v1",
-        "render_fingerprint": "sha256:current-media",
-        "rerelease_request_id": None,
-        "rerelease_authorization_revision": None,
+    request = _paired_release_request()
+    gameplay_identity = {
+        "version": "gameplay_surround_v1",
+        "variant_id": "gameplay_surround_v1",
+        "render_fingerprint": f"sha256:{'2' * 64}",
+        "rerelease_request_id": request["request_id"],
+        "rerelease_authorization_revision": request["revision"],
+    }
+    clean_identity = {
+        "version": "speaker_panels_v1",
+        "variant_id": "speaker_panels_v1",
+        "render_fingerprint": f"sha256:{'4' * 64}",
+        "rerelease_request_id": request["request_id"],
+        "rerelease_authorization_revision": request["revision"],
     }
     (episode / "publish.json").write_text(
         json.dumps(
@@ -394,7 +534,7 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
                 "release_revision": "sha256:prior-aggregate-release",
                 "shorts": [
                     {
-                        **identity,
+                        **gameplay_identity,
                         "clip_id": "clip_01",
                         "status": "submitted",
                         "scheduled": True,
@@ -403,7 +543,7 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
                         "job_id": "job-video",
                     },
                     {
-                        **identity,
+                        **clean_identity,
                         "clip_id": "clip_01",
                         "status": "submitted",
                         "scheduled": True,
@@ -415,8 +555,29 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
             }
         )
     )
+
+    clip = _paired_variant_clip()
+    clip.update(
+        title="A current clip",
+        metadata={"youtube": {"title": "Canonical clip title"}},
+    )
+
+    async def paired_review(_episode_id):
+        return {
+            "enabled_destinations": [
+                {"key": "youtube"},
+                {"key": "instagram"},
+                {"key": "x"},
+            ],
+            "longform": {
+                "canonical_render": {"current": True},
+                "approval": {"current": True},
+            },
+            "clips": [clip],
+        }
+
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "review_state", paired_review)
     monkeypatch.setattr(schedule, "_load_config", dict)
     monkeypatch.setattr(
         schedule,
@@ -428,9 +589,11 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
                 "blockers": [],
                 "short_versions": {
                     "clip_01": {
-                        "version": "background_motion_v1",
-                        "variant_id": "background_motion_v1",
-                        "render_fingerprint": "sha256:current-media",
+                        "version": "gameplay_surround_v1",
+                        "variant_id": "gameplay_surround_v1",
+                        "render_fingerprint": f"sha256:{'2' * 64}",
+                        "current": True,
+                        "re_release_request": request,
                     }
                 },
             }
@@ -449,6 +612,10 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
     assert [item["destinations"] for item in items] == [
         ["youtube", "tiktok"],
         ["x"],
+    ]
+    assert [item["variant_id"] for item in items] == [
+        "gameplay_surround_v1",
+        "speaker_panels_v1",
     ]
     assert [item["artifact_current"] for item in items] == [True, True]
 

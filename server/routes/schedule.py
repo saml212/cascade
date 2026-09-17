@@ -10,6 +10,10 @@ from fastapi import APIRouter, HTTPException
 
 from agents.qa import current_funnel_urls_for_episode, quality_snapshot
 from lib.paths import get_episodes_dir
+from lib.short_variants import (
+    DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    normalize_destination_distribution_targets,
+)
 from server.routes.review import review_state
 
 router = APIRouter(prefix="/api", tags=["schedule"])
@@ -182,7 +186,7 @@ def _receipt_state(receipt: dict) -> str | None:
 
 
 def _receipt_artifact_current(receipt: dict, version: object) -> bool | None:
-    """Compare a complete receipt identity with the selected short artifact."""
+    """Compare a complete receipt identity with its current short artifact."""
     fields = ("version", "variant_id", "render_fingerprint")
     if not isinstance(version, dict) or not all(
         field in receipt and field in version for field in fields
@@ -223,7 +227,87 @@ def _receipt_artifact_current(receipt: dict, version: object) -> bool | None:
             or (identity[3] is None) != (identity[4] is None)
         ):
             return None
-    return actual == expected
+    current = version.get("current", True)
+    if not isinstance(current, bool):
+        return None
+    return current and actual == expected
+
+
+def _release_request_targets_artifact(request: dict, version: dict) -> bool:
+    """Return whether one release request binds this exact variant render."""
+    if request.get("schema") == DESTINATION_DISTRIBUTION_RELEASE_SCHEMA:
+        targets = normalize_destination_distribution_targets(request.get("targets"))
+        target = next(
+            (
+                item
+                for item in targets or []
+                if item["variant_id"] == version["variant_id"]
+            ),
+            None,
+        )
+        return bool(
+            target and target["render_fingerprint"] == version["render_fingerprint"]
+        )
+    return (
+        request.get("variant_id") == version["variant_id"]
+        and request.get("render_fingerprint") == version["render_fingerprint"]
+    )
+
+
+def _receipt_artifact_version(
+    receipt: dict, clip: dict, selected_version: object
+) -> dict | None:
+    """Resolve the current render for the variant named by a receipt."""
+    identity = (receipt.get("version"), receipt.get("variant_id"))
+    if isinstance(selected_version, dict) and identity == (
+        selected_version.get("version"),
+        selected_version.get("variant_id"),
+    ):
+        return selected_version
+
+    version, variant_id = identity
+    if (
+        not isinstance(version, str)
+        or not version
+        or (variant_id is not None and not isinstance(variant_id, str))
+    ):
+        return None
+    review = clip.get("review") if isinstance(clip, dict) else None
+    if not isinstance(review, dict):
+        return None
+    if variant_id is None:
+        if version != "base":
+            return None
+        render = review.get("render")
+    else:
+        if version != variant_id:
+            return None
+        variants = review.get("variants")
+        state = variants.get(variant_id) if isinstance(variants, dict) else None
+        render = state.get("render") if isinstance(state, dict) else None
+    if not isinstance(render, dict):
+        return None
+
+    candidate = {
+        "version": version,
+        "variant_id": variant_id,
+        "render_fingerprint": render.get("fingerprint"),
+        "current": render.get("current") is True,
+    }
+    distribution = review.get("distribution")
+    request = (
+        distribution.get("re_release_request")
+        if isinstance(distribution, dict)
+        else None
+    )
+    if request is not None:
+        if not isinstance(request, dict):
+            candidate["current"] = False
+        else:
+            candidate["re_release_request"] = request
+            if not _release_request_targets_artifact(request, candidate):
+                candidate["current"] = False
+    return candidate
 
 
 def _release_gate(ep_dir: Path, config: dict) -> dict:
@@ -371,7 +455,10 @@ async def _get_approved_items(
                 request_id=receipt.get("request_id"),
                 error=receipt.get("error"),
                 artifact_current=_receipt_artifact_current(
-                    receipt, short_versions.get(clip_id)
+                    receipt,
+                    _receipt_artifact_version(
+                        receipt, clip, short_versions.get(clip_id)
+                    ),
                 ),
             )
             items.append(item)
