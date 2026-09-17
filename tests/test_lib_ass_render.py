@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from lib.ass import CaptionPlacement, CaptionStyle, generate_ass_from_diarized
@@ -127,6 +128,80 @@ def _ffprobe_video(path: Path) -> dict:
 
 
 class TestEndToEndRender:
+    def test_gameplay_word_wrap_raster_stays_inside_center_panel(self, tmp_path):
+        captions = tmp_path / "gameplay-wrap.ass"
+        diarized = {
+            "utterances": [
+                {
+                    "speaker": 0,
+                    "words": [
+                        {
+                            "word": word,
+                            "start": start,
+                            "end": start + 0.2,
+                            "speaker": 0,
+                        }
+                        for word, start in (
+                            ("essentially", 0.0),
+                            ("indefinitely,", 0.2),
+                            ("limited", 0.4),
+                        )
+                    ],
+                }
+            ]
+        }
+        generate_ass_from_diarized(
+            diarized,
+            0,
+            1,
+            captions,
+            CaptionStyle(
+                font_size=52,
+                margin_l=300,
+                margin_r=300,
+                margin_v=840,
+                max_raster_width_px=534,
+            ),
+            speaker_targets={0: "speaker_0"},
+            speaker_placements={"speaker_0": CaptionPlacement(540, 508)},
+        )
+        assert r"essentially\Nindefinitely, limited" in captions.read_text()
+
+        process = subprocess.run(
+            [
+                FFMPEG,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x00FF00:s=1080x1920:r=10:d=1",
+                "-ss",
+                "0.3",
+                "-vf",
+                f"subtitles='{escape_srt_path(captions)}',format=gray",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        frame = np.frombuffer(process.stdout, dtype=np.uint8).reshape(1920, 1080)
+        background = int(frame[0, 0])
+        ys, xs = np.where(np.abs(frame.astype(np.int16) - background) > 3)
+        assert len(xs)
+        assert int(xs.min()) >= 273
+        assert int(xs.max()) <= 806
+        # A two-speaker gameplay layout gives this anchor the first panel,
+        # whose unobscured vertical span is y=75..640.
+        assert int(ys.min()) >= 75
+        assert int(ys.max()) <= 640
+
     def test_libass_accepts_generated_ass(self, tmp_path):
         # Step 1: synthetic input video
         video = tmp_path / "src.mp4"

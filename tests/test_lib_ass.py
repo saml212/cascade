@@ -9,15 +9,19 @@ test_lib_ass_render.py — kept separate because it requires ffmpeg.
 import pytest
 
 from lib.ass import (
+    GAMEPLAY_CAPTION_MAX_RASTER_WIDTH_PX,
     CaptionPlacement,
     CaptionStyle,
     build_ass,
+    caption_line_raster_width,
+    caption_width_wrap_policy,
     escape_ass_text,
     fmt_ass_time,
     generate_ass_from_diarized,
     group_words_into_phrases,
     requires_single_lane_caption_timing,
     resolve_caption_speaker_targets,
+    wrap_caption_text,
 )
 from lib.timeline import Timeline, rebase_diarized
 
@@ -257,6 +261,63 @@ class TestBuildAss:
         assert "[Events]" in ass
         # No Dialogue: lines
         assert "Dialogue:" not in ass
+
+    def test_width_bounded_style_wraps_only_overflowing_text(self):
+        style = CaptionStyle(
+            font_size=52,
+            margin_l=300,
+            margin_r=300,
+            max_raster_width_px=GAMEPLAY_CAPTION_MAX_RASTER_WIDTH_PX,
+        )
+        phrases = [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "essentially indefinitely, limited",
+                "speaker": 0,
+            },
+            {"start": 1.0, "end": 2.0, "text": "submarine to stay", "speaker": 0},
+        ]
+
+        ass = build_ass(phrases, style)
+
+        assert "essentially\\Nindefinitely, limited" in ass
+        assert "submarine to stay" in ass
+        assert caption_line_raster_width(phrases[0]["text"], style) > 534
+        assert wrap_caption_text(phrases[1]["text"], style) == phrases[1]["text"]
+
+    def test_width_bounded_style_rejects_unbreakable_overflow(self):
+        style = CaptionStyle(font_size=52, max_raster_width_px=40)
+
+        with pytest.raises(ValueError, match="word boundaries"):
+            wrap_caption_text("unbreakable", style)
+
+    def test_width_policy_is_absent_until_a_cue_changes(self):
+        style = CaptionStyle(font_size=52, max_raster_width_px=534)
+        safe = {"utterances": [{"speaker": 0, "words": [_word("short", 0.0, 0.4)]}]}
+        overflow = {
+            "utterances": [
+                {
+                    "speaker": 0,
+                    "words": [
+                        _word("essentially", 0.0, 0.4),
+                        _word("indefinitely,", 0.4, 0.8),
+                        _word("limited", 0.8, 1.2),
+                    ],
+                }
+            ]
+        }
+
+        assert caption_width_wrap_policy(safe, 0, 1, style) is None
+        policy = caption_width_wrap_policy(overflow, 0, 2, style)
+        assert policy == {
+            "version": "gameplay-center-word-wrap/v1",
+            "max_raster_width_px": 534,
+            "metric": "coretext-helvetica-bold-libass-scale/v1",
+            "changed_cue_count": 1,
+            "changed_cues_revision": policy["changed_cues_revision"],
+        }
+        assert policy["changed_cues_revision"].startswith("sha256:")
 
 
 # ── end-to-end: diarized → file ─────────────────────────────────────────────

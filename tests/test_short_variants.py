@@ -45,6 +45,7 @@ from lib.short_variants import (
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
+    gameplay_caption_width_policy,
     load_background_asset,
     load_background_variant_asset,
     normalize_destination_distribution_targets,
@@ -365,7 +366,10 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         "probe",
         lambda path: {"format": {"duration": "1" if Path(path) == base else "180"}},
     )
-    base_record = {"fingerprint": "sha256:base"}
+    base_record = {
+        "fingerprint": "sha256:base",
+        "clip_source_intervals": [[0, 1]],
+    }
     base_identity = file_content_identity(base)["scan_identity"]
     encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
     fingerprint = background_variant_fingerprint(
@@ -521,6 +525,40 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
     assert restored["current"] is True
+
+    transcript_path = episode_dir / "diarized_transcript.json"
+    safe_transcript = json.loads(transcript_path.read_text())
+    overflow = deepcopy(safe_transcript)
+    overflow["utterances"] = [
+        {
+            "speaker": 5,
+            "words": [
+                {
+                    "word": word,
+                    "start": start,
+                    "end": start + 0.2,
+                    "speaker": 5,
+                }
+                for word, start in (
+                    ("essentially", 0.1),
+                    ("indefinitely,", 0.3),
+                    ("limited", 0.5),
+                )
+            ],
+        }
+    ]
+    transcript_path.write_text(json.dumps(overflow))
+    _, width_policy_changed = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert width_policy_changed["current"] is False
+    assert "width-wrap policy changed" in width_policy_changed["detail"]
+    transcript_path.write_text(json.dumps(safe_transcript))
+
     override_path.write_text("null")
     _, malformed_override = background_variant_state(
         episode_dir,
@@ -533,7 +571,6 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
     assert "must be a mapping" in malformed_override["detail"]
     override_path.unlink()
 
-    transcript_path = episode_dir / "diarized_transcript.json"
     transcript = json.loads(transcript_path.read_text())
     transcript["speaker_map"][0]["mapping_confidence"] = 0.9
     transcript_path.write_text(json.dumps(transcript))
@@ -731,6 +768,74 @@ def test_clean_no_neutral_caption_keeps_v1_context_and_fingerprint(tmp_path):
     )
     assert fingerprint == (
         "sha256:38c75dbad8c13d025a548264bb1cd8510b43f4effcad9055da9bbe9b49718948"
+    )
+
+
+def test_gameplay_width_policy_changes_only_overflowing_caption_context(tmp_path):
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    episode, safe_diarized, segments = _write_gameplay_caption_context(episode_dir)
+    legacy_context = speaker_panel_caption_context_revision(
+        episode_dir,
+        episode=episode,
+        diarized=safe_diarized,
+        segment_document=segments,
+    )
+
+    safe_policy = gameplay_caption_width_policy(
+        safe_diarized,
+        segments,
+        episode["crop_config"],
+        [(0, 1)],
+    )
+    assert safe_policy is None
+    assert (
+        speaker_panel_caption_context_revision(
+            episode_dir,
+            episode=episode,
+            diarized=safe_diarized,
+            segment_document=segments,
+            caption_width_policy=safe_policy,
+        )
+        == legacy_context
+    )
+
+    overflow = deepcopy(safe_diarized)
+    overflow["utterances"] = [
+        {
+            "speaker": 5,
+            "words": [
+                {
+                    "word": word,
+                    "start": start,
+                    "end": start + 0.2,
+                    "speaker": 5,
+                }
+                for word, start in (
+                    ("essentially", 0.1),
+                    ("indefinitely,", 0.3),
+                    ("limited", 0.5),
+                )
+            ],
+        }
+    ]
+    width_policy = gameplay_caption_width_policy(
+        overflow,
+        segments,
+        episode["crop_config"],
+        [(0, 1)],
+    )
+    assert width_policy is not None
+    assert width_policy["changed_cue_count"] == 1
+    assert (
+        speaker_panel_caption_context_revision(
+            episode_dir,
+            episode=episode,
+            diarized=overflow,
+            segment_document=segments,
+            caption_width_policy=width_policy,
+        )
+        != legacy_context
     )
 
 

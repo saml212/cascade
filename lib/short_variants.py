@@ -13,7 +13,15 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from lib.ass import caption_ranges_use_target, resolve_caption_speaker_targets
+from lib.ass import (
+    GAMEPLAY_CAPTION_MAX_RASTER_WIDTH_PX,
+    GAMEPLAY_CAPTION_METRIC,
+    GAMEPLAY_CAPTION_WRAP_VERSION,
+    CaptionStyle,
+    caption_ranges_use_target,
+    caption_width_wrap_policy,
+    resolve_caption_speaker_targets,
+)
 from lib.atomic_write import atomic_write_json
 from lib.caption_speaker_overrides import (
     apply_current_caption_speaker_overrides,
@@ -27,7 +35,7 @@ from lib.gameplay_playback import (
     require_resolved_gameplay_playback,
     resolve_gameplay_asset_playback,
 )
-from lib.timeline import Timeline
+from lib.timeline import Timeline, rebase_diarized
 
 BACKGROUND_VARIANT_ID = "background_motion_v1"
 SATISFYING_VARIANT_ID = "satisfying_motion_v1"
@@ -41,6 +49,9 @@ BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 GAMEPLAY_SURROUND_VARIANT_MODE = "podcast_gameplay_surround_v1"
 GAMEPLAY_SURROUND_LAYOUT_VERSION = "gameplay-surround/v1"
 GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION = "source-speaker-panel/v1"
+GAMEPLAY_CAPTION_FONT_SIZE = 52
+GAMEPLAY_CAPTION_FALLBACK_FONT_SIZE = 24
+GAMEPLAY_CAPTION_MARGIN_H = 300
 SPEAKER_PANELS_VARIANT_MODE = "podcast_speaker_panels_v1"
 SPEAKER_PANELS_LAYOUT_VERSION = "speaker-panels/v1"
 SPEAKER_PANEL_CAPTION_CONTEXT_VERSION = "speaker-panel-effective/v1"
@@ -88,6 +99,18 @@ CLEAN_NEUTRAL_HEADER_POLICY = {
     "font_size_px": 48,
     "background_box": [0, 0, 1080, 72],
 }
+
+
+def gameplay_caption_style() -> CaptionStyle:
+    """Return the shared width-bounded style for gameplay captions."""
+    return CaptionStyle(
+        font_size=GAMEPLAY_CAPTION_FONT_SIZE,
+        margin_l=GAMEPLAY_CAPTION_MARGIN_H,
+        margin_r=GAMEPLAY_CAPTION_MARGIN_H,
+        max_raster_width_px=GAMEPLAY_CAPTION_MAX_RASTER_WIDTH_PX,
+    )
+
+
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
@@ -673,6 +696,7 @@ def speaker_panel_caption_context_revision(
     segment_document: dict | None = None,
     caption_speaker_overrides: dict | None = None,
     neutral_header_policy: dict | None = None,
+    caption_width_policy: dict | None = None,
 ) -> str:
     """Fingerprint inputs unique to speaker-panel caption placement."""
 
@@ -724,6 +748,21 @@ def speaker_panel_caption_context_revision(
         if neutral_header_policy != CLEAN_NEUTRAL_HEADER_POLICY:
             raise ValueError("Unsupported clean neutral-header caption policy")
         state["neutral_header_policy"] = CLEAN_NEUTRAL_HEADER_POLICY
+    if caption_width_policy is not None:
+        if (
+            caption_width_policy.get("version") != GAMEPLAY_CAPTION_WRAP_VERSION
+            or caption_width_policy.get("max_raster_width_px")
+            != GAMEPLAY_CAPTION_MAX_RASTER_WIDTH_PX
+            or caption_width_policy.get("metric") != GAMEPLAY_CAPTION_METRIC
+            or not isinstance(caption_width_policy.get("changed_cue_count"), int)
+            or isinstance(caption_width_policy.get("changed_cue_count"), bool)
+            or caption_width_policy["changed_cue_count"] <= 0
+            or not _SHA256.fullmatch(
+                str(caption_width_policy.get("changed_cues_revision", ""))
+            )
+        ):
+            raise ValueError("Unsupported gameplay caption width policy")
+        state["caption_width_policy"] = caption_width_policy
     return _json_revision(state)
 
 
@@ -759,12 +798,45 @@ def speaker_panel_neutral_header_policy(
     return None
 
 
+def gameplay_caption_width_policy(
+    diarized: dict,
+    segment_document: dict,
+    crop_config: dict,
+    source_intervals: object,
+) -> dict | None:
+    """Fingerprint only clips whose gameplay captions require word wrapping."""
+    if not isinstance(source_intervals, (list, tuple)):
+        raise TypeError("Gameplay caption width policy needs clip source intervals")
+    intervals = []
+    for interval in source_intervals:
+        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+            raise TypeError("Gameplay caption width policy has malformed intervals")
+        start, end = float(interval[0]), float(interval[1])
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError("Gameplay caption width policy has invalid intervals")
+        intervals.append((start, end))
+    if not intervals:
+        raise ValueError("Gameplay caption width policy needs clip source intervals")
+    timeline = Timeline(max(end for _, end in intervals), intervals)
+    captions = rebase_diarized(diarized, timeline)
+    return caption_width_wrap_policy(
+        captions,
+        0,
+        timeline.duration,
+        gameplay_caption_style(),
+        speaker_targets=resolve_caption_speaker_targets(
+            captions, segment_document, crop_config
+        ),
+        fallback_font_size=GAMEPLAY_CAPTION_FALLBACK_FONT_SIZE,
+    )
+
+
 def _current_speaker_panel_caption_state(
     episode_dir: Path,
     clip_id: str,
     variant_id: str,
     base_record: dict,
-) -> tuple[str, dict | None, dict | None]:
+) -> tuple[str, dict | None, dict | None, dict | None]:
     def load_document(filename: str) -> dict:
         try:
             value = json.loads((Path(episode_dir) / filename).read_text())
@@ -806,6 +878,16 @@ def _current_speaker_panel_caption_state(
         crop_config,
         base_record.get("clip_source_intervals"),
     )
+    caption_width_policy = (
+        gameplay_caption_width_policy(
+            diarized,
+            segment_document,
+            crop_config,
+            base_record.get("clip_source_intervals"),
+        )
+        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        else None
+    )
     revision = speaker_panel_caption_context_revision(
         Path(episode_dir),
         episode=episode,
@@ -813,8 +895,9 @@ def _current_speaker_panel_caption_state(
         segment_document=segment_document,
         caption_speaker_overrides=binding,
         neutral_header_policy=neutral_header_policy,
+        caption_width_policy=caption_width_policy,
     )
-    return revision, binding, neutral_header_policy
+    return revision, binding, neutral_header_policy, caption_width_policy
 
 
 def require_speaker_panel_caption_context_revision(value: object) -> str:
@@ -1030,11 +1113,13 @@ def background_variant_state(
                 )
             caption_speaker_overrides = None
             neutral_header_policy = None
+            caption_width_policy = None
             if variant_id in SPEAKER_PANEL_VARIANT_IDS:
                 (
                     caption_context_revision,
                     caption_speaker_overrides,
                     neutral_header_policy,
+                    caption_width_policy,
                 ) = _current_speaker_panel_caption_state(
                     episode_dir,
                     clip_id,
@@ -1059,6 +1144,11 @@ def background_variant_state(
                 if isinstance(recorded_captions, dict)
                 else None
             )
+            recorded_caption_width_policy = (
+                recorded_captions.get("width_policy")
+                if isinstance(recorded_captions, dict)
+                else None
+            )
             if base_record.get("fingerprint") != recorded_base.get(
                 "fingerprint"
             ) or base_identity != recorded_base.get("scan_identity"):
@@ -1078,11 +1168,13 @@ def background_variant_state(
                 recorded_caption_context != caption_context_revision
                 or recorded_caption_speaker_overrides != caption_speaker_overrides
                 or recorded_neutral_header_policy != neutral_header_policy
+                or recorded_caption_width_policy != caption_width_policy
             ):
                 stale_detail = (
                     "The speaker bindings or panel anchors changed for speaker-panel "
-                    "captions, reviewed word attribution changed, or the neutral-caption "
-                    "policy changed after this variant was rendered."
+                    "captions, reviewed word attribution changed, the neutral-caption "
+                    "policy changed, or the gameplay width-wrap policy changed after "
+                    "this variant was rendered."
                 )
             else:
                 expected = background_variant_fingerprint(

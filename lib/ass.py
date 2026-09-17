@@ -24,10 +24,15 @@ ffmpeg, the ASS format is plain text, and the only operation we need is
 python-ass or pysubs2 would be more dependency than code.
 """
 
+import hashlib
+import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from itertools import pairwise
 from pathlib import Path
+
+from PIL import ImageFont
 
 # ── styling defaults ────────────────────────────────────────────────────────
 
@@ -74,6 +79,12 @@ MAX_PHRASE_DURATION = 2.5
 
 CAPTION_SINGLE_LANE_VERSION = "single-lane/v1"
 CAPTION_EVENT_GAP_SECONDS = 0.02
+GAMEPLAY_CAPTION_WRAP_VERSION = "gameplay-center-word-wrap/v1"
+GAMEPLAY_CAPTION_MAX_RASTER_WIDTH_PX = 534
+GAMEPLAY_CAPTION_METRIC = "coretext-helvetica-bold-libass-scale/v1"
+_LIBASS_HELVETICA_METRIC_SCALE = 0.0836
+_CAPTION_METRIC_OVERSAMPLE = 10
+_HELVETICA_FONT = Path("/System/Library/Fonts/Helvetica.ttc")
 
 
 @dataclass
@@ -94,6 +105,7 @@ class CaptionStyle:
     play_res_x: int = DEFAULT_PLAY_RES_X
     play_res_y: int = DEFAULT_PLAY_RES_Y
     bold: bool = True
+    max_raster_width_px: int | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +229,74 @@ def escape_ass_text(text: str) -> str:
         .replace("}", "\\}")
         .replace("\n", "\\N")
     )
+
+
+@lru_cache(maxsize=16)
+def _caption_metric_font(
+    font: str, font_size: int, bold: bool
+) -> ImageFont.FreeTypeFont:
+    """Load the exact CoreText face used by production libass renders.
+
+    libass rasterizes Helvetica at 83.6% of the nominal ASS point size on the
+    declared 1080x1920 canvas. Measuring an oversampled face and applying that
+    scale matches the production raster while keeping this decision available
+    before an expensive video render.
+    """
+    if font != DEFAULT_FONT or not _HELVETICA_FONT.is_file():
+        raise ValueError("Width-bounded captions require macOS Helvetica")
+    return ImageFont.truetype(
+        str(_HELVETICA_FONT),
+        font_size * _CAPTION_METRIC_OVERSAMPLE,
+        index=1 if bold else 0,
+    )
+
+
+def caption_line_raster_width(text: str, style: CaptionStyle) -> int:
+    """Estimate the full libass glyph-and-outline raster width in pixels."""
+    if "\n" in text:
+        return max(caption_line_raster_width(line, style) for line in text.split("\n"))
+    font = _caption_metric_font(style.font, style.font_size, style.bold)
+    glyph_width = round(font.getlength(text) * _LIBASS_HELVETICA_METRIC_SCALE)
+    return glyph_width + style.outline * 2
+
+
+def wrap_caption_text(text: str, style: CaptionStyle) -> str:
+    """Wrap an overflowing caption at one word boundary without shrinking it."""
+    limit = style.max_raster_width_px
+    if limit is None:
+        return text
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError("Caption raster width must be a positive integer")
+
+    wrapped_lines = []
+    for line in text.split("\n"):
+        if caption_line_raster_width(line, style) <= limit:
+            wrapped_lines.append(line)
+            continue
+        words = line.split()
+        candidates = []
+        for index in range(1, len(words)):
+            left = " ".join(words[:index])
+            right = " ".join(words[index:])
+            left_width = caption_line_raster_width(left, style)
+            right_width = caption_line_raster_width(right, style)
+            if left_width <= limit and right_width <= limit:
+                candidates.append(
+                    (
+                        max(left_width, right_width),
+                        abs(left_width - right_width),
+                        index,
+                        left,
+                        right,
+                    )
+                )
+        if not candidates:
+            raise ValueError(
+                f"Caption cannot fit {limit}px at word boundaries: {line!r}"
+            )
+        _, _, _, left, right = min(candidates)
+        wrapped_lines.extend((left, right))
+    return "\n".join(wrapped_lines)
 
 
 # ── phrase grouping ─────────────────────────────────────────────────────────
@@ -435,6 +515,68 @@ def group_words_into_phrases(
     return phrases
 
 
+def caption_width_wrap_policy(
+    diarized: dict,
+    start: float,
+    end: float,
+    style: CaptionStyle,
+    *,
+    speaker_targets: Mapping[object, str] | None = None,
+    fallback_target: str = "BOTH",
+    fallback_font_size: int | None = None,
+) -> dict | None:
+    """Return a fingerprintable policy only when this clip needs wrapping."""
+    words = _extract_words_in_range(diarized, start, end)
+    phrases = group_words_into_phrases(
+        words,
+        clip_start=start,
+        words_per_phrase=style.words_per_phrase,
+        preserve_reviewed_panel_overlaps=(
+            diarized.get("_caption_text_replacements_applied")
+            == "cascade.short-caption-speaker-overrides/v2"
+            and speaker_targets is not None
+        ),
+    )
+    changed = []
+    for ordinal, phrase in enumerate(phrases, 1):
+        phrase_style = style
+        if (
+            speaker_targets is not None
+            and fallback_font_size is not None
+            and speaker_targets.get(phrase.get("speaker"), fallback_target)
+            == fallback_target
+        ):
+            phrase_style = replace(style, font_size=fallback_font_size)
+        wrapped = wrap_caption_text(phrase["text"], phrase_style)
+        if wrapped == phrase["text"]:
+            continue
+        changed.append(
+            {
+                "ordinal": ordinal,
+                "start": round(float(phrase["start"]), 6),
+                "end": round(float(phrase["end"]), 6),
+                "text": phrase["text"],
+                "wrapped_text": wrapped,
+                "font_size": phrase_style.font_size,
+            }
+        )
+    if not changed:
+        return None
+    changed_revision = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(changed, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    return {
+        "version": GAMEPLAY_CAPTION_WRAP_VERSION,
+        "max_raster_width_px": style.max_raster_width_px,
+        "metric": GAMEPLAY_CAPTION_METRIC,
+        "changed_cue_count": len(changed),
+        "changed_cues_revision": changed_revision,
+    }
+
+
 def requires_single_lane_caption_timing(
     diarized: dict, start: float, end: float
 ) -> bool:
@@ -510,8 +652,11 @@ def build_ass(phrases: Iterable[dict], style: CaptionStyle | None = None) -> str
 
     lines = [header]
     for ph in phrases:
-        text = escape_ass_text(ph["text"])
         placement = ph.get("placement")
+        phrase_style = style
+        if isinstance(placement, CaptionPlacement) and placement.font_size is not None:
+            phrase_style = replace(style, font_size=placement.font_size)
+        text = escape_ass_text(wrap_caption_text(ph["text"], phrase_style))
         layer = 0
         if placement is not None:
             if not isinstance(placement, CaptionPlacement):

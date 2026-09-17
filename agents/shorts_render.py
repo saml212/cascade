@@ -73,6 +73,8 @@ from lib.short_variants import (
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
+    gameplay_caption_style,
+    gameplay_caption_width_policy,
     load_background_asset,
     load_background_variant_asset,
     record_background_variant,
@@ -239,6 +241,7 @@ class ShortsRenderAgent(BaseAgent):
         caption_context_revision = None
         caption_speaker_overrides = None
         neutral_header_policy = None
+        caption_width_policy = None
         if variant_id in SPEAKER_PANEL_VARIANT_IDS:
             diarized = current_diarized_transcript(
                 self.episode_dir, episode, self.config
@@ -261,6 +264,16 @@ class ShortsRenderAgent(BaseAgent):
                 episode.get("crop_config") or {},
                 timeline.keep_intervals,
             )
+            caption_width_policy = (
+                gameplay_caption_width_policy(
+                    diarized,
+                    segment_document,
+                    episode.get("crop_config") or {},
+                    timeline.keep_intervals,
+                )
+                if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                else None
+            )
             caption_context_revision = speaker_panel_caption_context_revision(
                 self.episode_dir,
                 episode=episode,
@@ -268,6 +281,7 @@ class ShortsRenderAgent(BaseAgent):
                 segment_document=segment_document,
                 caption_speaker_overrides=caption_speaker_overrides,
                 neutral_header_policy=neutral_header_policy,
+                caption_width_policy=caption_width_policy,
             )
         fingerprint = background_variant_fingerprint(
             base_record,
@@ -341,6 +355,7 @@ class ShortsRenderAgent(BaseAgent):
                         "caption_context_revision": caption_context_revision,
                         "caption_speaker_overrides": caption_speaker_overrides,
                         "neutral_header_policy": neutral_header_policy,
+                        "caption_width_policy": caption_width_policy,
                     },
                     segment_document=segment_document,
                 )
@@ -1261,6 +1276,11 @@ class ShortsRenderAgent(BaseAgent):
                         if background.get("neutral_header_policy") is not None
                         else {}
                     ),
+                    **(
+                        {"width_policy": background["caption_width_policy"]}
+                        if background.get("caption_width_policy") is not None
+                        else {}
+                    ),
                 },
                 variant_id=background["variant_id"],
             )
@@ -1372,12 +1392,9 @@ class ShortsRenderAgent(BaseAgent):
     @staticmethod
     def _caption_style(background: dict | None) -> CaptionStyle:
         if background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID:
-            return CaptionStyle(
-                font_size=52,
-                margin_l=300,
-                margin_r=300,
-                margin_v=BACKGROUND_CAPTION_MARGIN_V,
-            )
+            style = gameplay_caption_style()
+            style.margin_v = BACKGROUND_CAPTION_MARGIN_V
+            return style
         if background and background.get("variant_id") == SPEAKER_PANELS_VARIANT_ID:
             return CaptionStyle(font_size=64, margin_l=60, margin_r=60)
         if background:
