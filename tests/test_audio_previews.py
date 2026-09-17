@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agents.transcribe import export_logical_track_window
+from lib.ffprobe import get_duration
 from server.routes import episodes
 
 
@@ -175,22 +176,7 @@ def test_preview_entirely_before_source_renders_only_silence(tmp_path):
         tracks=[{"dest_path": str(source), "duration_seconds": 20}],
     )
 
-    duration = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert float(duration.stdout) == pytest.approx(5, abs=0.1)
+    assert get_duration(output) == pytest.approx(5, abs=0.1)
 
 
 @pytest.mark.parametrize(
