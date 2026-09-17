@@ -955,6 +955,15 @@ class TestReceiptTerminalEvidence:
             is None
         )
 
+        malformed = self._response()
+        malformed["results"].append("not-a-provider-result")
+        assert (
+            terminal_destinations_from_status(
+                self._receipt(), malformed, profile_username="account-a"
+            )
+            is None
+        )
+
     @pytest.mark.parametrize(
         "change",
         (

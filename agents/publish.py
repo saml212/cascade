@@ -205,6 +205,26 @@ def _identity_evidence(expected: dict[str, str], observed: object) -> tuple[bool
     return matched, conflicting
 
 
+def _provider_result_items(
+    response: dict, *, strict: bool = True
+) -> list[tuple[str, dict]] | None:
+    results = response.get("results")
+    if not results:
+        return []
+    if isinstance(results, dict):
+        items = list(results.items())
+    elif isinstance(results, list):
+        items = [
+            (str(item.get("platform", "")) if isinstance(item, dict) else "", item)
+            for item in results
+        ]
+    else:
+        return None
+    if strict and any(not isinstance(item, dict) for _, item in items):
+        return None
+    return [(str(platform), item) for platform, item in items if isinstance(item, dict)]
+
+
 def status_identity_conflicts(
     receipt: dict,
     response: object,
@@ -215,11 +235,10 @@ def status_identity_conflicts(
     identity = _provider_identity(receipt)
     if not identity or not isinstance(response, dict):
         return False
-    values = response.get("results")
-    items = list(values.values()) if isinstance(values, dict) else values
     observed = [response]
-    if isinstance(items, list):
-        observed.extend(item for item in items if isinstance(item, dict))
+    observed.extend(
+        item for _, item in _provider_result_items(response, strict=False) or []
+    )
     top_matches, _ = _identity_evidence(identity, response)
     for index, item in enumerate(observed):
         matches, conflicting = _identity_evidence(identity, item)
@@ -324,6 +343,21 @@ def _rerelease_receipt_fields(request):
     if acknowledgement is not None:
         fields["unresolved_history_acknowledgement"] = acknowledgement
     return fields
+
+
+def _short_receipt_identity(clip_id, version, identity, platforms):
+    return {
+        "clip_id": clip_id,
+        "platforms": platforms,
+        "request_id": identity,
+        "external_id": identity,
+        "idempotency_key": identity,
+        "version": version["version"],
+        "variant_id": version["variant_id"],
+        "render_fingerprint": version["render_fingerprint"],
+        "approval_revision": version["revision"],
+        **_rerelease_receipt_fields(version.get("re_release_request")),
+    }
 
 
 def _destination_request_fields(receipt):
@@ -475,16 +509,11 @@ def short_destination_copy(
         result["youtube"] = {
             "title": str(source.get("title") or title),
             "description": description,
-            **(
-                {
-                    "first_comment": _build_first_comment(
-                        youtube_url, spotify_url, channel_handle
-                    )
-                }
-                if youtube_url
-                else {}
-            ),
         }
+        if youtube_url:
+            result["youtube"]["first_comment"] = _build_first_comment(
+                youtube_url, spotify_url, channel_handle
+            )
     for destination in ("tiktok", "instagram"):
         if destination not in destinations:
             continue
@@ -886,11 +915,10 @@ def status_response_has_unresolved_work(response: object) -> bool:
     """Deny history fallback while exact provider status remains uncertain."""
     if not isinstance(response, dict) or not response:
         return True
-    results = response.get("results")
-    items = list(results.values()) if isinstance(results, dict) else results
     evidence = [response]
-    if isinstance(items, list):
-        evidence.extend(item for item in items if isinstance(item, dict))
+    evidence.extend(
+        item for _, item in _provider_result_items(response, strict=False) or []
+    )
     return any(_provider_result_has_unresolved_work(item) for item in evidence)
 
 
@@ -952,21 +980,11 @@ def terminal_destinations_from_status(
         return None
     identity = _provider_identity(receipt)
     results = response.get("results")
-    items: list[tuple[str, dict]] = []
-    if isinstance(results, dict):
-        if any(not isinstance(value, dict) for value in results.values()):
-            return None
-        items = [
-            (str(platform), value)
-            for platform, value in results.items()
-            if isinstance(value, dict)
-        ]
-    elif isinstance(results, list) and response.get("status") in {
-        "completed",
-        "failed",
-        "cancelled",
-    }:
-        if any(not isinstance(value, dict) for value in results):
+    items = _provider_result_items(response)
+    if items is None:
+        return None
+    if isinstance(results, list):
+        if response.get("status") not in {"completed", "failed", "cancelled"}:
             return None
         total = response.get("total")
         completed = response.get("completed")
@@ -976,11 +994,6 @@ def terminal_destinations_from_status(
             not isinstance(completed, int) or completed != total
         ):
             return None
-        items = [
-            (str(value.get("platform", "")), value)
-            for value in results
-            if isinstance(value, dict)
-        ]
     response_matches, response_conflicts = _identity_evidence(identity, response)
     if not identity or response_conflicts:
         return None
@@ -1099,8 +1112,7 @@ def short_receipt_history_revision(
             or receipt.get("rerelease_request_id") != exclude_request_id
         )
     ]
-    encoded = json.dumps(receipts, sort_keys=True, separators=(",", ":")).encode()
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return _document_revision(receipts)
 
 
 def _stable_receipt(receipt: dict) -> dict:
@@ -1480,6 +1492,7 @@ def _provider_status_is_queued(receipt: dict, status: dict, bound: list[dict]) -
     identity = _provider_identity(receipt)
     platforms = receipt.get("platforms")
     results = status.get("results")
+    items = _provider_result_items(status)
     if not (
         identity
         and all(status.get(field) == value for field, value in identity.items())
@@ -1489,14 +1502,11 @@ def _provider_status_is_queued(receipt: dict, status: dict, bound: list[dict]) -
         and platforms
         and len(platforms) == len(set(platforms))
         and isinstance(results, list)
-        and len(results) == len(platforms)
-        and all(isinstance(item, dict) for item in results)
-        and all(
-            isinstance(item.get("platform"), str) and item["platform"]
-            for item in results
-        )
-        and len({item["platform"] for item in results}) == len(results)
-        and {item["platform"] for item in results} == set(platforms)
+        and items is not None
+        and len(items) == len(platforms)
+        and all(platform for platform, _ in items)
+        and len({platform for platform, _ in items}) == len(items)
+        and {platform for platform, _ in items} == set(platforms)
         and type(status.get("total")) is int
         and status["total"] == len(platforms)
         and all(
@@ -1523,7 +1533,7 @@ def _provider_status_is_queued(receipt: dict, status: dict, bound: list[dict]) -
                 "error_message",
             )
         )
-        for item in results
+        for _, item in items
     )
 
 
@@ -1592,14 +1602,10 @@ def schedule_cancellation_provider_safe(
         ):
             return False, "Provider status conflicts with the scheduled receipt"
         top_match, _ = _identity_evidence(identity, status)
-        results = status.get("results")
-        children = (
-            list(results.values()) if isinstance(results, dict) else results or []
-        )
-        if not isinstance(children, list) or any(
-            not isinstance(item, dict) for item in children
-        ):
+        items = _provider_result_items(status)
+        if items is None:
             return False, "Provider status results are malformed"
+        children = [item for _, item in items]
         if not after_delete and any(
             item.get("profile_username") not in (None, profile_username)
             for item in [status, *children]
@@ -1998,7 +2004,6 @@ class PublishAgent(BaseAgent):
         co_schedule_ids = set()
         for clip_id in selected_ids:
             clip, version = by_id[clip_id], effective_versions[clip_id]
-            rerelease = version.get("re_release_request")
             target = _short_target_fields(clip_id, version)
             target_revision = _document_revision(target)
             identity = _destination_external_id(
@@ -2122,21 +2127,13 @@ class PublishAgent(BaseAgent):
                     + "; ".join(media_issues)
                 )
             intent = {
-                "clip_id": clip_id,
+                **_short_receipt_identity(clip_id, version, identity, destinations),
                 "status": "intent_recorded",
-                "platforms": destinations,
-                "request_id": identity,
-                "external_id": identity,
-                "idempotency_key": identity,
                 "scheduled": scheduled_at is not None,
                 "scheduled_date": (
                     scheduled_at.isoformat() if scheduled_at is not None else None
                 ),
                 "timezone": tz_name,
-                "version": version["version"],
-                "variant_id": version["variant_id"],
-                "render_fingerprint": version["render_fingerprint"],
-                "approval_revision": version["revision"],
                 "destination_schema": destination_schema,
                 "destination_episode_id": self.episode_dir.name,
                 "destination_profile_username": data["user"],
@@ -2148,7 +2145,6 @@ class PublishAgent(BaseAgent):
                 "destination_copy": copy,
                 "copy_schema": SHORT_COPY_SCHEMA,
                 "copy_revision": _document_revision(copy),
-                **_rerelease_receipt_fields(rerelease),
             }
             if destination_bindings:
                 intent["destination_bindings"] = destination_bindings
@@ -2537,17 +2533,21 @@ class PublishAgent(BaseAgent):
             and previous.get("external_id") in {identity, legacy_identity}
             and self._definitive_payload_rejection(previous)
         )
+
+        def reuse_previous():
+            return {
+                **previous,
+                "editorial_revision": longform_revision,
+                "reused_receipt": True,
+            }
+
         if (
             isinstance(previous, dict)
             and previous.get("external_id") in {identity, legacy_identity}
             and previous.get("status") in RECORDED_STATES
             and not retry_rejection
         ):
-            return {
-                **previous,
-                "editorial_revision": longform_revision,
-                "reused_receipt": True,
-            }
+            return reuse_previous()
 
         transport = self._verified_longform_transport(
             revision,
@@ -2556,11 +2556,7 @@ class PublishAgent(BaseAgent):
             approval_scope=approval_scope,
         )
         if retry_rejection and transport is None:
-            return {
-                **previous,
-                "editorial_revision": longform_revision,
-                "reused_receipt": True,
-            }
+            return reuse_previous()
         retry_rejection = retry_rejection and transport is not None
 
         path = self.episode_dir / "upload_video.mp4"
@@ -3076,18 +3072,11 @@ class PublishAgent(BaseAgent):
         if destination_target:
             result = {**destination_target, **result}
         result.update(
-            clip_id=clip_id,
-            platforms=platforms,
+            _short_receipt_identity(clip_id, version, identity, platforms),
             scheduled=scheduled_at is not None,
-            version=version["version"],
-            variant_id=version["variant_id"],
-            render_fingerprint=version["render_fingerprint"],
-            approval_revision=version["revision"],
             destination_copy=copy,
             copy_revision=_document_revision(copy),
         )
-        request = version.get("re_release_request")
-        result.update(_rerelease_receipt_fields(request))
         if scheduled_at:
             result.update(
                 scheduled_date=scheduled_at.isoformat(),
@@ -3141,6 +3130,19 @@ class PublishAgent(BaseAgent):
         return command
 
     @staticmethod
+    def _run_json_command(command):
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=35,
+            check=False,
+        )
+        if process.returncode:
+            raise ValueError(process.stderr.strip() or process.stdout.strip())
+        return json.loads(process.stdout)
+
+    @staticmethod
     def _provider_json(api_key: str, url: str, query: dict[str, str] | None = None):
         command = [
             "curl",
@@ -3157,13 +3159,7 @@ class PublishAgent(BaseAgent):
                 command += ["--data-urlencode", f"{key}={value}"]
         command.append(url)
         try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=35,
-                check=False,
-            )
+            response = PublishAgent._run_json_command(command)
         except subprocess.TimeoutExpired:
             raise RuntimeError(
                 "Upload-Post destination account check timed out; "
@@ -3174,16 +3170,14 @@ class PublishAgent(BaseAgent):
                 "Upload-Post destination account check could not run; "
                 "no shorts were submitted"
             ) from None
-        if process.returncode:
-            raise RuntimeError(
-                "Upload-Post rejected the destination account check; "
-                "no shorts were submitted"
-            )
-        try:
-            response = json.loads(process.stdout)
         except json.JSONDecodeError:
             raise RuntimeError(
                 "Upload-Post destination account response was not JSON; "
+                "no shorts were submitted"
+            ) from None
+        except ValueError:
+            raise RuntimeError(
+                "Upload-Post rejected the destination account check; "
                 "no shorts were submitted"
             ) from None
         if not isinstance(response, dict) or response.get("success") is not True:
@@ -3245,24 +3239,20 @@ class PublishAgent(BaseAgent):
                     "no shorts were submitted"
                 )
 
-        for platform in ("facebook", "linkedin"):
+        page_endpoints = {
+            "facebook": (FACEBOOK_PAGES_URL, FACEBOOK_PAGE_PIN_URL),
+            "linkedin": (LINKEDIN_PAGES_URL, LINKEDIN_PAGE_PIN_URL),
+        }
+        for platform, (pages_url, pin_url) in page_endpoints.items():
             binding = bindings.get(platform)
             if not binding:
                 continue
             discovery = self._provider_json(
-                api_key,
-                FACEBOOK_PAGES_URL if platform == "facebook" else LINKEDIN_PAGES_URL,
-                {"profile": profile_username},
+                api_key, pages_url, {"profile": profile_username}
             )
             pages = self._provider_target_rows(discovery, "pages", platform)
             pinned = self._provider_json(
-                api_key,
-                (
-                    FACEBOOK_PAGE_PIN_URL
-                    if platform == "facebook"
-                    else LINKEDIN_PAGE_PIN_URL
-                ),
-                {"profile_username": profile_username},
+                api_key, pin_url, {"profile_username": profile_username}
             )
             pinned_pages = self._provider_target_rows(pinned, "pages", platform)
             if "selected_page_id" not in pinned:
@@ -3282,13 +3272,9 @@ class PublishAgent(BaseAgent):
                         "Upload-Post LinkedIn is pinned to a Page; no shorts were submitted"
                     )
                 continue
-            matches = [page for page in pages if page["id"] == binding["target_id"]]
-            pinned_matches = [
-                page for page in pinned_pages if page["id"] == binding["target_id"]
-            ]
             if (
-                len(matches) != 1
-                or len(pinned_matches) != 1
+                sum(page["id"] == binding["target_id"] for page in pages) != 1
+                or sum(page["id"] == binding["target_id"] for page in pinned_pages) != 1
                 or selected not in (None, binding["target_id"])
             ):
                 raise RuntimeError(
@@ -3304,11 +3290,8 @@ class PublishAgent(BaseAgent):
                 {"profile": profile_username},
             )
             boards = self._provider_target_rows(board_response, "boards", "pinterest")
-            matches = [
-                board for board in boards if board["id"] == pinterest["target_id"]
-            ]
             if (
-                len(matches) != 1
+                sum(board["id"] == pinterest["target_id"] for board in boards) != 1
                 or not isinstance(board_response.get("pinterest_account_used"), str)
                 or not board_response["pinterest_account_used"]
             ):
@@ -3324,6 +3307,10 @@ class PublishAgent(BaseAgent):
             "idempotency_key": identity,
             "request_id": identity,
         }
+
+        def failure(status, error, receipt=base, **details):
+            return {**receipt, **details, "status": status, "error": error}
+
         try:
             process = subprocess.run(
                 command,
@@ -3333,34 +3320,28 @@ class PublishAgent(BaseAgent):
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return {
-                **base,
-                "status": "unknown",
-                "error": f"Upload timed out ({timeout}s)",
-            }
+            return failure("unknown", f"Upload timed out ({timeout}s)")
         except OSError as error:
-            return {**base, "status": "failed", "error": str(error)}
+            return failure("failed", str(error))
         if process.returncode:
-            return {
-                **base,
-                "status": "unknown",
-                "error": f"curl error: {process.stderr[:500]}",
-                "stdout": process.stdout,
-            }
+            return failure(
+                "unknown",
+                f"curl error: {process.stderr[:500]}",
+                stdout=process.stdout,
+            )
         try:
             response = json.loads(process.stdout)
         except json.JSONDecodeError:
             payload_rejected = "413 request entity too large" in process.stdout.lower()
-            return {
-                **base,
-                "status": "failed" if payload_rejected else "unknown",
-                "error": (
+            return failure(
+                "failed" if payload_rejected else "unknown",
+                (
                     "Upload-Post rejected the request with HTTP 413"
                     if payload_rejected
                     else f"non-JSON response from Upload-Post: {process.stdout[:200]}"
                 ),
                 **({"http_status": 413} if payload_rejected else {}),
-            }
+            )
 
         receipt = {**base, "response": response}
         if response.get("job_id"):
@@ -3372,11 +3353,11 @@ class PublishAgent(BaseAgent):
             and not response.get("request_id")
             and not response.get("job_id")
         ):
-            return {
-                **receipt,
-                "status": "failed",
-                "error": response.get("error") or response.get("message"),
-            }
+            return failure(
+                "failed",
+                response.get("error") or response.get("message"),
+                receipt,
+            )
         platform_results = response.get("results")
         if isinstance(platform_results, dict):
             failures = {
@@ -3395,23 +3376,23 @@ class PublishAgent(BaseAgent):
                     "error": "Upload-Post omitted this requested platform",
                 }
             if failures:
-                return {
-                    **receipt,
-                    "status": "partial_failure",
-                    "error": (
+                return failure(
+                    "partial_failure",
+                    (
                         "Upload-Post reported platform failures: "
                         + ", ".join(sorted(failures))
                     ),
-                    "platform_failures": failures,
-                }
+                    receipt,
+                    platform_failures=failures,
+                )
             return {**receipt, "status": "published"}
         request_id = response.get("request_id", response.get("job_id"))
         if not request_id:
-            return {
-                **receipt,
-                "status": "unknown",
-                "error": response.get("error") or response.get("message"),
-            }
+            return failure(
+                "unknown",
+                response.get("error") or response.get("message"),
+                receipt,
+            )
         return {**receipt, "status": "submitted"}
 
     def _remote_schedule(self, api_key, user):
@@ -3429,16 +3410,7 @@ class PublishAgent(BaseAgent):
             SCHEDULE_URL,
         ]
         try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=35,
-                check=False,
-            )
-            if process.returncode:
-                raise ValueError(process.stderr.strip() or process.stdout.strip())
-            remote = json.loads(process.stdout).get("scheduled_posts")
+            remote = self._run_json_command(command).get("scheduled_posts")
             if not isinstance(remote, list):
                 raise TypeError("scheduled_posts is missing")
         except (
@@ -3502,11 +3474,6 @@ class PublishAgent(BaseAgent):
             if publish.get("profile_username") not in (None, user):
                 continue
             for item in shorts:
-                if not isinstance(item, dict):
-                    raise TypeError(
-                        f"Cannot inspect local publish receipt {path}; "
-                        "no shorts were submitted"
-                    )
                 if item.get("status") not in RECORDED_STATES or not item.get(
                     "scheduled"
                 ):
@@ -3617,24 +3584,16 @@ class PublishAgent(BaseAgent):
                 raise RuntimeError("Existing provider schedule conflicts with preview")
         receipt = {
             **(destination_target or {}),
-            "clip_id": str(clip.get("id", "")),
+            **_short_receipt_identity(
+                str(clip.get("id", "")), version, identity, platforms
+            ),
             "status": existing.get("status", "submitted"),
-            "platforms": platforms,
-            "request_id": identity,
-            "external_id": identity,
-            "idempotency_key": identity,
             "scheduled": True,
             "scheduled_date": scheduled_at.isoformat(),
             "timezone": tz_name,
-            "version": version["version"],
-            "variant_id": version["variant_id"],
-            "render_fingerprint": version["render_fingerprint"],
-            "approval_revision": version["revision"],
             "reused_receipt": True,
             "receipt_source": existing["source"],
         }
-        request = version.get("re_release_request")
-        receipt.update(_rerelease_receipt_fields(request))
         if existing.get("job_id"):
             receipt["job_id"] = existing["job_id"]
         return receipt
@@ -3766,21 +3725,17 @@ class PublishAgent(BaseAgent):
         return datetime.combine(date, time(hour=hour), tzinfo=zone)
 
     @staticmethod
-    def _receipt_key(receipt):
-        return receipt_key(receipt)
-
-    @classmethod
-    def _merge_short_receipts(cls, current, previous):
+    def _merge_short_receipts(current, previous):
         current = [item for item in current if isinstance(item, dict)]
         previous = previous if isinstance(previous, list) else []
         current_keys = {
-            key for item in current if (key := cls._receipt_key(item)) is not None
+            key for item in current if (key := receipt_key(item)) is not None
         }
         history = []
         for item in previous:
             if not isinstance(item, dict):
                 continue
-            key = cls._receipt_key(item)
+            key = receipt_key(item)
             if key is not None and key in current_keys:
                 continue
             history.append({**item, "historical_receipt": True})
@@ -3920,25 +3875,23 @@ class LongformPublishAgent(PublishAgent):
                 approval_scope="longform",
             )
 
-        previous_shorts = previous.get("shorts", [])
-        if not isinstance(previous_shorts, list):
-            previous_shorts = []
+        state = longform.get("status") if isinstance(longform, dict) else "failed"
         result = {
             **previous,
-            **self._result(
-                [],
-                longform,
-                ["youtube"],
-                release_revision,
-                user,
-                previous_shorts=previous_shorts,
-            ),
+            "longform": longform,
+            "shorts_submitted": 0,
+            "shorts_reused": 0,
+            "shorts_published": 0,
+            "shorts_failed": 0,
+            "shorts_unknown": 0,
+            "platforms": ["youtube"],
+            "release_revision": release_revision,
+            "profile_username": user,
+            "publish_status": state,
             "approval_scope": "longform",
             "longform_publication_revision": gate["revision"],
             "shorts": previous.get("shorts", []),
         }
-        state = longform.get("status") if isinstance(longform, dict) else "failed"
-        result["publish_status"] = state
         for stale_field in (
             "action_required",
             "next_action",
@@ -3961,7 +3914,7 @@ class LongformPublishAgent(PublishAgent):
             )
 
         old_longform = previous.get("longform")
-        history = previous.get("longform_history", [])
+        history = previous.get("longform_history")
         history = (
             [item for item in history if isinstance(item, dict)]
             if isinstance(history, list)
@@ -3972,20 +3925,12 @@ class LongformPublishAgent(PublishAgent):
             and isinstance(longform, dict)
             and old_longform.get("external_id") != longform.get("external_id")
         ):
-            old_key = (
-                old_longform.get("external_id"),
-                old_longform.get("job_id"),
-                old_longform.get("server_request_id"),
-            )
-            if not any(
-                (
-                    item.get("external_id"),
-                    item.get("job_id"),
-                    item.get("server_request_id"),
-                )
-                == old_key
-                for item in history
-            ):
+
+            def identity(item):
+                fields = ("external_id", "job_id", "server_request_id")
+                return tuple(item.get(field) for field in fields)
+
+            if not any(identity(item) == identity(old_longform) for item in history):
                 history.append({**old_longform, "historical_receipt": True})
         if history:
             result["longform_history"] = history
