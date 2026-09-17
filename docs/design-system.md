@@ -206,7 +206,7 @@ Ease curve (default for all state transitions): `cubic-bezier(0.2, 0.8, 0.2, 1)`
 
 - **Left nav (72px, icon-only).** Dashboard, New Episode, and Schedule. Icons + subtle labels on hover. Active item gets the amber accent as a 2px left border + slight surface-2 background.
 - **Main content.** Fluid width, max 1440px, centered. Screens that need full width (crop setup, longform review, clip review) can opt out of the max-width and expand edge-to-edge.
-- **Agent panel (right rail, 380px, reserved).** Always present in the layout. Today: renders an "Agent" header + a single placeholder card reading *"Agent chat arrives in Phase C. For now, agents speak through this panel's status feed."* Below the placeholder, a live event log of the current episode's pipeline events (the existing poll-based status translated into plain English). This panel is collapsible (chevron in top-right) — collapsed state is 48px wide with just the "Agent" spine label rotated 90°.
+- **Agent panel (right rail, 380px, reserved).** Always present in the layout. It shows the current episode status and a live event log of pipeline events translated into plain English. This panel is collapsible (chevron in top-right) — collapsed state is 48px wide with just the "Agent" spine label rotated 90°.
 
 The agent panel is architecturally load-bearing: every screen assumes it might be present. Pages that need maximum canvas (crop setup, longform review) auto-collapse it on entry and remember the choice per-user.
 
@@ -295,8 +295,8 @@ These are the screens being built, each with a planned layout shape. Details liv
 | New Episode | `/new` | Single-column wizard, 1–2 steps |
 | Episode Detail | `/episodes/:id` | Sticky summary header + scrolling sections (Overview, Longform, Clips, Audio, Metadata). Agent panel visible by default. |
 | Crop Setup | `/episodes/:id/crop-setup` | Full-width, agent panel collapsed by default. Split layout: video + canvas left, speakers + sync right. **Not tabbed** — everything visible, arranged as a single editing surface. |
-| Longform Review | `/episodes/:id/longform` | Full-width. Player top, cut timeline below, edit-request input docked bottom. |
-| Clip Review | `/episodes/:id/clips` | List of ClipCards, one expanded at a time. Chat input docked bottom. |
+| Longform Review | `/episodes/:id/longform` | Full-width source player with transcript, cut timeline, and explicit IN/OUT review controls. |
+| Clip Review | `/episodes/:id/clips` | List of ClipCards, one expanded at a time, with explicit metadata, variant, and approval controls. |
 | Publish | `/episodes/:id/publish` | Schedule timeline (week view) + per-platform status column |
 | Backup | `/episodes/:id/backup` | Confirmation screen with explicit dangerous-action UI |
 | Schedule | `/schedule` | 7-day calendar, clips laid on platform-colored lanes |
