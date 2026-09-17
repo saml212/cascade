@@ -376,6 +376,40 @@ class TestSafetyGate:
         assert result["shorts_submitted"] == 1
         assert result["shorts_failed"] == 0
 
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        ((None, "None"), ("", ""), (0, "0")),
+        ids=("null", "empty", "zero"),
+    )
+    def test_ordinary_delivery_preserves_present_legacy_title_values(
+        self, env, episode_dir, title, expected
+    ):
+        config = _publish_config()
+        for platform in ("tiktok", "instagram", "x"):
+            config["platforms"][platform]["enabled"] = False
+        _seed_episode(episode_dir, config=config)
+        agent = _make_agent(episode_dir, config)
+        data = agent._inputs(bind_legacy=True)
+        data["approved"][0]["title"] = title
+        data["short_metadata"]["clip_0"]["youtube"].pop("title")
+
+        with (
+            patch.object(agent, "_inputs", return_value=data),
+            patch("agents.publish.quality_snapshot", return_value=data["snapshot"]),
+            patch.object(
+                agent,
+                "_publish_longform",
+                return_value={"status": "published"},
+            ),
+            patch.object(
+                agent, "_publish_short_deliveries", return_value=[]
+            ) as publish,
+        ):
+            agent.execute()
+
+        delivery = publish.call_args.args[0][0]
+        assert delivery.snapshot()["copy"]["youtube"]["title"] == expected
+
     def test_required_destination_variant_blocks_legacy_short_publish(
         self, env, episode_dir
     ):

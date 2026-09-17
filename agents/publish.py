@@ -2739,7 +2739,7 @@ class PublishAgent(BaseAgent):
                     short_destination_copy(
                         short_metadata.get(clip_id, {}),
                         platforms,
-                        title=str(clip.get("title") or f"Clip {clip_id}"),
+                        title=clip.get("title", f"Clip {clip_id}"),
                         hub_url=hub_url,
                         youtube_url=youtube_url,
                         spotify_url=funnel_urls["spotify"],
