@@ -216,6 +216,24 @@ def test_episode_url_template_rejects_unsafe_or_ambiguous_values(template):
         episode_hub_url(config, "ep_private")
 
 
+@pytest.mark.parametrize(
+    "public_url",
+    (
+        "http://private.invalid/media",
+        "https://user@private.invalid/media",
+        "https://private.invalid:bad/media",
+        "https://private.invalid:99999/media",
+        "https://bad host/media",
+        "https://private.invalid/\x00media",
+    ),
+)
+def test_legacy_episode_hub_rejects_unsafe_r2_public_url(public_url):
+    config = _config()
+    config["podcast"]["r2"]["public_url"] = public_url
+
+    assert episode_hub_url(config, "ep_private") is None
+
+
 def test_enabled_expansion_account_and_target_are_release_bound(tmp_path):
     config = _config()
     episode = _episode()

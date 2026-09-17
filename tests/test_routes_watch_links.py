@@ -22,8 +22,7 @@ def watch_links_api(tmp_path, monkeypatch):
     config = {
         "podcast": {
             "title": "Local",
-            "r2": {"public_url": "https://public.example"},
-            "links": {},
+            "links": {"episode_url_template": "https://thelocalpod.link/#{episode_id}"},
         }
     }
     monkeypatch.setattr(watch_links, "EPISODES_DIR", episodes)
@@ -50,7 +49,7 @@ def test_watch_links_and_html_are_current_and_read_only(watch_links_api):
 
     assert response.status_code == 200
     assert response.json()["landing_page"]["url"] == (
-        "https://public.example/links/episodes/ep_test.html"
+        "https://thelocalpod.link/#ep_test"
     )
     assert response.json()["exact_episode_destination_count"] == 2
     assert preview.status_code == 200
@@ -124,3 +123,62 @@ def test_watch_links_rejects_relative_apple_catalog_path(watch_links_api):
 
     assert response.status_code == 409
     assert "must be an absolute path" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "http://thelocalpod.link/{episode_id}",
+        "https://thelocalpod.link/no-placeholder",
+        "https://thelocalpod.link/{episode_id}/{other}",
+        "https://thelocalpod.link:bad/{episode_id}",
+        "https://thelocalpod.link:99999/{episode_id}",
+        "https://./{episode_id}",
+        "https://user@thelocalpod.link/{episode_id}",
+        "https://bad host/{episode_id}",
+        "https://thelocalpod.link/\x00{episode_id}",
+    ],
+)
+def test_watch_links_rejects_unsafe_canonical_template(watch_links_api, template):
+    client, _episode_file, config = watch_links_api
+    config["podcast"]["links"]["episode_url_template"] = template
+
+    response = client.get("/api/episodes/ep_test/watch-links")
+
+    assert response.status_code == 409
+    assert "episode_url_template" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "http://public.example",
+        "https://user@public.example",
+        "https://public.example:99999",
+        "https://bad host",
+        "https://public.example/\x00unsafe",
+    ],
+)
+def test_watch_links_rejects_unsafe_legacy_r2_fallback(watch_links_api, public_url):
+    client, _episode_file, config = watch_links_api
+    del config["podcast"]["links"]["episode_url_template"]
+    config["podcast"]["r2"] = {"public_url": public_url}
+
+    response = client.get("/api/episodes/ep_test/watch-links")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "No safe episode landing URL is configured"
+
+
+def test_watch_links_rejects_malformed_funnel_map(watch_links_api, monkeypatch):
+    client, _episode_file, _config = watch_links_api
+    monkeypatch.setattr(
+        episode_hub,
+        "current_funnel_urls_for_episode",
+        lambda *_args: [],
+    )
+
+    response = client.get("/api/episodes/ep_test/watch-links")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Current funnel URLs must be a JSON object"

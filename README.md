@@ -170,35 +170,19 @@ All settings live in `config/config.toml`. Key sections:
 
 ## Episode Hub (Link-in-Bio)
 
-The canonical `thelocalpod.link` site combines show-level platform links with
-revision-bound pages for episodes that have current full-episode destinations.
-Configure the show URLs under `[podcast.links]` and the R2 destination under
-`[podcast.r2]`.
+The canonical public episode hub is maintained in the separate
+`thelocalpod.link` GitHub Pages repository. Configure its exact episode URL under
+`podcast.links.episode_url_template`; Cascade uses that URL in reviewed publication
+copy and the read-only watch-link API. Cloudflare R2 continues to serve media, RSS,
+artwork, and historical watch pages, but Cascade no longer creates or replaces R2
+HTML pages.
 
-Prepare the reviewable site in a separate directory. An optional Apple catalog
-supplies exact Apple episode URLs
-only for entries with a matching `episode_id`; otherwise the page labels its Apple
-destination as a show-level fallback.
-
-```bash
-.venv/bin/python -m links.episode_hub prepare \
-  --episodes-root /path/to/cascade/episodes \
-  --output-dir /tmp/cascade-watch-site \
-  --apple-catalog /path/to/apple-current-video-catalog.json
-```
-
-The prepared manifest binds every HTML file by size and SHA-256. After review, upload
-those exact bytes to the configured R2 bucket; episode pages are uploaded before the
-branded `links/index.html` entry point.
-
-```bash
-.venv/bin/python -m links.episode_hub upload \
-  --site-dir /tmp/cascade-watch-site
-```
-
-The API exposes the same current link resolution at
-`GET /api/episodes/{episode_id}/watch-links` and an HTML preview at
-`GET /api/episodes/{episode_id}/watch-page`.
+`GET /api/episodes/{episode_id}/watch-links` exposes current revision-bound
+YouTube and Spotify destinations plus the exact-ID Apple catalog match when one is
+available. `GET /api/episodes/{episode_id}/watch-page` renders the same document as
+an escaped local HTML preview. `landing_page.path` is the canonical origin-relative
+path, query, and fragment, so fragment-routed episode identities remain distinct.
+Neither endpoint writes episode or remote state.
 
 ## API Costs per Episode
 

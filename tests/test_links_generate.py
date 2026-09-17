@@ -1,21 +1,26 @@
-"""The retired alternate link-page command points to the canonical hub."""
+"""Retired R2 watch-site commands fail before creating output."""
 
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
-def test_retired_generator_fails_with_actionable_migration(tmp_path: Path) -> None:
+
+@pytest.mark.parametrize("module", ["links.generate", "links.episode_hub"])
+def test_retired_generator_fails_with_actionable_migration(
+    tmp_path: Path, module: str
+) -> None:
     output = tmp_path / "old-links.html"
     result = subprocess.run(
-        [sys.executable, "-m", "links.generate", "-o", str(output)],
+        [sys.executable, "-m", module, "-o", str(output)],
         capture_output=True,
         text=True,
         check=False,
     )
 
     assert result.returncode == 2
-    assert "standalone show-level links page was retired" in result.stderr
-    assert "links.episode_hub prepare" in result.stderr
-    assert "links.episode_hub upload" in result.stderr
+    assert "R2 watch-site generator is retired" in result.stderr
+    assert "thelocalpod.link" in result.stderr
+    assert "GET /api/episodes/{episode_id}/watch-links" in result.stderr
     assert not output.exists()

@@ -159,10 +159,10 @@ link = ""                                 # Main website or YouTube channel URL
 owner_email = ""                          # Email for RSS feed (required by Apple Podcasts)
 
 [podcast.links]
-# Fill in the platforms you use — empty strings are skipped in the generated page
-# Handles are auto-extracted from URLs and shown as link labels
-display_name = ""                         # Override title on links page (optional)
-tagline = ""                              # Shown below your podcast name
+# Read-only watch-link previews use the display identity and Apple fallback below.
+# The canonical public site is maintained separately and selected by the template.
+display_name = ""                         # Override title in watch-page preview
+tagline = ""                              # Shown below the preview title
 episode_url_template = ""                 # Optional HTTPS URL with one {episode_id}
 spotify = ""
 youtube = ""

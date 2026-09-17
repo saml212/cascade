@@ -182,6 +182,24 @@ def _private_identity(scope: str, value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _safe_https_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
+        and parsed.hostname.strip(".")
+        and not any(char.isspace() for char in parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and (port is None or 1 <= port <= 65535)
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
 def episode_hub_url(config: dict, episode_id: str) -> str | None:
     if not episode_id:
         return None
@@ -197,28 +215,16 @@ def episode_hub_url(config: dict, episode_id: str) -> str | None:
                 "{episode_id} placeholder"
             )
         url = template.replace("{episode_id}", quote(episode_id, safe=""))
-        try:
-            parsed = urlsplit(url)
-            port = parsed.port
-        except ValueError:
-            parsed = None
-            port = None
-        if (
-            parsed is None
-            or parsed.scheme != "https"
-            or not parsed.hostname
-            or not parsed.hostname.strip(".")
-            or parsed.username is not None
-            or parsed.password is not None
-            or (port is not None and not 1 <= port <= 65535)
-            or any(ord(char) < 32 or ord(char) == 127 for char in url)
-        ):
+        if not _safe_https_url(url):
             raise ValueError(
                 "podcast.links.episode_url_template must produce an HTTPS URL"
             )
         return url
-    base = str(podcast.get("r2", {}).get("public_url", "")).rstrip("/")
-    if not base.startswith("https://"):
+    public_url = podcast.get("r2", {}).get("public_url")
+    if not isinstance(public_url, str):
+        return None
+    base = public_url.rstrip("/")
+    if not _safe_https_url(base):
         return None
     return f"{base}/links/episodes/{quote(episode_id, safe='')}.html"
 
