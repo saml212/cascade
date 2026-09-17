@@ -6,7 +6,7 @@ import { dataUrl, transpileTs } from './load-ts.mjs';
 const compiled = await transpileTs(
   new URL('../src/lib/dom.ts', import.meta.url)
 );
-const { h } = await import(
+const { h, nativeVideoOwnsSpace } = await import(
   dataUrl(
     compiled.replace(
       /^import \{ onCleanup \} from ['"]\.\/signals['"];$/m,
@@ -14,6 +14,24 @@ const { h } = await import(
     )
   )
 );
+
+test('focused videos own Space without disabling page-level shortcuts', () => {
+  const previousVideo = globalThis.HTMLVideoElement;
+  class FakeVideoElement {}
+
+  try {
+    globalThis.HTMLVideoElement = FakeVideoElement;
+    const sourceVideo = new FakeVideoElement();
+    const approvedVideo = new FakeVideoElement();
+
+    assert.equal(nativeVideoOwnsSpace({ key: ' ', target: sourceVideo }), true);
+    assert.equal(nativeVideoOwnsSpace({ key: ' ', target: approvedVideo }), true);
+    assert.equal(nativeVideoOwnsSpace({ key: ' ', target: {} }), false);
+    assert.equal(nativeVideoOwnsSpace({ key: 'j', target: sourceVideo }), false);
+  } finally {
+    globalThis.HTMLVideoElement = previousVideo;
+  }
+});
 
 test('owned media cleanup detaches the source and resets the decoder', () => {
   const previousDocument = globalThis.document;

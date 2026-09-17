@@ -19,7 +19,7 @@
  * updates are applied imperatively to existing row elements via rowRegistry.
  */
 
-import { h, mount } from '../lib/dom';
+import { h, mount, nativeVideoOwnsSpace } from '../lib/dom';
 import { signal, effect, type Signal } from '../lib/signals';
 import { api, type EpisodeReviewState, type UnknownRecord } from '../lib/api';
 import {
@@ -248,6 +248,7 @@ export function LongformReview(target: HTMLElement, episodeId: string): void {
 
   const keyHandler = (e: KeyboardEvent): void => {
     if (isInputFocused()) return;
+    if (nativeVideoOwnsSpace(e)) return;
     const v = videoRef.el;
 
     switch (e.key) {

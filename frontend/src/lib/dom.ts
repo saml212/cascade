@@ -20,6 +20,12 @@ export function releaseMediaElement(el: ReleasableMedia): void {
   el.load();
 }
 
+export function nativeVideoOwnsSpace(
+  event: Pick<KeyboardEvent, 'key' | 'target'>
+): boolean {
+  return event.key === ' ' && event.target instanceof HTMLVideoElement;
+}
+
 function applyProp(el: Element, key: string, value: unknown): void {
   if (value == null || value === false) return;
 
