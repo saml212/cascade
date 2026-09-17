@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from lib.atomic_write import atomic_write_json
 from lib.caption_speaker_overrides import (
     CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+    caption_speaker_override_document_revision,
     caption_speaker_override_state,
     caption_speaker_overrides_path,
     normalize_caption_speaker_override_document,
@@ -106,8 +107,8 @@ class CaptionSpeakerExpectedWord(BaseModel):
 
     word: str = Field(min_length=1, max_length=200)
     punctuated_word: str = Field(min_length=1, max_length=200)
-    start: float = Field(ge=0)
-    end: float = Field(gt=0)
+    start: float = Field(ge=0, strict=True)
+    end: float = Field(gt=0, strict=True)
 
     @model_validator(mode="after")
     def validate_timing(self) -> Self:
@@ -124,10 +125,10 @@ class CaptionSpeakerOverrideInput(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
     )
-    start: float = Field(ge=0)
-    end: float = Field(gt=0)
-    from_asr_speaker: int = Field(ge=0)
-    to_asr_speaker: int = Field(ge=0)
+    start: float = Field(ge=0, strict=True)
+    end: float = Field(gt=0, strict=True)
+    from_asr_speaker: int = Field(ge=0, strict=True)
+    to_asr_speaker: int = Field(ge=0, strict=True)
     source_speaker: str = Field(pattern=r"^speaker_[0-9]+$")
     target_crop: str = Field(pattern=r"^speaker_[0-9]+$")
     reason: str = Field(min_length=3, max_length=1000)
@@ -762,8 +763,10 @@ async def put_caption_speaker_overrides(
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+        latest_clips, _ = load_clips(episode_id)
+        latest_clip, _ = find_clip(latest_clips, clip_id)
         latest, _effective, _diarized, _segments, _crop = (
-            _caption_speaker_override_context(ep_dir, clip)
+            _caption_speaker_override_context(ep_dir, latest_clip)
         )
         if latest["revision"] != state["revision"]:
             raise HTTPException(
@@ -772,15 +775,31 @@ async def put_caption_speaker_overrides(
             )
 
         path = caption_speaker_overrides_path(ep_dir, clip_id)
+        expected_saved_document_revision = caption_speaker_override_document_revision(
+            clip_id, document
+        )
         if document is None:
             path.unlink(missing_ok=True)
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(path, document)
 
+        saved_clips, _ = load_clips(episode_id)
+        saved_clip, _ = find_clip(saved_clips, clip_id)
         saved, _effective, _diarized, _segments, _crop = (
-            _caption_speaker_override_context(ep_dir, clip)
+            _caption_speaker_override_context(ep_dir, saved_clip)
         )
+        if (
+            saved["current"] is not True
+            or saved["document_revision"] != expected_saved_document_revision
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Caption inputs changed while the saved overrides were checked; "
+                    "inspect the current state before retrying."
+                ),
+            )
         return _public_caption_speaker_override_state(saved)
 
 

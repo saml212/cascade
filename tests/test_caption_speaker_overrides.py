@@ -7,8 +7,10 @@ import pytest
 
 from lib.caption_speaker_overrides import (
     CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+    apply_current_caption_speaker_overrides,
     caption_speaker_override_state,
     caption_speaker_overrides_path,
+    normalize_caption_speaker_override_document,
     validate_caption_speaker_override_document,
 )
 from lib.ffprobe import file_fingerprint
@@ -246,4 +248,54 @@ def test_state_never_binds_file_revision_to_another_transcript_object(tmp_path):
     with pytest.raises(ValueError, match="changed while it was inspected"):
         caption_speaker_override_state(
             tmp_path, clip, stale_object, segments, crop_config
+        )
+
+
+def test_state_revision_binds_clip_bounds_and_stored_schema_is_strict(tmp_path):
+    diarized, clip, segments, crop_config, transcript_path = _review_inputs(tmp_path)
+    first, _ = caption_speaker_override_state(
+        tmp_path, clip, diarized, segments, crop_config
+    )
+    moved = {**clip, "start_seconds": clip["start_seconds"] + 0.1}
+    second, _ = caption_speaker_override_state(
+        tmp_path, moved, diarized, segments, crop_config
+    )
+    assert second["revision"] != first["revision"]
+
+    transcript_revision = file_fingerprint(transcript_path)["id"]
+    invalid = _document(clip["id"], transcript_revision)
+    invalid["overrides"][0]["id"] = "../../unstable"
+    with pytest.raises(ValueError, match="id is invalid"):
+        normalize_caption_speaker_override_document(invalid, clip["id"])
+    invalid = _document(clip["id"], transcript_revision)
+    invalid["overrides"][0]["start"] = "4092.32"
+    with pytest.raises(TypeError, match="finite number"):
+        normalize_caption_speaker_override_document(invalid, clip["id"])
+
+
+def test_effective_variant_helper_binds_valid_sidecar_and_fails_closed(tmp_path):
+    diarized, clip, segments, crop_config, transcript_path = _review_inputs(tmp_path)
+    document = _document(clip["id"], file_fingerprint(transcript_path)["id"])
+    path = caption_speaker_overrides_path(tmp_path, clip["id"])
+    path.parent.mkdir()
+    path.write_text(json.dumps(document))
+
+    effective, binding = apply_current_caption_speaker_overrides(
+        tmp_path, clip, diarized, segments, crop_config
+    )
+
+    assert binding == {
+        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        "clock": "source",
+        "revision": binding["revision"],
+        "operation_ids": [override["id"] for override in _reviewed_overrides()],
+        "override_count": 3,
+        "applied_word_count": 7,
+    }
+    assert effective["utterances"][0]["words"][0]["speaker"] == 2
+
+    path.write_text("{not-json")
+    with pytest.raises(ValueError, match="file is invalid"):
+        apply_current_caption_speaker_overrides(
+            tmp_path, clip, diarized, segments, crop_config
         )

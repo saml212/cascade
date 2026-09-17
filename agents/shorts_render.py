@@ -18,6 +18,7 @@ from lib.ass import (
     resolve_caption_speaker_targets,
 )
 from lib.audio_mix import generate_audio_mix
+from lib.caption_speaker_overrides import apply_current_caption_speaker_overrides
 from lib.crop import compute_crop, resolve_speaker
 from lib.delivery_video import (
     audio_packet_signature,
@@ -234,17 +235,28 @@ class ShortsRenderAgent(BaseAgent):
         encoding = get_video_encoding_policy(self.config, "shorts")
         diarized = None
         caption_context_revision = None
+        caption_speaker_overrides = None
         if variant_id in SPEAKER_PANEL_VARIANT_IDS:
             diarized = current_diarized_transcript(
                 self.episode_dir, episode, self.config
             )
             if not diarized:
                 raise ValueError("Current transcript is required for variant captions")
+            diarized, caption_speaker_overrides = (
+                apply_current_caption_speaker_overrides(
+                    self.episode_dir,
+                    clip,
+                    diarized,
+                    segment_document,
+                    episode.get("crop_config") or {},
+                )
+            )
             caption_context_revision = speaker_panel_caption_context_revision(
                 self.episode_dir,
                 episode=episode,
                 diarized=diarized,
                 segment_document=segment_document,
+                caption_speaker_overrides=caption_speaker_overrides,
             )
         fingerprint = background_variant_fingerprint(
             base_record,
@@ -316,6 +328,7 @@ class ShortsRenderAgent(BaseAgent):
                         "base_record": base_record,
                         "base_identity": base_identity,
                         "caption_context_revision": caption_context_revision,
+                        "caption_speaker_overrides": caption_speaker_overrides,
                     },
                     segment_document=segment_document,
                 )
@@ -1223,6 +1236,11 @@ class ShortsRenderAgent(BaseAgent):
                     **(
                         {"context_revision": background["caption_context_revision"]}
                         if speaker_panel_variant
+                        else {}
+                    ),
+                    **(
+                        {"speaker_overrides": background["caption_speaker_overrides"]}
+                        if background.get("caption_speaker_overrides") is not None
                         else {}
                     ),
                 },

@@ -253,6 +253,52 @@ class TestCaptionSpeakerOverrides:
         assert "no longer matches" in response.json()["detail"]
         assert not (ep_dir / "caption_speaker_overrides" / "clip_04.json").exists()
 
+    def test_clip_change_during_validation_conflicts_before_write(
+        self, test_client, monkeypatch
+    ):
+        client, ep_dir = self._prepare(test_client, monkeypatch)
+        endpoint = "/api/episodes/ep_001/clips/clip_04/caption-speaker-overrides"
+        state = client.get(endpoint).json()
+
+        from server.routes import clips as clips_mod
+
+        original_validate = clips_mod.validate_caption_speaker_override_document
+
+        def validate_then_move_clip(*args, **kwargs):
+            result = original_validate(*args, **kwargs)
+            clips = json.loads((ep_dir / "clips.json").read_text())
+            clips["clips"][0]["start_seconds"] = 105.0
+            clips["clips"][0]["start"] = 105.0
+            (ep_dir / "clips.json").write_text(json.dumps(clips))
+            return result
+
+        monkeypatch.setattr(
+            clips_mod,
+            "validate_caption_speaker_override_document",
+            validate_then_move_clip,
+        )
+
+        response = client.put(endpoint, json=self._request(state))
+
+        assert response.status_code == 409
+        assert "changed while" in response.json()["detail"]
+        assert not (ep_dir / "caption_speaker_overrides" / "clip_04.json").exists()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (("start", False), ("start", "103.0"), ("from_asr_speaker", True)),
+    )
+    def test_numeric_fields_are_strict(self, test_client, monkeypatch, field, value):
+        client, _ep_dir = self._prepare(test_client, monkeypatch)
+        endpoint = "/api/episodes/ep_001/clips/clip_04/caption-speaker-overrides"
+        state = client.get(endpoint).json()
+        request = self._request(state)
+        request["overrides"][0][field] = value
+
+        response = client.put(endpoint, json=request)
+
+        assert response.status_code == 422
+
 
 class TestApproveReject:
     def test_approve_clip_binds_current_render(self, test_client, monkeypatch):

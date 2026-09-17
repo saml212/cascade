@@ -15,6 +15,11 @@ from pathlib import Path
 
 from lib.ass import resolve_caption_speaker_targets
 from lib.atomic_write import atomic_write_json
+from lib.caption_speaker_overrides import (
+    apply_current_caption_speaker_overrides,
+    caption_speaker_overrides_path,
+)
+from lib.clips import load_clips
 from lib.crop import visual_crop_state
 from lib.delivery_video import render_artifact_state
 from lib.ffprobe import file_fingerprint, probe, scan_identity
@@ -588,6 +593,7 @@ def speaker_panel_caption_context_revision(
     episode: dict | None = None,
     diarized: dict | None = None,
     segment_document: dict | None = None,
+    caption_speaker_overrides: dict | None = None,
 ) -> str:
     """Fingerprint inputs unique to speaker-panel caption placement."""
 
@@ -633,10 +639,59 @@ def speaker_panel_caption_context_revision(
         ],
         "longform_speakers": longform_speakers,
     }
+    if caption_speaker_overrides is not None:
+        state["caption_speaker_overrides"] = caption_speaker_overrides
     return _json_revision(state)
 
 
 gameplay_surround_caption_context_revision = speaker_panel_caption_context_revision
+
+
+def _current_speaker_panel_caption_state(
+    episode_dir: Path, clip_id: str
+) -> tuple[str, dict | None]:
+    def load_document(filename: str) -> dict:
+        try:
+            value = json.loads((Path(episode_dir) / filename).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Speaker-panel caption context needs current {filename}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"Speaker-panel caption context needs a mapping in {filename}"
+            )
+        return value
+
+    episode = load_document("episode.json")
+    diarized = load_document("diarized_transcript.json")
+    segment_document = load_document("segments.json")
+    crop_config = episode.get("crop_config") or {}
+    if not isinstance(crop_config, dict):
+        raise TypeError("Speaker-panel caption context needs a crop mapping")
+
+    binding = None
+    if caption_speaker_overrides_path(episode_dir, clip_id).exists():
+        matching_clips = [
+            clip for clip in load_clips(Path(episode_dir)) if clip.get("id") == clip_id
+        ]
+        if len(matching_clips) != 1:
+            raise ValueError("Caption speaker overrides need one current matching clip")
+        diarized, binding = apply_current_caption_speaker_overrides(
+            Path(episode_dir),
+            matching_clips[0],
+            diarized,
+            segment_document,
+            crop_config,
+        )
+    revision = speaker_panel_caption_context_revision(
+        Path(episode_dir),
+        episode=episode,
+        diarized=diarized,
+        segment_document=segment_document,
+        caption_speaker_overrides=binding,
+    )
+    return revision, binding
 
 
 def require_speaker_panel_caption_context_revision(value: object) -> str:
@@ -850,14 +905,22 @@ def background_variant_state(
                     clip_duration_seconds=clip_duration,
                     source_durations=source_durations,
                 )
-            caption_context_revision = (
-                speaker_panel_caption_context_revision(episode_dir)
-                if variant_id in SPEAKER_PANEL_VARIANT_IDS
-                else None
-            )
+            caption_speaker_overrides = None
+            if variant_id in SPEAKER_PANEL_VARIANT_IDS:
+                (
+                    caption_context_revision,
+                    caption_speaker_overrides,
+                ) = _current_speaker_panel_caption_state(episode_dir, clip_id)
+            else:
+                caption_context_revision = None
             recorded_captions = record.get("captions")
             recorded_caption_context = (
                 recorded_captions.get("context_revision")
+                if isinstance(recorded_captions, dict)
+                else None
+            )
+            recorded_caption_speaker_overrides = (
+                recorded_captions.get("speaker_overrides")
                 if isinstance(recorded_captions, dict)
                 else None
             )
@@ -876,13 +939,14 @@ def background_variant_state(
                     if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
                     else "The background asset changed after this variant was rendered."
                 )
-            elif (
-                variant_id in SPEAKER_PANEL_VARIANT_IDS
-                and recorded_caption_context != caption_context_revision
+            elif variant_id in SPEAKER_PANEL_VARIANT_IDS and (
+                recorded_caption_context != caption_context_revision
+                or recorded_caption_speaker_overrides != caption_speaker_overrides
             ):
                 stale_detail = (
                     "The speaker bindings or panel anchors changed for speaker-panel "
-                    "captions after this variant was rendered."
+                    "captions, or reviewed word attribution changed after this variant "
+                    "was rendered."
                 )
             else:
                 expected = background_variant_fingerprint(

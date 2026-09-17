@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from agents.qa import clip_review_revision, short_distribution_state
+from lib.caption_speaker_overrides import (
+    CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+    apply_current_caption_speaker_overrides,
+    caption_speaker_overrides_path,
+)
 from lib.crop import visual_crop_state
+from lib.ffprobe import file_fingerprint
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
@@ -176,7 +182,24 @@ def _write_gameplay_caption_context(episode_dir):
     }
     diarized = {
         "clock": "source",
-        "speaker_map": [{"index": 5, "logical_track": 1, "mapping_confidence": 1.0}],
+        "speaker_map": [
+            {"index": 5, "logical_track": 1, "mapping_confidence": 1.0},
+            {"index": 6, "target_speaker": "speaker_1"},
+        ],
+        "utterances": [
+            {
+                "speaker": 5,
+                "words": [
+                    {
+                        "word": "sure",
+                        "punctuated_word": "Sure.",
+                        "start": 0.2,
+                        "end": 0.5,
+                        "speaker": 5,
+                    }
+                ],
+            }
+        ],
     }
     segments = {
         "clock": "source",
@@ -192,6 +215,52 @@ def _write_gameplay_caption_context(episode_dir):
     ):
         (episode_dir / filename).write_text(json.dumps(document))
     return episode, diarized, segments
+
+
+def _write_caption_speaker_override(episode_dir):
+    clip = {
+        "id": "clip_01",
+        "start": 0,
+        "end": 1,
+        "start_seconds": 0,
+        "end_seconds": 1,
+    }
+    (episode_dir / "clips.json").write_text(json.dumps({"clips": [clip]}))
+    document = {
+        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        "clock": "source",
+        "clip_id": "clip_01",
+        "transcript_revision": file_fingerprint(
+            episode_dir / "diarized_transcript.json"
+        )["id"],
+        "overrides": [
+            {
+                "id": "review_sure",
+                "start": 0.2,
+                "end": 0.5,
+                "from_asr_speaker": 5,
+                "to_asr_speaker": 6,
+                "source_speaker": "speaker_0",
+                "target_crop": "speaker_1",
+                "reason": "Reviewed close microphones and source picture.",
+                "expected_words": [
+                    {
+                        "word": "sure",
+                        "punctuated_word": "Sure.",
+                        "start": 0.2,
+                        "end": 0.5,
+                    }
+                ],
+            }
+        ],
+        "actor": "caption-reviewer",
+        "reason": "Apply one reviewed caption word.",
+        "updated_at": "2026-09-16T12:00:00+00:00",
+    }
+    path = caption_speaker_overrides_path(episode_dir, "clip_01")
+    path.parent.mkdir()
+    path.write_text(json.dumps(document))
+    return path, clip
 
 
 @pytest.mark.parametrize(
@@ -406,6 +475,26 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
     assert current["current"] is True
+
+    override_path, _clip = _write_caption_speaker_override(episode_dir)
+    _, caption_changed = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert caption_changed["current"] is False
+    assert "reviewed word attribution changed" in caption_changed["detail"]
+    override_path.unlink()
+    _, restored = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert restored["current"] is True
 
     transcript_path = episode_dir / "diarized_transcript.json"
     transcript = json.loads(transcript_path.read_text())
@@ -663,6 +752,79 @@ def test_speaker_panels_are_asset_free_and_bind_effective_context(
         variant_id=SPEAKER_PANELS_VARIANT_ID,
     )
     assert current["current"] is True
+
+    override_path, clip = _write_caption_speaker_override(episode_dir)
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    diarized = json.loads((episode_dir / "diarized_transcript.json").read_text())
+    segments = json.loads((episode_dir / "segments.json").read_text())
+    effective, binding = apply_current_caption_speaker_overrides(
+        episode_dir, clip, diarized, segments, episode["crop_config"]
+    )
+    corrected_context = speaker_panel_caption_context_revision(
+        episode_dir,
+        episode=episode,
+        diarized=effective,
+        segment_document=segments,
+        caption_speaker_overrides=binding,
+    )
+    assert corrected_context != context_revision
+    corrected_fingerprint = background_variant_fingerprint(
+        base_record,
+        base_identity,
+        None,
+        encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+        caption_context_revision=corrected_context,
+    )
+    corrected_record = record_background_variant(
+        episode_dir,
+        "clip_01",
+        fingerprint=corrected_fingerprint,
+        timeline=Timeline.from_edits(1),
+        media={"duration_seconds": 1, "width": 1080, "height": 1920},
+        base_record=base_record,
+        base_identity=base_identity,
+        asset=None,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+        captions={
+            "path": str(captions.relative_to(episode_dir)),
+            "format": "ass",
+            "burned_in": True,
+            "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": corrected_context,
+            "speaker_overrides": binding,
+        },
+    )
+    assert corrected_record["captions"]["speaker_overrides"] == binding
+    _, corrected_current = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert corrected_current["current"] is True
+
+    override_path.unlink()
+    _, removed = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert removed["current"] is False
+    assert "reviewed word attribution changed" in removed["detail"]
+    output.with_suffix(".json").write_text(json.dumps(record))
+    _, restored = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert restored["current"] is True
 
     manifest_path = output.with_suffix(".json")
     malformed = json.loads(manifest_path.read_text())

@@ -8,6 +8,7 @@ import math
 import re
 from collections.abc import Mapping
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from lib.ass import resolve_caption_speaker_targets
@@ -27,7 +28,7 @@ def _json_revision(value: object) -> str:
 
 
 def _finite_number(value: object, field: str) -> float:
-    if isinstance(value, bool):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise TypeError(f"{field} must be a finite number")
     number = float(value)
     if not math.isfinite(number):
@@ -41,10 +42,26 @@ def _speaker_id(value: object, field: str) -> int:
     return value
 
 
-def _nonempty_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+def _bounded_text(
+    value: object, field: str, *, min_length: int = 1, max_length: int
+) -> str:
+    if not isinstance(value, str):
         raise TypeError(f"{field} must be nonempty text")
-    return value.strip()
+    text = value.strip()
+    if not min_length <= len(text) <= max_length:
+        raise ValueError(f"{field} has an invalid length")
+    return text
+
+
+def _review_timestamp(value: object) -> str:
+    text = _bounded_text(value, "updated_at", max_length=100)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("updated_at must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("updated_at must include a timezone")
+    return text
 
 
 def caption_speaker_overrides_path(episode_dir: Path, clip_id: str) -> Path:
@@ -64,9 +81,11 @@ def _normalize_expected_word(value: object) -> dict:
     if end <= start:
         raise ValueError("Expected caption word end must be after its start")
     return {
-        "word": _nonempty_text(value.get("word"), "expected_words.word"),
-        "punctuated_word": _nonempty_text(
-            value.get("punctuated_word"), "expected_words.punctuated_word"
+        "word": _bounded_text(value.get("word"), "expected_words.word", max_length=200),
+        "punctuated_word": _bounded_text(
+            value.get("punctuated_word"),
+            "expected_words.punctuated_word",
+            max_length=200,
         ),
         "start": start,
         "end": end,
@@ -97,8 +116,13 @@ def _normalize_override(value: object) -> dict:
     target = _speaker_id(value.get("to_asr_speaker"), "to_asr_speaker")
     if source == target:
         raise ValueError("Caption speaker override must change the speaker")
-    source_speaker = _nonempty_text(value.get("source_speaker"), "source_speaker")
-    target_crop = _nonempty_text(value.get("target_crop"), "target_crop")
+    operation_id = _bounded_text(value.get("id"), "override.id", max_length=128)
+    if not _CLIP_ID.fullmatch(operation_id):
+        raise ValueError("Caption speaker override id is invalid")
+    source_speaker = _bounded_text(
+        value.get("source_speaker"), "source_speaker", max_length=64
+    )
+    target_crop = _bounded_text(value.get("target_crop"), "target_crop", max_length=64)
     if not _CROP_SPEAKER.fullmatch(source_speaker):
         raise ValueError("source_speaker must identify one reviewed crop speaker")
     if not _CROP_SPEAKER.fullmatch(target_crop):
@@ -118,14 +142,16 @@ def _normalize_override(value: object) -> dict:
     ):
         raise ValueError("Every expected word midpoint must be inside its override")
     return {
-        "id": _nonempty_text(value.get("id"), "override.id"),
+        "id": operation_id,
         "start": start,
         "end": end,
         "from_asr_speaker": source,
         "to_asr_speaker": target,
         "source_speaker": source_speaker,
         "target_crop": target_crop,
-        "reason": _nonempty_text(value.get("reason"), "override.reason"),
+        "reason": _bounded_text(
+            value.get("reason"), "override.reason", min_length=3, max_length=1000
+        ),
         "expected_words": expected_words,
     }
 
@@ -170,9 +196,11 @@ def normalize_caption_speaker_override_document(value: object, clip_id: str) -> 
         "clip_id": clip_id,
         "transcript_revision": transcript_revision,
         "overrides": normalized,
-        "actor": _nonempty_text(value.get("actor"), "actor"),
-        "reason": _nonempty_text(value.get("reason"), "reason"),
-        "updated_at": _nonempty_text(value.get("updated_at"), "updated_at"),
+        "actor": _bounded_text(value.get("actor"), "actor", max_length=120),
+        "reason": _bounded_text(
+            value.get("reason"), "reason", min_length=3, max_length=1000
+        ),
+        "updated_at": _review_timestamp(value.get("updated_at")),
     }
 
 
@@ -189,15 +217,33 @@ def caption_speaker_override_revision(clip_id: str, document: dict | None) -> st
     return _json_revision(state)
 
 
+def caption_speaker_override_document_revision(
+    clip_id: str, document: dict | None
+) -> str:
+    """Return the mutation CAS identity, including review metadata."""
+    caption_speaker_overrides_path(Path("."), clip_id)
+    return _json_revision(
+        document
+        if document is not None
+        else {
+            "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+            "clip_id": clip_id,
+            "document": None,
+        }
+    )
+
+
 def _word_identity(word: Mapping[str, object]) -> dict:
     start = _finite_number(word.get("start"), "transcript word start")
     end = _finite_number(word.get("end"), "transcript word end")
     if end <= start:
         raise ValueError("Transcript word end must be after its start")
     return {
-        "word": _nonempty_text(word.get("word"), "transcript word"),
-        "punctuated_word": _nonempty_text(
-            word.get("punctuated_word"), "punctuated transcript word"
+        "word": _bounded_text(word.get("word"), "transcript word", max_length=200),
+        "punctuated_word": _bounded_text(
+            word.get("punctuated_word"),
+            "punctuated transcript word",
+            max_length=200,
         ),
         "start": start,
         "end": end,
@@ -341,7 +387,7 @@ def caption_speaker_override_state(
     """Return inspectable state plus the caption-only effective transcript."""
     clip_id = str(clip.get("id") or "")
     caption_speaker_overrides_path(episode_dir, clip_id)
-    _clip_bounds(clip)
+    clip_bounds = _clip_bounds(clip)
     transcript_path = Path(episode_dir) / "diarized_transcript.json"
     transcript_revision = _bound_transcript_revision(transcript_path, diarized)
     speaker_targets = resolve_caption_speaker_targets(
@@ -359,16 +405,10 @@ def caption_speaker_override_state(
 
     overrides_revision = caption_speaker_override_revision(clip_id, document)
     document_revision = (
-        _json_revision(document)
+        caption_speaker_override_document_revision(clip_id, document)
         if document is not None
         else stored_revision
-        or _json_revision(
-            {
-                "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
-                "clip_id": clip_id,
-                "document": None,
-            }
-        )
+        or caption_speaker_override_document_revision(clip_id, None)
     )
     binding_state = [
         {"asr_speaker": source, "target_speaker": target}
@@ -378,6 +418,7 @@ def caption_speaker_override_state(
         {
             "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
             "clip_id": clip_id,
+            "clip_source_window": list(clip_bounds),
             "transcript_revision": transcript_revision,
             "speaker_targets": binding_state,
             "overrides_revision": overrides_revision,
@@ -403,6 +444,7 @@ def caption_speaker_override_state(
         "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
         "clock": "source",
         "clip_id": clip_id,
+        "clip_source_window": list(clip_bounds),
         "current": error is None,
         "revision": revision,
         "transcript_revision": transcript_revision,
@@ -435,3 +477,54 @@ def require_current_caption_speaker_overrides(
     if not state["current"]:
         raise ValueError(state.get("error") or "Caption speaker overrides are stale")
     return effective, state
+
+
+def caption_speaker_overrides_binding(state: Mapping[str, object]) -> dict | None:
+    """Return only pixel-affecting override identity for a variant manifest."""
+    if state.get("current") is not True:
+        raise ValueError("Caption speaker overrides are not current")
+    count = state.get("override_count")
+    applied = state.get("applied_word_count")
+    overrides = state.get("overrides")
+    if not isinstance(count, int) or not isinstance(applied, int):
+        raise TypeError("Caption speaker override counts are invalid")
+    if not isinstance(overrides, list) or len(overrides) != count:
+        raise TypeError("Caption speaker override state is malformed")
+    if count == 0:
+        if applied != 0:
+            raise TypeError("Empty caption speaker overrides changed words")
+        return None
+    revision = str(state.get("overrides_revision") or "")
+    if not _SHA256.fullmatch(revision) or applied <= 0:
+        raise TypeError("Caption speaker override identity is invalid")
+    operation_ids = [
+        override.get("id") if isinstance(override, Mapping) else None
+        for override in overrides
+    ]
+    if any(not isinstance(operation_id, str) for operation_id in operation_ids):
+        raise TypeError("Caption speaker override operation ids are invalid")
+    return {
+        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        "clock": "source",
+        "revision": revision,
+        "operation_ids": operation_ids,
+        "override_count": count,
+        "applied_word_count": applied,
+    }
+
+
+def apply_current_caption_speaker_overrides(
+    episode_dir: Path,
+    clip: Mapping[str, object],
+    diarized: dict,
+    segment_document: dict,
+    crop_config: dict,
+) -> tuple[dict, dict | None]:
+    """Return effective panel-caption words and their optional manifest binding."""
+    clip_id = str(clip.get("id") or "")
+    if not caption_speaker_overrides_path(episode_dir, clip_id).exists():
+        return diarized, None
+    effective, state = require_current_caption_speaker_overrides(
+        episode_dir, clip, diarized, segment_document, crop_config
+    )
+    return effective, caption_speaker_overrides_binding(state)
