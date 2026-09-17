@@ -710,9 +710,7 @@ def test_clean_no_neutral_caption_keeps_v1_context_and_fingerprint(tmp_path):
     )
 
 
-def test_clean_neutral_header_policy_stales_only_affected_clip(
-    tmp_path, monkeypatch
-):
+def test_clean_neutral_header_policy_stales_only_affected_clip(tmp_path, monkeypatch):
     episode_dir = tmp_path / "episode"
     episode_dir.mkdir()
     episode, diarized, segments = _write_gameplay_caption_context(episode_dir)
@@ -869,9 +867,7 @@ def test_clean_neutral_header_policy_stales_only_affected_clip(
     assert unaffected["current"] is True
 
     affected_base_path = episode_dir / "shorts" / "clip_01.mp4"
-    affected_base_identity = file_content_identity(affected_base_path)[
-        "scan_identity"
-    ]
+    affected_base_identity = file_content_identity(affected_base_path)["scan_identity"]
     corrected_fingerprint = background_variant_fingerprint(
         affected_base,
         affected_base_identity,

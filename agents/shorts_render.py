@@ -1524,7 +1524,9 @@ class ShortsRenderAgent(BaseAgent):
         if neutral_header_policy is not None:
             policy_box = tuple(neutral_header_policy["background_box"])
             if policy_box != fallback_box:
-                raise ValueError("Neutral-header policy does not match the clean layout")
+                raise ValueError(
+                    "Neutral-header policy does not match the clean layout"
+                )
             fallback_box = policy_box
         fallback = CaptionPlacement(
             x=x,

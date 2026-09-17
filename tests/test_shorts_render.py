@@ -560,9 +560,7 @@ def test_clean_no_neutral_caption_keeps_legacy_ass_bytes(
     }
     diarized = {
         "clock": "source",
-        "speaker_map": [
-            {"index": 5, "logical_track": 1, "mapping_confidence": 1.0}
-        ],
+        "speaker_map": [{"index": 5, "logical_track": 1, "mapping_confidence": 1.0}],
         "utterances": [
             {
                 "speaker": 5,
@@ -662,7 +660,10 @@ def test_clean_neutral_header_is_readable_and_stays_outside_picture(
 
     assert fallback.font_size == 48
     assert fallback.background_box == (0, 0, 1080, 72)
-    assert r"{\an7\pos(0,0)\p1\bord0\shad0\1c&H000000&}m 0 0 l 1080 0 l 1080 72 l 0 72{\p0}" in ass
+    assert (
+        r"{\an7\pos(0,0)\p1\bord0\shad0\1c&H000000&}m 0 0 l 1080 0 l 1080 72 l 0 72{\p0}"
+        in ass
+    )
     assert r"{\an5\pos(540,36)\fs48}significantly higher rates" in ass
 
     rendered = subprocess.run(

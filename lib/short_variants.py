@@ -653,6 +653,7 @@ def speaker_panel_caption_context_revision(
         state["neutral_header_policy"] = CLEAN_NEUTRAL_HEADER_POLICY
     return _json_revision(state)
 
+
 def speaker_panel_neutral_header_policy(
     variant_id: str,
     diarized: dict,
@@ -668,7 +669,9 @@ def speaker_panel_neutral_header_policy(
     intervals = []
     for interval in source_intervals:
         if not isinstance(interval, (list, tuple)) or len(interval) != 2:
-            raise TypeError("Clean neutral-header policy has malformed source intervals")
+            raise TypeError(
+                "Clean neutral-header policy has malformed source intervals"
+            )
         start, end = float(interval[0]), float(interval[1])
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             raise ValueError("Clean neutral-header policy has invalid source intervals")
