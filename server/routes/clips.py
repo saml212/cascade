@@ -10,13 +10,21 @@ import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Self
 from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lib.atomic_write import atomic_write_json
+from lib.caption_speaker_overrides import (
+    CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+    caption_speaker_override_state,
+    caption_speaker_overrides_path,
+    normalize_caption_speaker_override_document,
+    validate_caption_speaker_override_document,
+)
 from lib.clips import (
     load_clips as _load_clips_from_dir,
 )
@@ -32,6 +40,7 @@ from lib.short_variants import (
     BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
+    SPEAKER_PANEL_VARIANT_IDS,
     background_variant_output,
     background_variant_state,
     default_background_asset_id,
@@ -51,6 +60,7 @@ _render_jobs_lock = threading.Lock()
 _active_render_jobs: set[str] = set()
 _render_completion_tasks: set[asyncio.Task] = set()
 _RENDER_JOBS_PATH = Path("work/clip_render_jobs.json")
+_caption_speaker_overrides_lock = threading.Lock()
 
 
 def _release_render_task(task: asyncio.Task) -> None:
@@ -89,6 +99,61 @@ class VariantRenderRequest(BaseModel):
 
 class VariantApprovalRequest(BaseModel):
     expected_revision: str
+
+
+class CaptionSpeakerExpectedWord(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    word: str = Field(min_length=1, max_length=200)
+    punctuated_word: str = Field(min_length=1, max_length=200)
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("expected word end must be after its start")
+        return self
+
+
+class CaptionSpeakerOverrideInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+    )
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    from_asr_speaker: int = Field(ge=0)
+    to_asr_speaker: int = Field(ge=0)
+    source_speaker: str = Field(pattern=r"^speaker_[0-9]+$")
+    target_crop: str = Field(pattern=r"^speaker_[0-9]+$")
+    reason: str = Field(min_length=3, max_length=1000)
+    expected_words: list[CaptionSpeakerExpectedWord] = Field(
+        min_length=1, max_length=100
+    )
+
+    @model_validator(mode="after")
+    def validate_transition(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("caption speaker override end must be after its start")
+        if self.from_asr_speaker == self.to_asr_speaker:
+            raise ValueError("caption speaker override must change the speaker")
+        if self.source_speaker == self.target_crop:
+            raise ValueError("caption speaker override must change its crop target")
+        return self
+
+
+class CaptionSpeakerOverridesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    expected_document_revision: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    expected_transcript_revision: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=3, max_length=1000)
+    overrides: list[CaptionSpeakerOverrideInput] = Field(max_length=100)
 
 
 class DistributionSelectionRequest(BaseModel):
@@ -293,6 +358,54 @@ def find_clip(clips: list, clip_id: str) -> tuple[dict, int]:
         if clip.get("id") == clip_id:
             return clip, i
     raise HTTPException(status_code=404, detail=f"Clip {clip_id} not found")
+
+
+def _caption_speaker_override_context(
+    ep_dir: Path, clip: dict
+) -> tuple[dict, dict, dict, dict, dict]:
+    from agents.pipeline import load_config
+    from agents.speaker_cut import current_speaker_segments
+    from agents.transcribe import current_diarized_transcript
+
+    try:
+        episode = json.loads((ep_dir / "episode.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(
+            status_code=409, detail="Episode state is unavailable."
+        ) from exc
+    config = load_config()
+    diarized = current_diarized_transcript(ep_dir, episode, config)
+    if diarized is None:
+        raise HTTPException(
+            status_code=409,
+            detail="A current canonical transcript is required for caption overrides.",
+        )
+    segments = current_speaker_segments(ep_dir, episode, config)
+    if segments is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Current speaker segments are required for caption overrides.",
+        )
+    crop_config = episode.get("crop_config") or {}
+    if not isinstance(crop_config, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="A current crop configuration is required for caption overrides.",
+        )
+    try:
+        state, effective = caption_speaker_override_state(
+            ep_dir, clip, diarized, segments, crop_config
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return state, effective, diarized, segments, crop_config
+
+
+def _public_caption_speaker_override_state(state: dict) -> dict:
+    return {
+        **state,
+        "affected_variants": sorted(SPEAKER_PANEL_VARIANT_IDS),
+    }
 
 
 def _clear_final_approval(clip: dict) -> None:
@@ -584,6 +697,91 @@ async def get_clip(episode_id: str, clip_id: str) -> dict:
     clips, _ = load_clips(episode_id)
     clip, _ = find_clip(clips, clip_id)
     return clip
+
+
+@router.get("/{clip_id}/caption-speaker-overrides")
+async def get_caption_speaker_overrides(episode_id: str, clip_id: str) -> dict:
+    """Inspect reviewed word-level attribution used only by panel captions."""
+    clips, clips_file = load_clips(episode_id)
+    clip, _ = find_clip(clips, clip_id)
+    state, _effective, _diarized, _segments, _crop = _caption_speaker_override_context(
+        clips_file.parent, clip
+    )
+    return _public_caption_speaker_override_state(state)
+
+
+@router.put("/{clip_id}/caption-speaker-overrides")
+async def put_caption_speaker_overrides(
+    episode_id: str, clip_id: str, req: CaptionSpeakerOverridesRequest
+) -> dict:
+    """Replace one clip's guarded caption attribution without canonical edits."""
+    with _caption_speaker_overrides_lock:
+        clips, clips_file = load_clips(episode_id)
+        clip, _ = find_clip(clips, clip_id)
+        ep_dir = clips_file.parent
+        state, _effective, diarized, segments, crop_config = (
+            _caption_speaker_override_context(ep_dir, clip)
+        )
+        if req.expected_document_revision != state["document_revision"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Caption speaker overrides changed; refresh before saving.",
+            )
+        if req.expected_transcript_revision != state["transcript_revision"]:
+            raise HTTPException(
+                status_code=409,
+                detail="The canonical transcript changed; review the words again.",
+            )
+
+        document = None
+        if req.overrides:
+            try:
+                document = normalize_caption_speaker_override_document(
+                    {
+                        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+                        "clock": "source",
+                        "clip_id": clip_id,
+                        "transcript_revision": req.expected_transcript_revision,
+                        "overrides": [
+                            override.model_dump() for override in req.overrides
+                        ],
+                        "actor": req.actor,
+                        "reason": req.reason,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    clip_id,
+                )
+                validate_caption_speaker_override_document(
+                    document,
+                    clip=clip,
+                    diarized=diarized,
+                    segment_document=segments,
+                    crop_config=crop_config,
+                    transcript_revision=state["transcript_revision"],
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        latest, _effective, _diarized, _segments, _crop = (
+            _caption_speaker_override_context(ep_dir, clip)
+        )
+        if latest["revision"] != state["revision"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Caption inputs changed while the update was validated.",
+            )
+
+        path = caption_speaker_overrides_path(ep_dir, clip_id)
+        if document is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, document)
+
+        saved, _effective, _diarized, _segments, _crop = (
+            _caption_speaker_override_context(ep_dir, clip)
+        )
+        return _public_caption_speaker_override_state(saved)
 
 
 @router.post("/bulk/approve")

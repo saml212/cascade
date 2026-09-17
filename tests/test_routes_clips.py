@@ -95,6 +95,165 @@ class TestGetClip:
         assert resp.status_code == 404
 
 
+class TestCaptionSpeakerOverrides:
+    @staticmethod
+    def _prepare(test_client, monkeypatch):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(
+            episodes_dir,
+            "ep_001",
+            {"crop_config": {"speakers": [{}, {}, {}]}},
+        )
+        clip = {
+            "id": "clip_04",
+            "start_seconds": 100.0,
+            "end_seconds": 110.0,
+            "start": 100.0,
+            "end": 110.0,
+            "duration": 10.0,
+            "title": "Reviewed words",
+            "status": "approved",
+        }
+        _add_clips(episodes_dir, "ep_001", [clip])
+        diarized = {
+            "clock": "source",
+            "speaker_map": [
+                {"index": 1, "target_speaker": "speaker_1"},
+                {"index": 2, "target_speaker": "speaker_2"},
+            ],
+            "utterances": [
+                {
+                    "speaker": 1,
+                    "words": [
+                        {
+                            "word": "sure",
+                            "punctuated_word": "Sure.",
+                            "start": 103.0,
+                            "end": 103.5,
+                            "speaker": 1,
+                        },
+                        {
+                            "word": "next",
+                            "punctuated_word": "Next.",
+                            "start": 103.5,
+                            "end": 104.0,
+                            "speaker": 1,
+                        },
+                    ],
+                }
+            ],
+        }
+        segments = {"clock": "source", "track_mapping": []}
+        (ep_dir / "diarized_transcript.json").write_text(json.dumps(diarized))
+        (ep_dir / "segments.json").write_text(json.dumps(segments))
+
+        import agents.pipeline as pipeline_mod
+        import agents.speaker_cut as speaker_cut_mod
+        import agents.transcribe as transcribe_mod
+
+        monkeypatch.setattr(pipeline_mod, "load_config", dict)
+        monkeypatch.setattr(
+            transcribe_mod,
+            "current_diarized_transcript",
+            lambda *_args, **_kwargs: diarized,
+        )
+        monkeypatch.setattr(
+            speaker_cut_mod,
+            "current_speaker_segments",
+            lambda *_args, **_kwargs: segments,
+        )
+        return client, ep_dir
+
+    @staticmethod
+    def _request(state, *, word="sure"):
+        return {
+            "expected_document_revision": state["document_revision"],
+            "expected_transcript_revision": state["transcript_revision"],
+            "actor": "caption-reviewer",
+            "reason": "Reviewed source picture and close microphones.",
+            "overrides": [
+                {
+                    "id": "review_sure",
+                    "start": 103.0,
+                    "end": 103.5,
+                    "from_asr_speaker": 1,
+                    "to_asr_speaker": 2,
+                    "source_speaker": "speaker_1",
+                    "target_crop": "speaker_2",
+                    "reason": "Reviewed source picture and close microphones.",
+                    "expected_words": [
+                        {
+                            "word": word,
+                            "punctuated_word": "Sure.",
+                            "start": 103.0,
+                            "end": 103.5,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def test_put_is_cas_guarded_and_changes_only_caption_sidecar(
+        self, test_client, monkeypatch
+    ):
+        client, ep_dir = self._prepare(test_client, monkeypatch)
+        endpoint = "/api/episodes/ep_001/clips/clip_04/caption-speaker-overrides"
+        inspected = client.get(endpoint)
+        assert inspected.status_code == 200
+        initial = inspected.json()
+        assert initial["current"] is True
+        assert initial["override_count"] == 0
+        canonical_paths = [
+            ep_dir / "episode.json",
+            ep_dir / "clips.json",
+            ep_dir / "diarized_transcript.json",
+            ep_dir / "segments.json",
+        ]
+        before = {path: path.read_bytes() for path in canonical_paths}
+
+        saved = client.put(endpoint, json=self._request(initial))
+
+        assert saved.status_code == 200
+        state = saved.json()
+        assert state["current"] is True
+        assert state["override_count"] == 1
+        assert state["applied_word_count"] == 1
+        assert state["affected_variants"] == [
+            "gameplay_surround_v1",
+            "speaker_panels_v1",
+        ]
+        assert all(path.read_bytes() == before[path] for path in canonical_paths)
+        assert (ep_dir / "caption_speaker_overrides" / "clip_04.json").is_file()
+
+        stale = client.put(endpoint, json=self._request(initial))
+        assert stale.status_code == 409
+        assert "changed" in stale.json()["detail"]
+
+        clear = {
+            "expected_document_revision": state["document_revision"],
+            "expected_transcript_revision": state["transcript_revision"],
+            "actor": "caption-reviewer",
+            "reason": "Remove the reviewed caption attribution.",
+            "overrides": [],
+        }
+        cleared = client.put(endpoint, json=clear)
+        assert cleared.status_code == 200
+        assert cleared.json()["override_count"] == 0
+        assert not (ep_dir / "caption_speaker_overrides" / "clip_04.json").exists()
+        assert all(path.read_bytes() == before[path] for path in canonical_paths)
+
+    def test_word_mismatch_writes_nothing(self, test_client, monkeypatch):
+        client, ep_dir = self._prepare(test_client, monkeypatch)
+        endpoint = "/api/episodes/ep_001/clips/clip_04/caption-speaker-overrides"
+        state = client.get(endpoint).json()
+
+        response = client.put(endpoint, json=self._request(state, word="wrong"))
+
+        assert response.status_code == 409
+        assert "no longer matches" in response.json()["detail"]
+        assert not (ep_dir / "caption_speaker_overrides" / "clip_04.json").exists()
+
+
 class TestApproveReject:
     def test_approve_clip_binds_current_render(self, test_client, monkeypatch):
         client, episodes_dir = test_client
