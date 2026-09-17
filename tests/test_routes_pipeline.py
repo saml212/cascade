@@ -199,6 +199,7 @@ class TestRunPipeline:
         thread_class.assert_not_called()
         assert pipeline._running == running_before
 
+
 class TestCancelPipeline:
     def test_cancel_not_running(self, test_client):
         client, episodes_dir = test_client

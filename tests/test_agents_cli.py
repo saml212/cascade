@@ -8,7 +8,8 @@ import pytest
 from agents.__main__ import _start_pipeline, main
 
 
-def test_retired_agent_fails_before_episode_creation(tmp_path, capsys):
+@pytest.mark.parametrize("retired_agent", ("metadata_gen", "podcast_feed"))
+def test_retired_agent_fails_before_episode_creation(tmp_path, capsys, retired_agent):
     with (
         patch.object(
             sys,
@@ -18,7 +19,7 @@ def test_retired_agent_fails_before_episode_creation(tmp_path, capsys):
                 "--source-path",
                 str(tmp_path),
                 "--agents",
-                "metadata_gen",
+                retired_agent,
             ],
         ),
         patch("agents.__main__._create_episode") as create_episode,
@@ -28,7 +29,7 @@ def test_retired_agent_fails_before_episode_creation(tmp_path, capsys):
         main()
 
     assert error.value.code == 2
-    assert "retired agent(s): metadata_gen" in capsys.readouterr().err
+    assert f"retired agent(s): {retired_agent}" in capsys.readouterr().err
     create_episode.assert_not_called()
     check_server.assert_not_called()
 

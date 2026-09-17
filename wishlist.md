@@ -55,7 +55,7 @@ Harness gaps discovered but not yet built:
 
 ## Repo cleanup (for the `dev` or `clean` subagent)
 
-- [ ] Decide fate of untracked tests: `test_agent_podcast_feed.py`, `test_agent_publish.py`, `test_lib_ass.py`, `test_lib_ass_render.py`. Commit or delete.
+- [ ] Decide fate of untracked tests: `test_agent_publish.py`, `test_lib_ass.py`, `test_lib_ass_render.py`. Commit or delete.
 - [ ] Rename `tests/test_lib_ass_render.py` or confirm it's intentionally named (tests lib/ass.py's render path, not a nonexistent `ass_render` module).
 - [ ] Commit or revert the uncommitted changes in `clip_miner.py`, `longform_render.py`, `audio_enhance.py`, etc. Git status shows 15+ modified files — backlog of stalled work.
 - [ ] Verify new `audio_enhance.py` config keys (`audio_compressor_threshold`, `audio_compressor_ratio`, `audio_denoise_mix`) are in `config.example.toml` and documented.
@@ -63,4 +63,4 @@ Harness gaps discovered but not yet built:
 ## Questions for a future session
 
 - Does `thumbnail_gen` really need OpenAI, or can it be replaced with a local model now that image gen has improved?
-- Should `podcast_feed`, `publish`, `backup` be extracted to a separate "post-production" pipeline with its own scheduling?
+- Should `publish` and `backup` be extracted to a separate "post-production" pipeline with its own scheduling?
