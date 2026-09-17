@@ -157,7 +157,10 @@ export function distributionChangeLockReason(
       typeof reReleaseReason === 'string' &&
       reReleaseReason.trim()
     ) {
-      return reReleaseReason.trim();
+      const trimmed = reReleaseReason.trim();
+      return trimmed === 'Prior receipts have unresolved remote destinations.'
+        ? 'Existing posts are queued or need confirmation. Resolve them before changing this version.'
+        : trimmed;
     }
   }
   const reason = review.distribution.change_lock_reason;

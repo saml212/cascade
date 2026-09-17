@@ -527,6 +527,27 @@ test('shows exact blocked re-release reason and validates prepared state', () =>
   assert.equal(clipReReleaseViewState(review).kind, 'blocked');
 });
 
+test('clarifies the generic unresolved-receipts lock without changing other reasons', () => {
+  const review = reviewState({
+    distributionVersion: 'gameplay_surround_v1',
+    backgroundApproved: true,
+  });
+  review.distribution.change_locked = true;
+  review.distribution.re_release_allowed = false;
+  review.distribution.re_release_reason =
+    'Prior receipts have unresolved remote destinations.';
+  assert.equal(
+    distributionChangeLockReason(review),
+    'Existing posts are queued or need confirmation. Resolve them before changing this version.'
+  );
+
+  review.distribution.re_release_reason = 'Provider status conflicts.';
+  assert.equal(
+    distributionChangeLockReason(review),
+    'Provider status conflicts.'
+  );
+});
+
 test('fails closed when a prepared request no longer matches its target', () => {
   const review = reviewState({ backgroundApproved: true });
   review.distribution.change_locked = true;
