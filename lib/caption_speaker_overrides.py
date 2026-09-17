@@ -205,6 +205,7 @@ def normalize_caption_speaker_override_document(value: object, clip_id: str) -> 
 
 
 def caption_speaker_override_revision(clip_id: str, document: dict | None) -> str:
+    """Return only the caption-pixel identity, excluding review metadata."""
     state = {
         "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
         "clock": "source",
@@ -212,7 +213,14 @@ def caption_speaker_override_revision(clip_id: str, document: dict | None) -> st
         "transcript_revision": (
             document.get("transcript_revision") if document is not None else None
         ),
-        "overrides": document.get("overrides", []) if document is not None else [],
+        "overrides": (
+            [
+                {key: value for key, value in override.items() if key != "reason"}
+                for override in document.get("overrides", [])
+            ]
+            if document is not None
+            else []
+        ),
     }
     return _json_revision(state)
 
@@ -324,13 +332,20 @@ def _apply_document(
     return reviewed, len(selected)
 
 
-def _read_document(path: Path) -> tuple[dict | None, str | None, str | None]:
+def _read_document(
+    path: Path,
+) -> tuple[object | None, str | None, str | None, bool]:
     if not path.exists():
-        return None, None, None
+        return None, None, None, False
     try:
         stored_revision = file_fingerprint(path)["id"]
     except OSError as exc:
-        return None, f"Caption speaker override file cannot be read: {exc}", None
+        return (
+            None,
+            f"Caption speaker override file cannot be read: {exc}",
+            None,
+            True,
+        )
     try:
         value = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
@@ -338,8 +353,9 @@ def _read_document(path: Path) -> tuple[dict | None, str | None, str | None]:
             None,
             f"Caption speaker override file is invalid ({stored_revision}): {exc}",
             stored_revision,
+            True,
         )
-    return value, None, stored_revision
+    return value, None, stored_revision, True
 
 
 def _bound_transcript_revision(path: Path, diarized: dict) -> str:
@@ -394,10 +410,10 @@ def caption_speaker_override_state(
         diarized, segment_document, crop_config
     )
     path = caption_speaker_overrides_path(episode_dir, clip_id)
-    raw, read_error, stored_revision = _read_document(path)
+    raw, read_error, stored_revision, document_present = _read_document(path)
     document = None
     error = read_error
-    if raw is not None:
+    if document_present and error is None:
         try:
             document = normalize_caption_speaker_override_document(raw, clip_id)
         except (TypeError, ValueError) as exc:

@@ -495,6 +495,17 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
     assert restored["current"] is True
+    override_path.write_text("null")
+    _, malformed_override = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert malformed_override["current"] is False
+    assert "must be a mapping" in malformed_override["detail"]
+    override_path.unlink()
 
     transcript_path = episode_dir / "diarized_transcript.json"
     transcript = json.loads(transcript_path.read_text())
@@ -825,6 +836,17 @@ def test_speaker_panels_are_asset_free_and_bind_effective_context(
         variant_id=SPEAKER_PANELS_VARIANT_ID,
     )
     assert restored["current"] is True
+    override_path.write_text("null")
+    _, malformed_override = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert malformed_override["current"] is False
+    assert "must be a mapping" in malformed_override["detail"]
+    override_path.unlink()
 
     manifest_path = output.with_suffix(".json")
     malformed = json.loads(manifest_path.read_text())

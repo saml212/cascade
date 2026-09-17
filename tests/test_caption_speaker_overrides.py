@@ -8,6 +8,8 @@ import pytest
 from lib.caption_speaker_overrides import (
     CAPTION_SPEAKER_OVERRIDES_SCHEMA,
     apply_current_caption_speaker_overrides,
+    caption_speaker_override_document_revision,
+    caption_speaker_override_revision,
     caption_speaker_override_state,
     caption_speaker_overrides_path,
     normalize_caption_speaker_override_document,
@@ -165,6 +167,36 @@ def test_exact_seven_words_apply_to_copy_and_leave_canonical_bytes(tmp_path):
         }
 
 
+def test_review_metadata_changes_only_the_document_cas_revision(tmp_path):
+    _diarized, clip, _segments, _crop_config, transcript_path = _review_inputs(
+        tmp_path
+    )
+    document = normalize_caption_speaker_override_document(
+        _document(clip["id"], file_fingerprint(transcript_path)["id"]), clip["id"]
+    )
+    changed = copy.deepcopy(document)
+    changed["actor"] = "second-reviewer"
+    changed["reason"] = "Keep the same pixel result with updated review context."
+    changed["updated_at"] = "2026-09-16T13:00:00+00:00"
+    assert caption_speaker_override_revision(
+        clip["id"], changed
+    ) == caption_speaker_override_revision(clip["id"], document)
+    assert caption_speaker_override_document_revision(
+        clip["id"], changed
+    ) != caption_speaker_override_document_revision(clip["id"], document)
+
+    changed = copy.deepcopy(document)
+    changed["overrides"][0]["reason"] = (
+        "Updated evidence summary without changing the selected words."
+    )
+    assert caption_speaker_override_revision(
+        clip["id"], changed
+    ) == caption_speaker_override_revision(clip["id"], document)
+    assert caption_speaker_override_document_revision(
+        clip["id"], changed
+    ) != caption_speaker_override_document_revision(clip["id"], document)
+
+
 def test_stale_or_mismatched_document_fails_closed(tmp_path):
     diarized, clip, segments, crop_config, transcript_path = _review_inputs(tmp_path)
     transcript_revision = file_fingerprint(transcript_path)["id"]
@@ -296,6 +328,12 @@ def test_effective_variant_helper_binds_valid_sidecar_and_fails_closed(tmp_path)
 
     path.write_text("{not-json")
     with pytest.raises(ValueError, match="file is invalid"):
+        apply_current_caption_speaker_overrides(
+            tmp_path, clip, diarized, segments, crop_config
+        )
+
+    path.write_text("null")
+    with pytest.raises(ValueError, match="must be a mapping"):
         apply_current_caption_speaker_overrides(
             tmp_path, clip, diarized, segments, crop_config
         )
