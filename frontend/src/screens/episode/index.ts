@@ -1,10 +1,11 @@
 import { Button } from '../../components/Button';
+import { PublicationEvidenceLink } from '../../components/PublicationEvidenceLink';
 import { QualityReview, type QualityReviewControls } from '../../components/QualityReview';
 import { StatusPill } from '../../components/StatusPill';
 import { StepProgress } from '../../components/StepProgress';
 import { Icon } from '../../components/icons';
 import { api, type DeliveryStatus, type EpisodeReviewState, type QualitySnapshot, type UnknownRecord } from '../../lib/api';
-import { clipDistributionReady, publicationEvidenceStatusLabel } from '../../lib/clip-review-surface';
+import { clipDistributionReady } from '../../lib/clip-review-surface';
 import { coalescedRefresh } from '../../lib/coalesced-refresh';
 import { h, mount, releaseMediaElement } from '../../lib/dom';
 import {
@@ -1593,28 +1594,10 @@ function publicationEvidenceRow(record: EpisodePublicationEvidence): HTMLElement
         : record.clip_id
           ? `Short ${record.clip_id}`
           : 'Short';
-  const destinations = record.destinations ?? (record.destination ? [record.destination] : ['unknown destination']);
-  const safeUrl = record.url?.startsWith('https://') || record.url?.startsWith('http://') ? record.url : null;
-  const line = h(
-    'span',
-    { class: 'text-body-sm text-ink-secondary' },
-    `${content} · ${destinations.map((value) => value.replaceAll('_', ' ')).join(', ')} · ${publicationEvidenceStatusLabel(record.status, record.scheduled)}${record.job_id ? ` · Job ${record.job_id}` : record.request_id ? ` · Request ${record.request_id}` : ''}${record.error ? ` · ${record.error}` : ''}`,
-  );
   return h(
     'div',
     { class: 'py-2.5' },
-    safeUrl
-      ? h(
-          'a',
-          {
-            href: safeUrl,
-            target: '_blank',
-            rel: 'noreferrer',
-            class: 'hover:text-accent',
-          },
-          line,
-        )
-      : line,
+    PublicationEvidenceLink(record, content),
   );
 }
 

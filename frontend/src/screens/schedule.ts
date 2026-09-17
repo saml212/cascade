@@ -2,15 +2,14 @@
  * Schedule — current approved release proposals and recorded publication evidence.
  */
 
-import { h, mount } from '../lib/dom';
-import { signal, effect } from '../lib/signals';
+import { PublicationEvidenceLink } from '../components/PublicationEvidenceLink';
 import { api, type ClipVariantId, type UnknownRecord } from '../lib/api';
+import { distributionVersionLabel } from '../lib/clip-review-surface';
+import { h, mount } from '../lib/dom';
+import type { EpisodePublicationEvidence } from '../lib/episode-release';
 import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
-import {
-  distributionVersionLabel,
-  publicationEvidenceStatusLabel,
-} from '../lib/clip-review-surface';
+import { signal, effect } from '../lib/signals';
 
 interface ScheduleItem {
   type: 'longform' | 'short' | string;
@@ -49,19 +48,8 @@ interface HeldEpisode {
   blockers?: string[];
 }
 
-interface PublicationEvidence {
-  episode_id: string;
+interface PublicationEvidence extends EpisodePublicationEvidence {
   name?: string;
-  content_type: 'podcast_audio' | 'longform' | 'short' | string;
-  destination?: string;
-  destinations?: string[];
-  status: string;
-  clip_id?: string;
-  url?: string;
-  scheduled?: boolean;
-  job_id?: string;
-  request_id?: string;
-  error?: string;
   version?: 'base' | ClipVariantId;
   variant_id?: null | ClipVariantId;
 }
@@ -481,41 +469,5 @@ function renderPublicationRecord(record: PublicationEvidence): HTMLElement {
           record.variant_id
         )}`
       : 'Short';
-  const destinations =
-    record.destinations ??
-    (record.destination ? [record.destination] : ['unknown destination']);
-  const destinationLabel = destinations
-    .map((value) => value.replaceAll('_', ' '))
-    .join(', ');
-  const status = publicationEvidenceStatusLabel(
-    record.status,
-    record.scheduled
-  );
-  const safeUrl =
-    record.url?.startsWith('https://') || record.url?.startsWith('http://')
-      ? record.url
-      : null;
-  const label = h(
-    'span',
-    { class: 'text-body-sm text-ink-secondary' },
-    `${content} · ${destinationLabel} · ${status}${
-      record.job_id
-        ? ` · Job ${record.job_id}`
-        : record.request_id
-          ? ` · Request ${record.request_id}`
-          : ''
-    }${record.error ? ` · ${record.error}` : ''}`
-  );
-  return safeUrl
-    ? h(
-        'a',
-        {
-          href: safeUrl,
-          target: '_blank',
-          rel: 'noreferrer',
-          class: 'hover:text-accent',
-        },
-        label
-      )
-    : label;
+  return PublicationEvidenceLink(record, content);
 }
