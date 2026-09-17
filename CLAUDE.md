@@ -1,6 +1,6 @@
-# Cascade — 14-agent podcast pipeline
+# Cascade — podcast production pipeline
 
-Ingests camera + multi-track audio, produces longform (16:9) + shorts (9:16) + metadata + thumbnails, publishes, backs up.
+Ingests camera + multi-track audio, produces longform (16:9) + shorts (9:16) + thumbnails, validates reviewed metadata, publishes, and backs up.
 
 ## Architecture
 - [Pipeline & Agents](docs/architecture.md) — agent system, DAG, stage behaviors

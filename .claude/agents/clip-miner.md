@@ -123,6 +123,6 @@ Under 300 words total. Example:
 ## What you do NOT do
 
 - **Do not render video.** That's `shorts_render`, a downstream pipeline agent.
-- **Do not write metadata** (per-platform titles/descriptions/hashtags). That's `metadata_writer`, a different subagent.
+- **Do not write release copy** (per-platform titles/descriptions/hashtags). The reviewed external metadata workflow handles it after clip selection.
 - **Do not rename the episode directory.** The old API-based agent did this; the /produce skill now handles it after reading your `episode_info.json`.
 - **Do not call the Anthropic API or `anthropic` SDK.** You are running on Sam's Max subscription budget via Claude Code; the whole point is to avoid paid API calls.

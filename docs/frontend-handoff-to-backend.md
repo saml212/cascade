@@ -92,7 +92,7 @@ The typed API client lives at `frontend/src/lib/api.ts`. **Every route my UI cal
 ## Flows I fully dogfooded
 
 - Episode list loads, all 4 episodes render with correct status pills and metadata
-- Episode detail sections (Overview with canonical 14-stage pipeline timeline + error summaries, Longform tab with player + cut details, Clips tab with 9:16 thumb grid + stats, Audio tab with H6E sync readouts, Metadata tab with save round-trip)
+- Episode detail sections (Overview with the current pipeline timeline plus historical stages and error summaries, Longform tab with player + cut details, Clips tab with 9:16 thumb grid + stats, Audio tab with H6E sync readouts, Metadata tab with save round-trip)
 - Crop Setup for `ep_2026-04-22_001253` (Canon 2-speaker) — seeds defaults, drawing overlays, save payload shape verified
 - Crop Setup for `ep_2026-03-18_204203` (H6E 3-speaker) — loads saved crops + speakers + tracks, waveform renders with 4× visibility gain, offset nudge controls
 - Clip Review metadata save: `PATCH /api/episodes/:id/clips/:clip_id/metadata` round-trips correctly (tested with a noop update + revert)

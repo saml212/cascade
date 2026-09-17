@@ -15,7 +15,6 @@ Longer-term workstreams captured during the 2026-04-21 session. Ordered roughly 
 **Still to do:**
 - Build async polling against Upload-Post's `/api/uploadposts/status` endpoint so `/produce` can detect when YouTube finishes processing and fire the URL back into `episode.json` automatically. Today `/produce` asks Sam to paste the URL.
 - Split `publish` into explicit longform / shorts modes OR rely on render-gate + idempotency (current approach).
-- Update `metadata_gen` prompt to emit "link in bio" + `thelocalpod.link` instead of raw URLs in captions (some platforms de-rank the latter).
 
 ### 2. Linktree auto-update
 
@@ -141,13 +140,12 @@ readback instead of an application-local chat session.
 3. Implement URL polling so shorts can fire automatically once longform is live.
 4. Linktree auto-update.
 5. Browser-use social audit agent (one-shot prompt).
-6. Metadata_gen prompt update (link-in-bio phrasing) — cheap, slot anywhere.
-7. Daily social admin agent.
-8. Reddit distribution skill.
-9. Substack distribution skill.
-10. Wikipedia — Sam-driven; no engineering work required.
-11. GEO as an ongoing optimization layer on top of #8–10.
-12. pebbleml.com — apply the same playbook once the podcast playbook is proven.
+6. Daily social admin agent.
+7. Reddit distribution skill.
+8. Substack distribution skill.
+9. Wikipedia — Sam-driven; no engineering work required.
+10. GEO as an ongoing optimization layer on top of #7–9.
+11. pebbleml.com — apply the same playbook once the podcast playbook is proven.
 
 ## Open questions
 

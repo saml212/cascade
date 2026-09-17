@@ -55,7 +55,7 @@ class MyAgent(BaseAgent):
 - **tomllib** (stdlib) for TOML — `tomli` has been removed.
 - **macOS SD cards**: filter resource forks — `if not f.name.startswith("._")`.
 - **Never hardcode** `/Volumes/1TB_SSD/` — use `lib.paths.resolve_path()`.
-- **anthropic SDK**: only in `agents/clip_miner.py` and `agents/metadata_gen.py`. Do NOT introduce new imports — a migration to the `claude` CLI is pending.
+- **anthropic SDK**: only in `agents/clip_miner.py`. Do NOT introduce new imports — a migration to the `claude` CLI is pending.
 - **Logging**: `logger = logging.getLogger(__name__)`, never `print()` for debug.
 
 ## After any change

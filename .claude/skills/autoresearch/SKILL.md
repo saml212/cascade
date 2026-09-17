@@ -1,6 +1,6 @@
 ---
 name: autoresearch
-description: Iteratively optimize any text artifact (prompt, skill description, doc, spec) via a generate→score→keep loop. Carries a lessons ledger so each iteration learns from prior failures. Use when the developer says "make this better", "optimize this prompt", "iterate on", "keep improving until X", or when a prompt/skill is underperforming. Cascade use cases: clip_miner prompt quality, metadata_gen per-platform prompts, skill descriptions, agent system prompts.
+description: Iteratively optimize any text artifact (prompt, skill description, doc, spec) via a generate→score→keep loop. Carries a lessons ledger so each iteration learns from prior failures. Use when the developer says "make this better", "optimize this prompt", "iterate on", "keep improving until X", or when a prompt/skill is underperforming. Cascade use cases: clip_miner prompt quality, skill descriptions, and agent system prompts.
 ---
 
 # /autoresearch — iterative artifact optimization
@@ -107,8 +107,6 @@ Do NOT invoke for:
 - `/autoresearch agents/clip_miner.py clip-mining-prompt` — optimize the
   clip mining prompt against a rubric of "picks clips in 45-75s sweet spot,
   prefers complete thoughts, avoids filler"
-- `/autoresearch agents/metadata_gen.py platform-metadata` — per-platform
-  metadata quality
 - `/autoresearch .claude/agents/python-specialist.md` — is the specialist
   prompt producing good work?
 

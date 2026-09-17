@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from agents import RETIRED_AGENTS
 from agents.qa import (
     LONGFORM_PUBLISH_APPROVAL_SCHEMA,
     current_funnel_urls_for_episode,
@@ -41,6 +42,19 @@ class _SingleAgentWorker(threading.Thread):
     pass
 
 
+def _reject_retired_agents(agents: list[str] | None) -> None:
+    retired = sorted(set(agents or ()) & RETIRED_AGENTS)
+    if retired:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agent_retired",
+                "agents": retired,
+                "message": "One or more requested agents are retired.",
+            },
+        )
+
+
 def _start_pipeline_thread(
     episode_id: str,
     source_path: str,
@@ -49,6 +63,7 @@ def _start_pipeline_thread(
     audio_path: str | None = None,
 ) -> None:
     """Start and register one background pipeline with a single launch contract."""
+    _reject_retired_agents(agents)
 
     def _run() -> None:
         from agents.pipeline import run_pipeline
@@ -222,6 +237,7 @@ async def run_pipeline_endpoint(
 ) -> PipelineActionResponse:
     """Trigger the full pipeline as a background task."""
     logger.info("POST /api/episodes/%s/run-pipeline", episode_id)
+    _reject_retired_agents(req.agents)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
             raise HTTPException(
@@ -266,6 +282,7 @@ async def run_single_agent(
     from agents import AGENT_REGISTRY
     from agents.pipeline import load_config
 
+    _reject_retired_agents([agent_name])
     if agent_name not in AGENT_REGISTRY:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
 
@@ -452,13 +469,13 @@ async def resume_pipeline(
 
     If `agents` is provided in the body, we run only those (filtered to ones
     not already completed). This is what /produce relies on to gate
-    paid-API stages: it dispatches subagents to produce clips.json /
-    metadata.json, then resumes with an explicit list so the cost-locked
-    agents never run automatically. If `agents` is omitted we run every
-    remaining local-production agent. Publication agents require an explicit
-    request and a current release approval.
+    externally reviewed clip and copy updates before resuming with an explicit
+    list, so the cost-locked agents never run automatically. If `agents` is
+    omitted we run every remaining local-production agent. Publication agents
+    require an explicit request and a current release approval.
     """
     logger.info("POST /api/episodes/%s/resume-pipeline", episode_id)
+    _reject_retired_agents(req.agents if req is not None else None)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
             raise HTTPException(
@@ -616,7 +633,6 @@ async def approve_longform(
                 [
                     "clip_miner",
                     "shorts_render",
-                    "metadata_gen",
                     "thumbnail_gen",
                     "qa",
                 ],

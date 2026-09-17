@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from agents import RETIRED_AGENTS
+
 BASE_URL = "http://localhost:8420"
 
 
@@ -47,7 +49,15 @@ def _start_pipeline(client, episode_id, source_path, audio_path, agents):
         body["agents"] = agents
 
     resp = client.post(f"{BASE_URL}/api/episodes/{episode_id}/run-pipeline", json=body)
+    detail = None
     if resp.status_code == 409:
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            detail = payload.get("detail")
+    if detail == "Pipeline already running for this episode":
         print(f"Pipeline already running for {episode_id}")
         return True
     resp.raise_for_status()
@@ -146,7 +156,9 @@ def _poll_status(client, episode_id):
                 pct = progress.get("percent", 0)
                 msg = progress.get("message", "")
                 if pct > 0:
-                    sys.stdout.write(f"\r  [running] {current_agent} ({pct}%{' — ' + msg if msg else ''})")
+                    sys.stdout.write(
+                        f"\r  [running] {current_agent} ({pct}%{' — ' + msg if msg else ''})"
+                    )
                     sys.stdout.flush()
 
         # Check terminal states
@@ -158,7 +170,9 @@ def _poll_status(client, episode_id):
             print()
             print("Pipeline paused: awaiting crop setup.")
             print(f"Configure speaker crop points in the web UI, then resume:")
-            print(f"  curl -X POST {BASE_URL}/api/episodes/{episode_id}/resume-pipeline")
+            print(
+                f"  curl -X POST {BASE_URL}/api/episodes/{episode_id}/resume-pipeline"
+            )
             return data, episode_id
 
         if status == "awaiting_backup_approval":
@@ -208,11 +222,16 @@ def main():
         help="Run only specific agents (e.g. --agents ingest stitch)",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose output",
     )
     args = parser.parse_args()
+
+    retired = sorted(set(args.agents or ()) & RETIRED_AGENTS)
+    if retired:
+        parser.error(f"retired agent(s): {', '.join(retired)}")
 
     # Validate all source paths exist
     source_paths = args.source_path
@@ -262,7 +281,7 @@ def main():
     # Set up Ctrl+C handler
     cancelled = False
 
-    def _handle_sigint(sig, frame):
+    def _handle_sigint(_sig, _frame):
         nonlocal cancelled
         if cancelled:
             print("\nForce quit.")

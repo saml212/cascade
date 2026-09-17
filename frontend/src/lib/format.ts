@@ -401,7 +401,7 @@ const AGENT_LABELS: Record<string, string> = {
   backup: 'Backing up',
 };
 
-/** Canonical order of the 14-stage cascade pipeline. */
+/** Canonical order for new pipeline runs. Historical stages append below it. */
 export const CANONICAL_AGENTS: string[] = [
   'ingest',
   'stitch',
@@ -411,7 +411,6 @@ export const CANONICAL_AGENTS: string[] = [
   'clip_miner',
   'longform_render',
   'shorts_render',
-  'metadata_gen',
   'thumbnail_gen',
   'qa',
   'podcast_feed',

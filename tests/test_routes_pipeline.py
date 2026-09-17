@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from tests.test_routes_episodes import _create_episode
 
@@ -138,6 +139,58 @@ class TestRunPipeline:
             "agents": ["ingest"],
         }
 
+    @pytest.mark.parametrize(
+        ("path", "payload"),
+        [
+            ("run-agent/metadata_gen", {}),
+            ("run-pipeline", {"agents": ["ingest", "metadata_gen"]}),
+            ("resume-pipeline", {"agents": ["metadata_gen"]}),
+        ],
+    )
+    def test_retired_metadata_generator_rejects_before_worker_or_episode_mutation(
+        self, test_client, path, payload
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        episode_file = episode_dir / "episode.json"
+        before = episode_file.read_bytes()
+        from server.routes import pipeline
+
+        running_before = dict(pipeline._running)
+        cancelled_before = set(pipeline._cancel_requested)
+        with (
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+            patch("server.routes.pipeline._SingleAgentWorker") as single_worker,
+        ):
+            response = client.post(f"/api/episodes/ep_001/{path}", json=payload)
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "code": "agent_retired",
+            "agents": ["metadata_gen"],
+            "message": "One or more requested agents are retired.",
+        }
+        thread_class.assert_not_called()
+        single_worker.assert_not_called()
+        assert pipeline._running == running_before
+        assert pipeline._cancel_requested == cancelled_before
+        assert episode_file.read_bytes() == before
+
+    def test_thread_launcher_defensively_rejects_retired_agent(self):
+        from server.routes import pipeline
+
+        running_before = dict(pipeline._running)
+        with (
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+            pytest.raises(HTTPException) as error,
+        ):
+            pipeline._start_pipeline_thread("ep_001", "/tmp/source", ["metadata_gen"])
+
+        assert error.value.status_code == 409
+        assert error.value.detail["agents"] == ["metadata_gen"]
+        thread_class.assert_not_called()
+        assert pipeline._running == running_before
+
 
 class TestCancelPipeline:
     def test_cancel_not_running(self, test_client):
@@ -197,7 +250,6 @@ class TestEditorialApproval:
         assert requested == [
             "clip_miner",
             "shorts_render",
-            "metadata_gen",
             "thumbnail_gen",
             "qa",
         ]
@@ -1234,7 +1286,7 @@ class TestRunSingleAgent:
         release = threading.Event()
 
         class BlockingAgent:
-            def __init__(self, episode_dir, config):
+            def __init__(self, episode_dir, _config):
                 pass
 
             def run(self):

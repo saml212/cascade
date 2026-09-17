@@ -9,7 +9,6 @@ from lib.short_distribution import (
     PLATFORM_COPY_FIELDS,
     SHORT_DESTINATIONS,
     configured_destination_bindings,
-    metadata_schema,
     upload_fields,
     valid_destination_bindings,
     validate_destination_copy,
@@ -52,12 +51,11 @@ def _media_file(tmp_path, *, edit_list=False):
     return path
 
 
-def test_catalogue_preserves_original_order_and_metadata_shapes():
+def test_catalogue_preserves_original_order_and_copy_fields():
     assert SHORT_DESTINATIONS[:4] == ("youtube", "tiktok", "instagram", "x")
     assert set(SHORT_DESTINATIONS[4:]) == EXPANSION_DESTINATIONS
     assert PLATFORM_COPY_FIELDS["facebook"] == ("title", "description")
     assert PLATFORM_COPY_FIELDS["threads"] == ("text",)
-    assert metadata_schema("pinterest")["required"] == ["title", "description"]
 
 
 def test_final_copy_limits_count_provider_units_without_truncating():

@@ -13,7 +13,7 @@ from lib.audio_qa import AUDIO_FINDING_REVIEWS_PATH, AUDIO_FINDING_REVIEWS_SCHEM
 def current_output_continuity(monkeypatch):
     monkeypatch.setattr(
         "agents.qa.analyze_release_audio_continuity",
-        lambda *args, **kwargs: {
+        lambda *_args, **_kwargs: {
             "status": "pass",
             "safe": True,
             "artifacts": [],
@@ -243,6 +243,52 @@ class TestQAAgent:
         assert by_name["all_shorts_rendered"]["detail"].startswith("1/1 selected")
         assert by_name["metadata_valid"]["pass"] is True
         assert result["overall"] == "pass"
+
+    def test_canonical_copy_passes_without_legacy_metadata_file(
+        self, tmp_episode_dir, sample_config, sample_clips
+    ):
+        sample_config["platforms"] = {"youtube": {"enabled": True}}
+        for index, clip in enumerate(sample_clips, start=1):
+            clip["metadata"] = {
+                "youtube": {
+                    "title": f"Clip {index}",
+                    "description": "Reviewed copy",
+                }
+            }
+        self._setup_full_episode(tmp_episode_dir, sample_clips)
+        (tmp_episode_dir / "metadata" / "metadata.json").unlink()
+        (tmp_episode_dir / "episode.json").write_text(
+            json.dumps(
+                {
+                    "episode_id": tmp_episode_dir.name,
+                    "title": "Reviewed episode",
+                    "description": "Reviewed description",
+                }
+            )
+        )
+        mock_probe = {
+            "format": {"duration": "3600.0"},
+            "streams": [
+                {"codec_type": "video", "duration": "3600.0"},
+                {"codec_type": "audio", "duration": "3600.0"},
+            ],
+        }
+
+        agent = QAAgent(tmp_episode_dir, sample_config)
+        with (
+            patch("agents.qa.ffprobe", return_value=mock_probe),
+            patch("agents.qa.analyze_episode_audio", return_value={"findings": []}),
+            patch(
+                "agents.qa.audio_release_gate",
+                return_value={"status": "pass", "reason": "checked"},
+            ),
+        ):
+            result = agent.execute()
+
+        by_name = {check["name"]: check for check in result["checks"]}
+        assert by_name["metadata_valid"]["pass"] is True
+        assert result["overall"] == "pass"
+        assert not (tmp_episode_dir / "metadata" / "metadata.json").exists()
 
     def test_recorder_mix_camera_continuity_is_recorded_as_skipped(
         self, tmp_episode_dir, sample_config, sample_clips

@@ -8,7 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agents import AGENT_REGISTRY, PIPELINE_ORDER
+from agents import AGENT_REGISTRY, PIPELINE_ORDER, RETIRED_AGENTS
 from lib.atomic_write import atomic_write_json
 from lib.paths import resolve_path
 
@@ -24,9 +24,8 @@ AGENT_DEPS = {
     "clip_miner": {"transcribe", "speaker_cut"},
     "longform_render": {"speaker_cut", "transcribe"},
     "shorts_render": {"clip_miner", "speaker_cut"},
-    "metadata_gen": {"clip_miner"},
     "thumbnail_gen": {"transcribe"},
-    "qa": {"longform_render", "shorts_render", "metadata_gen", "thumbnail_gen"},
+    "qa": {"longform_render", "shorts_render", "thumbnail_gen"},
     "podcast_feed": {"qa"},
     "video_feed": {"qa"},
     "publish": {"qa"},
@@ -105,6 +104,11 @@ def run_pipeline(
     Returns:
         The final episode.json dict.
     """
+    requested_agents = list(agents) if agents is not None else None
+    retired = sorted(set(requested_agents or ()) & RETIRED_AGENTS)
+    if retired:
+        raise ValueError(f"Retired agent(s): {retired}")
+
     config = load_config()
     output_dir = resolve_path(config["paths"]["output_dir"], "episodes")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -145,8 +149,8 @@ def run_pipeline(
 
     # Determine which agents to run
     agent_names = (
-        list(agents)
-        if agents is not None
+        requested_agents
+        if requested_agents is not None
         else [
             name for name in PIPELINE_ORDER if name not in EXPLICIT_PUBLICATION_AGENTS
         ]
@@ -161,7 +165,7 @@ def run_pipeline(
         for name, message in existing_errors.items()
         if name not in agent_names
     }
-    if agents is not None:
+    if requested_agents is not None:
         # Partial re-run: remove requested agents from completed list so they re-run cleanly
         prev_completed = episode["pipeline"].get("agents_completed", [])
         episode["pipeline"]["agents_completed"] = [
@@ -332,9 +336,9 @@ def run_pipeline(
         bool(requested_set & crop_dependent_agents) and "crop_config" not in episode
     )
     # Pause after longform_render for user approval before spending API tokens
-    # on clip mining, metadata, shorts, etc.
+    # on clip mining, shorts, etc.
     # Only pause if longform_render is in the requested set AND has completed.
-    longform_approval_agents = {"clip_miner", "shorts_render", "metadata_gen"}
+    longform_approval_agents = {"clip_miner", "shorts_render"}
     longform_pause_needed = (
         bool(requested_set & longform_approval_agents)
         and "longform_render" in requested_set

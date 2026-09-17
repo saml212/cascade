@@ -4,7 +4,7 @@ Podcast automation pipeline that turns raw recordings into publish-ready shorts,
 
 ## What It Does
 
-Cascade runs a 14-agent pipeline:
+Cascade runs a DAG-based production pipeline:
 
 1. **Ingest** — Copy media from SD card(s) to SSD, validate with ffprobe, sync external audio
 2. **Stitch** — Concatenate clips via ffmpeg stream-copy
@@ -14,12 +14,11 @@ Cascade runs a 14-agent pipeline:
 6. **Clip Miner** — Claude identifies top 10 short-form candidates
 7. **Longform Render** — 16:9 speaker-cropped video with hardware encoding
 8. **Shorts Render** — 9:16 shorts with burned-in subtitles
-9. **Metadata Gen** — Per-platform titles, descriptions, hashtags, schedule
-10. **Thumbnail Gen** — AI-generated caricature artwork via OpenAI
-11. **QA** — Validate all outputs (durations, file sizes, formats)
-12. **Podcast Feed** — Extract audio, generate RSS, upload to Cloudflare R2
-13. **Publish** — Distribute to YouTube, TikTok, Instagram, and more
-14. **Backup** — rsync episode to external HDD
+9. **Thumbnail Gen** — AI-generated caricature artwork via OpenAI
+10. **QA** — Validate all outputs (durations, file sizes, formats, and reviewed release copy)
+11. **Podcast Feed** — Extract audio, generate RSS, upload to Cloudflare R2
+12. **Publish** — Distribute to YouTube, TikTok, Instagram, and more
+13. **Backup** — rsync episode to external HDD
 
 Agents run in parallel where possible (transcribe runs alongside audio analysis + speaker cut).
 
@@ -55,7 +54,7 @@ cp .env.example .env                               # Fill in API keys
 
 | Key | Required | Purpose |
 |-----|----------|---------|
-| `ANTHROPIC_API_KEY` | For API generation | Clip mining and automatic metadata generation |
+| `ANTHROPIC_API_KEY` | For API generation | Clip mining |
 | `DEEPGRAM_API_KEY` | For transcription | Nova-3 transcription + speaker diarization |
 | `OPENAI_API_KEY` | No | Thumbnail generation (caricature artwork) |
 | `YOUTUBE_CLIENT_ID` | No | YouTube publishing |
@@ -115,12 +114,12 @@ artifact contracts used by both the UI and autonomous agents.
 
 ```
 cascade/
-├── agents/          # 14 pipeline agents (DAG-parallel execution)
+├── agents/          # Pipeline agents (DAG-parallel execution)
 │   ├── base.py      # BaseAgent ABC (timing, logging, JSON I/O, config helpers)
 │   ├── pipeline.py  # DAG orchestrator with dependency-aware parallelism
 │   ├── ingest.py → stitch.py → audio_analysis.py → speaker_cut.py
 │   ├── transcribe.py (runs parallel to audio_analysis + speaker_cut)
-│   ├── clip_miner.py → shorts_render.py + metadata_gen.py (parallel)
+│   ├── clip_miner.py → shorts_render.py
 │   ├── longform_render.py (starts when speaker_cut + transcribe finish)
 │   ├── thumbnail_gen.py → qa.py → podcast_feed.py → publish.py → backup.py
 │   └── ...

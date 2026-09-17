@@ -176,27 +176,6 @@ PLATFORM_COPY_FIELDS = {
     name: tuple(spec.get("required_fields", spec["metadata_fields"]))
     for name, spec in SHORT_PLATFORM_SPECS.items()
 }
-PLATFORM_METADATA_FIELDS = {
-    name: tuple(spec["metadata_fields"]) for name, spec in SHORT_PLATFORM_SPECS.items()
-}
-
-
-def metadata_schema(platform: str) -> dict:
-    """Return the structured-generation schema for one platform's stored copy."""
-    fields = PLATFORM_METADATA_FIELDS[platform]
-    return {
-        "type": "object",
-        "properties": {
-            field: (
-                {"type": "array", "items": {"type": "string"}}
-                if field == "hashtags"
-                else {"type": "string"}
-            )
-            for field in fields
-        },
-        "required": list(fields),
-        "additionalProperties": False,
-    }
 
 
 def copy_length(value: str, unit: str) -> int:

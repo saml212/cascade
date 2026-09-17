@@ -5,12 +5,14 @@
 - **`base.py`** — `BaseAgent` ABC. Agents implement `execute() -> dict`. The `run()` wrapper handles timing, logging, writing `<agent_name>.json`, and `progress.json` for polling.
   - Helpers: `load_json()`, `load_json_safe()` (returns `{}` on missing/invalid), `save_json()`, `get_config(*keys, default=)`, `report_progress()`.
 - **`pipeline.py`** — DAG-based parallel orchestrator using `ThreadPoolExecutor(max_workers=3)`. `AGENT_DEPS` defines the dependency graph (e.g., `longform_render` depends on both `speaker_cut` and `transcribe`).
-- **`__init__.py`** — `AGENT_REGISTRY` (name → class) and `PIPELINE_ORDER` (ordered list of 14 names).
+- **`__init__.py`** — `AGENT_REGISTRY` (name → class), `PIPELINE_ORDER`, and names retired from new execution while their history remains readable.
 - **`__main__.py`** — CLI entry point for `python -m agents`.
 
 ## Pipeline Order
 
-1. `ingest` → 2. `stitch` → 3. `audio_analysis` → 4. `speaker_cut` → 5. `transcribe` → 6. `clip_miner` → 7. `longform_render` → 8. `shorts_render` → 9. `metadata_gen` → 10. `thumbnail_gen` → 11. `qa` → 12. `podcast_feed` → 13. `publish` → 14. `backup`
+`ingest` → `stitch` → `audio_analysis` → `speaker_cut` → `transcribe` → `clip_miner` → `longform_render` → `shorts_render` → `thumbnail_gen` → `qa` → explicit publication agents → `backup`
+
+Release copy is drafted outside the runtime pipeline, reviewed, and written through the canonical episode and clip PATCH routes before final QA. Legacy `metadata/metadata.json` files remain readable.
 
 ## Pipeline Behaviors
 

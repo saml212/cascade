@@ -12,7 +12,7 @@ tools:
   - Agent
 ---
 
-You are the orchestrator for **Cascade** — a 14-agent Python pipeline that processes podcast recordings into publish-ready video. Your job is coordination, not implementation.
+You are the orchestrator for **Cascade** — a Python pipeline that processes podcast recordings into publish-ready video. Your job is coordination, not implementation.
 
 ## When you're invoked
 
@@ -64,7 +64,7 @@ When in doubt: start with a specialist. If the result is too narrow and you real
 
 ## Cascade-specific gotchas you must preserve in plans
 
-- `anthropic` SDK imports are only in `agents/clip_miner.py` and `agents/metadata_gen.py`. Pending migration to `claude` CLI — don't introduce new imports.
+- `anthropic` SDK imports are only in `agents/clip_miner.py`. Pending migration to `claude` CLI — don't introduce new imports.
 - Deepgram: use `httpx` REST, not the SDK (v5 incompatible).
 - ffmpeg filter chain order is fixed: LUT → crop → scale → `format=yuv420p` → subtitles.
 - macOS resource forks (`._*.MP4`) must be filtered in any SD-card ingest path.

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agents import AGENT_REGISTRY, PIPELINE_ORDER
+from agents import AGENT_REGISTRY, PIPELINE_ORDER, RETIRED_AGENTS
 from agents.pipeline import (
     AGENT_DEPS,
     EXPLICIT_PUBLICATION_AGENTS,
@@ -51,17 +51,13 @@ class TestDagDependencies:
     def test_shorts_render_depends_on_clip_miner_and_speaker_cut(self):
         assert AGENT_DEPS["shorts_render"] == {"clip_miner", "speaker_cut"}
 
-    def test_metadata_gen_depends_on_clip_miner(self):
-        assert AGENT_DEPS["metadata_gen"] == {"clip_miner"}
-
     def test_thumbnail_gen_depends_on_transcribe(self):
         assert AGENT_DEPS["thumbnail_gen"] == {"transcribe"}
 
-    def test_qa_depends_on_all_render_and_metadata(self):
+    def test_qa_depends_on_all_render_outputs(self):
         assert AGENT_DEPS["qa"] == {
             "longform_render",
             "shorts_render",
-            "metadata_gen",
             "thumbnail_gen",
         }
 
@@ -242,8 +238,34 @@ class TestAgentRegistry:
     def test_registry_count_matches_pipeline_order(self):
         assert len(AGENT_REGISTRY) == len(PIPELINE_ORDER)
 
-    def test_pipeline_order_has_14_agents(self):
-        assert len(PIPELINE_ORDER) == 17
+    def test_pipeline_order_has_16_agents(self):
+        assert len(PIPELINE_ORDER) == 16
+
+    def test_retired_metadata_generator_is_not_registered(self):
+        assert "metadata_gen" in RETIRED_AGENTS
+        assert "metadata_gen" not in AGENT_REGISTRY
+        assert "metadata_gen" not in PIPELINE_ORDER
+
+
+def test_retired_metadata_generator_is_rejected_before_episode_mutation(tmp_path):
+    episodes_dir = tmp_path / "episodes"
+    episode_dir = episodes_dir / "ep_test"
+    episode_dir.mkdir(parents=True)
+    episode_file = episode_dir / "episode.json"
+    original = b'{"episode_id":"ep_test","pipeline":{"agents_requested":["qa"]}}\n'
+    episode_file.write_bytes(original)
+
+    with (
+        patch("agents.pipeline.load_config") as load_config,
+        pytest.raises(ValueError, match="Retired agent"),
+    ):
+        run_pipeline(
+            "/tmp/source", episode_id="ep_test", agents=["ingest", "metadata_gen"]
+        )
+
+    load_config.assert_not_called()
+    assert episode_file.read_bytes() == original
+    assert sorted(path.name for path in episode_dir.iterdir()) == ["episode.json"]
 
 
 class TestPipelinePauseAtCropSetup:
@@ -251,7 +273,7 @@ class TestPipelinePauseAtCropSetup:
 
     @patch("agents.pipeline._is_cancelled", return_value=False)
     @patch("agents.pipeline.load_config")
-    def test_pauses_when_crop_config_missing(self, mock_config, mock_cancel, tmp_path):
+    def test_pauses_when_crop_config_missing(self, mock_config, _mock_cancel, tmp_path):
         """Pipeline should pause with awaiting_crop_setup after stitch completes."""
         mock_config.return_value = {
             "paths": {"output_dir": str(tmp_path)},
@@ -286,7 +308,7 @@ class TestPipelinePauseAtCropSetup:
     @patch("agents.pipeline._is_cancelled", return_value=False)
     @patch("agents.pipeline.load_config")
     def test_continues_when_crop_config_present(
-        self, mock_config, mock_cancel, tmp_path
+        self, mock_config, _mock_cancel, tmp_path
     ):
         """Pipeline should NOT pause when crop_config is set before resuming."""
         mock_config.return_value = {
@@ -343,7 +365,7 @@ class TestPipelineNonCriticalFailure:
 
     @patch("agents.pipeline._is_cancelled", return_value=False)
     @patch("agents.pipeline.load_config")
-    def test_non_critical_failure_continues(self, mock_config, mock_cancel, tmp_path):
+    def test_non_critical_failure_continues(self, mock_config, _mock_cancel, tmp_path):
         """A non-critical agent failing should not abort the pipeline."""
         mock_config.return_value = {
             "paths": {"output_dir": str(tmp_path)},

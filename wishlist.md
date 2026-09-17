@@ -5,7 +5,6 @@ Running list of things to hand to a dev agent once the harness is built. Organiz
 ## API → `claude` CLI migration (use Max subscription, not API billing)
 
 - [ ] `agents/clip_miner.py` — replace Anthropic SDK call with `claude -p` subprocess. Stream-JSON output; parse clip JSON blocks from response.
-- [ ] `agents/metadata_gen.py` — same pattern. Per-platform metadata generation.
 - [ ] `agents/thumbnail_gen.py` — uses OpenAI for image, but any Claude calls in here should move too.
 - [ ] Update `CLAUDE.md` "API Costs per Episode" section to reflect subscription use.
 - [ ] Remove `ANTHROPIC_API_KEY` requirement from `.env.example` once migration is complete (unless something still needs it).
@@ -48,7 +47,6 @@ Built 2026-04-20→21 (see `.claude/` and `docs/`):
 
 Applications of the built tooling (still TODO):
 - [ ] Run `/autoresearch` on the `agents/clip_miner.py` prompt — rubric: picks clips in the 45-75s sweet spot, prefers complete thoughts, rejects filler. Score against 2–3 test episodes.
-- [ ] Run `/autoresearch` on `agents/metadata_gen.py` per-platform prompts — rubric: per-platform tone match, length compliance, hashtag quality.
 - [ ] Design a `/deploy-team` config for **multi-lens clip mining** — agents for humor / drama / educational / quotable lenses, each scoring the same transcript independently, then main agent synthesizes a final ranked clip list. Good first real use of the team tool beyond self-review.
 
 Harness gaps discovered but not yet built:
@@ -60,7 +58,6 @@ Harness gaps discovered but not yet built:
 - [ ] Decide fate of untracked tests: `test_agent_podcast_feed.py`, `test_agent_publish.py`, `test_lib_ass.py`, `test_lib_ass_render.py`. Commit or delete.
 - [ ] Rename `tests/test_lib_ass_render.py` or confirm it's intentionally named (tests lib/ass.py's render path, not a nonexistent `ass_render` module).
 - [ ] Commit or revert the uncommitted changes in `clip_miner.py`, `longform_render.py`, `audio_enhance.py`, etc. Git status shows 15+ modified files — backlog of stalled work.
-- [ ] Decide fate of `docs/PLAN_2026-04-11.md` and `docs/PLAN_publishing_2026-04-12.md` — archive to `docs/archive/` if complete, or update if still active.
 - [ ] Verify new `audio_enhance.py` config keys (`audio_compressor_threshold`, `audio_compressor_ratio`, `audio_denoise_mix`) are in `config.example.toml` and documented.
 
 ## Questions for a future session
