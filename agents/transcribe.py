@@ -45,7 +45,7 @@ CAMERA_AUDIO_CACHE_VERSION = "source-clock-v3"
 TRANSCRIPT_CANONICAL_VERSION = "source-clock-v3"
 TRANSCRIPT_CLOCK_MAPPING_VERSION = 1
 _TRANSCRIPT_AUDIO_VERSION = "logical-tracks-v3"
-_TRACK_WINDOW_VERSION = "source-track-window-v2"
+_TRACK_WINDOW_VERSION = "source-track-window-v3"
 _SOURCE_ACTIVITY_FINGERPRINT_VERSION = "source-activity-v2"
 _WORD_TIME_TOLERANCE = 0.12
 MAX_TRANSCRIPT_REVIEW_SECONDS = 120.0
@@ -581,6 +581,8 @@ def _bounded_audio_window_filters(
     cursor = max(0.0, audio_start)
     slices: list[tuple[Path, float, float]] = []
     for track in tracks:
+        if remaining <= 1e-6:
+            break
         track_duration = float(track.get("duration_seconds") or 0)
         if track_duration <= 0:
             if len(tracks) == 1:
@@ -694,7 +696,13 @@ def export_logical_track_window(
             "logical_track": logical_track,
             "source_window": {"start": start, "end": end},
             "audio_sync": sync,
-            "sources": [_file_identity(path) for path in paths],
+            "sources": [
+                {
+                    **_file_identity(path),
+                    "duration_seconds": track.get("duration_seconds"),
+                }
+                for track, path in zip(tracks, paths, strict=True)
+            ],
             "codec": {
                 "name": codec_name,
                 "sample_rate": sample_rate,

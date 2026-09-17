@@ -1,6 +1,7 @@
 """Regression tests for logical multi-segment audio previews."""
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
@@ -9,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agents.transcribe import export_logical_track_window
 from server.routes import episodes
 
 
@@ -94,6 +96,37 @@ def test_preview_cache_changes_when_source_changes(preview_client, monkeypatch):
     assert run.call_count == 2
 
 
+def test_preview_cache_changes_when_segment_duration_changes(
+    preview_client, monkeypatch
+):
+    client, episode_dir = preview_client
+    tracks = [
+        _track(episode_dir, "session_a_Tr2.WAV", 2, 100),
+        _track(episode_dir, "session_b_Tr2.WAV", 2, 100),
+    ]
+    _write_episode(episode_dir, tracks)
+
+    def fake_ffmpeg(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"mp3")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    run = Mock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr("agents.transcribe.subprocess.run", run)
+    url = "/api/episodes/ep_test/audio-preview/track/2?start=75&duration=10"
+    assert client.get(url).status_code == 200
+    assert run.call_args.args[0][run.call_args.args[0].index("-ss") + 1] == "75.0"
+
+    episode = json.loads((episode_dir / "episode.json").read_text())
+    episode["audio_tracks"][0]["duration_seconds"] = 50
+    (episode_dir / "episode.json").write_text(json.dumps(episode))
+
+    assert client.get(url).status_code == 200
+    assert run.call_count == 2
+    command = run.call_args.args[0]
+    assert command[command.index("-ss") + 1] == "25.0"
+    assert str(episode_dir / "audio" / "session_b_Tr2.WAV") in command
+
+
 def test_negative_sync_offset_keeps_leading_silence(preview_client, monkeypatch):
     client, episode_dir = preview_client
     tracks = [_track(episode_dir, "session_Tr1.WAV", 1, 100)]
@@ -115,6 +148,49 @@ def test_negative_sync_offset_keeps_leading_silence(preview_client, monkeypatch)
     silence_input = cmd.index("anullsrc=r=44100:cl=mono")
     assert cmd[silence_input - 2 : silence_input] == ["2.5", "-i"]
     assert "concat=n=2:v=0:a=1" in cmd[cmd.index("-filter_complex") + 1]
+
+
+@pytest.mark.skipif(
+    not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+    reason="FFmpeg is required for the real preview regression",
+)
+def test_preview_entirely_before_source_renders_only_silence(tmp_path):
+    source = tmp_path / "unreadable.wav"
+    source.write_bytes(b"this source must not be opened for an all-silence window")
+    output = tmp_path / "preview.mp3"
+
+    export_logical_track_window(
+        tmp_path,
+        {
+            "audio_sync": {
+                "offset_seconds": -10,
+                "tempo_factor": 1,
+                "r_squared": 1,
+            }
+        },
+        1,
+        0,
+        5,
+        output,
+        tracks=[{"dest_path": str(source), "duration_seconds": 20}],
+    )
+
+    duration = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert float(duration.stdout) == pytest.approx(5, abs=0.1)
 
 
 @pytest.mark.parametrize(
