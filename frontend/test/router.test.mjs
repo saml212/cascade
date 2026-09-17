@@ -112,3 +112,29 @@ test('same-episode aliases preserve the screen across navigation history', async
     delete globalThis.__routerDisposals;
   }
 });
+
+test('a failed first mount retries through a same-episode alias', async () => {
+  globalThis.__routerDisposals = 0;
+  const harness = await loadRouter('/episodes/retry');
+  let attempts = 0;
+  const mount = () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('first mount failed');
+  };
+  const options = { screenIdentity: (params) => `episode:${params.id}` };
+
+  try {
+    harness.router.route('/episodes/:id', mount, options);
+    harness.router.route('/episodes/:id/audio', mount, options);
+
+    assert.throws(() => harness.router.startRouter(), /first mount failed/);
+    harness.setPath('/episodes/retry/audio');
+
+    assert.equal(attempts, 2);
+    assert.equal(harness.router.currentPath(), '/episodes/retry/audio');
+    assert.equal(globalThis.__routerDisposals, 0);
+  } finally {
+    harness.restore();
+    delete globalThis.__routerDisposals;
+  }
+});

@@ -75,9 +75,11 @@ function dispatch(): void {
 
   disposeScreen?.();
   disposeScreen = null;
-  activeScreenIdentity = match.screenIdentity;
+  activeScreenIdentity = null;
   currentPath.set(path);
-  disposeScreen = effectScope(() => match.handler(match.params));
+  const nextDisposer = effectScope(() => match.handler(match.params));
+  disposeScreen = nextDisposer;
+  activeScreenIdentity = match.screenIdentity;
 }
 
 function matchRoute(path: string): Match {
