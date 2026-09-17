@@ -35,7 +35,7 @@ from agents.qa import (
 )
 from lib.atomic_write import atomic_write_json
 from lib.delivery_video import read_render_manifest, render_output_lock
-from lib.publication_contracts import ShortDestinationExecution
+from lib.publication_contracts import ShortDestinationExecution, ShortDestinationRequest
 from lib.short_distribution import (
     EXPANSION_DESTINATIONS,
     PLATFORM_COPY_FIELDS,
@@ -427,7 +427,7 @@ def _destination_receipt_valid(receipt: dict) -> bool:
 
 @dataclass(frozen=True)
 class ShortDeliverySpec:
-    """Immutable inputs for one short transport and its durable receipt."""
+    """Immutable exact target plus the current media needed to transport it."""
 
     clip_id: str
     identity: str
@@ -440,34 +440,26 @@ class ShortDeliverySpec:
         cls,
         clip: dict,
         version: dict,
-        platforms: list[str],
-        identity: str,
-        copy: dict,
-        *,
-        target: dict | None = None,
+        target: dict,
     ) -> "ShortDeliverySpec":
         clip_id = str(clip.get("id", ""))
-        if target is not None and not (
+        if not (
             _destination_receipt_valid(target)
             and target["clip_id"] == clip_id
-            and target["external_id"] == identity
-            and target["platforms"] == platforms
-            and target["destination_copy"] == copy
             and cls.receipt_matches_artifact(target, version)
             and cls.receipt_matches_version(target, version)
         ):
             raise ValueError("Short destination target is invalid")
-        scheduled = target["scheduled"] if target is not None else True
         snapshot = json.dumps(
-            {"clip": clip, "version": version, "copy": copy, "target": target},
+            {"clip": clip, "version": version, "target": target},
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
         return cls(
             clip_id=clip_id,
-            identity=identity,
-            platforms=tuple(platforms),
-            scheduled=scheduled,
+            identity=target["external_id"],
+            platforms=tuple(target["platforms"]),
+            scheduled=target["scheduled"],
             _snapshot=snapshot,
         )
 
@@ -486,21 +478,12 @@ class ShortDeliverySpec:
         provider_receipt: dict,
         scheduled_at: datetime | None,
         timezone_name: str,
-        *,
-        include_copy: bool = True,
     ) -> dict:
         snapshot = self.snapshot()
-        version = snapshot["version"]
-        result = {**(snapshot["target"] or {}), **provider_receipt}
-        result.update(
-            self.receipt_identity(
-                self.clip_id, version, self.identity, list(self.platforms)
-            ),
-            scheduled=scheduled_at is not None,
-        )
-        if include_copy:
-            copy = snapshot["copy"]
-            result.update(destination_copy=copy, copy_revision=_document_revision(copy))
+        target = snapshot["target"]
+        result = {**target, **provider_receipt}
+        result.update({key: value for key, value in target.items() if key != "status"})
+        result["scheduled"] = scheduled_at is not None
         if scheduled_at is not None:
             result.update(
                 scheduled_date=scheduled_at.isoformat(),
@@ -1985,13 +1968,18 @@ def schedule_cancellation_provider_safe(
 class PublishAgent(BaseAgent):
     name = "publish"
 
+    @staticmethod
+    def _validated_destination_request(value, contract=ShortDestinationRequest) -> dict:
+        return contract.model_validate(value).model_dump(
+            mode="json", exclude_unset=True
+        )
+
     def _explicit_destination_request(self) -> dict:
         value = getattr(self, "short_destination_request", None)
         try:
-            request = ShortDestinationExecution.model_validate(value)
+            return self._validated_destination_request(value, ShortDestinationExecution)
         except (TypeError, ValueError) as exc:
             raise AggregatePublicationRetired() from exc
-        return request.model_dump(mode="json", exclude_unset=True)
 
     def run(self) -> dict:
         """Keep distribution selection locked until publish.json is durable."""
@@ -2141,43 +2129,6 @@ class PublishAgent(BaseAgent):
             versions[clip_id] = version
         return versions
 
-    def _destination_execution_specs(self, data, plan):
-        versions = self._destination_versions(data, plan["variant_overrides"])
-        clips = {str(clip.get("id", "")): clip for clip in data["approved"]}
-        publish = {"shorts": data["previous_shorts"]}
-        specs = {}
-        for target in plan["targets"]:
-            clip_id = target["clip_id"]
-            version, authorized = _authorized_rerelease_version(
-                publish,
-                clips[clip_id],
-                versions[clip_id],
-                target["platforms"],
-            )
-            if (
-                target.get("rerelease_request_id") is not None and not authorized
-            ) or not (
-                ShortDeliverySpec.receipt_matches_artifact(target, version)
-                and ShortDeliverySpec.receipt_matches_version(target, version)
-            ):
-                raise RuntimeError(
-                    f"The reviewed destination plan for {clip_id} no longer matches "
-                    "its exact version and re-release lineage"
-                )
-            specs[clip_id] = ShortDeliverySpec.create(
-                clips[clip_id],
-                version,
-                target["platforms"],
-                target["external_id"],
-                target["destination_copy"],
-                target=target,
-            )
-        return [
-            specs[clip_id]
-            for clip in data["approved"]
-            if (clip_id := str(clip.get("id", ""))) in specs
-        ]
-
     def _enforce_required_short_variants(
         self, clip_ids, short_versions, destinations
     ) -> None:
@@ -2203,12 +2154,7 @@ class PublishAgent(BaseAgent):
     def _validated_variant_overrides(data, value):
         overrides = value.get("variant_overrides", {})
         approved_ids = {str(clip.get("id", "")) for clip in data["approved"]}
-        if not isinstance(overrides, dict) or any(
-            not isinstance(clip_id, str)
-            or clip_id not in approved_ids
-            or not isinstance(variant_id, str)
-            for clip_id, variant_id in overrides.items()
-        ):
+        if not set(overrides) <= approved_ids:
             raise RuntimeError(
                 "variant_overrides must map approved clip IDs to variants"
             )
@@ -2221,39 +2167,23 @@ class PublishAgent(BaseAgent):
             raise RuntimeError(str(exc)) from exc
         return overrides
 
-    def _destination_plan(self, data, value):
-        if not isinstance(value, dict):
-            raise TypeError("Short destination request is malformed")
-        try:
-            request_id = str(uuid.UUID(str(value.get("request_id"))))
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise RuntimeError("Short destination request_id must be a UUID") from exc
-        actor, reason = value.get("actor"), value.get("reason")
-        destinations = value.get("destinations")
+    def _destination_plan(self, data, value, *, inspect_remote=True):
+        contract = (
+            ShortDestinationExecution
+            if isinstance(value, dict) and "preview_revision" in value
+            else ShortDestinationRequest
+        )
+        value = self._validated_destination_request(value, contract)
+        request_id = value["request_id"]
+        actor, reason = value["actor"], value["reason"]
+        destinations = sorted(value["destinations"])
         overrides = self._validated_variant_overrides(data, value)
         copy_overrides = value.get("copy_overrides", {})
         publish_now = value.get("publish_now", False)
-        if value.get("request_id") != request_id:
-            raise RuntimeError("Short destination request_id must be canonical")
-        if not isinstance(actor, str) or actor != actor.strip() or not actor:
-            raise RuntimeError("Short destination actor is required")
-        if not isinstance(reason, str) or reason != reason.strip() or len(reason) < 3:
-            raise RuntimeError("Short destination reason is required")
-        if (
-            not isinstance(destinations, list)
-            or not destinations
-            or any(not isinstance(item, str) for item in destinations)
-            or len(destinations) != len(set(destinations))
-        ):
-            raise RuntimeError("Choose at least one unique short destination")
-        destinations = sorted(destinations)
-        if not isinstance(publish_now, bool):
-            raise TypeError("publish_now must be true or false")
-        if not isinstance(copy_overrides, dict) or any(
-            not isinstance(clip_id, str) or not isinstance(copy, dict)
-            for clip_id, copy in copy_overrides.items()
-        ):
-            raise RuntimeError("copy_overrides must map clip IDs to copy objects")
+        if actor != actor.strip() or reason != reason.strip():
+            raise RuntimeError("Short destination actor and reason must be trimmed")
+        if len(destinations) != len(set(destinations)):
+            raise RuntimeError("Choose unique short destinations")
         # A reviewed one-off expansion request may use a verified configured
         # binding while the destination remains disabled for global releases.
         approved_destinations = sorted(
@@ -2277,9 +2207,7 @@ class PublishAgent(BaseAgent):
         if requested_ids is None:
             selected_ids = approved_ids
         elif (
-            not isinstance(requested_ids, list)
-            or not requested_ids
-            or any(not isinstance(item, str) or not item for item in requested_ids)
+            not requested_ids
             or len(requested_ids) != len(set(requested_ids))
             or not set(requested_ids) <= set(approved_ids)
         ):
@@ -2303,7 +2231,7 @@ class PublishAgent(BaseAgent):
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
-        if destination_bindings:
+        if destination_bindings and inspect_remote:
             self._verify_destination_bindings(
                 data["api_key"], data["user"], destination_bindings
             )
@@ -2326,6 +2254,7 @@ class PublishAgent(BaseAgent):
         by_id = {str(clip.get("id", "")): clip for clip in data["approved"]}
         prior = data["previous_shorts"]
         targets = []
+        delivery_states = []
         identities = set()
         co_schedule_ids = set()
         for clip_id in selected_ids:
@@ -2494,7 +2423,15 @@ class PublishAgent(BaseAgent):
                 or exact.get("status") == "cancelled"
             ):
                 raise RuntimeError(f"{clip_id} destination request_id cannot be reused")
+            if exact and not ShortDeliverySpec.receipt_matches_version(exact, version):
+                raise RuntimeError(
+                    f"The recorded receipt for {clip_id} does not match its "
+                    "selected version; nothing was submitted"
+                )
             targets.append(intent)
+            delivery_states.append(
+                (ShortDeliverySpec.create(clip, version, intent), exact)
+            )
             identities.add(identity)
 
         request_receipts = [
@@ -2517,25 +2454,19 @@ class PublishAgent(BaseAgent):
             item["clip_id"]: item["deferred_platforms"] for item in targets
         }
 
-        occupied = [
-            item
-            for item in self._occupied_schedule(data["api_key"], data["user"])
-            if item.get("external_id") not in identities | co_schedule_ids
-        ]
-        reservations = list(occupied)
-        for target in targets:
-            if target["scheduled"]:
-                self._reserve(
-                    reservations,
-                    _parse_time(target["scheduled_date"]),
-                    target["external_id"],
-                    target["clip_id"],
-                    tz_name,
-                    weekday,
-                    weekend,
-                    episode_id=self.episode_dir.name,
-                    platforms=target["platforms"],
-                )
+        if inspect_remote:
+            occupied = [
+                item
+                for item in self._occupied_schedule(data["api_key"], data["user"])
+                if item.get("external_id") not in identities | co_schedule_ids
+            ]
+            self._reserve_deliveries(
+                [spec for spec, _receipt in delivery_states],
+                occupied,
+                data["episode"],
+                policy=(tz_name, weekday, weekend),
+                reference=reference,
+            )
         preview_revision = _document_revision(
             {
                 "schema": destination_schema,
@@ -2571,10 +2502,13 @@ class PublishAgent(BaseAgent):
                 item for item in approved_ids if item not in selected_ids
             ],
             "targets": targets,
+            "_delivery_states": delivery_states,
+            "_co_schedule_ids": co_schedule_ids,
             "preview_revision": preview_revision,
         }
 
     def preview_short_destinations(self, value):
+        value = self._validated_destination_request(value)
         with publication_lock(self.episode_dir.parent):
             data = self._inputs()
             locked_overrides = self._validated_variant_overrides(data, value)
@@ -2590,19 +2524,22 @@ class PublishAgent(BaseAgent):
                 ):
                     raise RuntimeError("Release inputs changed during preview")
                 plan = self._destination_plan(data, value)
+        public_plan = {
+            key: item for key, item in plan.items() if not key.startswith("_")
+        }
         return {
-            **plan,
+            **public_plan,
             "execute": {
-                "destinations": plan["requested_destinations"],
-                "clip_ids": plan["selected_clip_ids"],
-                "request_id": plan["request_id"],
-                "actor": plan["actor"],
-                "reason": plan["reason"],
-                "expected_release_revision": plan["release_revision"],
-                "variant_overrides": plan["variant_overrides"],
-                "copy_overrides": plan["copy_overrides"],
-                "publish_now": plan["publish_now"],
-                "preview_revision": plan["preview_revision"],
+                "destinations": public_plan["requested_destinations"],
+                "clip_ids": public_plan["selected_clip_ids"],
+                "request_id": public_plan["request_id"],
+                "actor": public_plan["actor"],
+                "reason": public_plan["reason"],
+                "expected_release_revision": public_plan["release_revision"],
+                "variant_overrides": public_plan["variant_overrides"],
+                "copy_overrides": public_plan["copy_overrides"],
+                "publish_now": public_plan["publish_now"],
+                "preview_revision": public_plan["preview_revision"],
             },
         }
 
@@ -2648,17 +2585,20 @@ class PublishAgent(BaseAgent):
                     "Release media, copy, or approvals changed after publication "
                     "started; nothing was submitted"
                 )
-            plan = self._destination_plan(data, destination_request)
-            deliveries = self._destination_execution_specs(data, plan)
+            plan = self._destination_plan(
+                data, destination_request, inspect_remote=False
+            )
+            delivery_states = plan["_delivery_states"]
             previous_shorts = self._persist_destination_intents(
-                previous, [spec.snapshot()["target"] for spec in deliveries]
+                previous,
+                [spec.snapshot()["target"] for spec, _receipt in delivery_states],
             )
             shorts = self._publish_short_deliveries(
-                deliveries,
-                previous_shorts,
+                delivery_states,
                 episode,
                 api_key,
                 user,
+                co_schedule_ids=plan["_co_schedule_ids"],
             )
             return self._result(
                 shorts,
@@ -2911,72 +2851,40 @@ class PublishAgent(BaseAgent):
 
     def _publish_short_deliveries(
         self,
-        deliveries,
-        previous,
+        delivery_states,
         episode,
         api_key,
         user,
+        *,
+        co_schedule_ids=(),
     ):
-        previous = previous if isinstance(previous, list) else []
         results = []
         pending = []
+        deliveries = [spec for spec, _receipt in delivery_states]
         snapshots = {spec: spec.snapshot() for spec in deliveries}
-        for spec in deliveries:
-            snapshot = snapshots[spec]
-            version = snapshot["version"]
-            clip_id, identity = spec.clip_id, spec.identity
-            recorded_for_clip = [
-                item
-                for item in previous
-                if isinstance(item, dict) and str(item.get("clip_id", "")) == clip_id
-            ]
-            receipt = next(
-                (
-                    item
-                    for item in recorded_for_clip
-                    if item.get("external_id") == identity
-                    and item.get("status") != "cancelled"
-                ),
-                None,
-            )
-            if receipt and not ShortDeliverySpec.receipt_matches_version(
-                receipt, version
-            ):
-                raise RuntimeError(
-                    f"The recorded receipt for {clip_id} does not match its "
-                    "selected version; nothing was submitted"
-                )
+        for spec, receipt in delivery_states:
             if receipt and receipt.get("status") not in {
                 "unknown",
                 "intent_recorded",
             }:
                 results.append({**receipt, "reused_receipt": True})
             else:
-                if version.get("active_for_new_writes") is not True:
-                    raise RuntimeError(
-                        f"The selected short variant for {clip_id} is retired; "
-                        "nothing was submitted"
-                    )
                 pending.append((spec, receipt))
         if not pending:
             return results
 
-        tz_name, weekday_limit, weekend_limit = self._short_schedule_policy()
+        policy = self._short_schedule_policy()
+        tz_name = policy[0]
         reference = self._schedule_reference(episode, tz_name)
 
         with self._schedule_lock():
+            bindings = snapshots[pending[0][0]]["target"].get(
+                "destination_bindings", {}
+            )
+            if bindings:
+                self._verify_destination_bindings(api_key, user, bindings)
             occupied = self._occupied_schedule(api_key, user)
             current_identities = {spec.identity for spec in deliveries}
-            co_schedule_ids = {
-                receipt.get("external_id")
-                for spec in deliveries
-                for receipt in previous
-                if receipt.get("clip_id") == spec.clip_id
-                and ShortDeliverySpec.receipt_matches_artifact(
-                    receipt, snapshots[spec]["version"]
-                )
-                and not set(receipt.get("platforms", [])) & set(spec.platforms)
-            }
             occupied = [
                 item
                 for item in occupied
@@ -3004,65 +2912,13 @@ class PublishAgent(BaseAgent):
                 else:
                     remaining.append(spec)
 
-            scheduled_remaining = [spec for spec in remaining if spec.scheduled]
-            schedule_by_clip = self._schedule_by_clip(
-                [
-                    {
-                        "clip_id": spec.clip_id,
-                        "scheduled_date": snapshots[spec]["target"]["scheduled_date"],
-                    }
-                    for spec in scheduled_remaining
-                ],
-                duplicate_suffix="; no shorts were submitted",
+            plans = self._reserve_deliveries(
+                remaining,
+                occupied,
+                episode,
+                policy=policy,
+                reference=reference,
             )
-            unscheduled = [
-                spec.clip_id
-                for spec in remaining
-                if spec.scheduled and spec.clip_id not in schedule_by_clip
-            ]
-            if unscheduled:
-                raise RuntimeError(
-                    "Approved clips are missing schedule entries: "
-                    + ", ".join(unscheduled)
-                )
-
-            plans = []
-            reservations = list(occupied)
-            for spec in remaining:
-                clip_id = spec.clip_id
-                entry = schedule_by_clip.get(clip_id)
-                scheduled_at = (
-                    None
-                    if not spec.scheduled
-                    else self._schedule_to_datetime(entry, tz_name, reference=reference)
-                    if entry
-                    else None
-                )
-                if scheduled_at:
-                    if _instant(scheduled_at) <= _instant(reference):
-                        raise RuntimeError(
-                            f"Schedule for {clip_id} is not in the future; "
-                            "no shorts were submitted"
-                        )
-                    if _instant(scheduled_at) > _instant(
-                        reference + timedelta(days=365)
-                    ):
-                        raise RuntimeError(
-                            f"Schedule for {clip_id} is more than 365 days away; "
-                            "no shorts were submitted"
-                        )
-                    self._reserve(
-                        reservations,
-                        scheduled_at,
-                        spec.identity,
-                        clip_id,
-                        tz_name,
-                        weekday_limit,
-                        weekend_limit,
-                        episode_id=self.episode_dir.name,
-                        platforms=spec.platforms,
-                    )
-                plans.append((spec, scheduled_at))
 
             for index, (spec, scheduled_at) in enumerate(plans, 1):
                 self.report_progress(index, len(plans), f"Uploading {spec.clip_id}")
@@ -3095,7 +2951,7 @@ class PublishAgent(BaseAgent):
             self.logger.warning("Short not found: %s", clip_id)
             return None
         title = clip.get("title", f"Clip {clip_id}")
-        copy = snapshot["copy"]
+        copy = snapshot["target"]["destination_copy"]
         upload_title = (
             copy["instagram"]["text"] if platforms == ["instagram"] else title
         )
@@ -3667,12 +3523,51 @@ class PublishAgent(BaseAgent):
         }
         if existing.get("job_id"):
             provider_receipt["job_id"] = existing["job_id"]
-        return spec.receipt(
-            provider_receipt,
-            scheduled_at,
-            tz_name,
-            include_copy=destination_target is not None,
-        )
+        return spec.receipt(provider_receipt, scheduled_at, tz_name)
+
+    def _reserve_deliveries(
+        self,
+        deliveries,
+        occupied,
+        episode,
+        *,
+        policy=None,
+        reference=None,
+    ):
+        tz_name, weekday_limit, weekend_limit = policy or self._short_schedule_policy()
+        reference = reference or self._schedule_reference(episode, tz_name)
+        reservations = list(occupied)
+        plans = []
+        for spec in deliveries:
+            scheduled_at = (
+                _parse_time(spec.snapshot()["target"]["scheduled_date"])
+                if spec.scheduled
+                else None
+            )
+            if scheduled_at is not None:
+                if _instant(scheduled_at) <= _instant(reference):
+                    raise RuntimeError(
+                        f"Schedule for {spec.clip_id} is not in the future; "
+                        "no shorts were submitted"
+                    )
+                if _instant(scheduled_at) > _instant(reference + timedelta(days=365)):
+                    raise RuntimeError(
+                        f"Schedule for {spec.clip_id} is more than 365 days away; "
+                        "no shorts were submitted"
+                    )
+                self._reserve(
+                    reservations,
+                    scheduled_at,
+                    spec.identity,
+                    spec.clip_id,
+                    tz_name,
+                    weekday_limit,
+                    weekend_limit,
+                    episode_id=self.episode_dir.name,
+                    platforms=spec.platforms,
+                )
+            plans.append((spec, scheduled_at))
+        return plans
 
     @staticmethod
     def _reserve(

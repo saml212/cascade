@@ -116,10 +116,7 @@ def test_delivery_spec_freezes_nested_transport_inputs():
     spec = ShortDeliverySpec.create(
         clip,
         version,
-        target["platforms"],
-        target["external_id"],
-        copy,
-        target=target,
+        target,
     )
     frozen = spec.snapshot()
     receipt = spec.receipt(
@@ -136,7 +133,9 @@ def test_delivery_spec_freezes_nested_transport_inputs():
     assert spec.snapshot() == frozen
     assert spec.snapshot()["clip"]["title"] == "Reviewed title"
     assert spec.snapshot()["version"]["path"].endswith("clip_04.mp4")
-    assert spec.snapshot()["copy"]["facebook"]["title"] == "A title"
+    assert (
+        spec.snapshot()["target"]["destination_copy"]["facebook"]["title"] == "A title"
+    )
     assert (
         spec.snapshot()["target"]["destination_bindings"]["facebook"]["target_id"]
         == "facebook-page"
@@ -151,8 +150,7 @@ def test_delivery_spec_freezes_nested_transport_inputs():
     )
 
 
-def test_delivery_spec_preserves_legacy_receipt_shape_and_lineage_omissions():
-    clip = {"id": "clip_04", "title": "Reviewed title"}
+def test_delivery_identity_preserves_lineage_omissions():
     version = {
         "version": "base",
         "variant_id": None,
@@ -160,34 +158,7 @@ def test_delivery_spec_preserves_legacy_receipt_shape_and_lineage_omissions():
         "render_fingerprint": "sha256:render",
         "revision": "sha256:approval",
     }
-    copy = {"instagram": {"text": "Reviewed copy"}}
     identity = "cascade-short-golden"
-    scheduled_at = datetime(2026, 9, 18, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
-    spec = ShortDeliverySpec.create(clip, version, ["instagram"], identity, copy)
-
-    assert spec.receipt(
-        {"status": "submitted", "job_id": "provider-job"},
-        scheduled_at,
-        "America/Los_Angeles",
-    ) == {
-        "status": "submitted",
-        "job_id": "provider-job",
-        "clip_id": "clip_04",
-        "platforms": ["instagram"],
-        "request_id": identity,
-        "external_id": identity,
-        "idempotency_key": identity,
-        "version": "base",
-        "variant_id": None,
-        "render_fingerprint": "sha256:render",
-        "approval_revision": "sha256:approval",
-        "scheduled": True,
-        "destination_copy": copy,
-        "copy_revision": _document_revision(copy),
-        "scheduled_date": scheduled_at.isoformat(),
-        "timezone": "America/Los_Angeles",
-    }
-
     request = {
         "request_id": "e3c0748e-6080-46cf-b64c-86d6b578ec04",
         "actor": "release-operator",
@@ -251,10 +222,7 @@ def test_delivery_spec_rejects_malformed_reviewed_target(field, value):
         ShortDeliverySpec.create(
             {"id": "clip_04"},
             version,
-            ["facebook"],
-            target.get("external_id", "cascade-short-tampered"),
-            {"facebook": {"title": "A title", "description": "A description"}},
-            target=target,
+            target,
         )
 
 
@@ -272,36 +240,12 @@ def test_delivery_spec_rejects_inputs_that_do_not_match_reviewed_target():
         "revision": "sha256:approval",
     }
     inputs = (
-        ({"id": "clip_other"}, version, ["facebook"], target["external_id"]),
-        ({"id": "clip_04"}, version, ["facebook"], "cascade-short-other"),
-        ({"id": "clip_04"}, version, ["instagram"], target["external_id"]),
-        (
-            {"id": "clip_04"},
-            {**version, "render_fingerprint": "sha256:other"},
-            ["facebook"],
-            target["external_id"],
-        ),
+        ({"id": "clip_other"}, version),
+        ({"id": "clip_04"}, {**version, "render_fingerprint": "sha256:other"}),
     )
-    for clip, candidate, platforms, identity in inputs:
+    for clip, candidate in inputs:
         with pytest.raises(ValueError, match="target is invalid"):
-            ShortDeliverySpec.create(
-                clip,
-                candidate,
-                platforms,
-                identity,
-                target["destination_copy"],
-                target=target,
-            )
-
-    with pytest.raises(ValueError, match="target is invalid"):
-        ShortDeliverySpec.create(
-            {"id": "clip_04"},
-            version,
-            ["facebook"],
-            target["external_id"],
-            {"facebook": {"title": "Different", "description": "A description"}},
-            target=target,
-        )
+            ShortDeliverySpec.create(clip, candidate, target)
 
 
 @pytest.mark.parametrize(
@@ -409,6 +353,7 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
     }
     agent = PublishAgent(episode_dir, config)
     monkeypatch.setattr(agent, "_occupied_schedule", lambda *_args: [])
+    monkeypatch.setattr(agent, "_verify_destination_bindings", lambda *_args: None)
     monkeypatch.setattr(
         agent,
         "_schedule_reference",
@@ -441,10 +386,7 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
     spec = ShortDeliverySpec.create(
         {"id": "clip_04", "title": "Title"},
         version,
-        target["platforms"],
-        target["external_id"],
-        target["destination_copy"],
-        target=target,
+        target,
     )
     prior_background = {
         "clip_id": "clip_04",
@@ -459,11 +401,11 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
         "approval_revision": "sha256:existing-approval",
     }
     result = agent._publish_short_deliveries(
-        [spec],
-        [target, prior_background],
+        [(spec, target)],
         {},
         "test-key",
         "test-profile",
+        co_schedule_ids={prior_background["external_id"]},
     )
 
     assert result[0]["scheduled"] is False
@@ -472,8 +414,7 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
     assert not any("timezone=" in value for value in commands[0])
 
     retried = agent._publish_short_deliveries(
-        [spec],
-        [prior_background, *result],
+        [(spec, result[0])],
         {},
         "test-key",
         "test-profile",

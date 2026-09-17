@@ -144,19 +144,13 @@ def _destination_delivery_spec(clip, version, copy, bindings):
         "destination_copy": copy,
         "copy_schema": SHORT_COPY_SCHEMA,
         "copy_revision": _document_revision(copy),
-        "destination_bindings": bindings,
     }
+    if bindings:
+        target["destination_bindings"] = bindings
     target["destination_request_revision"] = _document_revision(
         ShortDeliverySpec.request_fields(target)
     )
-    return ShortDeliverySpec.create(
-        clip,
-        version,
-        platforms,
-        identity,
-        copy,
-        target=target,
-    )
+    return ShortDeliverySpec.create(clip, version, target)
 
 
 def _seed_episode(
@@ -2590,7 +2584,7 @@ class TestShortDestinationRequests:
         ]
 
         plan["targets"].reverse()
-        specs = agent._destination_execution_specs(data, plan)
+        specs = [spec for spec, _receipt in plan["_delivery_states"]]
         assert [spec.clip_id for spec in specs] == ["clip_0", "clip_1", "clip_2"]
 
         stored = agent._persist_destination_intents(
@@ -2613,8 +2607,7 @@ class TestShortDestinationRequests:
 
         monkeypatch.setattr(agent, "_submit_short", submit)
         results = agent._publish_short_deliveries(
-            specs,
-            stored,
+            [(spec, None) for spec in specs],
             data["episode"],
             data["api_key"],
             data["user"],
@@ -4231,7 +4224,7 @@ class TestExpandedShortDestinations:
     ):
         agent = _make_agent(episode_dir)
         (episode_dir / "shorts" / "clip_0.mp4").write_bytes(b"video")
-        spec = ShortDeliverySpec.create(
+        spec = _destination_delivery_spec(
             {"id": "clip_0", "title": "Generic clip title"},
             {
                 "path": "shorts/clip_0.mp4",
@@ -4240,9 +4233,8 @@ class TestExpandedShortDestinations:
                 "render_fingerprint": "sha256:render",
                 "revision": "sha256:approval",
             },
-            platforms,
-            "cascade-short-id",
             copy,
+            {},
         )
         with patch.object(
             agent, "_submit", return_value={"status": "submitted"}
