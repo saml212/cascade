@@ -20,7 +20,6 @@ import {
   type ClipReviewState,
   type EpisodeReviewState,
   type ReviewArtifact,
-  type ReviewDestination,
   type ShortVariantReview,
   type UnknownRecord,
 } from '../lib/api';
@@ -91,6 +90,8 @@ interface ClipNavigation {
   previousId?: string;
   nextId?: string;
 }
+
+const VARIANT_SURFACES = ['background', 'gameplay', 'panels'] as const;
 
 export const CLIP_METADATA_PLATFORMS: PlatformSpec[] = [
   {
@@ -197,11 +198,28 @@ export const CLIP_METADATA_PLATFORMS: PlatformSpec[] = [
   },
 ];
 
-function enabledPlatforms(destinations: ReviewDestination[]): PlatformSpec[] {
-  const enabled = new Set(destinations.map((destination) => destination.key));
-  return CLIP_METADATA_PLATFORMS.filter((platform) =>
-    enabled.has(platform.key)
-  );
+interface ReviewMutation {
+  run: () => Promise<unknown>;
+  busy?: Signal<boolean>;
+  started?: string;
+  succeeded: string;
+  successTone?: 'info' | 'success';
+  after: () => void | Promise<void>;
+}
+
+async function runReviewMutation(mutation: ReviewMutation): Promise<void> {
+  const { run, busy, started, succeeded, after } = mutation;
+  busy?.set(true);
+  if (started) showToast(started);
+  try {
+    await run();
+    showToast(succeeded, mutation.successTone ?? 'success');
+    await after();
+  } catch (error) {
+    showToast((error as Error).message, 'error');
+  } finally {
+    busy?.set(false);
+  }
 }
 
 interface ChatMessage {
@@ -442,7 +460,12 @@ export function ClipReview(
 
     const state = review();
     const labels = speakerLabels();
-    const platforms = enabledPlatforms(state?.enabled_destinations ?? []);
+    const enabled = new Set(
+      (state?.enabled_destinations ?? []).map((destination) => destination.key)
+    );
+    const platforms = CLIP_METADATA_PLATFORMS.filter((platform) =>
+      enabled.has(platform.key)
+    );
     const groups = groupClipReviewCandidates(cs);
     const rejectedVisible = showRejected();
     const displayed = rejectedVisible
@@ -657,18 +680,16 @@ function renderHeader(
         title: ready
           ? 'Approve each current base file and its current copy'
           : 'Render or re-render every kept base candidate first',
-        onClick: async () => {
-          try {
-            await api.approveClips(
-              episodeId,
-              kept.map((clip) => String(clip.id ?? clip.clip_id))
-            );
-            showToast('Base renders approved for the current files.', 'success');
-            navigate(`/episodes/${episodeId}`);
-          } catch (e) {
-            showToast((e as Error).message, 'error');
-          }
-        },
+        onClick: () =>
+          runReviewMutation({
+            run: () =>
+              api.approveClips(
+                episodeId,
+                kept.map((clip) => String(clip.id ?? clip.clip_id))
+              ),
+            succeeded: 'Base renders approved for the current files.',
+            after: () => navigate(`/episodes/${episodeId}`),
+          }),
       })
     );
   });
@@ -685,16 +706,13 @@ function renderHeader(
       variant: 'secondary',
       size: 'md',
       label: 'Complete metadata',
-      onClick: async () => {
-        try {
-          showToast('Auto-filling metadata…');
-          await api.completeMetadata(episodeId);
-          showToast('Metadata complete.', 'success');
-          location.reload();
-        } catch (e) {
-          showToast((e as Error).message, 'error');
-        }
-      },
+      onClick: () =>
+        runReviewMutation({
+          run: () => api.completeMetadata(episodeId),
+          started: 'Auto-filling metadata…',
+          succeeded: 'Metadata complete.',
+          after: () => location.reload(),
+        }),
     }),
     approveHost
   );
@@ -1020,7 +1038,7 @@ function clipExpanded(
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
-  const variantSurfaces = (['background', 'gameplay', 'panels'] as const).filter(
+  const variantSurfaces = VARIANT_SURFACES.filter(
     (candidate) => Boolean(clipVariantForSurface(review, candidate))
   );
   const availableSurfaces = new Set<ClipReviewSurface>([
@@ -1056,6 +1074,7 @@ function clipExpanded(
       review,
       surface,
       selectSurface,
+      variantSurfaces,
       navigation,
       setExpanded
     ),
@@ -1065,6 +1084,7 @@ function clipExpanded(
       clip,
       review,
       surface,
+      variantSurfaces,
       rendering,
       selectingDistribution,
       approvalFeedback,
@@ -1087,13 +1107,11 @@ function renderReviewChoice(
   review: ClipReviewState,
   surface: Signal<ClipReviewSurface>,
   selectSurface: (surface: ClipReviewSurface) => void,
+  variantSurfaces: Exclude<ClipReviewSurface, 'base'>[],
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
   const base = review.render;
-  const variantSurfaces = (['background', 'gameplay', 'panels'] as const).filter(
-    (candidate) => Boolean(clipVariantForSurface(review, candidate))
-  );
   if (variantSurfaces.length === 0) {
     return renderReviewPlayer(clipId, base, navigation, setExpanded);
   }
@@ -1309,6 +1327,7 @@ function renderChoiceActions(
   clip: UnknownRecord,
   review: ClipReviewState,
   surface: Signal<ClipReviewSurface>,
+  variantSurfaces: Exclude<ClipReviewSurface, 'base'>[],
   rendering: Signal<boolean>,
   selectingDistribution: Signal<boolean>,
   approvalFeedback: Signal<ReadonlyMap<string, ClipApprovalFeedback>>,
@@ -1324,7 +1343,7 @@ function renderChoiceActions(
     approvalFeedback,
     reload
   );
-  const variants = (['background', 'gameplay', 'panels'] as const).flatMap(
+  const variants = variantSurfaces.flatMap(
     (candidate) => {
       const variant = clipVariantForSurface(review, candidate);
       return variant
@@ -1390,36 +1409,33 @@ function renderVariantActions(
                 : `Render ${lowerLabel}`,
         disabled: !baseCurrent || variant.approval.current || active,
         loading: active,
-        onClick: async () => {
-          try {
-            if (variant.render.current) {
-              await api.approveClipVariant(
-                episodeId,
-                clipId,
-                variant.id,
-                variant.approval.revision
-              );
-              showToast(`${label} approved for this render and copy.`, 'success');
-            } else {
-              rendering.set(true);
-              showToast(`Rendering ${lowerLabel} locally…`);
-              await api.renderClipVariant(
+        onClick: () => {
+          if (variant.render.current) {
+            return runReviewMutation({
+              run: () =>
+                api.approveClipVariant(
+                  episodeId,
+                  clipId,
+                  variant.id,
+                  variant.approval.revision
+                ),
+              succeeded: `${label} approved for this render and copy.`,
+              after: reload,
+            });
+          }
+          return runReviewMutation({
+            run: () =>
+              api.renderClipVariant(
                 episodeId,
                 clipId,
                 variant.id,
                 variant.asset_id ?? undefined
-              );
-              showToast(
-                `${label} rendered. Review it before approval.`,
-                'success'
-              );
-            }
-            await reload();
-          } catch (error) {
-            showToast((error as Error).message, 'error');
-          } finally {
-            rendering.set(false);
-          }
+              ),
+            busy: rendering,
+            started: `Rendering ${lowerLabel} locally…`,
+            succeeded: `${label} rendered. Review it before approval.`,
+            after: reload,
+          });
         },
       })
     );
@@ -1502,23 +1518,20 @@ function renderDistributionAction(
           (selected
             ? `${label} is the version that will be published and scheduled`
             : `Select the current, separately approved ${label.toLowerCase()} version for publication and scheduling`),
-        onClick: async () => {
+        onClick: () => {
           if (!version) return;
-          selecting.set(true);
-          try {
-            await api.selectClipDistribution(
-              episodeId,
-              clipId,
-              version.variantId,
-              version.approval.revision
-            );
-            showToast(`${label} selected for distribution.`, 'success');
-            await reload();
-          } catch (error) {
-            showToast((error as Error).message, 'error');
-          } finally {
-            selecting.set(false);
-          }
+          return runReviewMutation({
+            run: () =>
+              api.selectClipDistribution(
+                episodeId,
+                clipId,
+                version.variantId,
+                version.approval.revision
+              ),
+            busy: selecting,
+            succeeded: `${label} selected for distribution.`,
+            after: reload,
+          });
         },
       })
     );
@@ -1822,18 +1835,16 @@ function renderActions(
             await reload();
             return;
           }
-          try {
-            rendering.set(true);
-            await api.selectClip(episodeId, clipId);
-            showToast('Rendering the selected clip locally…');
-            await api.renderClip(episodeId, clipId);
-            showToast('Clip rendered. Review it before final approval.', 'success');
-            await reload();
-          } catch (e) {
-            showToast((e as Error).message, 'error');
-          } finally {
-            rendering.set(false);
-          }
+          return runReviewMutation({
+            run: async () => {
+              await api.selectClip(episodeId, clipId);
+              showToast('Rendering the selected clip locally…');
+              await api.renderClip(episodeId, clipId);
+            },
+            busy: rendering,
+            succeeded: 'Clip rendered. Review it before final approval.',
+            after: reload,
+          });
         },
       })
     );
@@ -1858,6 +1869,13 @@ function renderActions(
           : '';
     }
   });
+  const mutate = (run: () => Promise<unknown>, succeeded: string) =>
+    runReviewMutation({
+      run,
+      succeeded,
+      successTone: 'info',
+      after: reload,
+    });
 
   return h(
     'div',
@@ -1875,30 +1893,19 @@ function renderActions(
       variant: 'destructive',
       size: 'sm',
       label: 'Reject',
-      onClick: async () => {
-        try {
-          await api.rejectClip(episodeId, clipId);
-          showToast('Rejected.');
-          await reload();
-        } catch (e) {
-          showToast((e as Error).message, 'error');
-        }
-      },
+      onClick: () =>
+        mutate(() => api.rejectClip(episodeId, clipId), 'Rejected.'),
     }),
     Button({
       variant: 'ghost',
       size: 'sm',
       label: 'Alternative',
       title: 'Ask the clip miner for a similar clip',
-      onClick: async () => {
-        try {
-          await api.alternativeClip(episodeId, clipId);
-          showToast('Alternative requested.');
-          await reload();
-        } catch (e) {
-          showToast((e as Error).message, 'error');
-        }
-      },
+      onClick: () =>
+        mutate(
+          () => api.alternativeClip(episodeId, clipId),
+          'Alternative requested.'
+        ),
     }),
     feedbackHost
   );
@@ -1915,21 +1922,23 @@ function renderTrim(
   const initialEndText = formatEditableTimecode(initialEnd);
   const startStr = signal<string>(initialStartText);
   const endStr = signal<string>(initialEndText);
-
-  const startInput = h('input', {
-    type: 'text',
-    value: startStr(),
-    class: trimInputClass,
-    oninput: (e: Event) =>
-      startStr.set((e.target as HTMLInputElement).value),
-  }) as HTMLInputElement;
-  const endInput = h('input', {
-    type: 'text',
-    value: endStr(),
-    class: trimInputClass,
-    oninput: (e: Event) =>
-      endStr.set((e.target as HTMLInputElement).value),
-  }) as HTMLInputElement;
+  const field = (label: string, value: Signal<string>) =>
+    h(
+      'div',
+      null,
+      h(
+        'label',
+        { class: 'block text-heading-sm uppercase text-ink-tertiary mb-1' },
+        label
+      ),
+      h('input', {
+        type: 'text',
+        value: value(),
+        class: trimInputClass,
+        oninput: (event: Event) =>
+          value.set((event.target as HTMLInputElement).value),
+      })
+    );
 
   return h(
     'div',
@@ -1937,26 +1946,8 @@ function renderTrim(
       class:
         'flex items-end gap-4 px-5 py-4 border-t border-border-subtle flex-wrap',
     },
-    h(
-      'div',
-      null,
-      h(
-        'label',
-        { class: 'block text-heading-sm uppercase text-ink-tertiary mb-1' },
-        'Start'
-      ),
-      startInput
-    ),
-    h(
-      'div',
-      null,
-      h(
-        'label',
-        { class: 'block text-heading-sm uppercase text-ink-tertiary mb-1' },
-        'End'
-      ),
-      endInput
-    ),
+    field('Start', startStr),
+    field('End', endStr),
     Button({
       variant: 'secondary',
       size: 'md',
@@ -1975,16 +1966,15 @@ function renderTrim(
           );
           return;
         }
-        try {
-          await api.updateClip(episodeId, clipId, {
-            start_seconds: s,
-            end_seconds: e,
-          });
-          showToast('Trim saved.', 'success');
-          await reload();
-        } catch (err) {
-          showToast((err as Error).message, 'error');
-        }
+        return runReviewMutation({
+          run: () =>
+            api.updateClip(episodeId, clipId, {
+              start_seconds: s,
+              end_seconds: e,
+            }),
+          succeeded: 'Trim saved.',
+          after: reload,
+        });
       },
     })
   );
@@ -2117,27 +2107,18 @@ function platformEditor(
   }
 
   const inputs = spec.fields.map((f) => {
-    const el = f.multiline
-      ? (h('textarea', {
-          class: [
-            'w-full bg-surface-2 border border-border rounded-md px-3 py-2 text-body text-ink-primary',
-            'focus:border-accent focus:outline-none leading-relaxed',
-          ].join(' '),
-          rows: '4',
-          maxlength: f.maxLength,
-          value: draft[f.name],
-          oninput: (e: Event) =>
-            (draft[f.name] = (e.target as HTMLTextAreaElement).value),
-        }) as HTMLTextAreaElement)
-      : (h('input', {
-          type: 'text',
-          class:
-            'w-full h-9 bg-surface-2 border border-border rounded-md px-3 text-body text-ink-primary focus:border-accent focus:outline-none',
-          maxlength: f.maxLength,
-          value: draft[f.name],
-          oninput: (e: Event) =>
-            (draft[f.name] = (e.target as HTMLInputElement).value),
-        }) as HTMLInputElement);
+    const el = h(f.multiline ? 'textarea' : 'input', {
+      type: f.multiline ? undefined : 'text',
+      class: `w-full bg-surface-2 border border-border rounded-md px-3 text-body text-ink-primary focus:border-accent focus:outline-none ${
+        f.multiline ? 'py-2 leading-relaxed' : 'h-9'
+      }`,
+      rows: f.multiline ? '4' : undefined,
+      maxlength: f.maxLength,
+      value: draft[f.name],
+      oninput: (event: Event) => {
+        draft[f.name] = (event.target as HTMLInputElement).value;
+      },
+    });
 
     return h(
       'div',
@@ -2165,7 +2146,7 @@ function platformEditor(
         variant: 'primary',
         size: 'sm',
         label: 'Save',
-        onClick: async () => {
+        onClick: () => {
           const payload: UnknownRecord = {};
           for (const f of spec.fields) {
             const v = draft[f.name].trim();
@@ -2178,15 +2159,14 @@ function platformEditor(
               payload[f.name] = v;
             }
           }
-          try {
-            await api.updateClip(episodeId, clipId, {
-              metadata: { [spec.key]: payload },
-            });
-            showToast(`${spec.label} metadata saved.`, 'success');
-            await reload();
-          } catch (e) {
-            showToast((e as Error).message, 'error');
-          }
+          return runReviewMutation({
+            run: () =>
+              api.updateClip(episodeId, clipId, {
+                metadata: { [spec.key]: payload },
+              }),
+            succeeded: `${spec.label} metadata saved.`,
+            after: reload,
+          });
         },
       })
     )
