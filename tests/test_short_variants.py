@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +43,7 @@ from lib.short_variants import (
     load_background_variant_asset,
     record_background_variant,
     require_background_variant_asset,
+    resolve_gameplay_variant_playback,
     save_background_variant_approval,
     selected_short_variant_id,
     speaker_panel_caption_context_revision,
@@ -253,6 +255,21 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
     _write_gameplay_caption_context(episode_dir)
     caption_context_revision = gameplay_surround_caption_context_revision(episode_dir)
     asset_set = _gameplay_asset_set(tmp_path, monkeypatch)
+    asset_set = resolve_gameplay_variant_playback(
+        asset_set,
+        episode_id=episode_dir.name,
+        clip_id="clip_01",
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        clip_duration_seconds=1,
+        source_durations={item["asset_id"]: 180 for item in asset_set["assets"]},
+    )
+    from lib import short_variants as short_variants_module
+
+    monkeypatch.setattr(
+        short_variants_module,
+        "probe",
+        lambda path: {"format": {"duration": "1" if Path(path) == base else "180"}},
+    )
     base_record = {"fingerprint": "sha256:base"}
     base_identity = file_content_identity(base)["scan_identity"]
     encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
@@ -270,6 +287,8 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         "manifest_revision",
         "scan_identity",
         "playback_start_seconds",
+        "playback_loop",
+        "playback_policy",
         "focus_x",
         "focus_y",
         "fit_mode",
@@ -326,8 +345,6 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         )
         != fingerprint
     )
-    from lib import short_variants as short_variants_module
-
     with monkeypatch.context() as patch_context:
         patch_context.setattr(
             short_variants_module,
@@ -372,6 +389,15 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
     assert record["captions"]["context_revision"] == caption_context_revision
     assert record["asset"]["render_plan"] == GAMEPLAY_SURROUND_RENDER_PLAN
     assert len(record["asset"]["assets"]) == 3
+    assert all(
+        item["provenance"]["license"] == "original"
+        for item in record["asset"]["assets"]
+    )
+    assert all(
+        item["playback_policy"]["resolved_start_seconds"]
+        == item["playback_start_seconds"]
+        for item in record["asset"]["assets"]
+    )
     _, current = background_variant_state(
         episode_dir,
         "clip_01",
@@ -454,6 +480,14 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
 def test_caption_policy_invalidates_only_gameplay_surround(tmp_path, monkeypatch):
     ordinary_asset = _asset(tmp_path, monkeypatch)
     gameplay_assets = _gameplay_asset_set(tmp_path, monkeypatch)
+    gameplay_assets = resolve_gameplay_variant_playback(
+        gameplay_assets,
+        episode_id="episode",
+        clip_id="clip_01",
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+        clip_duration_seconds=1,
+        source_durations={item["asset_id"]: 180 for item in gameplay_assets["assets"]},
+    )
     base_record = {"fingerprint": "sha256:base"}
     base_identity = {"device": 1, "inode": 2, "size_bytes": 3, "mtime_ns": 4}
     encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
@@ -751,6 +785,28 @@ def test_asset_manifest_accepts_supported_fit_modes(tmp_path, monkeypatch, fit_m
     monkeypatch.setenv("CASCADE_BACKGROUND_ASSETS_DIR", str(root))
 
     assert load_background_asset("motion_v1")["fit_mode"] == fit_mode
+
+
+def test_asset_manifest_requires_boolean_playback_loop(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    root.mkdir()
+    media = root / "motion.mp4"
+    media.write_bytes(b"silent motion")
+    manifest = {
+        "asset_id": "motion_v1",
+        "file": media.name,
+        "sha256": hashlib.sha256(media.read_bytes()).hexdigest(),
+        "playback_loop": "yes",
+    }
+    (root / "motion.json").write_text(json.dumps(manifest))
+    monkeypatch.setenv("CASCADE_BACKGROUND_ASSETS_DIR", str(root))
+
+    with pytest.raises(ValueError, match="invalid playback_loop"):
+        load_background_asset("motion_v1")
+
+    manifest["playback_loop"] = True
+    (root / "motion.json").write_text(json.dumps(manifest))
+    assert load_background_asset("motion_v1")["playback_loop"] is True
 
 
 def test_same_path_variant_replacement_is_stale_and_cannot_be_approved(

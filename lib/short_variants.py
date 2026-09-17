@@ -7,14 +7,21 @@ import json
 import math
 import os
 import re
+import subprocess
+from copy import deepcopy
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from lib.ass import resolve_caption_speaker_targets
 from lib.atomic_write import atomic_write_json
 from lib.crop import visual_crop_state
 from lib.delivery_video import render_artifact_state
-from lib.ffprobe import file_fingerprint, scan_identity
+from lib.ffprobe import file_fingerprint, probe, scan_identity
+from lib.gameplay_playback import (
+    require_resolved_gameplay_playback,
+    resolve_gameplay_asset_playback,
+)
 from lib.timeline import Timeline
 
 BACKGROUND_VARIANT_ID = "background_motion_v1"
@@ -95,6 +102,14 @@ _VARIANT_ASSETS = {
     SPEAKER_PANELS_VARIANT_ID: None,
 }
 BACKGROUND_VARIANT_IDS = tuple(_VARIANT_LABELS)
+GAMEPLAY_VARIANT_IDS = frozenset(
+    {
+        MINECRAFT_PARKOUR_VARIANT_ID,
+        SUBWAY_SURFERS_VARIANT_ID,
+        GTA_DRIVING_VARIANT_ID,
+        GAMEPLAY_SURROUND_VARIANT_ID,
+    }
+)
 SPEAKER_PANEL_VARIANT_IDS = frozenset(
     {GAMEPLAY_SURROUND_VARIANT_ID, SPEAKER_PANELS_VARIANT_ID}
 )
@@ -328,6 +343,11 @@ def load_background_asset(asset_id: str, *, verify_content: bool = False) -> dic
         if fit_mode not in BACKGROUND_FIT_MODES:
             raise ValueError("Background asset manifest has invalid fit_mode")
         playback["fit_mode"] = fit_mode
+    if "playback_loop" in manifest:
+        playback_loop = manifest.get("playback_loop")
+        if not isinstance(playback_loop, bool):
+            raise ValueError("Background asset manifest has invalid playback_loop")
+        playback["playback_loop"] = playback_loop
     return {
         "asset_id": asset_id,
         "path": path,
@@ -365,6 +385,87 @@ def load_background_variant_asset(
     }
 
 
+def resolve_gameplay_variant_playback(
+    asset: dict,
+    *,
+    episode_id: str,
+    clip_id: str,
+    variant_id: str,
+    clip_duration_seconds: float,
+    source_durations: dict[str, float],
+) -> dict:
+    """Resolve every gameplay source to a deterministic per-clip window."""
+    if variant_id not in GAMEPLAY_VARIANT_IDS:
+        raise ValueError(f"{variant_id} is not a gameplay variant")
+    if not isinstance(asset, dict) or not isinstance(source_durations, dict):
+        raise TypeError("Gameplay playback resolution needs assets and durations")
+    require_background_variant_asset(variant_id, asset.get("asset_id"))
+    resolved = deepcopy(asset)
+    media_assets = (
+        resolved.get("assets")
+        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        else [resolved]
+    )
+    if not isinstance(media_assets, list) or not media_assets:
+        raise TypeError("Gameplay playback resolution needs source assets")
+    resolved_assets = []
+    for media_asset in media_assets:
+        if not isinstance(media_asset, dict):
+            raise TypeError("Gameplay playback resolution needs source mappings")
+        source_id = media_asset.get("asset_id")
+        if not isinstance(source_id, str) or source_id not in source_durations:
+            raise ValueError(f"Gameplay source duration is missing for {source_id}")
+        resolved_assets.append(
+            resolve_gameplay_asset_playback(
+                media_asset,
+                episode_id=episode_id,
+                clip_id=clip_id,
+                variant_id=variant_id,
+                clip_duration_seconds=clip_duration_seconds,
+                source_duration_seconds=source_durations[source_id],
+            )
+        )
+    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        resolved["assets"] = resolved_assets
+        return resolved
+    return resolved_assets[0]
+
+
+def _require_gameplay_variant_playback(asset: dict, variant_id: str) -> None:
+    if variant_id not in GAMEPLAY_VARIANT_IDS:
+        return
+    media_assets = (
+        asset.get("assets") if variant_id == GAMEPLAY_SURROUND_VARIANT_ID else [asset]
+    )
+    if not isinstance(media_assets, list) or not media_assets:
+        raise ValueError("Gameplay variant has no resolved source assets")
+    for media_asset in media_assets:
+        require_resolved_gameplay_playback(media_asset)
+
+
+@lru_cache(maxsize=512)
+def _probed_media_duration(identity: tuple) -> float:
+    result = probe(Path(identity[0]))
+    duration = float(result.get("format", {}).get("duration", 0))
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"Media has no positive duration: {Path(identity[0]).name}")
+    return duration
+
+
+def _media_duration(path: Path) -> float:
+    identity = _scan(path)
+    return _probed_media_duration(
+        (
+            identity["resolved_path"],
+            identity["device"],
+            identity["inode"],
+            identity["size_bytes"],
+            identity["mtime_ns"],
+            identity["ctime_ns"],
+        )
+    )
+
+
 def _asset_record(asset: dict, *, include_provenance: bool) -> dict:
     keys = [
         "asset_id",
@@ -372,6 +473,8 @@ def _asset_record(asset: dict, *, include_provenance: bool) -> dict:
         "manifest_revision",
         "scan_identity",
         "playback_start_seconds",
+        "playback_loop",
+        "playback_policy",
         "focus_x",
         "focus_y",
         "fit_mode",
@@ -424,6 +527,8 @@ def _recorded_asset_identity(recorded: dict | None) -> dict | None:
                 "manifest_revision",
                 "scan_identity",
                 "playback_start_seconds",
+                "playback_loop",
+                "playback_policy",
                 "focus_x",
                 "focus_y",
                 "fit_mode",
@@ -447,6 +552,8 @@ def _recorded_asset_identity(recorded: dict | None) -> dict | None:
                     "scan_identity",
                     "role",
                     "playback_start_seconds",
+                    "playback_loop",
+                    "playback_policy",
                     "focus_x",
                     "focus_y",
                     "fit_mode",
@@ -562,6 +669,8 @@ def background_variant_fingerprint(
         raise TypeError("The short variant requires an asset record")
     asset_id = asset.get("asset_id") if isinstance(asset, dict) else None
     require_background_variant_asset(variant_id, asset_id)
+    if isinstance(asset, dict):
+        _require_gameplay_variant_playback(asset, variant_id)
     state = {
         "variant_id": variant_id,
         "layout": _variant_layout(variant_id),
@@ -619,6 +728,8 @@ def record_background_variant(
         raise TypeError("The short variant requires an asset record")
     asset_id = asset.get("asset_id") if isinstance(asset, dict) else None
     require_background_variant_asset(variant_id, asset_id)
+    if isinstance(asset, dict):
+        _require_gameplay_variant_playback(asset, variant_id)
     output = background_variant_output(episode_dir, clip_id, variant_id)
     output_content = file_content_identity(output)
     output_identity = output_content["scan_identity"]
@@ -723,6 +834,22 @@ def background_variant_state(
                 if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
                 else load_background_asset(str(asset_id))
             )
+            if variant_id in GAMEPLAY_VARIANT_IDS:
+                clip_duration = _media_duration(base_path)
+                source_durations = {
+                    str(media_asset["asset_id"]): _media_duration(
+                        Path(media_asset["path"])
+                    )
+                    for media_asset in (asset.get("assets", [asset]) if asset else [])
+                }
+                asset = resolve_gameplay_variant_playback(
+                    asset,
+                    episode_id=Path(episode_dir).name,
+                    clip_id=clip_id,
+                    variant_id=variant_id,
+                    clip_duration_seconds=clip_duration,
+                    source_durations=source_durations,
+                )
             caption_context_revision = (
                 speaker_panel_caption_context_revision(episode_dir)
                 if variant_id in SPEAKER_PANEL_VARIANT_IDS
@@ -766,7 +893,14 @@ def background_variant_state(
                     variant_id=variant_id,
                     caption_context_revision=caption_context_revision,
                 )
-        except (KeyError, OSError, TypeError, ValueError) as exc:
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            OSError,
+            subprocess.CalledProcessError,
+            TypeError,
+            ValueError,
+        ) as exc:
             stale_detail = str(exc)
 
     render = render_artifact_state(

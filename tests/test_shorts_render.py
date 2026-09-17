@@ -179,11 +179,38 @@ def test_background_composition_copies_complete_base_audio(
 
     command = commands[0]
     assert command[command.index("-c:a") + 1] == "copy"
+    assert command[command.index("-stream_loop") + 1] == "-1"
     assert "-shortest" in command
     assert "-t" not in command
     graph = command[command.index("-filter_complex") + 1]
     assert "tpad=stop_mode=clone:stop_duration=0.25" in graph
     assert graph.count("enable='not(between(t,2.000000,4.000000))'") == 2
+
+
+def test_single_gameplay_composition_trims_resolved_window_without_looping(
+    tmp_episode_dir, sample_config
+):
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    commands = []
+    agent._run_ffmpeg = lambda command, **_kwargs: commands.append(command)
+
+    agent._compose_background_variant(
+        tmp_episode_dir / "podcast.mp4",
+        tmp_episode_dir / "gameplay.mp4",
+        tmp_episode_dir / "base.mp4",
+        tmp_episode_dir / "variant.mp4",
+        "30/1",
+        [],
+        ["-c:v", "libx264"],
+        12.345,
+        False,
+    )
+
+    command = commands[0]
+    graph = command[command.index("-filter_complex") + 1]
+    assert "[1:v]trim=start=12.345000,setpts=PTS-STARTPTS,scale=" in graph
+    assert "-stream_loop" not in command
+    assert command[command.index("-c:a") + 1] == "copy"
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
@@ -376,6 +403,7 @@ def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
             "focus_x": 0.4,
             "focus_y": 0.5,
             "fit_mode": "stretch",
+            "playback_policy": {"wrap_required": False},
         },
         {
             "role": "gta",
@@ -383,6 +411,7 @@ def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
             "playback_start_seconds": 11.5,
             "focus_x": 0.6,
             "focus_y": 0.5,
+            "playback_policy": {"wrap_required": False},
         },
         {
             "role": "minecraft",
@@ -390,6 +419,7 @@ def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
             "playback_start_seconds": 18,
             "focus_x": 0.55,
             "focus_y": 0.45,
+            "playback_policy": {"wrap_required": False},
         },
     ]
 
@@ -403,7 +433,9 @@ def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
         ["-c:v", "libx264"],
     )
 
-    graph = commands[0][commands[0].index("-filter_complex") + 1]
+    command = commands[0]
+    graph = command[command.index("-filter_complex") + 1]
+    assert "-stream_loop" not in command
     assert "[1:v]trim=start=7.250000,setpts=PTS-STARTPTS" in graph
     assert "[2:v]trim=start=11.500000,setpts=PTS-STARTPTS" in graph
     assert "[3:v]trim=start=18.000000,setpts=PTS-STARTPTS" in graph

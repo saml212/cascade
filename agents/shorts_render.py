@@ -62,6 +62,7 @@ from lib.short_variants import (
     GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
     GAMEPLAY_SURROUND_VARIANT_ID,
+    GAMEPLAY_VARIANT_IDS,
     SPEAKER_PANEL_VARIANT_IDS,
     SPEAKER_PANELS_RENDER_PLAN,
     SPEAKER_PANELS_VARIANT_ID,
@@ -77,6 +78,7 @@ from lib.short_variants import (
     require_background_variant_asset,
     require_gameplay_caption_context_revision,
     require_speaker_panel_caption_context_revision,
+    resolve_gameplay_variant_playback,
     speaker_panel_caption_context_revision,
 )
 from lib.srt import escape_srt_path
@@ -205,6 +207,7 @@ class ShortsRenderAgent(BaseAgent):
             else load_background_asset(asset_id, verify_content=True)
         )
         media_assets = asset.get("assets", [asset]) if asset else []
+        source_durations = {}
         for media_asset in media_assets:
             asset_probe = ffprobe(media_asset["path"])
             if not any(
@@ -215,14 +218,18 @@ class ShortsRenderAgent(BaseAgent):
                 item.get("codec_type") == "audio" for item in asset_probe["streams"]
             ):
                 raise ValueError("Background assets must be silent")
-            if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
-                asset_duration = float(asset_probe["format"]["duration"])
-                playback_start = float(media_asset.get("playback_start_seconds", 0.0))
-                if asset_duration - playback_start < base_duration:
-                    raise ValueError(
-                        "Gameplay assets must provide enough in-game footage after "
-                        "their playback start for the complete sample"
-                    )
+            source_durations[str(media_asset["asset_id"])] = float(
+                asset_probe["format"]["duration"]
+            )
+        if variant_id in GAMEPLAY_VARIANT_IDS:
+            asset = resolve_gameplay_variant_playback(
+                asset,
+                episode_id=self.episode_dir.name,
+                clip_id=str(clip["id"]),
+                variant_id=variant_id,
+                clip_duration_seconds=base_duration,
+                source_durations=source_durations,
+            )
 
         encoding = get_video_encoding_policy(self.config, "shorts")
         diarized = None
@@ -327,14 +334,22 @@ class ShortsRenderAgent(BaseAgent):
         fps: str,
         suppress_motion: list[tuple[float, float]],
         encoder_args: list[str],
+        playback_start_seconds: float | None = None,
+        loop_source: bool = True,
     ) -> None:
         disabled = "+".join(
             f"between(t,{start:.6f},{end:.6f})" for start, end in suppress_motion
         )
         enable = f":enable='not({disabled})'" if disabled else ""
+        playback_filter = (
+            ""
+            if playback_start_seconds is None
+            else f"trim=start={playback_start_seconds:.6f},setpts=PTS-STARTPTS,"
+        )
         graph = (
             "[0:v]setpts=PTS-STARTPTS[podcast];"
-            "[1:v]scale=1080:640:force_original_aspect_ratio=increase,"
+            f"[1:v]{playback_filter}"
+            "scale=1080:640:force_original_aspect_ratio=increase,"
             f"crop=1080:640,fps={fps},setpts=PTS-STARTPTS[motion];"
             f"[podcast][motion]overlay=0:1280{enable},"
             f"drawbox=x=0:y=1276:w=1080:h=8:color=black@0.85:t=fill{enable},"
@@ -350,8 +365,7 @@ class ShortsRenderAgent(BaseAgent):
                 "-y",
                 "-i",
                 str(podcast_video),
-                "-stream_loop",
-                "-1",
+                *(["-stream_loop", "-1"] if loop_source else []),
                 "-i",
                 str(asset),
                 "-i",
@@ -410,6 +424,17 @@ class ShortsRenderAgent(BaseAgent):
         subway = by_role["subway"]
         gta = by_role["gta"]
         minecraft = by_role["minecraft"]
+
+        def source_input(asset: dict) -> list[str]:
+            policy = asset.get("playback_policy")
+            wraps = (
+                bool(policy.get("wrap_required")) if isinstance(policy, dict) else True
+            )
+            return [
+                *(["-stream_loop", "-1"] if wraps else []),
+                "-i",
+                str(asset["path"]),
+            ]
 
         def playback_filter(asset: dict) -> str:
             start = float(asset.get("playback_start_seconds", 0.0))
@@ -493,18 +518,9 @@ class ShortsRenderAgent(BaseAgent):
                 "-y",
                 "-i",
                 str(podcast_video),
-                "-stream_loop",
-                "-1",
-                "-i",
-                str(by_role["subway"]["path"]),
-                "-stream_loop",
-                "-1",
-                "-i",
-                str(by_role["gta"]["path"]),
-                "-stream_loop",
-                "-1",
-                "-i",
-                str(by_role["minecraft"]["path"]),
+                *source_input(by_role["subway"]),
+                *source_input(by_role["gta"]),
+                *source_input(by_role["minecraft"]),
                 "-i",
                 str(base_short),
                 "-filter_complex",
@@ -630,6 +646,8 @@ class ShortsRenderAgent(BaseAgent):
                     encoder_args,
                 )
             else:
+                playback_policy = asset.get("playback_policy", {})
+                gameplay = background["variant_id"] in GAMEPLAY_VARIANT_IDS
                 self._compose_background_variant(
                     podcast_video,
                     asset["path"],
@@ -638,6 +656,8 @@ class ShortsRenderAgent(BaseAgent):
                     fps,
                     suppress_motion,
                     encoder_args,
+                    (float(asset["playback_start_seconds"]) if gameplay else None),
+                    (bool(playback_policy.get("wrap_required")) if gameplay else True),
                 )
             media = validate_av_output(staged, background["base_duration"])
             if (media["width"], media["height"]) != (1080, 1920):
