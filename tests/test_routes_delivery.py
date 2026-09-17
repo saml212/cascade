@@ -367,6 +367,60 @@ def test_unverified_base_mix_and_historical_mp3_remain_read_only(delivery):
     } == before
 
 
+@pytest.mark.parametrize(
+    "stale_selection",
+    [True, False],
+    ids=["stale-selection", "no-selection-or-base"],
+)
+def test_status_drops_cached_selected_audio_when_review_source_is_unavailable(
+    delivery, stale_selection
+):
+    _, mod, episodes_dir = delivery
+    episode_dir = make_episode(episodes_dir)
+    cached = {
+        "status": "not_prepared",
+        "video_status": "not_prepared",
+        "selected_audio_download_url": "/api/episodes/ep_test/delivery/selected-audio?v=old",
+        "selected_audio": {
+            "filename": "audio_repair_selected.wav",
+            "provenance": {
+                "kind": "selected_repair",
+                "currentness": "current",
+            },
+        },
+        "selected_audio_review_error": "old error",
+    }
+    mod._write_status(episode_dir, cached)
+    stored = (episode_dir / "delivery.json").read_bytes()
+    selected_audio = (
+        patch.object(
+            mod,
+            "selected_audio_source",
+            side_effect=ValueError(
+                "Selected repair audio has changed since review"
+            ),
+        )
+        if stale_selection
+        else patch.object(mod, "selected_audio_source", return_value=None)
+    )
+
+    with (
+        patch.object(mod, "load_config", return_value={}),
+        selected_audio,
+    ):
+        status = mod._refresh_status(episode_dir)
+
+    assert "selected_audio_download_url" not in status
+    assert "selected_audio" not in status
+    if stale_selection:
+        assert status["selected_audio_review_error"] == (
+            "Selected repair audio has changed since review"
+        )
+    else:
+        assert "selected_audio_review_error" not in status
+    assert (episode_dir / "delivery.json").read_bytes() == stored
+
+
 def test_video_prepare_explains_missing_speaker_prerequisites(delivery):
     client, mod, episodes_dir = delivery
     episode_dir = make_episode(episodes_dir)

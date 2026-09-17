@@ -63,8 +63,8 @@ cp .env.example .env                               # Fill in API keys
 | `TIKTOK_CLIENT_SECRET` | No | TikTok publishing |
 | `INSTAGRAM_ACCESS_TOKEN` | No | Instagram publishing |
 | `FACEBOOK_PAGE_ID` | No | Instagram publishing |
-| `CLOUDFLARE_ACCOUNT_ID` | No | Podcast RSS feed (R2 storage) |
-| `CLOUDFLARE_API_TOKEN` | No | Podcast RSS feed (R2 storage) |
+| `CLOUDFLARE_ACCOUNT_ID` | No | Apple video podcast RSS feed (R2 storage) |
+| `CLOUDFLARE_API_TOKEN` | No | Apple video podcast RSS feed (R2 storage) |
 | `UPLOAD_POST_API_KEY` | No | Upload-Post publishing |
 | `UPLOAD_POST_USER` | No | Upload-Post publishing |
 

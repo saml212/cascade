@@ -8,6 +8,7 @@ import {
   episodeDisplayDuration,
   formatDuration,
   formatRelative,
+  isVideoPreparationActive,
   pluralize,
   summarizeErrorText,
 } from '../../lib/format';
@@ -45,8 +46,7 @@ export function renderOverview(
     delivery?.video_status === 'ready' && !!delivery.video_download_url;
   const quality = ep.quality as QualitySnapshot | null | undefined;
   const releaseReady = quality?.release_gate.status === 'ready';
-  const deliveryPreparing =
-    delivery?.status === 'preparing' || delivery?.video_status === 'preparing';
+  const deliveryPreparing = isVideoPreparationActive(delivery);
 
   target.replaceChildren(
     h(

@@ -289,6 +289,12 @@ def _refresh_status(episode_dir: Path) -> dict:
             delivery_apply_lut=bool(episode.get("delivery_apply_lut", False)),
             delivery_burn_captions=bool(episode.get("delivery_burn_captions", False)),
         )
+        for key in (
+            "selected_audio_download_url",
+            "selected_audio",
+            "selected_audio_review_error",
+        ):
+            status.pop(key, None)
         status.update(_selected_audio_review_fields(episode_dir, episode, config))
         try:
             status["video_preflight"] = _video_preflight(

@@ -6,6 +6,7 @@ import {
   describeEpisodeStatus,
   describeStatus,
   episodeTitle,
+  isVideoPreparationActive,
 } from '../../lib/format';
 import { StatusPill } from '../../components/StatusPill';
 import { Button } from '../../components/Button';
@@ -253,7 +254,7 @@ function primaryActionFor(
       onClick: () => navigate(`/episodes/${episodeId}/delivery`),
     });
   }
-  if (delivery?.video_status === 'preparing' || delivery?.status === 'preparing') {
+  if (isVideoPreparationActive(delivery)) {
     return Button({
       variant: 'primary',
       label: 'View preparation',

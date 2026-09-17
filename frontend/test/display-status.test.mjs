@@ -3,9 +3,11 @@ import test from 'node:test';
 
 import { importTs } from './load-ts.mjs';
 
-const { describeEpisodeStatus, episodeDisplayDuration } = await importTs(
-  new URL('../src/lib/format.ts', import.meta.url)
-);
+const {
+  describeEpisodeStatus,
+  episodeDisplayDuration,
+  isVideoPreparationActive,
+} = await importTs(new URL('../src/lib/format.ts', import.meta.url));
 
 test('rendered delivery without a quality decision still requires review', () => {
   assert.equal(
@@ -100,6 +102,23 @@ test('historical audio state does not replace the pipeline status', () => {
       delivery: { status: 'ready', video_status: 'not_prepared' },
     }).key,
     'ready_to_render'
+  );
+});
+
+test('historical audio preparation does not present as active video work', () => {
+  assert.equal(
+    isVideoPreparationActive({
+      status: 'preparing',
+      video_status: 'not_prepared',
+    }),
+    false
+  );
+  assert.equal(
+    isVideoPreparationActive({
+      status: 'ready',
+      video_status: 'preparing',
+    }),
+    true
   );
 });
 

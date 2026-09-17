@@ -29,6 +29,12 @@ export function episodeDisplayDuration(
   return episode.duration_seconds as number | null | undefined;
 }
 
+export function isVideoPreparationActive(
+  delivery: Record<string, unknown> | null | undefined
+): boolean {
+  return delivery?.video_status === 'preparing';
+}
+
 export function formatTimecode(seconds: number | null | undefined): string {
   if (seconds == null || !isFinite(seconds)) return '--:--';
   const s = Math.max(0, Math.round(seconds));
