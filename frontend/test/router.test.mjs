@@ -12,9 +12,7 @@ async function loadRouter(initialPath) {
     addEventListener: (name, handler) => listeners.set(name, handler),
   };
 
-  const source = await transpileTs(
-    new URL('../src/lib/router.ts', import.meta.url)
-  );
+  const source = await transpileTs(new URL('../src/lib/router.ts', import.meta.url));
   const compiled = source.replace(
     /^import \{ signal, effectScope \} from ['"]\.\/signals['"];$/m,
     `
@@ -34,7 +32,7 @@ async function loadRouter(initialPath) {
           globalThis.__routerDisposals += 1;
         };
       };
-    `
+    `,
   );
   const router = await import(dataUrl(`${compiled}\n// ${crypto.randomUUID()}`));
 
@@ -62,15 +60,16 @@ test('same-episode aliases preserve the screen across navigation history', async
       '/episodes/:id/audio',
       '/episodes/:id/metadata',
       '/episodes/:id/delivery',
+      '/episodes/:id/publish',
+      '/episodes/:id/backup',
     ]) {
-      harness.router.route(
-        pattern,
-        (params) => mounts.push(`episode:${params.id}`),
-        { screenIdentity: episodeIdentity }
-      );
+      harness.router.route(pattern, (params) => mounts.push(`episode:${params.id}`), { screenIdentity: episodeIdentity });
     }
-    harness.router.route('/episodes/:id/longform/review', (params) => {
+    harness.router.route('/episodes/:id/longform', (params) => {
       mounts.push(`longform:${params.id}`);
+    });
+    harness.router.route('/episodes/:id/clips', (params) => {
+      mounts.push(`clips:${params.id}`);
     });
     harness.router.setFallback(() => mounts.push('fallback'));
     harness.router.startRouter();
@@ -81,6 +80,8 @@ test('same-episode aliases preserve the screen across navigation history', async
     harness.setPath('/episodes/episode%20one/audio');
     harness.setPath('/episodes/episode%20one/metadata');
     harness.setPath('/episodes/episode%20one/delivery');
+    harness.setPath('/episodes/episode%20one/publish');
+    harness.setPath('/episodes/episode%20one/backup');
     harness.setPath('/episodes/episode%20one/audio');
 
     assert.deepEqual(mounts, ['episode:episode one']);
@@ -91,22 +92,17 @@ test('same-episode aliases preserve the screen across navigation history', async
     assert.deepEqual(mounts, ['episode:episode one', 'episode:episode two']);
     assert.equal(globalThis.__routerDisposals, 1);
 
-    harness.setPath('/episodes/episode%20two/longform/review');
-    assert.deepEqual(mounts, [
-      'episode:episode one',
-      'episode:episode two',
-      'longform:episode two',
-    ]);
+    harness.setPath('/episodes/episode%20two/longform');
+    assert.deepEqual(mounts, ['episode:episode one', 'episode:episode two', 'longform:episode two']);
     assert.equal(globalThis.__routerDisposals, 2);
 
-    harness.setPath('/episodes/episode%20two/metadata');
-    assert.deepEqual(mounts, [
-      'episode:episode one',
-      'episode:episode two',
-      'longform:episode two',
-      'episode:episode two',
-    ]);
+    harness.setPath('/episodes/episode%20two/clips');
+    assert.deepEqual(mounts, ['episode:episode one', 'episode:episode two', 'longform:episode two', 'clips:episode two']);
     assert.equal(globalThis.__routerDisposals, 3);
+
+    harness.setPath('/episodes/episode%20two/metadata');
+    assert.deepEqual(mounts, ['episode:episode one', 'episode:episode two', 'longform:episode two', 'clips:episode two', 'episode:episode two']);
+    assert.equal(globalThis.__routerDisposals, 4);
   } finally {
     harness.restore();
     delete globalThis.__routerDisposals;
