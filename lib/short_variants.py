@@ -44,7 +44,6 @@ GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION = "source-speaker-panel/v1"
 SPEAKER_PANELS_VARIANT_MODE = "podcast_speaker_panels_v1"
 SPEAKER_PANELS_LAYOUT_VERSION = "speaker-panels/v1"
 SPEAKER_PANEL_CAPTION_CONTEXT_VERSION = "speaker-panel-effective/v1"
-GAMEPLAY_SURROUND_CAPTION_CONTEXT_VERSION = SPEAKER_PANEL_CAPTION_CONTEXT_VERSION
 DEFAULT_BACKGROUND_ASSET_ID = "original_block_parkour_v1"
 SATISFYING_BACKGROUND_ASSET_ID = "mixkit-47347"
 MINECRAFT_PARKOUR_ASSET_ID = "spicy_sauce_minecraft_12_v1"
@@ -684,9 +683,6 @@ def speaker_panel_neutral_header_policy(
     if caption_ranges_use_target(diarized, intervals, speaker_targets, "BOTH"):
         return deepcopy(CLEAN_NEUTRAL_HEADER_POLICY)
     return None
-
-
-gameplay_surround_caption_context_revision = speaker_panel_caption_context_revision
 
 
 def _current_speaker_panel_caption_state(

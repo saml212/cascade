@@ -383,8 +383,11 @@ def test_gameplay_caption_positions_follow_exact_spatial_panel_rows(
         ]
     }
 
-    placements, fallback = agent._gameplay_surround_caption_placements(
-        1920, 1080, crop_config
+    placements, fallback = agent._speaker_panel_placements(
+        1920,
+        1080,
+        crop_config,
+        variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
     )
 
     assert {speaker: placement.y for speaker, placement in placements.items()} == (

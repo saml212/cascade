@@ -45,7 +45,6 @@ from lib.short_variants import (
     background_variant_state,
     default_background_asset_id,
     file_content_identity,
-    gameplay_surround_caption_context_revision,
     load_background_asset,
     load_background_variant_asset,
     record_background_variant,
@@ -324,7 +323,7 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         path.write_bytes(content)
     (episode_dir / "captions.ass").write_text("[Script Info]\n")
     _write_gameplay_caption_context(episode_dir)
-    caption_context_revision = gameplay_surround_caption_context_revision(episode_dir)
+    caption_context_revision = speaker_panel_caption_context_revision(episode_dir)
     asset_set = _gameplay_asset_set(tmp_path, monkeypatch)
     asset_set = resolve_gameplay_variant_playback(
         asset_set,
@@ -517,8 +516,8 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
     segments = json.loads(segments_path.read_text())
     segments["track_mapping"][0]["person"] = "Renamed host"
     segments_path.write_text(json.dumps(segments))
-    assert gameplay_surround_caption_context_revision(episode_dir) == (
-        caption_context_revision
+    assert (
+        speaker_panel_caption_context_revision(episode_dir) == caption_context_revision
     )
     _, still_current = background_variant_state(
         episode_dir,

@@ -1446,28 +1446,6 @@ class ShortsRenderAgent(BaseAgent):
             )
         return rows
 
-    def _gameplay_surround_panel_rows(
-        self, src_w: int, src_h: int, crop_config: dict
-    ) -> list[tuple[int, int, int | None, int | None, int | None, int | None]]:
-        plan = GAMEPLAY_SURROUND_RENDER_PLAN
-        return self._speaker_panel_rows(
-            src_w,
-            src_h,
-            crop_config,
-            plan["podcast_width"],
-            plan["upper_height"] - plan["podcast_header_height"],
-        )
-
-    def _gameplay_surround_caption_placements(
-        self, src_w: int, src_h: int, crop_config: dict
-    ) -> tuple[dict[str, CaptionPlacement], CaptionPlacement]:
-        return self._speaker_panel_placements(
-            src_w,
-            src_h,
-            crop_config,
-            variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
-        )
-
     def _speaker_panel_placements(
         self,
         src_w: int,
