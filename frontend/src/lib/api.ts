@@ -638,8 +638,6 @@ export const api = {
     request<UnknownRecord>('POST', `/api/episodes/${id}/approve-backup`),
 
   /* Clips */
-  listClips: (id: string) =>
-    request<UnknownRecord[]>('GET', `/api/episodes/${id}/clips/`),
   approveClip: (id: string, clipId: string) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/${clipId}/approve`),
   selectClip: (id: string, clipId: string) =>
@@ -695,10 +693,6 @@ export const api = {
     ),
   approveClips: (id: string, clipIds: string[]) =>
     request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/approve`, {
-      clip_ids: clipIds,
-    }),
-  rejectClips: (id: string, clipIds: string[]) =>
-    request<UnknownRecord>('POST', `/api/episodes/${id}/clips/bulk/reject`, {
       clip_ids: clipIds,
     }),
   rejectClip: (id: string, clipId: string) =>
