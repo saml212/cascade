@@ -11,7 +11,11 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from lib.ass import resolve_caption_speaker_targets
+from lib.ass import (
+    MAX_PHRASE_DURATION,
+    MIN_PHRASE_DURATION,
+    resolve_caption_speaker_targets,
+)
 from lib.ffprobe import file_fingerprint
 
 CAPTION_SPEAKER_OVERRIDES_SCHEMA = "cascade.short-caption-speaker-overrides/v1"
@@ -141,12 +145,16 @@ def _normalize_display_phrase(
         for word in normalized_words
     ):
         raise ValueError("Every display word must be inside its text replacement")
-    return {
+    phrase = {
         "id": phrase_id,
         "to_asr_speaker": target,
         "target_crop": target_crop,
         "words": normalized_words,
     }
+    phrase_start, phrase_end = _phrase_bounds(phrase)
+    if phrase_end - phrase_start > MAX_PHRASE_DURATION:
+        raise ValueError("Display caption phrase exceeds the maximum display duration")
+    return phrase
 
 
 def _phrase_bounds(phrase: Mapping[str, object]) -> tuple[float, float]:
@@ -191,8 +199,10 @@ def _normalize_display_phrases(value: object, start: float, end: float) -> list[
 def _reject_same_panel_overlaps(phrases: list[dict]) -> None:
     for index, phrase in enumerate(phrases):
         phrase_start, phrase_end = _phrase_bounds(phrase)
+        phrase_end = max(phrase_end, phrase_start + MIN_PHRASE_DURATION)
         for other in phrases[index + 1 :]:
             other_start, other_end = _phrase_bounds(other)
+            other_end = max(other_end, other_start + MIN_PHRASE_DURATION)
             overlaps = other_start < phrase_end and phrase_start < other_end
             if overlaps and phrase["target_crop"] == other["target_crop"]:
                 raise ValueError(

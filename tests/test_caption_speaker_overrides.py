@@ -620,6 +620,43 @@ def test_text_replacement_rejects_stale_duplicate_selection_and_unsafe_phrases(
         normalize_caption_speaker_override_document(extra, clip["id"])
 
 
+def test_text_replacement_rejects_unsupported_render_intervals(tmp_path):
+    _diarized, clip, _segments, _crop_config, transcript_path = _review_inputs(tmp_path)
+    revision = file_fingerprint(transcript_path)["id"]
+
+    too_long = _text_replacement_document(clip["id"], revision)
+    replacement = too_long["text_replacements"][0]
+    phrase = replacement["display_phrases"][0]
+    phrase["words"][-1]["end"] = phrase["words"][0]["start"] + 2.6
+    replacement["end"] = phrase["words"][0]["start"] + 3.0
+    with pytest.raises(ValueError, match="maximum display duration"):
+        normalize_caption_speaker_override_document(too_long, clip["id"])
+
+    def _phrase(phrase_id, speaker, start, end):
+        return {
+            "id": phrase_id,
+            "to_asr_speaker": speaker,
+            "target_crop": f"speaker_{speaker}",
+            "words": [
+                {
+                    "word": phrase_id,
+                    "punctuated_word": phrase_id,
+                    "start": start,
+                    "end": end,
+                }
+            ],
+        }
+
+    rendered_collision = _text_replacement_document(clip["id"], revision)
+    rendered_collision["text_replacements"][0]["display_phrases"] = [
+        _phrase("speaker_one_first", 1, 4092.32, 4092.42),
+        _phrase("speaker_two", 2, 4092.37, 4092.47),
+        _phrase("speaker_one_second", 1, 4092.52, 4092.62),
+    ]
+    with pytest.raises(ValueError, match="different speaker panels"):
+        normalize_caption_speaker_override_document(rendered_collision, clip["id"])
+
+
 def test_text_replacement_rejects_duplicate_source_selection_and_stale_crop(
     tmp_path,
 ):
