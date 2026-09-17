@@ -140,15 +140,22 @@ class TestRunPipeline:
         }
 
     @pytest.mark.parametrize(
-        ("path", "payload"),
+        ("retired_agent", "path", "payload"),
         [
-            ("run-agent/metadata_gen", {}),
-            ("run-pipeline", {"agents": ["ingest", "metadata_gen"]}),
-            ("resume-pipeline", {"agents": ["metadata_gen"]}),
+            ("metadata_gen", "run-agent/metadata_gen", {}),
+            (
+                "metadata_gen",
+                "run-pipeline",
+                {"agents": ["ingest", "metadata_gen"]},
+            ),
+            ("metadata_gen", "resume-pipeline", {"agents": ["metadata_gen"]}),
+            ("podcast_feed", "run-agent/podcast_feed", {}),
+            ("podcast_feed", "run-pipeline", {"agents": ["podcast_feed"]}),
+            ("podcast_feed", "resume-pipeline", {"agents": ["podcast_feed"]}),
         ],
     )
-    def test_retired_metadata_generator_rejects_before_worker_or_episode_mutation(
-        self, test_client, path, payload
+    def test_retired_agent_rejects_before_worker_or_episode_mutation(
+        self, test_client, retired_agent, path, payload
     ):
         client, episodes_dir = test_client
         episode_dir = _create_episode(episodes_dir, "ep_001")
@@ -167,7 +174,7 @@ class TestRunPipeline:
         assert response.status_code == 409
         assert response.json()["detail"] == {
             "code": "agent_retired",
-            "agents": ["metadata_gen"],
+            "agents": [retired_agent],
             "message": "One or more requested agents are retired.",
         }
         thread_class.assert_not_called()
@@ -176,7 +183,8 @@ class TestRunPipeline:
         assert pipeline._cancel_requested == cancelled_before
         assert episode_file.read_bytes() == before
 
-    def test_thread_launcher_defensively_rejects_retired_agent(self):
+    @pytest.mark.parametrize("retired_agent", ("metadata_gen", "podcast_feed"))
+    def test_thread_launcher_defensively_rejects_retired_agent(self, retired_agent):
         from server.routes import pipeline
 
         running_before = dict(pipeline._running)
@@ -184,13 +192,12 @@ class TestRunPipeline:
             patch("server.routes.pipeline.threading.Thread") as thread_class,
             pytest.raises(HTTPException) as error,
         ):
-            pipeline._start_pipeline_thread("ep_001", "/tmp/source", ["metadata_gen"])
+            pipeline._start_pipeline_thread("ep_001", "/tmp/source", [retired_agent])
 
         assert error.value.status_code == 409
-        assert error.value.detail["agents"] == ["metadata_gen"]
+        assert error.value.detail["agents"] == [retired_agent]
         thread_class.assert_not_called()
         assert pipeline._running == running_before
-
 
 class TestCancelPipeline:
     def test_cancel_not_running(self, test_client):
@@ -390,14 +397,12 @@ class TestPublishApproval:
             patch("server.routes.pipeline.threading.Thread") as thread_class,
             patch("agents.pipeline.run_pipeline") as run_pipeline,
         ):
-            snapshot.return_value = _release_snapshot(
-                upload_post=True, podcast_rss=True
-            )
+            snapshot.return_value = _release_snapshot(upload_post=True)
             response = client.post("/api/episodes/ep_001/approve-publish")
             thread_class.call_args.kwargs["target"]()
 
         assert response.status_code == 200
-        assert run_pipeline.call_args.kwargs["agents"] == ["publish", "podcast_feed"]
+        assert run_pipeline.call_args.kwargs["agents"] == ["publish"]
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert episode["publish_approval"]["revision"] == "sha256:approved-plan"
         assert (
@@ -450,23 +455,24 @@ class TestPublishApproval:
             "episode_configured": True,
         }
 
-    def test_rss_only_plan_dispatches_only_podcast_feed(self, test_client):
+    def test_retired_rss_only_plan_dispatches_nothing(self, test_client):
         client, episodes_dir = test_client
-        _create_episode(episodes_dir, "ep_001")
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        before = (episode_dir / "episode.json").read_bytes()
 
         with (
             patch("server.routes.pipeline.quality_snapshot") as snapshot,
             patch("server.routes.pipeline.threading.Thread") as thread_class,
-            patch("agents.pipeline.run_pipeline") as run_pipeline,
         ):
             snapshot.return_value = _release_snapshot(
                 upload_post=False, podcast_rss=True
             )
             response = client.post("/api/episodes/ep_001/approve-publish")
-            thread_class.call_args.kwargs["target"]()
 
-        assert response.status_code == 200
-        assert run_pipeline.call_args.kwargs["agents"] == ["podcast_feed"]
+        assert response.status_code == 409
+        assert response.json()["detail"] == "No publication destinations are enabled"
+        thread_class.assert_not_called()
+        assert (episode_dir / "episode.json").read_bytes() == before
 
     def test_refuses_plan_without_destinations(self, test_client):
         client, episodes_dir = test_client
@@ -507,7 +513,7 @@ class TestPublishApproval:
             (episode_dir / "episode.json").read_text()
         )
 
-    def test_refuses_enabled_rss_without_bound_account(self, test_client):
+    def test_retired_rss_account_binding_is_not_evaluated(self, test_client):
         client, episodes_dir = test_client
         _create_episode(episodes_dir, "ep_001")
         release = _release_snapshot(upload_post=False, podcast_rss=True)
@@ -522,7 +528,7 @@ class TestPublishApproval:
             response = client.post("/api/episodes/ep_001/approve-publish")
 
         assert response.status_code == 409
-        assert "CLOUDFLARE_ACCOUNT_ID" in str(response.json()["detail"])
+        assert response.json()["detail"] == "No publication destinations are enabled"
         assert not thread_class.called
 
 

@@ -3,11 +3,7 @@ import test from 'node:test';
 
 import { importTs } from './load-ts.mjs';
 
-const {
-  describeEpisodeStatus,
-  episodeDisplayDuration,
-  formatDeliveryNote,
-} = await importTs(
+const { describeEpisodeStatus, episodeDisplayDuration } = await importTs(
   new URL('../src/lib/format.ts', import.meta.url)
 );
 
@@ -15,7 +11,7 @@ test('rendered delivery without a quality decision still requires review', () =>
   assert.equal(
     describeEpisodeStatus({
       status: 'awaiting_longform_review',
-      delivery: { status: 'ready', video_status: 'ready' },
+      delivery: { video_status: 'ready' },
     }).key,
     'quality_review_required'
   );
@@ -25,7 +21,7 @@ test('only the current release gate presents rendered delivery as ready', () => 
   assert.equal(
     describeEpisodeStatus({
       status: 'awaiting_longform_review',
-      delivery: { status: 'ready', video_status: 'ready' },
+      delivery: { video_status: 'ready' },
       quality: {
         quality: { status: 'passed' },
         release_gate: { status: 'ready' },
@@ -39,7 +35,7 @@ test('missing and stale quality reports stay in review', () => {
   for (const qualityStatus of ['missing', 'stale']) {
     assert.equal(
       describeEpisodeStatus({
-        delivery: { status: 'ready', video_status: 'ready' },
+        delivery: { video_status: 'ready' },
         quality: {
           quality: { status: qualityStatus },
           release_gate: { status: 'blocked' },
@@ -53,7 +49,7 @@ test('missing and stale quality reports stay in review', () => {
 test('a current failed report presents rendered delivery as blocked', () => {
   assert.equal(
     describeEpisodeStatus({
-      delivery: { status: 'ready', video_status: 'ready' },
+      delivery: { video_status: 'ready' },
       quality: {
         quality: { status: 'blocked' },
         release_gate: { status: 'blocked' },
@@ -66,7 +62,7 @@ test('a current failed report presents rendered delivery as blocked', () => {
 test('passed quality still requires explicit publish approval', () => {
   assert.equal(
     describeEpisodeStatus({
-      delivery: { status: 'ready', video_status: 'ready' },
+      delivery: { video_status: 'ready' },
       quality: {
         quality: { status: 'passed' },
         release_gate: { status: 'awaiting_publish_approval' },
@@ -78,7 +74,7 @@ test('passed quality still requires explicit publish approval', () => {
 
 test('passed technical QA labels pending editorial decisions as approval work', () => {
   const status = describeEpisodeStatus({
-    delivery: { status: 'ready', video_status: 'ready' },
+    delivery: { video_status: 'ready' },
     quality: {
       quality: { status: 'passed' },
       release_gate: {
@@ -97,13 +93,13 @@ test('passed technical QA labels pending editorial decisions as approval work', 
   assert.match(status.hint, /Technical QA passed/);
 });
 
-test('audio-only delivery never claims the video is ready', () => {
+test('historical audio state does not replace the pipeline status', () => {
   assert.equal(
     describeEpisodeStatus({
       status: 'ready_to_render',
       delivery: { status: 'ready', video_status: 'not_prepared' },
     }).key,
-    'delivery_audio_ready'
+    'ready_to_render'
   );
 });
 
@@ -117,32 +113,26 @@ test('live publishing status retains display priority', () => {
   );
 });
 
-test('display duration uses a ready delivery and otherwise falls back to source', () => {
+test('display duration uses a ready video and otherwise falls back to source', () => {
   assert.equal(
     episodeDisplayDuration({
       duration_seconds: 5400,
-      delivery: { status: 'ready', duration_seconds: 5267.7 },
+      delivery: {
+        video_status: 'ready',
+        video: { duration_seconds: 5267.7 },
+      },
     }),
     5267.7
   );
   assert.equal(
     episodeDisplayDuration({
       duration_seconds: 5400,
-      delivery: { status: 'preparing', duration_seconds: 5267.7 },
+      delivery: {
+        status: 'ready',
+        video_status: 'preparing',
+        video: { duration_seconds: 5267.7 },
+      },
     }),
     5400
-  );
-});
-
-test('delivery preparation note does not claim global publication state', () => {
-  assert.equal(
-    formatDeliveryNote(
-      'Local file only; nothing has been uploaded or published.'
-    ),
-    'This preparation step creates local files.'
-  );
-  assert.equal(
-    formatDeliveryNote('Measured against the current edit.'),
-    'Measured against the current edit.'
   );
 });

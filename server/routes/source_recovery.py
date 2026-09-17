@@ -314,7 +314,7 @@ def _registered_job_reason(episode_id: str, episode_dir: Path) -> str | None:
     worker = pipeline._running.get(episode_id)
     if worker is not None and worker.is_alive():
         return "pipeline"
-    if episode_id in delivery._running or episode_id in delivery._video_running:
+    if episode_id in delivery._video_running:
         return "delivery"
     prefix = f"{episode_dir.resolve()}:"
     if any(key.startswith(prefix) for key in clips._active_render_jobs):

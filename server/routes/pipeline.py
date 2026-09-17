@@ -777,7 +777,7 @@ async def publish_longform(episode_id: str, request: PublishLongformRequest) -> 
 async def approve_publish(
     episode_id: str, request: ApprovePublishRequest | None = None
 ) -> ApprovePublishResponse:
-    """Approve the current release, optionally starting legacy publishers."""
+    """Approve the current release, optionally starting aggregate publishing."""
     request = request or ApprovePublishRequest()
     logger.info("POST /api/episodes/%s/approve-publish", episode_id)
     async with _pipeline_lock:
@@ -811,8 +811,6 @@ async def approve_publish(
         publication_agents = []
         if plan["upload_post"]["enabled"]:
             publication_agents.append("publish")
-        if plan["podcast_rss"]["enabled"]:
-            publication_agents.append("podcast_feed")
         video_rss_plan = plan.get("video_podcast_rss", {"enabled": False})
         if not publication_agents and not video_rss_plan.get("enabled"):
             raise HTTPException(
@@ -832,13 +830,6 @@ async def approve_publish(
             "account_identity"
         ):
             configuration_blockers.append("UPLOAD_POST_USER is not configured")
-        rss_plan = plan["podcast_rss"]
-        if rss_plan.get("enabled") and not rss_plan.get("account_identity"):
-            configuration_blockers.append("CLOUDFLARE_ACCOUNT_ID is not configured")
-        if rss_plan.get("enabled") and not rss_plan.get("destination_configured"):
-            configuration_blockers.append("Podcast R2 destination is not configured")
-        if rss_plan.get("enabled") and not rss_plan.get("channel_configured"):
-            configuration_blockers.append("Podcast channel metadata is incomplete")
         if video_rss_plan.get("enabled") and not video_rss_plan.get("account_identity"):
             configuration_blockers.append("CLOUDFLARE_ACCOUNT_ID is not configured")
         if video_rss_plan.get("enabled") and not video_rss_plan.get(

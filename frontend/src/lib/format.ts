@@ -14,13 +14,17 @@ export function formatDuration(seconds: number | null | undefined): string {
   return `${sec}s`;
 }
 
-/** Prefer the verified edited delivery duration; otherwise show source duration. */
+/** Prefer the verified edited video duration; otherwise show source duration. */
 export function episodeDisplayDuration(
   episode: Record<string, unknown>
 ): number | null | undefined {
   const delivery = episode.delivery as Record<string, unknown> | null | undefined;
-  if (delivery?.status === 'ready' && typeof delivery.duration_seconds === 'number') {
-    return delivery.duration_seconds;
+  const video = delivery?.video as Record<string, unknown> | null | undefined;
+  if (
+    delivery?.video_status === 'ready' &&
+    typeof video?.duration_seconds === 'number'
+  ) {
+    return video.duration_seconds;
   }
   return episode.duration_seconds as number | null | undefined;
 }
@@ -109,21 +113,12 @@ export function formatRelative(iso: string | null | undefined): string {
   });
 }
 
-/** Avoid presenting a local preparation note as global publication state. */
-export function formatDeliveryNote(note: string): string {
-  return note === 'Local file only; nothing has been uploaded or published.'
-    ? 'This preparation step creates local files.'
-    : note;
-}
-
 /* ---------------------- Status → plain-English mapping --------------------- */
 
 export type StatusKey =
   | 'queued'
   | 'ready_to_render'
-  | 'delivery_preparing_audio'
   | 'delivery_preparing_video'
-  | 'delivery_audio_ready'
   | 'delivery_ready'
   | 'quality_review_required'
   | 'quality_blocked'
@@ -159,20 +154,10 @@ const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
     label: 'Ready to prepare',
     hint: 'Settings saved. Prepare files for upload.',
   },
-  delivery_preparing_audio: {
-    tone: 'working',
-    label: 'Preparing audio',
-    hint: 'Building and checking the podcast master.',
-  },
   delivery_preparing_video: {
     tone: 'working',
     label: 'Preparing video',
     hint: 'Building and checking the upload video.',
-  },
-  delivery_audio_ready: {
-    tone: 'waiting',
-    label: 'Audio ready',
-    hint: 'Podcast audio is rendered and measured. Prepare the upload video when ready.',
   },
   delivery_ready: {
     tone: 'success',
@@ -336,10 +321,7 @@ export function describeEpisodeStatus(
   if (delivery.video_status === 'preparing') {
     return { key: 'delivery_preparing_video', ...STATUS.delivery_preparing_video };
   }
-  if (delivery.status === 'preparing') {
-    return { key: 'delivery_preparing_audio', ...STATUS.delivery_preparing_audio };
-  }
-  if (delivery.status === 'ready' && delivery.video_status === 'ready') {
+  if (delivery.video_status === 'ready') {
     const quality = episode.quality as Record<string, unknown> | null | undefined;
     const report = quality?.quality as Record<string, unknown> | undefined;
     const gate = quality?.release_gate as Record<string, unknown> | undefined;
@@ -376,9 +358,6 @@ export function describeEpisodeStatus(
       ...STATUS.quality_review_required,
     };
   }
-  if (delivery.status === 'ready') {
-    return { key: 'delivery_audio_ready', ...STATUS.delivery_audio_ready };
-  }
   return base;
 }
 
@@ -396,7 +375,6 @@ const AGENT_LABELS: Record<string, string> = {
   metadata_gen: 'Writing metadata',
   thumbnail_gen: 'Generating thumbnails',
   qa: 'Quality check',
-  podcast_feed: 'Updating RSS feed',
   publish: 'Publishing',
   backup: 'Backing up',
 };
@@ -413,7 +391,6 @@ export const CANONICAL_AGENTS: string[] = [
   'shorts_render',
   'thumbnail_gen',
   'qa',
-  'podcast_feed',
   'publish',
   'backup',
 ];

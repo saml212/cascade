@@ -497,6 +497,18 @@ export interface DeliveryStatus extends UnknownRecord {
   completed_at?: string;
   notes?: string[];
   stale?: boolean;
+  selected_audio_download_url?: string;
+  selected_audio_review_error?: string;
+  selected_audio?: {
+    filename: string;
+    size_bytes: number;
+    provenance: {
+      kind: 'selected_repair' | 'base_mix';
+      currentness: 'current' | 'unverified';
+      clock: 'source';
+      editorial_cuts_applied: false;
+    };
+  };
   video_status?: 'not_prepared' | 'preparing' | 'ready' | 'failed';
   video_progress?: number;
   video_detail?: string;
@@ -546,8 +558,6 @@ export const api = {
 
   deliveryStatus: (id: string) =>
     request<DeliveryStatus>('GET', `/api/episodes/${id}/delivery`),
-  prepareDelivery: (id: string) =>
-    request<DeliveryStatus>('POST', `/api/episodes/${id}/delivery/prepare`),
   prepareDeliveryVideo: (id: string) =>
     request<DeliveryStatus>('POST', `/api/episodes/${id}/delivery/video/prepare`),
   saveDeliveryTrim: (id: string, start_seconds: number, end_seconds: number) =>

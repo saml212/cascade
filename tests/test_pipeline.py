@@ -64,14 +64,11 @@ class TestDagDependencies:
     def test_publish_depends_on_qa(self):
         assert AGENT_DEPS["publish"] == {"qa"}
 
-    def test_podcast_feed_depends_on_qa(self):
-        assert AGENT_DEPS["podcast_feed"] == {"qa"}
-
     def test_video_feed_depends_on_qa(self):
         assert AGENT_DEPS["video_feed"] == {"qa"}
 
-    def test_backup_depends_on_publish_and_podcast_feed_and_thumbnail(self):
-        assert AGENT_DEPS["backup"] == {"publish", "podcast_feed", "thumbnail_gen"}
+    def test_backup_depends_on_publish_and_thumbnail(self):
+        assert AGENT_DEPS["backup"] == {"publish", "thumbnail_gen"}
 
     def test_no_circular_dependencies(self):
         """Verify the DAG has no cycles."""
@@ -110,7 +107,7 @@ class TestDagDependencies:
 
 class TestNonCriticalAgents:
     def test_non_critical_agents_defined(self):
-        assert "podcast_feed" in NON_CRITICAL_AGENTS
+        assert "podcast_feed" not in NON_CRITICAL_AGENTS
         assert "video_feed" in NON_CRITICAL_AGENTS
         assert "publish" in NON_CRITICAL_AGENTS
         assert "backup" in NON_CRITICAL_AGENTS
@@ -132,7 +129,7 @@ class TestExplicitPublicationAgents:
         with (
             patch(
                 "agents.pipeline.PIPELINE_ORDER",
-                ["podcast_feed", "video_feed", "publish"],
+                ["video_feed", "publish"],
             ),
             patch(
                 "agents.pipeline.load_config",
@@ -143,7 +140,6 @@ class TestExplicitPublicationAgents:
 
         assert result["pipeline"]["agents_requested"] == []
         assert EXPLICIT_PUBLICATION_AGENTS == {
-            "podcast_feed",
             "video_feed",
             "publish",
             "longform_video_feed",
@@ -238,16 +234,14 @@ class TestAgentRegistry:
     def test_registry_count_matches_pipeline_order(self):
         assert len(AGENT_REGISTRY) == len(PIPELINE_ORDER)
 
-    def test_pipeline_order_has_16_agents(self):
-        assert len(PIPELINE_ORDER) == 16
-
-    def test_retired_metadata_generator_is_not_registered(self):
-        assert "metadata_gen" in RETIRED_AGENTS
-        assert "metadata_gen" not in AGENT_REGISTRY
-        assert "metadata_gen" not in PIPELINE_ORDER
+    def test_retired_agents_are_not_registered(self):
+        assert RETIRED_AGENTS == {"metadata_gen", "podcast_feed"}
+        assert RETIRED_AGENTS.isdisjoint(AGENT_REGISTRY)
+        assert RETIRED_AGENTS.isdisjoint(PIPELINE_ORDER)
 
 
-def test_retired_metadata_generator_is_rejected_before_episode_mutation(tmp_path):
+@pytest.mark.parametrize("retired_agent", sorted(RETIRED_AGENTS))
+def test_retired_agent_is_rejected_before_episode_mutation(tmp_path, retired_agent):
     episodes_dir = tmp_path / "episodes"
     episode_dir = episodes_dir / "ep_test"
     episode_dir.mkdir(parents=True)
@@ -259,9 +253,7 @@ def test_retired_metadata_generator_is_rejected_before_episode_mutation(tmp_path
         patch("agents.pipeline.load_config") as load_config,
         pytest.raises(ValueError, match="Retired agent"),
     ):
-        run_pipeline(
-            "/tmp/source", episode_id="ep_test", agents=["ingest", "metadata_gen"]
-        )
+        run_pipeline("/tmp/source", episode_id="ep_test", agents=[retired_agent])
 
     load_config.assert_not_called()
     assert episode_file.read_bytes() == original

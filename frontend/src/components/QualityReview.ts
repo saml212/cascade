@@ -936,7 +936,7 @@ function reviewDraftMap(
 function outputRole(role?: string, clipId?: string): string {
   if (role === 'selected_audio_master') return 'Selected audio master';
   if (role === 'upload_video') return 'Full upload video';
-  if (role === 'podcast_audio') return 'Podcast MP3';
+  if (role === 'podcast_audio') return 'Historical podcast MP3';
   if (role === 'short') return `Short${clipId ? ` ${clipId}` : ''}`;
   return role?.replaceAll('_', ' ') ?? 'Output artifact';
 }

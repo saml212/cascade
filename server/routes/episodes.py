@@ -17,7 +17,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from agents.pipeline import load_config
-from agents.podcast_feed import current_podcast_audio
 from agents.qa import editorial_revision, quality_snapshot
 from agents.speaker_cut import current_speaker_segments, rebind_visual_crop_segments
 from agents.transcribe import AudioWindowOutOfRange, export_logical_track_window
@@ -33,10 +32,7 @@ from lib.crop import speaker_crop_state, visual_crop_state
 from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
 from lib.ffprobe import get_dimensions
 from lib.paths import get_episodes_dir
-from server.routes.delivery import (
-    current_delivery_video_fields,
-    migrate_unchanged_delivery_audio_fingerprint,
-)
+from server.routes.delivery import current_delivery_video_fields
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +68,6 @@ def _delivery_snapshot(ep_dir: Path, config: dict | None = None) -> dict | None:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         episode, processing_config = {}, {}
 
-    if snapshot.get("status") == "ready":
-        try:
-            current_audio = current_podcast_audio(
-                ep_dir,
-                episode,
-                processing_config,
-                verify_content=False,
-            )
-        except (OSError, TypeError, ValueError):
-            current_audio = None
-        if current_audio is None or raw.get("output_stat") != {
-            "size": current_audio.stat().st_size,
-            "mtime_ns": current_audio.stat().st_mtime_ns,
-        }:
-            snapshot["status"] = "not_prepared"
     if snapshot.get("video_status") in {None, "ready"}:
         snapshot = {
             key: value
@@ -1050,9 +1031,7 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
             {"speaker_cut", "longform_render", "shorts_render", "qa"}
         )
     if audio_changed:
-        crop_dependent_agents.update(
-            {"longform_render", "shorts_render", "qa", "podcast_feed"}
-        )
+        crop_dependent_agents.update({"longform_render", "shorts_render", "qa"})
     if longform_changed:
         crop_dependent_agents.update({"longform_render", "qa"})
     if short_changed:
@@ -1090,10 +1069,6 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
         ep["status"] = "ready_to_render"
 
     write_episode(episode_id, ep)
-    delivery_audio_preserved = migrate_unchanged_delivery_audio_fingerprint(
-        ep_dir, old_episode, ep, config
-    )
-
     rebound = None
     if not speaker_mapping_changed:
         rebound = rebind_visual_crop_segments(ep_dir, old_episode, ep, config)
@@ -1135,5 +1110,5 @@ async def save_crop_config(episode_id: str, req: CropConfigRequest) -> dict:
         "invalidated_agents": sorted(crop_dependent_agents),
         "speaker_segments_preserved": segments_preserved,
         "migrated_short_render_ids": migrated_short_ids,
-        "delivery_audio_preserved": delivery_audio_preserved,
+        "delivery_audio_preserved": False,
     }

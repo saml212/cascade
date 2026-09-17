@@ -121,7 +121,7 @@ cascade/
 │   ├── transcribe.py (runs parallel to audio_analysis + speaker_cut)
 │   ├── clip_miner.py → shorts_render.py
 │   ├── longform_render.py (starts when speaker_cut + transcribe finish)
-│   ├── thumbnail_gen.py → qa.py → podcast_feed.py → publish.py → backup.py
+│   ├── thumbnail_gen.py → qa.py; video_feed.py + publish.py; backup.py
 │   └── ...
 ├── lib/             # Shared utilities
 │   ├── encoding.py  # VideoToolbox / libx264 encoder selection + LUT support

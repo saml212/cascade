@@ -26,16 +26,14 @@ AGENT_DEPS = {
     "shorts_render": {"clip_miner", "speaker_cut"},
     "thumbnail_gen": {"transcribe"},
     "qa": {"longform_render", "shorts_render", "thumbnail_gen"},
-    "podcast_feed": {"qa"},
     "video_feed": {"qa"},
     "publish": {"qa"},
     "longform_publish": {"longform_video_feed"},
     "longform_video_feed": set(),
-    "backup": {"publish", "podcast_feed", "thumbnail_gen"},
+    "backup": {"publish", "thumbnail_gen"},
 }
 
 NON_CRITICAL_AGENTS = {
-    "podcast_feed",
     "video_feed",
     "publish",
     "longform_publish",
@@ -45,7 +43,6 @@ NON_CRITICAL_AGENTS = {
 }
 EXPLICIT_PUBLICATION_AGENTS = frozenset(
     {
-        "podcast_feed",
         "video_feed",
         "publish",
         "longform_publish",

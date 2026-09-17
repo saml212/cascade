@@ -41,7 +41,7 @@ video_contrast = 1.0                      # eq contrast (1.0 = no change; LUT ha
 video_saturation = 1.04                   # eq saturation (subtle lift only)
 video_gamma = 1.01                        # eq gamma (very subtle brightness lift)
 
-# Podcast master: preserve natural speech, normalize once after mixing.
+# Selected audio master: preserve natural speech, normalize once after mixing.
 audio_enhance = true
 audio_enhance_mode = "transparent"      # "restoration" enables optional cleanup
 audio_target_lufs = -16                 # Production target, not an upload requirement
@@ -140,13 +140,6 @@ enabled = false
 require_approval = true
 account_username = ""
 board_id = ""                             # Required exact public board ID
-
-[platforms.podcast_rss]
-enabled = true
-feed_url = ""
-audio_format = "mp3"
-audio_bitrate = "128k"
-artwork_path = ""
 
 [platforms.video_podcast_rss]
 # Dedicated Apple video show. Uses feed-video.xml and immutable video objects;

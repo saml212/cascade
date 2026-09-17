@@ -2,15 +2,11 @@ import { Button } from '../components/Button';
 import { Icon } from '../components/icons';
 import { h, mount } from '../lib/dom';
 import { api, type DeliveryStatus, type UnknownRecord } from '../lib/api';
-import { formatDeliveryNote, pluralize } from '../lib/format';
+import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
 import { effect, onCleanup, signal } from '../lib/signals';
 import { showToast } from '../state/ui';
 import { stableControl, type StableControl } from '../lib/stable-control';
-import {
-  canPrepareDeliveryVideo,
-  showDeliveryVideoSection,
-} from '../lib/delivery-view';
 import {
   QualityReview,
   type QualityReviewControls,
@@ -18,7 +14,6 @@ import {
 import type { QualitySnapshot } from '../lib/api';
 
 interface DeliveryControls {
-  audio?: StableControl<HTMLAudioElement>;
   video?: StableControl<HTMLVideoElement>;
   trimStart?: StableControl<HTMLInputElement>;
   trimEnd?: StableControl<HTMLInputElement>;
@@ -46,7 +41,7 @@ export function Delivery(target: HTMLElement, episodeId: string): void {
       if (disposed) return;
       episode.set(ep);
       status.set(delivery);
-      if (delivery.status === 'preparing' || delivery.video_status === 'preparing') {
+      if (delivery.video_status === 'preparing') {
         window.clearTimeout(pollTimer);
         pollTimer = window.setTimeout(load, 2000);
       }
@@ -57,17 +52,6 @@ export function Delivery(target: HTMLElement, episodeId: string): void {
 
   effect(() => {
     page.replaceChildren(renderPage(episodeId, episode(), status(), controls, async () => {
-      try {
-        const update = await api.prepareDelivery(episodeId);
-        status.set({ ...(status.peek() ?? update), ...update });
-        showToast('Podcast audio preparation started.', 'success');
-        window.clearTimeout(pollTimer);
-        pollTimer = window.setTimeout(load, 1000);
-      } catch (error) {
-        showToast((error as Error).message, 'error');
-        await load();
-      }
-    }, async () => {
       try {
         const update = await api.prepareDeliveryVideo(episodeId);
         status.set({ ...(status.peek() ?? update), ...update });
@@ -81,7 +65,7 @@ export function Delivery(target: HTMLElement, episodeId: string): void {
     }, async (start, end) => {
       try {
         status.set(await api.saveDeliveryTrim(episodeId, start, end));
-        showToast('Episode trim saved. Prepare audio to apply it.', 'success');
+        showToast('Episode trim saved. Prepare the video to apply it.', 'success');
       } catch (error) {
         showToast((error as Error).message, 'error');
       }
@@ -97,7 +81,6 @@ function renderPage(
   episode: UnknownRecord | null,
   delivery: DeliveryStatus | null,
   controls: DeliveryControls,
-  prepare: () => Promise<void>,
   prepareVideo: () => Promise<void>,
   saveTrim: (start: number, end: number) => Promise<void>,
   refresh: () => Promise<void>
@@ -105,10 +88,7 @@ function renderPage(
   const title = episode
     ? String(episode.episode_name || episode.title || episode.guest_name || episodeId)
     : 'Loading episode…';
-  const state = delivery?.status;
   const loading = !delivery;
-  const audioBusy = state === 'preparing';
-  const videoBusy = delivery?.video_status === 'preparing';
   const quality =
     delivery?.quality ??
     (episode?.quality as QualitySnapshot | null | undefined);
@@ -130,7 +110,7 @@ function renderPage(
       h(
         'p',
         { class: 'text-body text-ink-secondary mt-3 max-w-[640px]' },
-        'Build and review local podcast audio and video, verify release quality, and download the finished files. This does not upload or publish anything.'
+        'Build and review the local release video, verify release quality, and download the finished file. This does not upload or publish anything.'
       )
     ),
     loading
@@ -143,39 +123,7 @@ function renderPage(
         }),
     clipReviewEntry(episodeId, episode, quality),
     delivery ? trimDetails(delivery, controls, saveTrim) : null,
-    h(
-      'div',
-      { class: 'panel p-6 flex flex-col gap-5' },
-      h('div', { class: 'flex items-center justify-between gap-4' },
-        h('div', null,
-          h('div', { class: 'text-heading-sm text-ink-primary' }, statusLabel(state)),
-          h('div', { class: 'text-body-sm text-ink-tertiary mt-1' }, statusDetail(delivery))
-        ),
-        Button({
-          variant: 'primary',
-          size: 'lg',
-          label: loading
-            ? 'Loading…'
-            : audioBusy
-            ? 'Preparing…'
-            : videoBusy
-              ? 'Video preparing…'
-              : state === 'ready'
-                ? 'Prepare again'
-                : 'Prepare episode',
-          loading: audioBusy,
-          disabled: loading || audioBusy || videoBusy,
-          onClick: () => void prepare(),
-        })
-      ),
-      delivery?.error
-        ? h('div', { class: 'rounded-md bg-status-danger/10 border border-status-danger/30 p-4 text-body text-status-danger' }, delivery.error)
-        : null,
-      delivery?.status === 'ready' ? readyDetails(delivery, controls) : null
-    ),
-    showDeliveryVideoSection(delivery)
-      ? videoDetails(delivery, controls, prepareVideo)
-      : null
+    delivery ? videoDetails(delivery, controls, prepareVideo) : null
   );
 }
 
@@ -229,7 +177,7 @@ function trimDetails(
   controls: DeliveryControls,
   saveTrim: (start: number, end: number) => Promise<void>
 ): HTMLElement {
-  const busy = delivery.status === 'preparing' || delivery.video_status === 'preparing';
+  const busy = delivery.video_status === 'preparing';
   controls.trimStart = stableControl(controls.trimStart, 'trim-start', () =>
     h('input', {
       value: formatTimestamp(delivery.trim_start_seconds ?? 0),
@@ -284,7 +232,6 @@ function videoDetails(
 ): HTMLElement {
   const videoState = delivery.video_status ?? 'not_prepared';
   const busy = videoState === 'preparing';
-  const canPrepare = canPrepareDeliveryVideo(delivery);
   const progress = Math.min(99, Math.max(0, delivery.video_progress ?? 0));
   const video = delivery.video;
   return h(
@@ -305,16 +252,14 @@ function videoDetails(
                 : 'Prepare a speaker-cut 1080p video with the saved edits and mastered audio.'
         )
       ),
-      canPrepare
-        ? Button({
-            variant: 'primary',
-            size: 'lg',
-            label: busy ? 'Preparing…' : videoState === 'ready' ? 'Prepare again' : 'Prepare video',
-            loading: busy,
-            disabled: busy,
-            onClick: () => void prepareVideo(),
-          })
-        : null
+      Button({
+        variant: 'primary',
+        size: 'lg',
+        label: busy ? 'Preparing…' : videoState === 'ready' ? 'Prepare again' : 'Prepare video',
+        loading: busy,
+        disabled: busy,
+        onClick: () => void prepareVideo(),
+      })
     ),
     busy
       ? h('div', { class: 'h-2 rounded-full bg-surface-3 overflow-hidden' },
@@ -354,71 +299,6 @@ function metric(label: string, value: string): HTMLElement {
   );
 }
 
-function readyDetails(
-  delivery: DeliveryStatus,
-  controls: DeliveryControls
-): HTMLElement {
-  const rows = [
-    ['Duration', formatDuration(delivery.duration_seconds)],
-    ['Duration check', `${numberUnit(delivery.duration_difference_seconds, ' sec')} difference`],
-    ['File size', formatBytes(delivery.size_bytes)],
-    ['Integrated loudness', numberUnit(delivery.integrated_lufs, ' LUFS')],
-    ['True peak', numberUnit(delivery.true_peak_dbfs, ' dBFS')],
-    ['Loudness range', numberUnit(delivery.loudness_range_lu, ' LU')],
-  ];
-  return h(
-    'div',
-    { class: 'border-t border-border pt-5 flex flex-col gap-4' },
-    h('div', { class: 'grid grid-cols-2 gap-x-8 gap-y-3' },
-      ...rows.map(([label, value]) => h('div', null,
-        h('div', { class: 'text-body-sm text-ink-tertiary' }, label),
-        h('div', { class: 'text-body text-ink-primary font-medium' }, value)
-      ))
-    ),
-    audioPlayer(delivery, controls),
-    h('div', { class: 'flex flex-wrap gap-3' },
-    h(
-      'a',
-      {
-        href: delivery.download_url,
-        download: delivery.filename || 'podcast_audio.mp3',
-        class: 'inline-flex h-11 px-5 items-center justify-center self-start rounded-md bg-accent text-ink-on-accent font-medium hover:brightness-110',
-      },
-      'Download MP3'
-    ),
-    h(
-      'a',
-      {
-        href: `/api/episodes/${delivery.episode_id}/delivery/metadata`,
-        download: `${delivery.episode_id}-delivery.json`,
-        class: 'inline-flex h-11 px-5 items-center justify-center rounded-md border border-border bg-surface-2 text-ink-primary font-medium hover:bg-surface-3',
-      },
-      'Download metadata'
-    )),
-    h('div', { class: 'text-body-sm text-ink-tertiary' },
-      ...(delivery.notes ?? []).map((note) =>
-        h('div', null, `• ${formatDeliveryNote(note)}`)
-      )
-    )
-  );
-}
-
-function audioPlayer(
-  delivery: DeliveryStatus,
-  controls: DeliveryControls
-): HTMLAudioElement {
-  const identity = `${delivery.download_url ?? ''}:${delivery.completed_at ?? ''}`;
-  controls.audio = stableControl(controls.audio, identity, () =>
-    h('audio', {
-      controls: true,
-      preload: 'metadata',
-      src: delivery.download_url,
-      class: 'w-full',
-    }) as HTMLAudioElement
-  );
-  return controls.audio.value;
-}
-
 function videoPlayer(
   delivery: DeliveryStatus,
   controls: DeliveryControls
@@ -435,28 +315,6 @@ function videoPlayer(
   return controls.video.value;
 }
 
-function statusLabel(status?: DeliveryStatus['status']): string {
-  if (!status) return 'Loading release state';
-  if (status === 'preparing') return 'Preparing audio';
-  if (status === 'ready') return 'Audio master rendered';
-  if (status === 'failed') return 'Preparation failed';
-  return 'Not prepared';
-}
-
-function statusDetail(status: DeliveryStatus | null): string {
-  if (!status) return 'Reading the current local artifacts and checks.';
-  if (status.status === 'not_prepared') {
-    return status.stale && status.download_url
-      ? 'A previous local podcast master is available, but its inputs changed. Prepare again to make it current.'
-      : 'No local podcast master has been prepared yet.';
-  }
-  if (status.status === 'preparing') return 'Mixing, mastering, encoding, and checking the finished MP3.';
-  if (status.status === 'failed') return 'Fix the issue below, then prepare the episode again.';
-  return status.completed_at
-    ? `Duration and loudness measured ${new Date(status.completed_at).toLocaleString()}`
-    : 'Duration and loudness checks completed.';
-}
-
 function formatDuration(value?: number): string {
   if (value == null) return '—';
   const hours = Math.floor(value / 3600);
@@ -467,10 +325,6 @@ function formatDuration(value?: number): string {
 
 function formatBytes(value?: number): string {
   return value == null ? '—' : `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function numberUnit(value: number | undefined, unit: string): string {
-  return value == null ? '—' : `${value.toFixed(1)}${unit}`;
 }
 
 function parseTimestamp(value: string): number | null {

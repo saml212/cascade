@@ -19,9 +19,7 @@ const PRIORITY: Record<string, number> = {
   delivery_ready: 95,
   quality_blocked: 98,
   quality_review_required: 96,
-  delivery_audio_ready: 75,
   delivery_preparing_video: 65,
-  delivery_preparing_audio: 65,
   awaiting_crop: 100,
   awaiting_longform_review: 90,
   awaiting_clip_review: 85,
@@ -288,9 +286,6 @@ function ctaFor(ep: EpisodeSummary): { label: string } {
     case 'quality_blocked':
     case 'quality_review_required':
       return { label: 'Review quality →' };
-    case 'delivery_audio_ready':
-      return { label: 'Prepare video →' };
-    case 'delivery_preparing_audio':
     case 'delivery_preparing_video':
       return { label: 'View preparation →' };
     case 'awaiting_crop':
@@ -320,8 +315,6 @@ function ctaTarget(ep: EpisodeSummary, key: string): string {
     case 'delivery_ready':
     case 'quality_blocked':
     case 'quality_review_required':
-    case 'delivery_audio_ready':
-    case 'delivery_preparing_audio':
     case 'delivery_preparing_video':
       return `${base}/delivery`;
     case 'awaiting_crop':

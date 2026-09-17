@@ -417,57 +417,6 @@ def _upload_post_plan(
     return plan
 
 
-def _podcast_rss_plan(
-    config: dict, episode: dict, environment: Mapping[str, str]
-) -> dict:
-    platforms = config.get("platforms", {})
-    enabled = platforms.get("podcast_rss", {}).get("enabled") is True
-    plan = {"enabled": enabled}
-    if not enabled:
-        return plan
-
-    podcast = config.get("podcast", {})
-    r2 = podcast.get("r2", {})
-    account = environment.get("CLOUDFLARE_ACCOUNT_ID", "")
-    required_channel_fields = (
-        "title",
-        "description",
-        "author",
-        "artwork_url",
-        "link",
-        "owner_email",
-    )
-    plan.update(
-        account_identity=(
-            _private_identity("cloudflare-account", account) if account else None
-        ),
-        destination_identity=_private_identity(
-            "podcast-r2-destination",
-            {
-                "bucket": r2.get("bucket", ""),
-                "public_url": str(r2.get("public_url", "")).rstrip("/"),
-            },
-        ),
-        destination_configured=bool(r2.get("bucket") and r2.get("public_url")),
-        channel_identity=_private_identity(
-            "podcast-channel",
-            {field: podcast.get(field) for field in PODCAST_CHANNEL_FIELDS},
-        ),
-        channel_configured=all(podcast.get(field) for field in required_channel_fields),
-        episode_identity=_private_identity(
-            "podcast-episode",
-            {
-                "episode_id": episode.get("episode_id", ""),
-                "title": episode.get("episode_name") or episode.get("title", ""),
-                "description": episode.get("episode_description")
-                or episode.get("description", ""),
-                "created_at": episode.get("created_at", ""),
-            },
-        ),
-    )
-    return plan
-
-
 def _video_podcast_rss_plan(
     config: dict, episode: dict, environment: Mapping[str, str]
 ) -> dict:
@@ -564,7 +513,9 @@ def current_publish_plan(
     return {
         "schema": PUBLISH_PLAN_SCHEMA,
         "upload_post": _upload_post_plan(config, episode, environment, funnel_urls),
-        "podcast_rss": _podcast_rss_plan(config, episode, environment),
+        # Keep the disabled member byte-for-byte stable because release approvals
+        # created before audio RSS retirement include it in their revision payload.
+        "podcast_rss": {"enabled": False},
         "video_podcast_rss": _video_podcast_rss_plan(config, episode, environment),
     }
 
@@ -733,15 +684,6 @@ def quality_revision(
             "transcript_corrections": "transcript_corrections.json",
         }.items()
     }
-    if config and (
-        config.get("platforms", {}).get("podcast_rss", {}).get("enabled") is True
-    ):
-        continuity_inputs.update(
-            podcast_audio=_file_signature(episode_dir / "podcast_audio.mp3"),
-            podcast_audio_proof=_file_signature(
-                episode_dir / "podcast_audio.fingerprint"
-            ),
-        )
     payload = {
         "editorial_revision": editorial_revision(episode_dir, episode),
         "output_continuity_detector": OUTPUT_CONTINUITY_VERSION,
@@ -1300,47 +1242,16 @@ def _output_continuity_targets(
             )
         )
 
-    podcast_path = episode_dir / "podcast_audio.mp3"
-    rss_enabled = (
-        config.get("platforms", {}).get("podcast_rss", {}).get("enabled") is True
+    targets.append(
+        {
+            "role": "podcast_audio",
+            "path": str((episode_dir / "podcast_audio.mp3").resolve()),
+            "clock": "output",
+            "required": False,
+            "status": "not_required",
+            "detail": "Podcast RSS delivery is disabled.",
+        }
     )
-    if not rss_enabled:
-        targets.append(
-            {
-                "role": "podcast_audio",
-                "path": str(podcast_path.resolve()),
-                "clock": "output",
-                "required": False,
-                "status": "not_required",
-                "detail": "Podcast RSS delivery is disabled.",
-            }
-        )
-    else:
-        try:
-            from agents.podcast_feed import current_podcast_audio
-
-            podcast_current = current_podcast_audio(
-                episode_dir,
-                episode,
-                config,
-            )
-            podcast_error = None
-        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
-            podcast_current = None
-            podcast_error = str(exc)
-        podcast_proof = _load_json(podcast_path.with_suffix(".fingerprint"), {})
-        targets.append(
-            _continuity_target(
-                podcast_path,
-                role="podcast_audio",
-                clock="output",
-                timeline=timeline,
-                current=podcast_current is not None,
-                proof=podcast_proof,
-                stale_detail=podcast_error
-                or "Podcast audio is stale for current release inputs.",
-            )
-        )
     return targets
 
 

@@ -446,7 +446,7 @@ def test_credentials_are_not_stored_or_bound_to_release_revision(tmp_path):
     assert "first-token" not in serialized
 
 
-def test_rss_destination_channel_and_account_change_release_revision(tmp_path):
+def test_retired_audio_rss_config_is_inert_and_revision_stable(tmp_path):
     config = _config()
     config["platforms"]["podcast_rss"]["enabled"] = True
     episode = _episode()
@@ -455,24 +455,28 @@ def test_rss_destination_channel_and_account_change_release_revision(tmp_path):
         tmp_path, episode, config=config, environment=environment
     )
 
+    assert current_publish_plan(config, episode, environment=environment)[
+        "podcast_rss"
+    ] == {"enabled": False}
+
     config["podcast"]["r2"]["bucket"] = "another-bucket"
     assert (
         release_revision(tmp_path, episode, config=config, environment=environment)
-        != approved
+        == approved
     )
 
     config["podcast"]["r2"]["bucket"] = "private-bucket"
     config["podcast"]["title"] = "Another show"
     assert (
         release_revision(tmp_path, episode, config=config, environment=environment)
-        != approved
+        == approved
     )
 
     config["podcast"]["title"] = "Private show title"
     environment["CLOUDFLARE_ACCOUNT_ID"] = "b"
     assert (
         release_revision(tmp_path, episode, config=config, environment=environment)
-        != approved
+        == approved
     )
 
 

@@ -5,7 +5,6 @@ from agents.backup import BackupAgent
 from agents.clip_miner import ClipMinerAgent
 from agents.ingest import IngestAgent
 from agents.longform_render import LongformRenderAgent
-from agents.podcast_feed import PodcastFeedAgent
 from agents.publish import LongformPublishAgent, PublishAgent
 from agents.qa import QAAgent
 from agents.shorts_render import ShortsRenderAgent
@@ -15,7 +14,7 @@ from agents.thumbnail_gen import ThumbnailGenAgent
 from agents.transcribe import TranscribeAgent
 from agents.video_feed import LongformVideoFeedAgent, VideoFeedAgent
 
-RETIRED_AGENTS = frozenset({"metadata_gen"})
+RETIRED_AGENTS = frozenset({"metadata_gen", "podcast_feed"})
 
 AGENT_REGISTRY = {
     "ingest": IngestAgent,
@@ -28,7 +27,6 @@ AGENT_REGISTRY = {
     "shorts_render": ShortsRenderAgent,
     "thumbnail_gen": ThumbnailGenAgent,
     "qa": QAAgent,
-    "podcast_feed": PodcastFeedAgent,
     "video_feed": VideoFeedAgent,
     "publish": PublishAgent,
     "longform_publish": LongformPublishAgent,
@@ -47,7 +45,6 @@ PIPELINE_ORDER = [
     "shorts_render",
     "thumbnail_gen",
     "qa",
-    "podcast_feed",
     "video_feed",
     "publish",
     "longform_video_feed",

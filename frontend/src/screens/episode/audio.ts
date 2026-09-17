@@ -13,7 +13,6 @@ import {
   formatOffsetMs,
   formatRelative,
 } from '../../lib/format';
-import { link } from '../../lib/router';
 import { effect, onCleanup, signal } from '../../lib/signals';
 import { stableControl, type StableControl } from '../../lib/stable-control';
 
@@ -75,7 +74,7 @@ export function renderAudio(
             )
           : null,
         audioSourcePanel(episode, currentQuality),
-        masterPanel(episodeId, currentDelivery, controls),
+        masterPanel(currentDelivery, controls),
         QualityReview({
           episodeId,
           quality: currentQuality,
@@ -124,28 +123,28 @@ function audioSourcePanel(
 }
 
 function masterPanel(
-  episodeId: string,
   delivery: DeliveryStatus | null,
   controls: AudioControls
 ): HTMLElement {
-  const current = delivery?.status === 'ready' && !delivery.stale;
-  const playable = Boolean(delivery?.download_url);
-  const title = current
-    ? 'Current podcast master'
-    : playable
-      ? 'Previous podcast master · inputs changed'
-      : delivery?.status === 'preparing'
-        ? 'Preparing podcast master'
-        : delivery?.status === 'failed'
-          ? 'Podcast master preparation failed'
-          : 'Podcast master not prepared';
-  const detail = current
-    ? 'These measurements and this player describe the current selected audio and episode range.'
-    : playable
-      ? 'These measurements belong to the previous MP3. Prepare again before release to apply the current selected audio and episode range.'
-      : delivery?.status === 'preparing'
-        ? 'Mixing, mastering, encoding, and checking the finished MP3.'
-        : 'Prepare local release files to create and measure the podcast MP3.';
+  const selectedUrl = delivery?.selected_audio_download_url;
+  const historicalUrl = delivery?.download_url;
+  const provenance = delivery?.selected_audio?.provenance;
+  const playable = Boolean(selectedUrl || historicalUrl);
+  const title = selectedUrl
+    ? provenance?.kind === 'selected_repair'
+      ? 'Current selected repair master'
+      : 'Available base mix · currentness unverified'
+    : historicalUrl
+      ? 'Historical podcast MP3'
+      : 'Audio master unavailable';
+  const detail = selectedUrl
+    ? provenance?.kind === 'selected_repair'
+      ? 'SOURCE CLOCK · This revision-validated selected repair is full length. Editorial cuts are not applied. Review the final rendered video for output timing and content.'
+      : 'SOURCE CLOCK · This existing base mix is available for reference, but its currentness is unverified. Editorial cuts are not applied. Review the final rendered video for output timing and content.'
+    : historicalUrl
+      ? 'HISTORICAL OUTPUT · This read-only retired export may reflect an earlier delivery cut. Review the final rendered video for current output timing and content.'
+      : delivery?.selected_audio_review_error ||
+        'The selected or mixed full-length master has not been created yet.';
 
   return h(
     'section',
@@ -159,7 +158,7 @@ function masterPanel(
         h(
           'div',
           { class: 'text-heading-sm uppercase text-ink-tertiary' },
-          'Delivery master'
+          'Full-length audio reference'
         ),
         h(
           'div',
@@ -171,35 +170,41 @@ function masterPanel(
           { class: 'text-body-sm text-ink-secondary mt-2 max-w-[680px]' },
           detail
         )
-      ),
-      h(
-        'a',
-        {
-          ...link(`/episodes/${episodeId}/delivery`),
-          class:
-            'inline-flex h-9 items-center rounded-md border border-border bg-surface-2 px-3 text-body-sm text-ink-primary hover:bg-surface-3',
-        },
-        'Open release preparation'
       )
     ),
     delivery && playable
       ? h(
           'div',
           { class: 'grid grid-cols-2 sm:grid-cols-4 gap-3' },
-          measurement('Duration', formatDuration(delivery.duration_seconds)),
-          measurement('Integrated', numberUnit(delivery.integrated_lufs, ' LUFS')),
-          measurement('True peak', numberUnit(delivery.true_peak_dbfs, ' dBFS')),
-          measurement('Loudness range', numberUnit(delivery.loudness_range_lu, ' LU'))
+          measurement(
+            'File',
+            selectedUrl
+              ? delivery.selected_audio?.filename || 'Selected audio'
+              : delivery.filename || 'Historical MP3'
+          ),
+          measurement(
+            'Size',
+            formatBytes(
+              selectedUrl ? delivery.selected_audio?.size_bytes : delivery.size_bytes
+            )
+          ),
+          ...(!selectedUrl && historicalUrl
+            ? [
+                measurement('Duration', formatDuration(delivery.duration_seconds)),
+                measurement(
+                  'Integrated loudness',
+                  numberUnit(delivery.integrated_lufs, ' LUFS')
+                ),
+              ]
+            : [])
         )
       : null,
     delivery && playable ? masterPlayer(delivery, controls) : null,
-    delivery?.completed_at && playable
+    delivery?.completed_at && historicalUrl && !selectedUrl
       ? h(
           'div',
           { class: 'text-body-sm text-ink-tertiary' },
-          `${current ? 'Measured' : 'Previous file measured'} ${formatRelative(
-            delivery.completed_at
-          )}`
+          `Historical file measured ${formatRelative(delivery.completed_at)}`
         )
       : null
   );
@@ -209,18 +214,26 @@ function masterPlayer(
   delivery: DeliveryStatus,
   controls: AudioControls
 ): HTMLAudioElement {
-  const identity = `${delivery.download_url ?? ''}:${delivery.completed_at ?? ''}`;
-  const current = delivery.status === 'ready' && !delivery.stale;
+  const source = delivery.selected_audio_download_url || delivery.download_url;
+  const identity = `${source ?? ''}:${delivery.completed_at ?? ''}`;
   controls.master = stableControl(controls.master, identity, () =>
     h('audio', {
       controls: true,
       preload: 'metadata',
-      src: delivery.download_url,
+      src: source,
       class: 'w-full',
-      'aria-label': current ? 'Current podcast master' : 'Previous podcast master',
+      'aria-label': delivery.selected_audio_download_url
+        ? delivery.selected_audio?.provenance.kind === 'selected_repair'
+          ? 'Current selected repair master on the source clock'
+          : 'Available base mix on the source clock with unverified currentness'
+        : 'Historical podcast MP3',
     }) as HTMLAudioElement
   );
   return controls.master.value;
+}
+
+function formatBytes(value: number | undefined): string {
+  return value == null ? '—' : `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function routingPanel(episode: Record<string, unknown>): HTMLElement {

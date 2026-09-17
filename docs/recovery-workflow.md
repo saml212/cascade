@@ -33,11 +33,16 @@ by hand.
    platform links. Saves are minimal PATCH requests: editing a title cannot
    overwrite a URL written concurrently by a background job. Typing during an
    active save remains visibly unsaved.
-3. **Prepare for upload** chooses the release range and builds verified local
-   podcast audio and upload video. Delivery status is fingerprinted against the
-   source, trims, crop and volume settings, canonical audio, and relevant
-   configuration. The UI says **Ready for upload** only when both verified
-   artifacts are current. Audio-only readiness never implies video readiness.
+3. **Prepare for upload** chooses the release range and builds the verified
+   upload video from the selected or base audio master. Delivery status is
+   fingerprinted against the source, trims, crop and volume settings,
+   canonical audio, and relevant configuration. The Audio view can play a
+   full-length source-clock reference without generating a new distribution
+   file. A selected repair is revision-validated; an existing base mix is
+   labeled with unverified currentness. Editorial cuts are not applied there,
+   so the final rendered-video review remains output authority. Retained
+   historical MP3s remain read-only references. The UI says **Ready for
+   upload** only when the video and its release evidence are current.
 
 Preparation creates local downloads. Publishing remains a separate explicit
 action with its own approval flow.

@@ -18,7 +18,8 @@ Release copy is drafted outside the runtime pipeline, reviewed, and written thro
 
 - After `stitch`, the pipeline **pauses** with `status: "awaiting_crop_setup"` if crop config isn't set — the user configures speaker crop points via the API before resuming.
 - After `clip_miner`, the episode directory is **renamed** to include the guest name slug.
-- `NON_CRITICAL_AGENTS = {"podcast_feed", "publish", "backup"}` — failures here don't abort the pipeline.
+- Video RSS, Upload-Post publishing, and backup remain explicit stages. Audio-only RSS generation is retired; existing feed receipts and MP3 files remain read-only history.
+- `NON_CRITICAL_AGENTS` contains the video/short publication, backup, and thumbnail stages, so their failures do not abort other completed work.
 - `episode.json` is the master state file, updated continuously.
 
 ## API and artifact contract

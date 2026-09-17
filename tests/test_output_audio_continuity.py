@@ -898,7 +898,7 @@ def test_legacy_video_mapping_rejects_unknown_or_stale_evidence(
         _render_audio_mapping(path, record, "keep_intervals", 10)
 
 
-def test_quality_revision_binds_transcript_mp3_and_render_output(tmp_path):
+def test_quality_revision_binds_transcript_and_render_but_ignores_retired_mp3(tmp_path):
     config = {"platforms": {"podcast_rss": {"enabled": True}}}
     baseline = quality_revision(tmp_path, {}, config=config)
 
@@ -908,7 +908,7 @@ def test_quality_revision_binds_transcript_mp3_and_render_output(tmp_path):
 
     (tmp_path / "podcast_audio.mp3").write_bytes(b"current mp3")
     podcast_revision = quality_revision(tmp_path, {}, config=config)
-    assert podcast_revision != transcript_revision
+    assert podcast_revision == transcript_revision
 
     (tmp_path / "render_manifest.json").write_text(
         '{"version":1,"shorts":{},"longform":{"output":{"size_bytes":1}}}'

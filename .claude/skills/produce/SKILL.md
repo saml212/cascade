@@ -14,7 +14,7 @@ Use `GET /openapi.json` for the live contract. Resolve the episode with `GET /ap
 - `GET /api/episodes/{id}/review` for playable files, exact render freshness, clip selection, metadata completeness, and revision-bound approvals.
 - `GET /api/episodes/{id}/quality` for current QA, findings, release blockers, and audio repair state.
 - `GET /api/episodes/{id}/pipeline-status` for active work, progress, and errors.
-- `GET /api/episodes/{id}/delivery` for local audio/video preparation and verified downloads.
+- `GET /api/episodes/{id}/delivery` for the source-clock selected/base audio reference, retained historical MP3, and local video preparation state.
 
 Do not infer readiness from `episode.json.status`, filenames, file existence, or a green UI label. A reviewable older file may remain playable while its `current` or release state is false.
 
@@ -33,7 +33,7 @@ Use bounded inspection endpoints instead of arbitrary filesystem paths:
 
 Treat speaker-label changes as revision-bound evidence edits. Read `GET /api/episodes/{id}/inspection/transcript/corrections`, support each proposed word or range with current source-clock evidence, and replay it against a temporary copy of the current transcript and shot plan before posting it back with `expected_revision`. Microphone dropout makes the surviving channel louder by construction, so channel dominance inside a zero or near-zero finding cannot establish speaker identity. Quarantine ambiguous turns. A speaker-label-only correction must preserve the selected audio fingerprint and bytes; an unexpected audio-identity change is an error, not a reason to regenerate or silently reselect audio. See the linked recovery workflow for the exact correction contract.
 
-Sample actual frames across crop transitions, speaker changes, overlaps, and captions. An agent may save evidence-backed crop settings through `POST /api/episodes/{id}/crop-config`; the UI lets the user review or override them. When present, consume its `invalidated_agents`, `speaker_segments_preserved`, `migrated_short_render_ids`, and `delivery_audio_preserved` response fields before deciding what to rerun. Keep source timestamps and edited/output timestamps labeled separately.
+Sample actual frames across crop transitions, speaker changes, overlaps, and captions. An agent may save evidence-backed crop settings through `POST /api/episodes/{id}/crop-config`; the UI lets the user review or override them. When present, consume its `invalidated_agents`, `speaker_segments_preserved`, and `migrated_short_render_ids` response fields before deciding what to rerun. Keep source timestamps and edited/output timestamps labeled separately.
 
 Preserve original recordings and prior reviewable exports. Stage replacements, verify duration, streams, fingerprints, and representative media, then publish them atomically. Never conceal damaged speech with generated words or synthetic audio. Report objective loudness, ASR, waveform, correlation, and timing evidence accurately; do not claim perceptual listening when none occurred.
 
@@ -55,10 +55,10 @@ For source-channel continuity:
 
 Prepare and inspect the complete local package before any public action:
 
-1. Read `GET /api/episodes/{id}/delivery`. If audio is `stale` or `not_prepared`, run `POST /api/episodes/{id}/delivery/prepare` and verify the fresh result even when an older MP3 exists; then prepare the current speaker-cut longform with `POST /api/episodes/{id}/delivery/video/prepare`.
+1. Read `GET /api/episodes/{id}/delivery`. `selected_audio_download_url` is a full-length source-clock reference: a selected repair is revision-validated, while a base mix explicitly has unverified currentness; editorial cuts are not applied to either. `download_url` is a retained historical MP3 fallback. Treat the final rendered video as output authority. Prepare the current speaker-cut longform with `POST /api/episodes/{id}/delivery/video/prepare`. Do not call the retired audio-only `/delivery/prepare` endpoint.
 2. Scope required clip and platform-copy work to selected, non-rejected clips. Select with `POST /api/episodes/{id}/clips/{clip_id}/select`, render locally with `POST /api/episodes/{id}/clips/{clip_id}/render`, and inspect the exact rendered short, captions, bounds, crop, and enabled-platform copy.
 3. Approve a clip only after its current render exists. Candidate selection is not final approval; changing pixels, timing, or copy invalidates the prior approval revision.
-4. Run QA against current audio, longform, shorts, thumbnails, and metadata. Missing, stale, failed, or review-required evidence remains visible as a blocker.
+4. Run QA against the selected audio master, longform, shorts, thumbnails, and metadata. Missing, stale, failed, or review-required evidence remains visible as a blocker.
 5. Record longform editorial approval with `POST /api/episodes/{id}/approve-longform` only after the current rendered revision has been reviewed. This is separate from permission to publish.
 
 If delivery reports that a current longform's encoded audio needs repair, use `POST /api/episodes/{id}/delivery/video/repair-audio`. For a current short, use `POST /api/episodes/{id}/clips/{clip_id}/repair-audio`. Both operations retain the reviewed video stream, produce a new audio-bearing file for review, and invalidate the affected approval until that exact result is reviewed again. Do not treat the accepted job as success: require the resulting manifest to show safe loudness, equal input/output H.264 packet signatures and counts, and the exact new output identity before review.

@@ -239,18 +239,7 @@ class TestListEpisodes:
         video.write_bytes(b"video")
         canonical.write_bytes(b"canonical")
         import server.routes.episodes as episodes_mod
-        from agents.podcast_feed import PodcastFeedAgent
-        from server.routes.delivery import _source_fingerprint
 
-        episode = json.loads((ep_dir / "episode.json").read_text())
-        config = episodes_mod.load_config()
-
-        def finish_audio(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"audio")
-            return subprocess.CompletedProcess(command, 0, stderr="")
-
-        with patch("agents.podcast_feed.subprocess.run", side_effect=finish_audio):
-            PodcastFeedAgent(ep_dir, config).prepare_local_audio()
         cached_status = {
             "status": "ready",
             "duration_seconds": 120.0,
@@ -259,7 +248,7 @@ class TestListEpisodes:
                 "size": audio.stat().st_size,
                 "mtime_ns": audio.stat().st_mtime_ns,
             },
-            "source_fingerprint": _source_fingerprint(ep_dir, episode, config),
+            "source_fingerprint": "historical-audio-proof",
         }
         (ep_dir / "delivery.json").write_text(json.dumps(cached_status))
 
@@ -1091,10 +1080,6 @@ class TestCropConfig:
                 "server.routes.episodes.migrate_unchanged_short_crop_fingerprints",
                 return_value=["clip_01"],
             ),
-            patch(
-                "server.routes.episodes.migrate_unchanged_delivery_audio_fingerprint",
-                return_value=True,
-            ),
         ):
             response = client.post(
                 "/api/episodes/ep_001/crop-config", json=changed_payload
@@ -1105,7 +1090,7 @@ class TestCropConfig:
         assert result["invalidated_agents"] == ["longform_render", "qa"]
         assert result["speaker_segments_preserved"] is True
         assert result["migrated_short_render_ids"] == ["clip_01"]
-        assert result["delivery_audio_preserved"] is True
+        assert result["delivery_audio_preserved"] is False
         assert rms.read_bytes() == b"rms"
         saved = json.loads(episode_path.read_text())
         assert saved["pipeline"]["agents_completed"] == [
