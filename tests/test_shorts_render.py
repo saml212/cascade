@@ -25,6 +25,7 @@ from lib.ass import (
 )
 from lib.delivery_video import (
     audio_packet_signature,
+    build_render_segments,
     ffmpeg_executable,
     render_space_budget,
 )
@@ -57,18 +58,36 @@ def test_batch_render_skips_rejected_candidates(tmp_episode_dir, sample_config):
     assert render.call_args.args == ([clips[0], clips[1]],)
 
 
-def test_clip_segments_switch_crop_dynamically_and_fill_gaps(
-    tmp_episode_dir, sample_config
-):
-    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+def test_clip_segments_switch_crop_dynamically_and_fill_gaps():
     segments = [
         {"start": 10, "end": 13, "speaker": "A"},
         {"start": 15, "end": 20, "speaker": "B"},
     ]
-    assert agent._get_clip_segments(segments, 10, 20) == [
-        {"start": 10.0, "end": 13.0, "speaker": "A"},
-        {"start": 13.0, "end": 15.0, "speaker": "BOTH"},
-        {"start": 15.0, "end": 20.0, "speaker": "B"},
+    assert build_render_segments(Timeline(20, [(10, 20)]), segments) == [
+        {
+            "start": 0.0,
+            "end": 3.0,
+            "duration": 3.0,
+            "source_start": 10.0,
+            "source_end": 13.0,
+            "speaker": "A",
+        },
+        {
+            "start": 3.0,
+            "end": 5.0,
+            "duration": 2.0,
+            "source_start": 13.0,
+            "source_end": 15.0,
+            "speaker": "BOTH",
+        },
+        {
+            "start": 5.0,
+            "end": 10.0,
+            "duration": 5.0,
+            "source_start": 15.0,
+            "source_end": 20.0,
+            "speaker": "B",
+        },
     ]
 
 

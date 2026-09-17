@@ -1331,17 +1331,6 @@ class ShortsRenderAgent(BaseAgent):
                 resolved.append(updated)
         return resolved
 
-    def _get_clip_segments(self, segments, clip_start, clip_end):
-        timeline = Timeline(float(clip_end), [(float(clip_start), float(clip_end))])
-        return [
-            {
-                "start": segment["source_start"],
-                "end": segment["source_end"],
-                "speaker": segment["speaker"],
-            }
-            for segment in build_render_segments(timeline, segments)
-        ]
-
     def _get_short_crop_region(self, speaker, src_w, src_h, crop_config):
         cx, cy, zoom, _ = resolve_speaker(
             speaker, src_w, src_h, crop_config, for_shorts=True
