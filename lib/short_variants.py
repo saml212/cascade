@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from lib.ass import resolve_caption_speaker_targets
+from lib.ass import caption_ranges_use_target, resolve_caption_speaker_targets
 from lib.atomic_write import atomic_write_json
 from lib.caption_speaker_overrides import (
     apply_current_caption_speaker_overrides,
@@ -83,6 +83,11 @@ SPEAKER_PANELS_RENDER_PLAN = {
     "title_font_size": 28,
     "brand": "thelocalpod.link",
     "brand_font_size": 26,
+}
+CLEAN_NEUTRAL_HEADER_POLICY = {
+    "version": "clean-neutral-header/v2",
+    "font_size_px": 48,
+    "background_box": [0, 0, 1080, 72],
 }
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
@@ -594,6 +599,7 @@ def speaker_panel_caption_context_revision(
     diarized: dict | None = None,
     segment_document: dict | None = None,
     caption_speaker_overrides: dict | None = None,
+    neutral_header_policy: dict | None = None,
 ) -> str:
     """Fingerprint inputs unique to speaker-panel caption placement."""
 
@@ -641,15 +647,51 @@ def speaker_panel_caption_context_revision(
     }
     if caption_speaker_overrides is not None:
         state["caption_speaker_overrides"] = caption_speaker_overrides
+    if neutral_header_policy is not None:
+        if neutral_header_policy != CLEAN_NEUTRAL_HEADER_POLICY:
+            raise ValueError("Unsupported clean neutral-header caption policy")
+        state["neutral_header_policy"] = CLEAN_NEUTRAL_HEADER_POLICY
     return _json_revision(state)
+
+def speaker_panel_neutral_header_policy(
+    variant_id: str,
+    diarized: dict,
+    segment_document: dict,
+    crop_config: dict,
+    source_intervals: object,
+) -> dict | None:
+    """Select larger neutral captions only for affected clean-panel clips."""
+    if variant_id != SPEAKER_PANELS_VARIANT_ID:
+        return None
+    if not isinstance(source_intervals, (list, tuple)):
+        raise TypeError("Clean neutral-header policy needs clip source intervals")
+    intervals = []
+    for interval in source_intervals:
+        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+            raise TypeError("Clean neutral-header policy has malformed source intervals")
+        start, end = float(interval[0]), float(interval[1])
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError("Clean neutral-header policy has invalid source intervals")
+        intervals.append((start, end))
+    if not intervals:
+        raise ValueError("Clean neutral-header policy needs clip source intervals")
+    speaker_targets = resolve_caption_speaker_targets(
+        diarized, segment_document, crop_config
+    )
+    if caption_ranges_use_target(diarized, intervals, speaker_targets, "BOTH"):
+        return deepcopy(CLEAN_NEUTRAL_HEADER_POLICY)
+    return None
 
 
 gameplay_surround_caption_context_revision = speaker_panel_caption_context_revision
 
 
 def _current_speaker_panel_caption_state(
-    episode_dir: Path, clip_id: str
-) -> tuple[str, dict | None]:
+    episode_dir: Path,
+    clip_id: str,
+    variant_id: str,
+    base_record: dict,
+) -> tuple[str, dict | None, dict | None]:
     def load_document(filename: str) -> dict:
         try:
             value = json.loads((Path(episode_dir) / filename).read_text())
@@ -684,14 +726,22 @@ def _current_speaker_panel_caption_state(
             segment_document,
             crop_config,
         )
+    neutral_header_policy = speaker_panel_neutral_header_policy(
+        variant_id,
+        diarized,
+        segment_document,
+        crop_config,
+        base_record.get("clip_source_intervals"),
+    )
     revision = speaker_panel_caption_context_revision(
         Path(episode_dir),
         episode=episode,
         diarized=diarized,
         segment_document=segment_document,
         caption_speaker_overrides=binding,
+        neutral_header_policy=neutral_header_policy,
     )
-    return revision, binding
+    return revision, binding, neutral_header_policy
 
 
 def require_speaker_panel_caption_context_revision(value: object) -> str:
@@ -906,11 +956,18 @@ def background_variant_state(
                     source_durations=source_durations,
                 )
             caption_speaker_overrides = None
+            neutral_header_policy = None
             if variant_id in SPEAKER_PANEL_VARIANT_IDS:
                 (
                     caption_context_revision,
                     caption_speaker_overrides,
-                ) = _current_speaker_panel_caption_state(episode_dir, clip_id)
+                    neutral_header_policy,
+                ) = _current_speaker_panel_caption_state(
+                    episode_dir,
+                    clip_id,
+                    variant_id,
+                    base_record,
+                )
             else:
                 caption_context_revision = None
             recorded_captions = record.get("captions")
@@ -921,6 +978,11 @@ def background_variant_state(
             )
             recorded_caption_speaker_overrides = (
                 recorded_captions.get("speaker_overrides")
+                if isinstance(recorded_captions, dict)
+                else None
+            )
+            recorded_neutral_header_policy = (
+                recorded_captions.get("neutral_header_policy")
                 if isinstance(recorded_captions, dict)
                 else None
             )
@@ -942,11 +1004,12 @@ def background_variant_state(
             elif variant_id in SPEAKER_PANEL_VARIANT_IDS and (
                 recorded_caption_context != caption_context_revision
                 or recorded_caption_speaker_overrides != caption_speaker_overrides
+                or recorded_neutral_header_policy != neutral_header_policy
             ):
                 stale_detail = (
                     "The speaker bindings or panel anchors changed for speaker-panel "
-                    "captions, or reviewed word attribution changed after this variant "
-                    "was rendered."
+                    "captions, reviewed word attribution changed, or the neutral-caption "
+                    "policy changed after this variant was rendered."
                 )
             else:
                 expected = background_variant_fingerprint(

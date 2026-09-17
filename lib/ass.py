@@ -247,6 +247,20 @@ def _extract_words_in_range(diarized: dict, start: float, end: float) -> list[di
     return out
 
 
+def caption_ranges_use_target(
+    diarized: dict,
+    source_ranges: Iterable[tuple[float, float]],
+    speaker_targets: Mapping[object, str],
+    target: str,
+) -> bool:
+    """Return whether a fully contained caption word resolves to ``target``."""
+    return any(
+        speaker_targets.get(word.get("speaker"), "BOTH") == target
+        for start, end in source_ranges
+        for word in _extract_words_in_range(diarized, float(start), float(end))
+    )
+
+
 def _partition_reviewed_caption_words(
     words: list[dict],
 ) -> tuple[list[dict], dict[str, list[dict]]]:

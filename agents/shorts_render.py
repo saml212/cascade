@@ -59,6 +59,7 @@ from lib.loudness import (
 )
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
+    CLEAN_NEUTRAL_HEADER_POLICY,
     CONTAIN_BLUR_FIT_MODE,
     GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
@@ -81,6 +82,7 @@ from lib.short_variants import (
     require_speaker_panel_caption_context_revision,
     resolve_gameplay_variant_playback,
     speaker_panel_caption_context_revision,
+    speaker_panel_neutral_header_policy,
 )
 from lib.srt import escape_srt_path
 from lib.timeline import Timeline, rebase_diarized
@@ -236,6 +238,7 @@ class ShortsRenderAgent(BaseAgent):
         diarized = None
         caption_context_revision = None
         caption_speaker_overrides = None
+        neutral_header_policy = None
         if variant_id in SPEAKER_PANEL_VARIANT_IDS:
             diarized = current_diarized_transcript(
                 self.episode_dir, episode, self.config
@@ -251,12 +254,20 @@ class ShortsRenderAgent(BaseAgent):
                     episode.get("crop_config") or {},
                 )
             )
+            neutral_header_policy = speaker_panel_neutral_header_policy(
+                variant_id,
+                diarized,
+                segment_document,
+                episode.get("crop_config") or {},
+                timeline.keep_intervals,
+            )
             caption_context_revision = speaker_panel_caption_context_revision(
                 self.episode_dir,
                 episode=episode,
                 diarized=diarized,
                 segment_document=segment_document,
                 caption_speaker_overrides=caption_speaker_overrides,
+                neutral_header_policy=neutral_header_policy,
             )
         fingerprint = background_variant_fingerprint(
             base_record,
@@ -329,6 +340,7 @@ class ShortsRenderAgent(BaseAgent):
                         "base_identity": base_identity,
                         "caption_context_revision": caption_context_revision,
                         "caption_speaker_overrides": caption_speaker_overrides,
+                        "neutral_header_policy": neutral_header_policy,
                     },
                     segment_document=segment_document,
                 )
@@ -1066,6 +1078,7 @@ class ShortsRenderAgent(BaseAgent):
                 src_h,
                 crop_config,
                 variant_id=background["variant_id"],
+                neutral_header_policy=background.get("neutral_header_policy"),
             )
             caption_options = {
                 "speaker_targets": resolve_caption_speaker_targets(
@@ -1241,6 +1254,11 @@ class ShortsRenderAgent(BaseAgent):
                     **(
                         {"speaker_overrides": background["caption_speaker_overrides"]}
                         if background.get("caption_speaker_overrides") is not None
+                        else {}
+                    ),
+                    **(
+                        {"neutral_header_policy": background["neutral_header_policy"]}
+                        if background.get("neutral_header_policy") is not None
                         else {}
                     ),
                 },
@@ -1468,6 +1486,7 @@ class ShortsRenderAgent(BaseAgent):
         crop_config: dict,
         *,
         variant_id: str,
+        neutral_header_policy: dict | None = None,
     ) -> tuple[dict[str, CaptionPlacement], CaptionPlacement]:
         """Place known speakers in their row and unknown speech in the header."""
         gameplay = variant_id == GAMEPLAY_SURROUND_VARIANT_ID
@@ -1497,12 +1516,28 @@ class ShortsRenderAgent(BaseAgent):
                 y=visible_top + visible_height - inset,
             )
             cursor += row_height
+        if neutral_header_policy is not None and (
+            gameplay or neutral_header_policy != CLEAN_NEUTRAL_HEADER_POLICY
+        ):
+            raise ValueError("Unsupported neutral-header caption policy")
+        fallback_box = (left, 0, width, header_h)
+        if neutral_header_policy is not None:
+            policy_box = tuple(neutral_header_policy["background_box"])
+            if policy_box != fallback_box:
+                raise ValueError("Neutral-header policy does not match the clean layout")
+            fallback_box = policy_box
         fallback = CaptionPlacement(
             x=x,
             y=header_h // 2,
             alignment=5,
-            font_size=24 if gameplay else 28,
-            background_box=(left, 0, width, header_h),
+            font_size=(
+                24
+                if gameplay
+                else CLEAN_NEUTRAL_HEADER_POLICY["font_size_px"]
+                if neutral_header_policy is not None
+                else 28
+            ),
+            background_box=fallback_box,
         )
         return placements, fallback
 

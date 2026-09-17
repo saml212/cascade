@@ -1,5 +1,6 @@
 """Focused tests for source-clock shorts rendering."""
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -7,6 +8,7 @@ from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from agents.shorts_render import (
     BACKGROUND_CAPTION_MARGIN_V,
@@ -29,11 +31,13 @@ from lib.delivery_video import (
 from lib.encoding import get_video_encoding_policy
 from lib.ffprobe import probe as ffprobe_probe
 from lib.short_variants import (
+    CLEAN_NEUTRAL_HEADER_POLICY,
     CONTAIN_BLUR_FIT_MODE,
     GAMEPLAY_SURROUND_VARIANT_ID,
     SPEAKER_PANELS_RENDER_PLAN,
     SPEAKER_PANELS_VARIANT_ID,
 )
+from lib.srt import escape_srt_path
 from lib.timeline import Timeline
 
 
@@ -533,6 +537,164 @@ def test_clean_speaker_panels_use_full_width_physical_rows(
     assert "scale=540" not in video_filter
     assert "SUBWAY" not in video_filter
     assert "MINECRAFT" not in video_filter
+
+
+def test_clean_no_neutral_caption_keeps_legacy_ass_bytes(
+    tmp_episode_dir, sample_config
+):
+    crop_config = {
+        "speakers": [
+            {
+                "label": "Host",
+                "longform_center_x": 400,
+                "longform_center_y": 500,
+                "longform_zoom": 1,
+            },
+            {
+                "label": "Guest",
+                "longform_center_x": 1500,
+                "longform_center_y": 500,
+                "longform_zoom": 1,
+            },
+        ]
+    }
+    diarized = {
+        "clock": "source",
+        "speaker_map": [
+            {"index": 5, "logical_track": 1, "mapping_confidence": 1.0}
+        ],
+        "utterances": [
+            {
+                "speaker": 5,
+                "words": [
+                    {
+                        "word": "sure",
+                        "punctuated_word": "Sure.",
+                        "start": 0.2,
+                        "end": 0.5,
+                        "speaker": 5,
+                    }
+                ],
+            }
+        ],
+    }
+    segments = {
+        "clock": "source",
+        "track_mapping": [
+            {"speaker": "speaker_0", "person": "Host", "logical_track": 1}
+        ],
+    }
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    placements, fallback = agent._speaker_panel_placements(
+        1920,
+        1080,
+        crop_config,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    captions = tmp_episode_dir / "legacy-clean.ass"
+    generate_ass_from_diarized(
+        diarized,
+        0,
+        1,
+        captions,
+        agent._caption_style({"variant_id": SPEAKER_PANELS_VARIANT_ID}),
+        speaker_targets=resolve_caption_speaker_targets(
+            diarized, segments, crop_config
+        ),
+        speaker_placements=placements,
+        fallback_placement=fallback,
+    )
+
+    assert fallback.font_size == 28
+    assert hashlib.sha256(captions.read_bytes()).hexdigest() == (
+        "3c45dd0746d07a88ea2d0ebae61bc1248192a3ff74bc900634d1e880b13ccd96"
+    )
+
+
+def test_clean_neutral_header_is_readable_and_stays_outside_picture(
+    tmp_episode_dir, sample_config
+):
+    phrase = "significantly higher rates"
+    assert len(phrase) == 26
+    crop_config = {
+        "speakers": [
+            {"label": "Host", "longform_center_x": 400},
+            {"label": "Guest", "longform_center_x": 1500},
+        ]
+    }
+    diarized = {
+        "clock": "source",
+        "speaker_map": [{"index": 9, "target_speaker": "BOTH"}],
+        "utterances": [
+            {
+                "speaker": 9,
+                "words": [
+                    {"word": "significantly", "start": 0.0, "end": 0.15},
+                    {"word": "higher", "start": 0.16, "end": 0.30},
+                    {"word": "rates", "start": 0.31, "end": 0.50},
+                ],
+            }
+        ],
+    }
+    segments = {"clock": "source", "track_mapping": []}
+    agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
+    placements, fallback = agent._speaker_panel_placements(
+        1920,
+        1080,
+        crop_config,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+        neutral_header_policy=CLEAN_NEUTRAL_HEADER_POLICY,
+    )
+    captions = tmp_episode_dir / "neutral-clean.ass"
+    generate_ass_from_diarized(
+        diarized,
+        0,
+        1,
+        captions,
+        agent._caption_style({"variant_id": SPEAKER_PANELS_VARIANT_ID}),
+        speaker_targets=resolve_caption_speaker_targets(
+            diarized, segments, crop_config
+        ),
+        speaker_placements=placements,
+        fallback_placement=fallback,
+    )
+    ass = captions.read_text()
+
+    assert fallback.font_size == 48
+    assert fallback.background_box == (0, 0, 1080, 72)
+    assert r"{\an7\pos(0,0)\p1\bord0\shad0\1c&H000000&}m 0 0 l 1080 0 l 1080 72 l 0 72{\p0}" in ass
+    assert r"{\an5\pos(540,36)\fs48}significantly higher rates" in ass
+
+    rendered = subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=#606060:s=1080x1920:r=1:d=1",
+            "-vf",
+            f"subtitles='{escape_srt_path(captions)}'",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    frame = Image.frombytes("RGB", (1080, 1920), rendered.stdout)
+    white_text = frame.convert("L").point(lambda value: 255 if value >= 240 else 0)
+    bounds = white_text.getbbox()
+    assert bounds is not None
+    left, top, right, bottom = bounds
+    assert 0 <= left < right <= 1080
+    assert 0 <= top < bottom <= 72
+    assert bottom - top >= 32
 
 
 def test_clean_speaker_panel_bindings_keep_host_ty_garrett_rows(

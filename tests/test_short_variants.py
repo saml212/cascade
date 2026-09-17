@@ -19,6 +19,7 @@ from lib.ffprobe import file_fingerprint
 from lib.short_variants import (
     BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
+    CLEAN_NEUTRAL_HEADER_POLICY,
     CONTAIN_BLUR_FIT_MODE,
     DEFAULT_BACKGROUND_ASSET_ID,
     GAMEPLAY_SURROUND_ASSET_SET_ID,
@@ -53,6 +54,7 @@ from lib.short_variants import (
     save_background_variant_approval,
     selected_short_variant_id,
     speaker_panel_caption_context_revision,
+    speaker_panel_neutral_header_policy,
     variant_record,
 )
 from lib.timeline import Timeline
@@ -680,6 +682,241 @@ def test_variant_artifact_paths_are_isolated(tmp_path):
     )
 
 
+def test_clean_no_neutral_caption_keeps_v1_context_and_fingerprint(tmp_path):
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    episode, diarized, segments = _write_gameplay_caption_context(episode_dir)
+
+    context_revision = speaker_panel_caption_context_revision(
+        episode_dir,
+        episode=episode,
+        diarized=diarized,
+        segment_document=segments,
+    )
+    fingerprint = background_variant_fingerprint(
+        {"fingerprint": "sha256:base"},
+        {"size_bytes": 123, "mtime_ns": 456},
+        None,
+        {"video_bitrate": "10M", "audio_bitrate": "192k"},
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+        caption_context_revision=context_revision,
+    )
+
+    assert context_revision == (
+        "sha256:a29db166f5e4a0ce9a21defc64ba070f3045d09f3e307d13635b1c7a44766bcb"
+    )
+    assert fingerprint == (
+        "sha256:38c75dbad8c13d025a548264bb1cd8510b43f4effcad9055da9bbe9b49718948"
+    )
+
+
+def test_clean_neutral_header_policy_stales_only_affected_clip(
+    tmp_path, monkeypatch
+):
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    episode, diarized, segments = _write_gameplay_caption_context(episode_dir)
+    diarized["speaker_map"].append({"index": 9, "target_speaker": "BOTH"})
+    diarized["utterances"].extend(
+        [
+            {
+                "speaker": 9,
+                "words": [
+                    {
+                        "word": "unknown",
+                        "start": 0.2,
+                        "end": 0.5,
+                        "speaker": 9,
+                    }
+                ],
+            },
+            {
+                "speaker": 5,
+                "words": [
+                    {
+                        "word": "known",
+                        "start": 2.2,
+                        "end": 2.5,
+                        "speaker": 5,
+                    }
+                ],
+            },
+        ]
+    )
+    (episode_dir / "diarized_transcript.json").write_text(json.dumps(diarized))
+
+    affected_policy = speaker_panel_neutral_header_policy(
+        SPEAKER_PANELS_VARIANT_ID,
+        diarized,
+        segments,
+        episode["crop_config"],
+        [(0, 1)],
+    )
+    assert affected_policy == CLEAN_NEUTRAL_HEADER_POLICY
+    assert (
+        speaker_panel_neutral_header_policy(
+            SPEAKER_PANELS_VARIANT_ID,
+            diarized,
+            segments,
+            episode["crop_config"],
+            [(2, 3)],
+        )
+        is None
+    )
+    assert (
+        speaker_panel_neutral_header_policy(
+            GAMEPLAY_SURROUND_VARIANT_ID,
+            diarized,
+            segments,
+            episode["crop_config"],
+            [(0, 1)],
+        )
+        is None
+    )
+
+    legacy_context = speaker_panel_caption_context_revision(
+        episode_dir,
+        episode=episode,
+        diarized=diarized,
+        segment_document=segments,
+    )
+    affected_context = speaker_panel_caption_context_revision(
+        episode_dir,
+        episode=episode,
+        diarized=diarized,
+        segment_document=segments,
+        neutral_header_policy=affected_policy,
+    )
+    assert affected_context != legacy_context
+    encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
+
+    def old_clean_record(clip_id, source_interval):
+        base = episode_dir / "shorts" / f"{clip_id}.mp4"
+        output = background_variant_output(
+            episode_dir, clip_id, SPEAKER_PANELS_VARIANT_ID
+        )
+        captions = (
+            episode_dir
+            / "subtitles"
+            / "short_variants"
+            / SPEAKER_PANELS_VARIANT_ID
+            / f"{clip_id}.ass"
+        )
+        for path, content in (
+            (base, f"base-{clip_id}".encode()),
+            (output, f"clean-{clip_id}".encode()),
+            (captions, b"legacy captions"),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        base_record = {
+            "fingerprint": f"sha256:base-{clip_id}",
+            "clip_source_intervals": [list(source_interval)],
+        }
+        base_identity = file_content_identity(base)["scan_identity"]
+        fingerprint = background_variant_fingerprint(
+            base_record,
+            base_identity,
+            None,
+            encoding,
+            variant_id=SPEAKER_PANELS_VARIANT_ID,
+            caption_context_revision=legacy_context,
+        )
+        record_background_variant(
+            episode_dir,
+            clip_id,
+            fingerprint=fingerprint,
+            timeline=Timeline(3, [source_interval]),
+            media={"duration_seconds": 1, "width": 1080, "height": 1920},
+            base_record=base_record,
+            base_identity=base_identity,
+            asset=None,
+            encoding=encoding,
+            captions={
+                "path": str(captions.relative_to(episode_dir)),
+                "format": "ass",
+                "burned_in": True,
+                "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+                "context_revision": legacy_context,
+            },
+            variant_id=SPEAKER_PANELS_VARIANT_ID,
+        )
+        return base_record
+
+    affected_base = old_clean_record("clip_01", (0, 1))
+    unaffected_base = old_clean_record("clip_02", (2, 3))
+    monkeypatch.setenv(
+        "CASCADE_BACKGROUND_ASSETS_DIR", str(tmp_path / "missing-assets")
+    )
+
+    _, affected = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=affected_base,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    _, unaffected = background_variant_state(
+        episode_dir,
+        "clip_02",
+        base_record=unaffected_base,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+
+    assert affected["current"] is False
+    assert "neutral-caption policy changed" in affected["detail"]
+    assert unaffected["current"] is True
+
+    affected_base_path = episode_dir / "shorts" / "clip_01.mp4"
+    affected_base_identity = file_content_identity(affected_base_path)[
+        "scan_identity"
+    ]
+    corrected_fingerprint = background_variant_fingerprint(
+        affected_base,
+        affected_base_identity,
+        None,
+        encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+        caption_context_revision=affected_context,
+    )
+    corrected_captions = (
+        episode_dir
+        / "subtitles"
+        / "short_variants"
+        / SPEAKER_PANELS_VARIANT_ID
+        / "clip_01.ass"
+    )
+    record_background_variant(
+        episode_dir,
+        "clip_01",
+        fingerprint=corrected_fingerprint,
+        timeline=Timeline(3, [(0, 1)]),
+        media={"duration_seconds": 1, "width": 1080, "height": 1920},
+        base_record=affected_base,
+        base_identity=affected_base_identity,
+        asset=None,
+        encoding=encoding,
+        captions={
+            "path": str(corrected_captions.relative_to(episode_dir)),
+            "format": "ass",
+            "burned_in": True,
+            "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": affected_context,
+            "neutral_header_policy": affected_policy,
+        },
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    _, corrected = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=affected_base,
+        encoding=encoding,
+        variant_id=SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert corrected["current"] is True
+
+
 def test_speaker_panels_are_asset_free_and_bind_effective_context(
     tmp_path, monkeypatch
 ):
@@ -704,7 +941,10 @@ def test_speaker_panels_are_asset_free_and_bind_effective_context(
         path.write_bytes(content)
     _write_gameplay_caption_context(episode_dir)
     context_revision = speaker_panel_caption_context_revision(episode_dir)
-    base_record = {"fingerprint": "sha256:base"}
+    base_record = {
+        "fingerprint": "sha256:base",
+        "clip_source_intervals": [[0, 1]],
+    }
     base_identity = file_content_identity(base)["scan_identity"]
     encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
 
