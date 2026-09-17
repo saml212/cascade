@@ -146,21 +146,27 @@ export function clipDistributionLabel(review: ClipReviewState): string {
   return selectedDistributionVersion(review)?.label ?? 'Unknown version';
 }
 
+function reReleaseReasonForDisplay(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const reason = value.trim();
+  return reason === 'Prior receipts have unresolved remote destinations.'
+    ? 'Existing posts are queued or need confirmation. Resolve them before changing this version.'
+    : reason;
+}
+
 export function distributionChangeLockReason(
   review: ClipReviewState
 ): string | null {
   if (review.distribution.change_locked === false) return null;
   if (review.distribution.change_locked === true) {
-    const reReleaseReason = review.distribution.re_release_reason;
+    const reReleaseReason = reReleaseReasonForDisplay(
+      review.distribution.re_release_reason
+    );
     if (
       review.distribution.re_release_allowed === false &&
-      typeof reReleaseReason === 'string' &&
-      reReleaseReason.trim()
+      reReleaseReason
     ) {
-      const trimmed = reReleaseReason.trim();
-      return trimmed === 'Prior receipts have unresolved remote destinations.'
-        ? 'Existing posts are queued or need confirmation. Resolve them before changing this version.'
-        : trimmed;
+      return reReleaseReason;
     }
   }
   const reason = review.distribution.change_lock_reason;
@@ -303,11 +309,9 @@ export function clipReReleaseViewState(
   const distribution = review.distribution;
   const rawRequest = distribution.re_release_request;
   const consumed = distribution.re_release_request_consumed;
-  const backendReason =
-    typeof distribution.re_release_reason === 'string' &&
-    distribution.re_release_reason.trim()
-      ? distribution.re_release_reason.trim()
-      : null;
+  const backendReason = reReleaseReasonForDisplay(
+    distribution.re_release_reason
+  );
   if (rawRequest === null) {
     if (consumed !== null) {
       return {

@@ -540,6 +540,11 @@ test('clarifies the generic unresolved-receipts lock without changing other reas
     distributionChangeLockReason(review),
     'Existing posts are queued or need confirmation. Resolve them before changing this version.'
   );
+  assert.deepEqual(clipReReleaseViewState(review), {
+    kind: 'blocked',
+    reason:
+      'Existing posts are queued or need confirmation. Resolve them before changing this version.',
+  });
 
   review.distribution.re_release_reason = 'Provider status conflicts.';
   assert.equal(
