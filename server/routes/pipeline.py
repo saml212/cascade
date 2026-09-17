@@ -7,13 +7,13 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
-from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agents import RETIRED_AGENTS
+from agents.publish import AggregatePublicationRetired
 from agents.qa import (
     LONGFORM_PUBLISH_APPROVAL_SCHEMA,
     current_funnel_urls_for_episode,
@@ -24,6 +24,10 @@ from agents.qa import (
 from lib.atomic_write import atomic_write_json
 from lib.audio_mix import selected_audio_source
 from lib.paths import get_episodes_dir
+from lib.publication_contracts import (
+    ShortDestinationExecution,
+    ShortDestinationRequest,
+)
 from server.routes import require_episode_dir
 
 logger = logging.getLogger(__name__)
@@ -42,7 +46,14 @@ class _SingleAgentWorker(threading.Thread):
     pass
 
 
-def _reject_retired_agents(agents: list[str] | None) -> None:
+def _reject_retired_agents(
+    agents: list[str] | None, *, allow_explicit_publish: bool = False
+) -> None:
+    if not allow_explicit_publish and "publish" in (agents or ()):
+        raise HTTPException(
+            status_code=409,
+            detail=AggregatePublicationRetired.detail(),
+        )
     retired = sorted(set(agents or ()) & RETIRED_AGENTS)
     if retired:
         raise HTTPException(
@@ -135,24 +146,6 @@ class ResumePipelineRequest(BaseModel):
     agents: Optional[list[str]] = None
 
 
-class ShortDestinationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    destinations: list[str] = Field(min_length=1)
-    clip_ids: list[str] | None = None
-    request_id: UUID
-    actor: str = Field(min_length=1, max_length=200)
-    reason: str = Field(min_length=3, max_length=1000)
-    expected_release_revision: str = Field(min_length=1)
-    variant_overrides: dict[str, str] = Field(default_factory=dict)
-    copy_overrides: dict[str, dict] = Field(default_factory=dict)
-    publish_now: bool = False
-
-
-class ShortDestinationExecution(ShortDestinationRequest):
-    preview_revision: str = Field(min_length=1)
-
-
 class RunAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -165,7 +158,13 @@ class ApproveLongformRequest(BaseModel):
 
 
 class ApprovePublishRequest(BaseModel):
-    start_publication: bool = True
+    model_config = ConfigDict(extra="forbid")
+
+    start_publication: Literal[False]
+
+
+class ApprovalConflictResponse(BaseModel):
+    detail: object
 
 
 class ApproveLongformPublishRequest(BaseModel):
@@ -282,7 +281,14 @@ async def run_single_agent(
     from agents import AGENT_REGISTRY
     from agents.pipeline import load_config
 
-    _reject_retired_agents([agent_name])
+    _reject_retired_agents(
+        [agent_name],
+        allow_explicit_publish=agent_name == "publish" and req.publish is not None,
+    )
+    if req.publish is not None and agent_name != "publish":
+        raise HTTPException(
+            status_code=400, detail="publish input is only valid for publish"
+        )
     if agent_name not in AGENT_REGISTRY:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
 
@@ -299,10 +305,6 @@ async def run_single_agent(
     if agent_name == "ingest" and req.source_path:
         agent.source_path = req.source_path
     if req.publish is not None:
-        if agent_name != "publish":
-            raise HTTPException(
-                status_code=400, detail="publish input is only valid for publish"
-            )
         agent.short_destination_request = req.publish.model_dump(
             mode="json", exclude_unset=True
         )
@@ -773,12 +775,45 @@ async def publish_longform(episode_id: str, request: PublishLongformRequest) -> 
     }
 
 
-@router.post("/{episode_id}/approve-publish")
+@router.post(
+    "/{episode_id}/approve-publish",
+    responses={
+        409: {
+            "description": "Aggregate publication is retired or approval is blocked.",
+            "model": ApprovalConflictResponse,
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "aggregate_publication_retired": {
+                            "summary": "Publication was requested during approval",
+                            "value": {"detail": AggregatePublicationRetired.detail()},
+                        }
+                    },
+                }
+            },
+        }
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": ApprovePublishRequest.model_json_schema()
+                }
+            },
+        }
+    },
+)
 async def approve_publish(
-    episode_id: str, request: ApprovePublishRequest | None = None
+    episode_id: str, request: object = Body(default=None)
 ) -> ApprovePublishResponse:
-    """Approve the current release, optionally starting aggregate publishing."""
-    request = request or ApprovePublishRequest()
+    """Record approval for the current release without choosing destinations."""
+    if not (
+        isinstance(request, dict)
+        and set(request) == {"start_publication"}
+        and request["start_publication"] is False
+    ):
+        _reject_retired_agents(["publish"])
     logger.info("POST /api/episodes/%s/approve-publish", episode_id)
     async with _pipeline_lock:
         if episode_id in _running and _running[episode_id].is_alive():
@@ -808,22 +843,11 @@ async def approve_publish(
             )
         now = datetime.now(timezone.utc).isoformat()
         plan = gate["publish_plan"]
-        publication_agents = []
-        if plan["upload_post"]["enabled"]:
-            publication_agents.append("publish")
         video_rss_plan = plan.get("video_podcast_rss", {"enabled": False})
-        if not publication_agents and not video_rss_plan.get("enabled"):
+        if not plan["upload_post"]["enabled"] and not video_rss_plan.get("enabled"):
             raise HTTPException(
                 status_code=409,
                 detail="No publication destinations are enabled",
-            )
-        if request.start_publication and not publication_agents:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Video RSS publication uses its dedicated endpoint; record approval "
-                    "with start_publication=false first"
-                ),
             )
         configuration_blockers = []
         if plan["upload_post"].get("enabled") and not plan["upload_post"].get(
@@ -866,27 +890,14 @@ async def approve_publish(
             "approved_at": now,
             "plan": plan,
         }
-        if request.start_publication:
-            episode["status"] = "processing"
-
         atomic_write_json(episode_file, episode)
 
-        if request.start_publication:
-            _start_pipeline_thread(
-                episode_id, episode.get("source_path", ""), publication_agents
-            )
-
-    logger.info(
-        "Publication approved for %s; started=%s agents=%s",
-        episode_id,
-        request.start_publication,
-        publication_agents,
-    )
+    logger.info("Publication approved for %s", episode_id)
     return {
-        "status": "shorts_publishing" if request.start_publication else "approved",
+        "status": "approved",
         "episode_id": episode_id,
-        "publication_started": request.start_publication,
-        "publication_agents": publication_agents if request.start_publication else [],
+        "publication_started": False,
+        "publication_agents": [],
     }
 
 

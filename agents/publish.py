@@ -35,6 +35,7 @@ from agents.qa import (
 )
 from lib.atomic_write import atomic_write_json
 from lib.delivery_video import read_render_manifest, render_output_lock
+from lib.publication_contracts import ShortDestinationExecution
 from lib.short_distribution import (
     EXPANSION_DESTINATIONS,
     PLATFORM_COPY_FIELDS,
@@ -133,6 +134,25 @@ SLOT_HOURS = {"morning": 9, "afternoon": 14, "evening": 18}
 
 class ShortDestinationConflict(RuntimeError):
     """A reviewed short request conflicts with current release state."""
+
+
+class AggregatePublicationRetired(RuntimeError):
+    """New publication requires an exact reviewed destination request."""
+
+    code = "aggregate_publication_retired"
+    message = (
+        "Aggregate publication is retired. Record approval with "
+        '{"start_publication":false}, preview exact destinations with '
+        "publish-shorts/preview, then execute the returned request with "
+        "run-agent/publish."
+    )
+
+    def __init__(self):
+        super().__init__(self.message)
+
+    @classmethod
+    def detail(cls) -> dict:
+        return {"code": cls.code, "message": cls.message}
 
 
 @contextmanager
@@ -1965,8 +1985,18 @@ def schedule_cancellation_provider_safe(
 class PublishAgent(BaseAgent):
     name = "publish"
 
+    def _explicit_destination_request(self) -> dict:
+        value = getattr(self, "short_destination_request", None)
+        try:
+            request = ShortDestinationExecution.model_validate(value)
+        except (TypeError, ValueError) as exc:
+            raise AggregatePublicationRetired() from exc
+        return request.model_dump(mode="json", exclude_unset=True)
+
     def run(self) -> dict:
         """Keep distribution selection locked until publish.json is durable."""
+        if type(self) is PublishAgent:
+            self._explicit_destination_request()
         with publication_lock(self.episode_dir.parent):
             self._publication_lock_held = True
             try:
@@ -1989,7 +2019,7 @@ class PublishAgent(BaseAgent):
             )
         return previous
 
-    def _inputs(self, *, bind_legacy=False):
+    def _inputs(self):
         episode = self.load_json_safe("episode.json")
         snapshot = quality_snapshot(self.episode_dir, config=self.config)
         gate = snapshot["release_gate"]
@@ -2048,8 +2078,6 @@ class PublishAgent(BaseAgent):
             quality_revision_value=snapshot["quality"]["current_revision"],
         )
         longform_revision = snapshot["approvals"]["editorial"]["revision"]
-        if bind_legacy:
-            self._bind_legacy_funnel_urls(episode, funnel_urls, longform_revision)
         short_metadata = {
             str(item["id"]): item
             for item in metadata.get("clips", [])
@@ -2596,28 +2624,15 @@ class PublishAgent(BaseAgent):
         return stored["shorts"]
 
     def execute(self) -> dict:
-        data = self._inputs(bind_legacy=True)
-        episode, snapshot, gate = (data[key] for key in ("episode", "snapshot", "gate"))
+        destination_request = self._explicit_destination_request()
+        data = self._inputs()
+        episode, gate = (data[key] for key in ("episode", "gate"))
         api_key, user = (data[key] for key in ("api_key", "user"))
-        approved, metadata, platforms = (
-            data[key] for key in ("approved", "metadata", "platforms")
-        )
-        previous, previous_shorts = (
-            data[key] for key in ("previous", "previous_shorts")
-        )
-        funnel_urls = data["funnel_urls"]
+        approved, short_versions = (data[key] for key in ("approved", "short_versions"))
+        previous = data["previous"]
         longform_revision = data["longform_revision"]
-        short_metadata, short_versions = (
-            data[key] for key in ("short_metadata", "short_versions")
-        )
         revision = gate["revision"]
-        youtube_url = funnel_urls["youtube"]
-        destination_request = getattr(self, "short_destination_request", None)
-        locked_overrides = (
-            self._validated_variant_overrides(data, destination_request)
-            if isinstance(destination_request, dict)
-            else {}
-        )
+        locked_overrides = self._validated_variant_overrides(data, destination_request)
         with self._publication_output_locks(approved, short_versions, locked_overrides):
             live_snapshot = quality_snapshot(self.episode_dir, config=self.config)
             live_gate = live_snapshot["release_gate"]
@@ -2633,140 +2648,27 @@ class PublishAgent(BaseAgent):
                     "Release media, copy, or approvals changed after publication "
                     "started; nothing was submitted"
                 )
-            if destination_request is not None:
-                plan = self._destination_plan(data, destination_request)
-                deliveries = self._destination_execution_specs(data, plan)
-                previous_shorts = self._persist_destination_intents(
-                    previous, [spec.snapshot()["target"] for spec in deliveries]
-                )
-                shorts = self._publish_short_deliveries(
-                    deliveries,
-                    None,
-                    previous_shorts,
-                    episode,
-                    api_key,
-                    user,
-                )
-                return self._result(
-                    shorts,
-                    previous.get("longform"),
-                    plan["requested_destinations"],
-                    revision,
-                    user,
-                    previous_shorts=previous_shorts,
-                    deferred_destinations=plan["deferred_destinations"],
-                )
-            if any(
-                receipt.get("destination_request_id") for receipt in previous_shorts
-            ) or any(
-                isinstance(version.get("re_release_request"), dict)
-                and version["re_release_request"].get(
-                    "unresolved_history_acknowledgement"
-                )
-                for version in short_versions.values()
-            ):
-                raise RuntimeError(
-                    "An existing destination request requires a reviewed explicit "
-                    "destination subset"
-                )
-            longform = self._publish_longform(
-                episode,
-                metadata.get("longform", {}),
-                previous.get("longform"),
-                revision,
-                longform_revision,
-                snapshot["quality"]["current_revision"],
-                youtube_url,
-                platforms,
-                api_key,
-                user,
+            plan = self._destination_plan(data, destination_request)
+            deliveries = self._destination_execution_specs(data, plan)
+            previous_shorts = self._persist_destination_intents(
+                previous, [spec.snapshot()["target"] for spec in deliveries]
             )
-            if "youtube" in platforms and not youtube_url:
-                state = (
-                    longform.get("status") if isinstance(longform, dict) else "failed"
-                )
-                if state in {
-                    "submitted",
-                    "unknown",
-                    "published",
-                    "already_submitted",
-                }:
-                    publish_status = "waiting_for_longform_publication"
-                    reason = (
-                        "The YouTube longform submission is awaiting a public URL."
-                        if state != "unknown"
-                        else "The YouTube longform submission outcome is unknown."
-                    )
-                    next_action = (
-                        f"Poll POST /api/episodes/{self.episode_dir.name}/"
-                        "check-upload-urls, then rerun publish after it records the "
-                        "current public URL."
-                    )
-                else:
-                    publish_status = "longform_failed"
-                    reason = "The YouTube longform submission failed."
-                    next_action = (
-                        "Resolve the reported longform error and rerun the current "
-                        "approved publish job."
-                    )
-                result = self._result(
-                    [],
-                    longform,
-                    platforms,
-                    revision,
-                    user,
-                    reason,
-                    previous_shorts,
-                )
-                result.update(
-                    publish_status=publish_status,
-                    action_required=True,
-                    next_action=next_action,
-                )
-                return result
-            self._enforce_required_short_variants(
-                [str(clip.get("id", "")) for clip in approved],
-                short_versions,
-                platforms,
-            )
-            hub_url = episode_hub_url(self.config, self.episode_dir.name)
-            deliveries = [
-                ShortDeliverySpec.create(
-                    clip,
-                    short_versions[clip_id],
-                    platforms,
-                    self._identity(revision, "short", clip_id),
-                    short_destination_copy(
-                        short_metadata.get(clip_id, {}),
-                        platforms,
-                        title=clip.get("title", f"Clip {clip_id}"),
-                        hub_url=hub_url,
-                        youtube_url=youtube_url,
-                        spotify_url=funnel_urls["spotify"],
-                        channel_handle=self.config.get("podcast", {}).get(
-                            "channel_handle", ""
-                        ),
-                    ),
-                )
-                for clip in approved
-                if (clip_id := str(clip.get("id", "")))
-            ]
             shorts = self._publish_short_deliveries(
                 deliveries,
-                metadata.get("schedule", []),
                 previous_shorts,
                 episode,
                 api_key,
                 user,
             )
-        return self._result(
-            shorts,
-            longform,
-            platforms,
-            revision,
-            user,
-            previous_shorts=previous_shorts,
-        )
+            return self._result(
+                shorts,
+                previous.get("longform"),
+                plan["requested_destinations"],
+                revision,
+                user,
+                previous_shorts=previous_shorts,
+                deferred_destinations=plan["deferred_destinations"],
+            )
 
     @contextmanager
     def _publication_output_locks(self, clips, short_versions, variant_overrides=None):
@@ -3007,32 +2909,9 @@ class PublishAgent(BaseAgent):
             isinstance(error, str) and "413 request entity too large" in error.lower()
         )
 
-    def _bind_legacy_funnel_urls(
-        self, episode: dict, funnel_urls: dict, longform_revision: str
-    ) -> None:
-        changed = False
-        if (
-            funnel_urls["youtube"]
-            and episode.get("youtube_longform_url_source")
-            in {"supplied", "upload_post_receipt"}
-            and episode.get("youtube_longform_url_editorial_revision") is None
-        ):
-            episode["youtube_longform_url_editorial_revision"] = longform_revision
-            changed = True
-        if (
-            funnel_urls["spotify"]
-            and episode.get("spotify_longform_url_editorial_revision") is None
-        ):
-            episode["spotify_longform_url_source"] = "supplied"
-            episode["spotify_longform_url_editorial_revision"] = longform_revision
-            changed = True
-        if changed:
-            self.save_json("episode.json", episode)
-
     def _publish_short_deliveries(
         self,
         deliveries,
-        schedule,
         previous,
         episode,
         api_key,
@@ -3044,7 +2923,7 @@ class PublishAgent(BaseAgent):
         snapshots = {spec: spec.snapshot() for spec in deliveries}
         for spec in deliveries:
             snapshot = snapshots[spec]
-            clip, version = snapshot["clip"], snapshot["version"]
+            version = snapshot["version"]
             clip_id, identity = spec.clip_id, spec.identity
             recorded_for_clip = [
                 item
@@ -3060,19 +2939,6 @@ class PublishAgent(BaseAgent):
                 ),
                 None,
             )
-            if (
-                receipt is None
-                and recorded_for_clip
-                and snapshot["target"] is None
-                and not valid_rerelease_authorization(
-                    {"shorts": previous}, clip, version
-                )
-            ):
-                raise RuntimeError(
-                    f"A historical publication receipt exists for {clip_id}; "
-                    "prepare an explicit re-release identity before submitting "
-                    "it again"
-                )
             if receipt and not ShortDeliverySpec.receipt_matches_version(
                 receipt, version
             ):
@@ -3100,15 +2966,10 @@ class PublishAgent(BaseAgent):
 
         with self._schedule_lock():
             occupied = self._occupied_schedule(api_key, user)
-            current_identities = {
-                spec.identity
-                for spec in deliveries
-                if snapshots[spec]["target"] is not None
-            }
+            current_identities = {spec.identity for spec in deliveries}
             co_schedule_ids = {
                 receipt.get("external_id")
                 for spec in deliveries
-                if snapshots[spec]["target"] is not None
                 for receipt in previous
                 if receipt.get("clip_id") == spec.clip_id
                 and ShortDeliverySpec.receipt_matches_artifact(
@@ -3144,25 +3005,15 @@ class PublishAgent(BaseAgent):
                     remaining.append(spec)
 
             scheduled_remaining = [spec for spec in remaining if spec.scheduled]
-            if schedule is None:
-                schedule = [
+            schedule_by_clip = self._schedule_by_clip(
+                [
                     {
                         "clip_id": spec.clip_id,
                         "scheduled_date": snapshots[spec]["target"]["scheduled_date"],
                     }
                     for spec in scheduled_remaining
-                ]
-            if not schedule and scheduled_remaining:
-                schedule = self._generate_schedule(
-                    [snapshots[spec]["clip"] for spec in scheduled_remaining],
-                    weekday_limit,
-                    weekend_limit,
-                    tz_name=tz_name,
-                    reference=reference,
-                    occupied=occupied,
-                )
-            schedule_by_clip = self._schedule_by_clip(
-                schedule, duplicate_suffix="; no shorts were submitted"
+                ],
+                duplicate_suffix="; no shorts were submitted",
             )
             unscheduled = [
                 spec.clip_id
@@ -3898,65 +3749,6 @@ class PublishAgent(BaseAgent):
             )
         reservations.append(candidate)
 
-    def _generate_schedule(
-        self,
-        clips,
-        weekday_per_day,
-        weekend_per_day,
-        *,
-        tz_name="America/Los_Angeles",
-        reference=None,
-        occupied=(),
-    ):
-        zone = ZoneInfo(tz_name)
-        reference = (reference or datetime.now(zone)).astimezone(zone)
-        reservations = list(occupied)
-        schedule = []
-        clip_index = 0
-        day_offset = 1
-        while clip_index < len(clips):
-            date = reference.date() + timedelta(days=day_offset)
-            limit = weekend_per_day if date.weekday() >= 4 else weekday_per_day
-            same_day = [
-                item
-                for item in reservations
-                if item["scheduled_at"].astimezone(zone).date() == date
-            ]
-            slots = (
-                ["morning"]
-                if limit == 1
-                else ["morning", "evening"]
-                if limit == 2
-                else ["morning", "afternoon", "evening"]
-            )
-            remaining = max(0, limit - _schedule_capacity_count(same_day))
-            for slot in slots:
-                candidate = datetime.combine(
-                    date, time(hour=SLOT_HOURS[slot]), tzinfo=zone
-                )
-                if not remaining or clip_index >= len(clips):
-                    break
-                if any(
-                    _instant(item["scheduled_at"]) == _instant(candidate)
-                    for item in same_day
-                ):
-                    continue
-                schedule.append(
-                    {
-                        "clip_id": clips[clip_index].get("id"),
-                        "platform": "all",
-                        "day_offset": day_offset,
-                        "time_slot": slot,
-                    }
-                )
-                record = {"scheduled_at": candidate, "source": "generated"}
-                reservations.append(record)
-                same_day.append(record)
-                clip_index += 1
-                remaining -= 1
-            day_offset += 1
-        return schedule
-
     @staticmethod
     def _schedule_to_datetime(sched, tz_name, *, reference=None):
         zone = ZoneInfo(tz_name)
@@ -4014,7 +3806,6 @@ class PublishAgent(BaseAgent):
         platforms,
         revision,
         user,
-        deferred_reason=None,
         previous_shorts=None,
         deferred_destinations=None,
     ):
@@ -4043,10 +3834,7 @@ class PublishAgent(BaseAgent):
         }
         if deferred_destinations is not None:
             result["deferred_destinations"] = deferred_destinations
-        if deferred_reason:
-            result["shorts_deferred"] = True
-            result["shorts_deferred_reason"] = deferred_reason
-        elif result["shorts_failed"]:
+        if result["shorts_failed"]:
             result.update(
                 publish_status="shorts_failed",
                 action_required=True,

@@ -8,8 +8,8 @@ These tests pin the safety-critical behaviors:
    submitted. Background: at one point the X (Twitter) integration silently
    failed because Upload-Post returned HTTP 200 with an error body and the
    agent only checked the curl exit code.
-3. Schedule entries from metadata.json are honored when present and a
-   fallback schedule is generated when missing.
+3. Exact reviewed schedule entries are honored, while immediate explicit
+   requests do not invent a schedule.
 4. The X-specific ``x_long_text_as_post=true`` flag is sent so long X posts
    don't silently fail.
 
@@ -28,6 +28,7 @@ import pytest
 
 from agents.publish import (
     ARTIFACT_SHORT_DESTINATION_SCHEMA,
+    AggregatePublicationRetired,
     LongformPublishAgent,
     PublishAgent,
     ShortDeliverySpec,
@@ -35,6 +36,7 @@ from agents.publish import (
     _document_revision,
 )
 from agents.qa import (
+    LONGFORM_PUBLISH_APPROVAL_SCHEMA,
     SHORT_COPY_SCHEMA,
     clip_review_revision,
     editorial_revision,
@@ -294,11 +296,68 @@ def _make_agent(episode_dir, config=None):
     return PublishAgent(episode_dir, config or _publish_config())
 
 
+def _explicit_agent(
+    episode_dir,
+    config=None,
+    *,
+    destinations=None,
+    clip_ids=None,
+    publish_now=True,
+):
+    config = config or _publish_config()
+    agent = _make_agent(episode_dir, config)
+    destinations = destinations or ["x"]
+    request = _destination_request(
+        episode_dir,
+        config,
+        request_id="6928a351-a198-4c05-9f2f-f51931b03ace",
+        destinations=destinations,
+        clip_ids=clip_ids,
+    )
+    request["publish_now"] = publish_now
+    request["expected_release_revision"] = agent._inputs()["gate"]["revision"]
+    agent.short_destination_request = agent.preview_short_destinations(request)[
+        "execute"
+    ]
+    return agent
+
+
 def _mock_proc(stdout="", stderr="", returncode=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
-def _write_video_feed_receipt(episode_dir, config):
+def _approve_seeded_scoped_longform(episode_dir, config, *, video_feed=False):
+    episode_path = episode_dir / "episode.json"
+    episode = json.loads(episode_path.read_text())
+    gate = {
+        "safe": True,
+        "can_approve": True,
+        "revision": "sha256:scoped",
+        "source_release_revision": episode["publish_approval"]["revision"],
+        "editorial_revision": episode["editorial_approval"]["revision"],
+        "quality_revision": quality_revision(episode_dir, episode, config=config),
+        "approval": {"current": True},
+        "publish_plan": {"youtube": {"enabled": True, "destination_configured": True}},
+        "blockers": [],
+    }
+    if video_feed:
+        gate["publish_plan"]["video_podcast_rss"] = {
+            "enabled": True,
+            "format": "video",
+            "account_identity": "sha256:r2-account",
+            "destination_configured": True,
+            "channel_configured": True,
+            "episode_configured": True,
+        }
+    episode["longform_publish_approval"] = {
+        "schema": LONGFORM_PUBLISH_APPROVAL_SCHEMA,
+        "revision": gate["revision"],
+    }
+    _write_json(episode_path, episode)
+    return gate
+
+
+def _write_video_feed_receipt(episode_dir, config, *, scoped_gate=None):
     video = episode_dir / "upload_video.mp4"
     scan = file_fingerprint(video)
     digest = scan["id"].removeprefix("sha256:")
@@ -312,30 +371,89 @@ def _write_video_feed_receipt(episode_dir, config):
         "sha256": digest,
         "render_fingerprint": render_fingerprint,
     }
-    _write_json(
-        episode_dir / "video_feed.json",
-        {
-            "schema": "cascade.video-podcast-feed/v1",
-            "status": "published",
-            "episode_id": episode_dir.name,
-            "release_revision": episode["publish_approval"]["revision"],
-            "editorial_revision": episode["editorial_approval"]["revision"],
-            "quality_revision": quality_revision(episode_dir, episode, config=config),
-            "publish_approval_current": True,
-            "video": {
-                "path": str(video),
-                "object_key": object_key,
-                "url": f"{public_url}/{object_key}",
-                "size_bytes": scan["size_bytes"],
-                "render_fingerprint": render_fingerprint,
-                "sha256": digest,
-                "remote": remote,
-            },
+    receipt = {
+        "schema": "cascade.video-podcast-feed/v1",
+        "status": "published",
+        "episode_id": episode_dir.name,
+        "release_revision": episode["publish_approval"]["revision"],
+        "editorial_revision": episode["editorial_approval"]["revision"],
+        "quality_revision": quality_revision(episode_dir, episode, config=config),
+        "publish_approval_current": True,
+        "video": {
+            "path": str(video),
+            "object_key": object_key,
+            "url": f"{public_url}/{object_key}",
+            "size_bytes": scan["size_bytes"],
+            "render_fingerprint": render_fingerprint,
+            "sha256": digest,
+            "remote": remote,
         },
-    )
+    }
+    if scoped_gate is not None:
+        receipt.update(
+            approval_scope="longform",
+            publication_revision=scoped_gate["revision"],
+        )
+    _write_json(episode_dir / "video_feed.json", receipt)
 
 
 # ── safety gate ─────────────────────────────────────────────────────────────
+
+
+class TestRetiredAggregateBoundary:
+    @pytest.mark.parametrize("entrypoint", ("run", "execute"))
+    @pytest.mark.parametrize(
+        "request_payload",
+        (
+            None,
+            {},
+            {
+                "destinations": ["x"],
+                "request_id": "b8c0b129-599c-48cb-b363-60a5fe4dc46c",
+                "actor": "operator",
+                "reason": "Reviewed release",
+                "expected_release_revision": "sha256:release",
+            },
+        ),
+    )
+    def test_raw_publish_rejects_before_locks_or_writes(
+        self, episode_dir, entrypoint, request_payload
+    ):
+        agent = PublishAgent(episode_dir, _publish_config())
+        if request_payload is not None:
+            agent.short_destination_request = request_payload
+        with (
+            patch.object(agent, "_inputs") as inputs,
+            patch("agents.publish.publication_lock") as publication_lock,
+            patch("agents.publish.subprocess.run") as provider,
+            pytest.raises(AggregatePublicationRetired),
+        ):
+            getattr(agent, entrypoint)()
+
+        inputs.assert_not_called()
+        publication_lock.assert_not_called()
+        provider.assert_not_called()
+        assert not (episode_dir.parent / ".publish-schedule.lock").exists()
+        assert not (episode_dir / "progress.json").exists()
+        assert not (episode_dir / "publish.json").exists()
+
+    def test_raw_execution_uses_the_api_request_normalization(self, episode_dir):
+        request_id = "B8C0B129-599C-48CB-B363-60A5FE4DC46C"
+        agent = PublishAgent(episode_dir, _publish_config())
+        agent.short_destination_request = {
+            "destinations": ["x"],
+            "request_id": request_id,
+            "actor": " release operator ",
+            "reason": " reviewed release ",
+            "expected_release_revision": "sha256:release",
+            "preview_revision": "sha256:preview",
+        }
+
+        normalized = agent._explicit_destination_request()
+
+        assert normalized["request_id"] == request_id.lower()
+        assert normalized["actor"] == " release operator "
+        assert normalized["reason"] == " reviewed release "
 
 
 class TestSafetyGate:
@@ -348,26 +466,24 @@ class TestSafetyGate:
         episode.pop("publish_approval")
         episode["publish_approved"] = True
         _write_json(episode_path, episode)
-        agent = _make_agent(episode_dir)
         with (
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="release gate blocked"),
         ):
-            agent.execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
     def test_refuses_when_episode_json_missing(self, env, episode_dir):
-        agent = _make_agent(episode_dir)
         with (
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="release gate blocked"),
         ):
-            agent.execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
     def test_runs_with_current_publish_approval(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(
                 stdout=json.dumps({"request_id": "req_123"}),
@@ -375,57 +491,6 @@ class TestSafetyGate:
             result = agent.execute()
         assert result["shorts_submitted"] == 1
         assert result["shorts_failed"] == 0
-
-    @pytest.mark.parametrize(
-        ("title", "expected"),
-        ((None, "None"), ("", ""), (0, "0")),
-        ids=("null", "empty", "zero"),
-    )
-    def test_ordinary_delivery_preserves_present_legacy_title_values(
-        self, env, episode_dir, title, expected
-    ):
-        config = _publish_config()
-        for platform in ("tiktok", "instagram", "x"):
-            config["platforms"][platform]["enabled"] = False
-        _seed_episode(episode_dir, config=config)
-        agent = _make_agent(episode_dir, config)
-        data = agent._inputs(bind_legacy=True)
-        data["approved"][0]["title"] = title
-        data["short_metadata"]["clip_0"]["youtube"].pop("title")
-
-        with (
-            patch.object(agent, "_inputs", return_value=data),
-            patch("agents.publish.quality_snapshot", return_value=data["snapshot"]),
-            patch.object(
-                agent,
-                "_publish_longform",
-                return_value={"status": "published"},
-            ),
-            patch.object(
-                agent, "_publish_short_deliveries", return_value=[]
-            ) as publish,
-        ):
-            agent.execute()
-
-        delivery = publish.call_args.args[0][0]
-        assert delivery.snapshot()["copy"]["youtube"]["title"] == expected
-
-    def test_required_destination_variant_blocks_legacy_short_publish(
-        self, env, episode_dir
-    ):
-        config = _publish_config()
-        config["platforms"]["x"]["required_short_variant_id"] = "speaker_panels_v1"
-        _seed_episode(episode_dir, config=config)
-
-        with (
-            patch("agents.publish.subprocess.run") as run,
-            pytest.raises(
-                RuntimeError, match="Submit a separate x destination request"
-            ),
-        ):
-            _make_agent(episode_dir, config).execute()
-
-        run.assert_not_called()
 
     def test_destination_change_after_approval_is_blocked(self, env, episode_dir):
         config = _publish_config()
@@ -436,7 +501,7 @@ class TestSafetyGate:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="release gate blocked"),
         ):
-            _make_agent(episode_dir, config).execute()
+            _explicit_agent(episode_dir, config)
         run.assert_not_called()
 
     def test_account_change_after_approval_is_blocked(
@@ -449,7 +514,7 @@ class TestSafetyGate:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="release gate blocked"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
     @pytest.mark.parametrize("report_state", ["missing", "failed", "stale"])
@@ -471,7 +536,7 @@ class TestSafetyGate:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="release gate blocked"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
     def test_pending_clip_is_never_submitted(self, env, episode_dir):
@@ -496,41 +561,8 @@ class TestSafetyGate:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="release gate blocked"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
-
-    def test_episode_editor_copy_is_the_publisher_payload(self, env, episode_dir):
-        config = _publish_config()
-        config["platforms"]["youtube"]["self_declared_made_for_kids"] = True
-        _seed_episode(episode_dir, config=config, youtube_url=None)
-        episode_path = episode_dir / "episode.json"
-        episode = json.loads(episode_path.read_text())
-        episode["title"] = "Title saved in the episode editor"
-        episode["description"] = "Description saved in the episode editor"
-        episode["tags"] = ["editor-copy"]
-        episode["publish_approval"] = {
-            "revision": release_revision(episode_dir, episode, config=config),
-            "approved_at": "2026-01-01T00:02:00+00:00",
-        }
-        _write_json(episode_path, episode)
-        qa_path = episode_dir / "qa" / "qa.json"
-        report = json.loads(qa_path.read_text())
-        report["quality_revision"] = quality_revision(episode_dir, episode)
-        _write_json(qa_path, report)
-
-        captured = []
-        with patch("agents.publish.subprocess.run") as run:
-            run.side_effect = lambda cmd, **_kwargs: (
-                captured.append(cmd)
-                or _mock_proc(stdout=json.dumps({"request_id": "request"}))
-            )
-            _make_agent(episode_dir, config).execute()
-
-        longform = next(cmd for cmd in captured if "upload_video.mp4" in " ".join(cmd))
-        fields = _multipart_values(longform)
-        assert "youtube_title=Title saved in the episode editor" in fields
-        assert "youtube_description=Description saved in the episode editor" in fields
-        assert "selfDeclaredMadeForKids=true" in fields
 
 
 class TestApiKeyGate:
@@ -538,17 +570,15 @@ class TestApiKeyGate:
         monkeypatch.delenv("UPLOAD_POST_API_KEY", raising=False)
         monkeypatch.setenv("UPLOAD_POST_USER", "test_user")
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
         with pytest.raises(RuntimeError, match="UPLOAD_POST_API_KEY"):
-            agent.execute()
+            _explicit_agent(episode_dir)
 
     def test_missing_user_raises(self, monkeypatch, episode_dir):
         monkeypatch.setenv("UPLOAD_POST_API_KEY", "k")
         monkeypatch.delenv("UPLOAD_POST_USER", raising=False)
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
         with pytest.raises(RuntimeError, match="UPLOAD_POST_USER"):
-            agent.execute()
+            _explicit_agent(episode_dir)
 
 
 # ── per-platform error surfacing ────────────────────────────────────────────
@@ -560,7 +590,7 @@ class TestErrorSurfacing:
 
     def test_api_error_in_200_response_reported_as_failed(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(
                 stdout=json.dumps({"error": "x_long_text_as_post required"}),
@@ -577,7 +607,7 @@ class TestErrorSurfacing:
 
     def test_missing_request_id_is_ambiguous(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(stdout=json.dumps({"unexpected": "shape"}))
             result = agent.execute()
@@ -586,7 +616,7 @@ class TestErrorSurfacing:
 
     def test_curl_failure_persists_stdout(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(
                 stdout="some body",
@@ -600,7 +630,7 @@ class TestErrorSurfacing:
 
     def test_non_json_response_is_ambiguous(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(stdout="<html>nginx error</html>")
             result = agent.execute()
@@ -609,7 +639,7 @@ class TestErrorSurfacing:
 
     def test_successful_submission_persists_response(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(
                 stdout=json.dumps({"request_id": "req_xyz", "extra": "data"}),
@@ -631,7 +661,7 @@ class TestErrorSurfacing:
         }
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(stdout=json.dumps(response))
-            agent = _make_agent(episode_dir)
+            agent = _explicit_agent(episode_dir)
             result = agent.run()
             repeated = agent.execute()
 
@@ -648,7 +678,7 @@ class TestErrorSurfacing:
         response = {"success": False, "error": "rejected", "results": {}}
         with patch("agents.publish.subprocess.run") as run:
             run.return_value = _mock_proc(stdout=json.dumps(response))
-            result = _make_agent(episode_dir).execute()
+            result = _explicit_agent(episode_dir).execute()
 
         assert result["shorts_failed"] == 1
         assert result["shorts"][0]["status"] == "failed"
@@ -660,7 +690,7 @@ class TestErrorSurfacing:
 class TestXLongTextFlag:
     def test_x_long_text_flag_sent_when_x_metadata_present(self, env, episode_dir):
         _seed_episode(episode_dir)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         captured = []
         with patch("agents.publish.subprocess.run") as run:
 
@@ -695,12 +725,11 @@ class TestXLongTextFlag:
             }
         ]
         _seed_episode(episode_dir, clips=clips)
-        agent = _make_agent(episode_dir)
         with (
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="x copy is missing: text"),
         ):
-            agent.execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
 
@@ -713,9 +742,9 @@ class TestYouTubeLongformFunnel:
     def _seed_with_longform_url(
         self, episode_dir, *, youtube_url=None, spotify_url=None, channel_handle=None
     ):
-        config = _publish_config()
+        config = _destination_config()
         if channel_handle:
-            config["podcast"] = {"channel_handle": channel_handle}
+            config["podcast"]["channel_handle"] = channel_handle
         _seed_episode(episode_dir, config=config, youtube_url=None)
         ep_path = episode_dir / "episode.json"
         ep = json.loads(ep_path.read_text())
@@ -755,7 +784,7 @@ class TestYouTubeLongformFunnel:
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc123",
         )
-        agent = _make_agent(episode_dir, config)
+        agent = _explicit_agent(episode_dir, config, destinations=["youtube"])
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         # First call is the short upload
         short_cmd = captured[0]
@@ -776,7 +805,7 @@ class TestYouTubeLongformFunnel:
             youtube_url="https://youtube.com/watch?v=abc",
             spotify_url="https://open.spotify.com/episode/xyz",
         )
-        agent = _make_agent(episode_dir, config)
+        agent = _explicit_agent(episode_dir, config, destinations=["youtube"])
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
         flags = _multipart_values(short_cmd)
@@ -790,58 +819,24 @@ class TestYouTubeLongformFunnel:
             youtube_url="https://youtube.com/watch?v=abc",
             channel_handle="@local-pod",
         )
-        agent = _make_agent(episode_dir, config)
+        agent = _explicit_agent(episode_dir, config, destinations=["youtube"])
         captured = self._capture_upload_cmds(env, episode_dir, agent)
         short_cmd = captured[0]
         flags = _multipart_values(short_cmd)
         first_comment = next(f for f in flags if f.startswith("youtube_first_comment="))
         assert "@local-pod" in first_comment
 
-    def test_shorts_deferred_when_no_youtube_url(self, env, episode_dir):
-        _seed_episode(episode_dir, youtube_url=None)
-        agent = _make_agent(episode_dir)
-        captured = []
-        with patch("agents.publish.subprocess.run") as run:
-            run.side_effect = lambda cmd, **_kwargs: (
-                captured.append(cmd)
-                or _mock_proc(stdout=json.dumps({"request_id": "longform"}))
-            )
-            result = agent.execute()
-
-        assert result["shorts_deferred"] is True
-        assert result["shorts"] == []
-        assert len(captured) == 1
-        assert "upload_video.mp4" in " ".join(captured[0])
-
-    def test_longform_failure_requires_action(self, env, episode_dir):
-        _seed_episode(episode_dir, youtube_url=None)
-        with patch("agents.publish.subprocess.run") as run:
-            run.return_value = _mock_proc(
-                stdout=json.dumps({"success": False, "error": "youtube rejected"})
-            )
-            result = _make_agent(episode_dir).execute()
-
-        assert result["publish_status"] == "longform_failed"
-        assert result["action_required"] is True
-        assert "youtube rejected" in result["longform"]["error"]
-        assert "awaiting a public URL" not in result["shorts_deferred_reason"]
-
-    def test_longform_idempotent_when_url_already_set(self, env, episode_dir):
-        # When youtube_longform_url is already recorded, publish skips the
-        # longform re-upload. This is the two-phase flow: longform uploads on
-        # the first publish run (URL not yet set), then on the SECOND run
-        # (after URL is saved) only shorts upload.
+    def test_supplied_funnel_url_permits_explicit_short(self, env, episode_dir):
         config = self._seed_with_longform_url(
             episode_dir,
             youtube_url="https://youtube.com/watch?v=abc",
         )
-        agent = _make_agent(episode_dir, config)
+        agent = _explicit_agent(episode_dir, config)
         captured = self._capture_upload_cmds(env, episode_dir, agent)
-        # Only 1 call: short upload. Longform upload is skipped by idempotency.
         assert len(captured) == 1
         assert "upload_video.mp4" not in " ".join(captured[0])
 
-    def test_receipt_url_keeps_the_approved_batch_current(self, env, episode_dir):
+    def test_bound_receipt_funnel_url_permits_explicit_short(self, env, episode_dir):
         _seed_episode(episode_dir, youtube_url=None)
         episode_path = episode_dir / "episode.json"
         episode = json.loads(episode_path.read_text())
@@ -853,50 +848,35 @@ class TestYouTubeLongformFunnel:
         episode["youtube_longform_url_release_revision"] = revision
         _write_json(episode_path, episode)
 
-        captured = self._capture_upload_cmds(env, episode_dir, _make_agent(episode_dir))
+        captured = self._capture_upload_cmds(
+            env, episode_dir, _explicit_agent(episode_dir)
+        )
 
         assert len(captured) == 1
         assert "upload_video.mp4" not in " ".join(captured[0])
 
     def test_unbound_receipt_url_is_rejected(self, env, episode_dir):
-        _seed_episode(episode_dir, youtube_url=None)
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
         episode_path = episode_dir / "episode.json"
         episode = json.loads(episode_path.read_text())
         episode["youtube_longform_url"] = "https://youtube.com/watch?v=stale"
         episode["youtube_longform_url_source"] = "upload_post_receipt"
         _write_json(episode_path, episode)
+        gate = _approve_seeded_scoped_longform(episode_dir, config)
+        agent = LongformPublishAgent(episode_dir, config)
 
         with (
+            patch("agents.publish.longform_publication_snapshot", return_value=gate),
+            patch(
+                "agents.publish.current_funnel_urls",
+                return_value={"youtube": "", "spotify": ""},
+            ),
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="does not belong"),
         ):
-            _make_agent(episode_dir).execute()
+            agent.execute()
         run.assert_not_called()
-
-    def test_stale_longform_receipt_does_not_skip_current_upload(
-        self, env, episode_dir
-    ):
-        _seed_episode(episode_dir, youtube_url=None)
-        _write_json(
-            episode_dir / "publish.json",
-            {
-                "longform": {
-                    "status": "submitted",
-                    "external_id": "cascade-longform-stale",
-                }
-            },
-        )
-        captured = []
-        with patch("agents.publish.subprocess.run") as run:
-            run.side_effect = lambda command, **_kwargs: (
-                captured.append(command)
-                or _mock_proc(stdout=json.dumps({"request_id": "current"}))
-            )
-            result = _make_agent(episode_dir).execute()
-
-        assert len(captured) == 1
-        assert "upload_video.mp4" in " ".join(captured[0])
-        assert result["longform"].get("reused_receipt") is not True
 
 
 # ── rejected clips skipped ──────────────────────────────────────────────────
@@ -928,7 +908,7 @@ class TestRejectedClips:
             },
         ]
         _seed_episode(episode_dir, clips=clips)
-        agent = _make_agent(episode_dir)
+        agent = _explicit_agent(episode_dir)
         upload_calls = []
         with patch("agents.publish.subprocess.run") as run:
 
@@ -1268,7 +1248,7 @@ class TestVersionedShorts:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="unapproved, or retired"),
         ):
-            _make_agent(episode_dir, config).execute()
+            _explicit_agent(episode_dir, config)
 
         run.assert_not_called()
 
@@ -1290,7 +1270,7 @@ class TestVersionedShorts:
                 commands.append(command)
                 or _mock_proc(stdout=json.dumps({"request_id": "variant-job"}))
             )
-            agent = _make_agent(episode_dir, config)
+            agent = _explicit_agent(episode_dir, config)
             first = agent.run()
             second = agent.execute()
 
@@ -1302,13 +1282,7 @@ class TestVersionedShorts:
         assert receipt["render_fingerprint"] == "sha256:variant-render"
         assert receipt["approval_revision"] == "sha256:variant-review"
         assert second["shorts"][0]["reused_receipt"] is True
-        editorial_revision_value = snapshot["approvals"]["editorial"]["revision"]
-        assert first["longform"]["external_id"] == agent._identity(
-            editorial_revision_value, "longform"
-        )
-        assert first["longform"]["external_id"] != agent._identity(
-            snapshot["release_gate"]["revision"], "longform"
-        )
+        assert first["longform"] is None
 
     @pytest.mark.parametrize("legacy_receipt", [False, True])
     def test_short_release_change_reuses_current_longform_receipt(
@@ -1372,18 +1346,14 @@ class TestVersionedShorts:
                 commands.append(command)
                 or _mock_proc(stdout=json.dumps({"request_id": "variant-job"}))
             )
-            result = _make_agent(episode_dir, config).execute()
+            result = _explicit_agent(episode_dir, config).execute()
 
         assert len(commands) == 1
         assert f"video=@{variant}" in commands[0]
         assert "upload_video.mp4" not in " ".join(commands[0])
-        assert result["longform"]["status"] == "already_submitted"
-        assert (
-            result["longform"]["youtube_longform_url"]
-            == "https://youtube.com/watch?v=current-longform"
-        )
+        assert result["longform"] == longform_receipt
         stored = json.loads(episode_path.read_text())
-        assert stored["youtube_longform_url_editorial_revision"] == longform_revision
+        assert stored == episode
 
     @pytest.mark.parametrize(
         "receipt_identity",
@@ -1406,32 +1376,14 @@ class TestVersionedShorts:
         variant.parent.mkdir(parents=True)
         variant.write_bytes(b"approved variant")
         snapshot = self._variant_snapshot(episode_dir, config)
-        revision = snapshot["release_gate"]["revision"]
-        identity = _make_agent(episode_dir, config)._identity(
-            revision, "short", "clip_0"
-        )
-        _write_json(
-            episode_dir / "publish.json",
-            {
-                "release_revision": revision,
-                "shorts": [
-                    {
-                        "clip_id": "clip_0",
-                        "status": "submitted",
-                        "external_id": identity,
-                        **receipt_identity,
-                    }
-                ],
-            },
-        )
+        selected = snapshot["release_gate"]["short_versions"]["clip_0"]
+        receipt = {
+            "clip_id": "clip_0",
+            "status": "submitted",
+            **receipt_identity,
+        }
 
-        with (
-            patch("agents.publish.quality_snapshot", return_value=snapshot),
-            patch("agents.publish.subprocess.run") as run,
-            pytest.raises(RuntimeError, match="does not match its selected version"),
-        ):
-            _make_agent(episode_dir, config).execute()
-        run.assert_not_called()
+        assert ShortDeliverySpec.receipt_matches_version(receipt, selected) is False
 
     def test_fieldless_legacy_receipt_is_accepted_only_for_base(self, episode_dir):
         legacy_receipt = {"clip_id": "clip_0", "status": "submitted"}
@@ -1451,31 +1403,6 @@ class TestVersionedShorts:
         assert (
             ShortDeliverySpec.receipt_matches_version(legacy_receipt, variant) is False
         )
-
-    def test_deferred_longform_run_preserves_prior_short_receipts(
-        self, env, episode_dir
-    ):
-        _seed_episode(episode_dir, youtube_url=None)
-        prior = {
-            "clip_id": "clip_0",
-            "status": "submitted",
-            "external_id": "cascade-short-prior-release",
-            "scheduled": True,
-        }
-        _write_json(
-            episode_dir / "publish.json",
-            {"release_revision": "sha256:prior-release", "shorts": [prior]},
-        )
-
-        with patch("agents.publish.subprocess.run") as run:
-            run.return_value = _mock_proc(
-                stdout=json.dumps({"request_id": "new-longform"})
-            )
-            result = _make_agent(episode_dir).run()
-
-        assert result["shorts_deferred"] is True
-        stored = json.loads((episode_dir / "publish.json").read_text())
-        assert stored["shorts"] == [{**prior, "historical_receipt": True}]
 
     def test_old_release_receipt_blocks_same_base_from_being_submitted_again(
         self, env, episode_dir
@@ -1499,7 +1426,7 @@ class TestVersionedShorts:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="explicit re-release identity"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
     def test_explicit_rerelease_uses_new_identity_and_preserves_history(
@@ -1574,7 +1501,7 @@ class TestVersionedShorts:
                 commands.append(command)
                 or _mock_proc(stdout=json.dumps({"request_id": "new-request"}))
             )
-            agent = _make_agent(episode_dir, config)
+            agent = _explicit_agent(episode_dir, config)
             first = agent.run()
             second = agent.execute()
 
@@ -1671,7 +1598,7 @@ class TestVersionedShorts:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="explicit re-release identity"),
         ):
-            _make_agent(episode_dir, config).execute()
+            _explicit_agent(episode_dir, config)
         run.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1691,7 +1618,7 @@ class TestVersionedShorts:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="Cannot inspect prior short"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir)
         run.assert_not_called()
 
     def test_media_replacement_after_initial_gate_snapshot_blocks_submission(
@@ -1703,6 +1630,7 @@ class TestVersionedShorts:
         _seed_episode(episode_dir, config=config)
         initial = quality_snapshot(episode_dir, config=config)
         short = episode_dir / "shorts" / "clip_0.mp4"
+        agent = _explicit_agent(episode_dir, config)
         calls = 0
 
         def snapshot(*_args, **_kwargs):
@@ -1718,7 +1646,7 @@ class TestVersionedShorts:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="Release media"),
         ):
-            _make_agent(episode_dir, config).execute()
+            agent.execute()
         run.assert_not_called()
 
     def test_longform_replacement_after_initial_gate_blocks_all_submission(
@@ -1730,6 +1658,7 @@ class TestVersionedShorts:
         _seed_episode(episode_dir, config=config, youtube_url=None)
         initial = quality_snapshot(episode_dir, config=config)
         longform = episode_dir / "upload_video.mp4"
+        agent = _explicit_agent(episode_dir, config)
         calls = 0
 
         def snapshot(*_args, **_kwargs):
@@ -1745,7 +1674,7 @@ class TestVersionedShorts:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="Release media"),
         ):
-            _make_agent(episode_dir, config).execute()
+            agent.execute()
         run.assert_not_called()
 
 
@@ -1766,7 +1695,7 @@ class TestIdempotency:
                 commands.append(command)
                 or (_ for _ in ()).throw(subprocess.TimeoutExpired(command, 600))
             )
-            agent = _make_agent(episode_dir)
+            agent = _explicit_agent(episode_dir)
             first = agent.run()
             second = agent.execute()
 
@@ -1782,14 +1711,27 @@ class TestIdempotency:
         assert second["shorts"][0]["reused_receipt"] is True
 
     def test_longform_upload_has_stable_identity(self, env, episode_dir):
-        _seed_episode(episode_dir, youtube_url=None)
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        gate = _approve_seeded_scoped_longform(episode_dir, config)
         captured = []
-        with patch("agents.publish.subprocess.run") as run:
+        agent = LongformPublishAgent(episode_dir, config)
+        with (
+            patch(
+                "agents.publish.longform_publication_snapshot",
+                return_value=gate,
+            ),
+            patch(
+                "agents.publish.current_funnel_urls",
+                return_value={"youtube": "", "spotify": ""},
+            ),
+            patch("agents.publish.subprocess.run") as run,
+        ):
             run.side_effect = lambda command, **_kwargs: (
                 captured.append(command)
                 or _mock_proc(stdout=json.dumps({"request_id": "longform"}))
             )
-            _make_agent(episode_dir).execute()
+            agent.execute()
 
         headers = self._values(captured[0], "-H")
         fields = _multipart_values(captured[0])
@@ -1802,14 +1744,26 @@ class TestIdempotency:
         )
 
     def test_longform_timeout_is_not_automatically_resubmitted(self, env, episode_dir):
-        _seed_episode(episode_dir, youtube_url=None)
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        gate = _approve_seeded_scoped_longform(episode_dir, config)
         commands = []
-        with patch("agents.publish.subprocess.run") as run:
+        agent = LongformPublishAgent(episode_dir, config)
+        with (
+            patch(
+                "agents.publish.longform_publication_snapshot",
+                return_value=gate,
+            ),
+            patch(
+                "agents.publish.current_funnel_urls",
+                return_value={"youtube": "", "spotify": ""},
+            ),
+            patch("agents.publish.subprocess.run") as run,
+        ):
             run.side_effect = lambda command, **_kwargs: (
                 commands.append(command)
                 or (_ for _ in ()).throw(subprocess.TimeoutExpired(command, 1200))
             )
-            agent = _make_agent(episode_dir)
             first = agent.run()
             second = agent.execute()
 
@@ -1839,6 +1793,18 @@ class TestLongformTransport:
         }
         return config
 
+    @staticmethod
+    def _execute(agent, gate):
+        with (
+            patch("agents.publish.longform_publication_snapshot", return_value=gate),
+            patch("agents.video_feed.longform_publication_snapshot", return_value=gate),
+            patch(
+                "agents.publish.current_funnel_urls",
+                return_value={"youtube": "", "spotify": ""},
+            ),
+        ):
+            return agent.execute()
+
     @pytest.fixture
     def remote_object(self):
         with (
@@ -1856,19 +1822,54 @@ class TestLongformTransport:
             }
             yield head
 
+    def test_episode_editor_copy_is_the_publisher_payload(self, env, episode_dir):
+        config = _publish_config()
+        config["platforms"]["youtube"]["self_declared_made_for_kids"] = True
+        _seed_episode(episode_dir, config=config, youtube_url=None)
+        episode_path = episode_dir / "episode.json"
+        episode = json.loads(episode_path.read_text())
+        episode.update(
+            title="Title saved in the episode editor",
+            description="Description saved in the episode editor",
+            tags=["editor-copy"],
+        )
+        _write_json(episode_path, episode)
+        gate = _approve_seeded_scoped_longform(episode_dir, config)
+        captured = []
+
+        with (
+            patch("agents.publish.longform_publication_snapshot", return_value=gate),
+            patch(
+                "agents.publish.current_funnel_urls",
+                return_value={"youtube": "", "spotify": ""},
+            ),
+            patch("agents.publish.subprocess.run") as run,
+        ):
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"request_id": "request"}))
+            )
+            LongformPublishAgent(episode_dir, config).execute()
+
+        fields = _multipart_values(captured[0])
+        assert "youtube_title=Title saved in the episode editor" in fields
+        assert "youtube_description=Description saved in the episode editor" in fields
+        assert "selfDeclaredMadeForKids=true" in fields
+
     def test_verified_video_feed_object_is_submitted_by_url(
         self, env, episode_dir, remote_object
     ):
         config = self._config()
         _seed_episode(episode_dir, config=config, youtube_url=None)
-        _write_video_feed_receipt(episode_dir, config)
+        gate = _approve_seeded_scoped_longform(episode_dir, config, video_feed=True)
+        _write_video_feed_receipt(episode_dir, config, scoped_gate=gate)
         commands = []
         with patch("agents.publish.subprocess.run") as run:
             run.side_effect = lambda command, **_kwargs: (
                 commands.append(command)
                 or _mock_proc(stdout=json.dumps({"request_id": "remote-request"}))
             )
-            result = _make_agent(episode_dir, config).execute()
+            result = self._execute(LongformPublishAgent(episode_dir, config), gate)
 
         fields = _multipart_values(commands[0])
         transport = result["longform"]["transport"]
@@ -1882,7 +1883,8 @@ class TestLongformTransport:
     ):
         config = self._config()
         _seed_episode(episode_dir, config=config, youtube_url=None)
-        _write_video_feed_receipt(episode_dir, config)
+        gate = _approve_seeded_scoped_longform(episode_dir, config, video_feed=True)
+        _write_video_feed_receipt(episode_dir, config, scoped_gate=gate)
         path = episode_dir / "video_feed.json"
         receipt = json.loads(path.read_text())
         receipt["release_revision"] = "sha256:stale"
@@ -1892,7 +1894,7 @@ class TestLongformTransport:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="transport proof is stale"),
         ):
-            _make_agent(episode_dir, config).execute()
+            self._execute(LongformPublishAgent(episode_dir, config), gate)
         run.assert_not_called()
 
     def test_missing_remote_object_blocks_before_submission(
@@ -1900,7 +1902,8 @@ class TestLongformTransport:
     ):
         config = self._config()
         _seed_episode(episode_dir, config=config, youtube_url=None)
-        _write_video_feed_receipt(episode_dir, config)
+        gate = _approve_seeded_scoped_longform(episode_dir, config, video_feed=True)
+        _write_video_feed_receipt(episode_dir, config, scoped_gate=gate)
         remote_object.side_effect = None
         remote_object.return_value = None
 
@@ -1908,7 +1911,7 @@ class TestLongformTransport:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="transport proof is stale"),
         ):
-            _make_agent(episode_dir, config).execute()
+            self._execute(LongformPublishAgent(episode_dir, config), gate)
         run.assert_not_called()
 
     def test_verified_url_retries_only_definitive_legacy_413(
@@ -1916,7 +1919,8 @@ class TestLongformTransport:
     ):
         config = self._config()
         _seed_episode(episode_dir, config=config, youtube_url=None)
-        _write_video_feed_receipt(episode_dir, config)
+        gate = _approve_seeded_scoped_longform(episode_dir, config, video_feed=True)
+        _write_video_feed_receipt(episode_dir, config, scoped_gate=gate)
         episode = json.loads((episode_dir / "episode.json").read_text())
         identity = publication_identity(
             episode_dir.name,
@@ -1943,7 +1947,7 @@ class TestLongformTransport:
             run.return_value = _mock_proc(
                 stdout=json.dumps({"request_id": "remote-request"})
             )
-            result = _make_agent(episode_dir, config).execute()
+            result = self._execute(LongformPublishAgent(episode_dir, config), gate)
 
         assert run.call_count == 1
         assert result["longform"]["external_id"] == identity
@@ -1958,7 +1962,8 @@ class TestLongformTransport:
     ):
         config = self._config()
         _seed_episode(episode_dir, config=config, youtube_url=None)
-        _write_video_feed_receipt(episode_dir, config)
+        gate = _approve_seeded_scoped_longform(episode_dir, config, video_feed=True)
+        _write_video_feed_receipt(episode_dir, config, scoped_gate=gate)
         episode = json.loads((episode_dir / "episode.json").read_text())
         identity = publication_identity(
             episode_dir.name,
@@ -1978,7 +1983,7 @@ class TestLongformTransport:
             },
         )
         with patch("agents.publish.subprocess.run") as run:
-            result = _make_agent(episode_dir, config).execute()
+            result = self._execute(LongformPublishAgent(episode_dir, config), gate)
 
         run.assert_not_called()
         assert result["longform"]["status"] == "unknown"
@@ -2075,20 +2080,6 @@ class TestScheduleConversion:
                 schedule, "America/Los_Angeles", reference=reference
             )
 
-    def test_generate_schedule_distributes_clips_across_days(self, env, episode_dir):
-        agent = _make_agent(episode_dir)
-        clips = [{"id": f"clip_{i}"} for i in range(5)]
-        reference = datetime(2026, 1, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
-        sched = agent._generate_schedule(
-            clips,
-            weekday_per_day=1,
-            weekend_per_day=2,
-            reference=reference,
-        )
-        assert len(sched) == 5
-        assert all(s["day_offset"] >= 1 for s in sched)
-        assert sorted(s["clip_id"] for s in sched) == [f"clip_{i}" for i in range(5)]
-
     def test_stale_approval_uses_current_time_as_schedule_reference(
         self, env, episode_dir
     ):
@@ -2118,6 +2109,21 @@ class TestScheduleReservation:
         fields = _multipart_values(command)
         return next(value for value in fields if value.startswith("scheduled_date="))
 
+    def test_explicit_publish_now_does_not_generate_a_schedule(self, env, episode_dir):
+        _seed_episode(episode_dir)
+        captured = []
+        with patch("agents.publish.subprocess.run") as run:
+            run.side_effect = lambda command, **_kwargs: (
+                captured.append(command)
+                or _mock_proc(stdout=json.dumps({"job_id": "immediate-job"}))
+            )
+            result = _explicit_agent(episode_dir).execute()
+
+        fields = _multipart_values(captured[0])
+        assert not any(value.startswith("scheduled_date=") for value in fields)
+        assert result["shorts"][0]["scheduled"] is False
+        assert result["shorts"][0]["scheduled_date"] is None
+
     def test_remote_job_reserves_global_daily_slot(self, env, monkeypatch, episode_dir):
         _seed_episode(episode_dir)
         monkeypatch.setattr(
@@ -2131,17 +2137,10 @@ class TestScheduleReservation:
                 }
             ],
         )
-        captured = []
-        with patch("agents.publish.subprocess.run") as run:
-            run.side_effect = lambda command, **_kwargs: (
-                captured.append(command)
-                or _mock_proc(stdout=json.dumps({"job_id": "new-job"}))
-            )
-            _make_agent(episode_dir).execute()
+        occupied = _make_agent(episode_dir)._occupied_schedule("key", "test_user")
 
-        assert self._scheduled_field(captured[0]) == (
-            "scheduled_date=2099-01-06T09:00:00"
-        )
+        assert occupied[0]["job_id"] == "other-job"
+        assert occupied[0]["scheduled_at"].isoformat() == "2099-01-05T18:00:00+00:00"
 
     def test_local_episode_receipt_reserves_global_daily_slot(self, env, episode_dir):
         _seed_episode(episode_dir)
@@ -2161,17 +2160,11 @@ class TestScheduleReservation:
                 ],
             },
         )
-        captured = []
-        with patch("agents.publish.subprocess.run") as run:
-            run.side_effect = lambda command, **_kwargs: (
-                captured.append(command)
-                or _mock_proc(stdout=json.dumps({"job_id": "new-job"}))
-            )
-            _make_agent(episode_dir).execute()
+        occupied = _make_agent(episode_dir)._occupied_schedule("key", "test_user")
 
-        assert self._scheduled_field(captured[0]) == (
-            "scheduled_date=2099-01-06T09:00:00"
-        )
+        assert any(item.get("job_id") == "other-job" for item in occupied)
+        local = next(item for item in occupied if item.get("job_id") == "other-job")
+        assert local["scheduled_at"].isoformat() == "2099-01-05T09:00:00-08:00"
 
     def test_explicit_collision_blocks_before_upload(
         self, env, monkeypatch, episode_dir
@@ -2194,7 +2187,7 @@ class TestScheduleReservation:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="Schedule collision"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
     def test_absolute_schedule_is_sent_as_local_wall_time(self, env, episode_dir):
@@ -2213,7 +2206,7 @@ class TestScheduleReservation:
                 captured.append(command)
                 or _mock_proc(stdout=json.dumps({"job_id": "scheduled-job"}))
             )
-            result = _make_agent(episode_dir).execute()
+            result = _explicit_agent(episode_dir, publish_now=False).execute()
 
         assert self._scheduled_field(captured[0]) == (
             "scheduled_date=2099-07-01T09:00:00"
@@ -2233,9 +2226,9 @@ class TestScheduleReservation:
         )
         with (
             patch("agents.publish.subprocess.run") as run,
-            pytest.raises(RuntimeError, match="not in the future"),
+            pytest.raises(RuntimeError, match="not safely in the future"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
     def test_duplicate_external_labels_do_not_collapse_remote_jobs(
@@ -2281,7 +2274,15 @@ class TestScheduleReservation:
         assert occupied[0]["scheduled_at"].isoformat() == "2026-09-19T16:00:00+00:00"
 
     def test_malformed_sibling_receipt_blocks_before_upload(self, env, episode_dir):
-        _seed_episode(episode_dir)
+        _seed_episode(
+            episode_dir,
+            schedule=[
+                {
+                    "clip_id": "clip_0",
+                    "scheduled_date": "2099-07-01T09:00:00-07:00",
+                }
+            ],
+        )
         other = episode_dir.parent / "ep_other"
         other.mkdir()
         (other / "publish.json").write_text("not json")
@@ -2290,7 +2291,7 @@ class TestScheduleReservation:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="Cannot inspect local publish receipt"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
     def test_malformed_current_receipt_blocks_before_upload(self, env, episode_dir):
@@ -2301,30 +2302,37 @@ class TestScheduleReservation:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="current publish receipt"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
     def test_unknown_scheduled_receipt_recovers_remote_job_id(
         self, env, monkeypatch, episode_dir
     ):
-        _seed_episode(episode_dir)
-        episode = json.loads((episode_dir / "episode.json").read_text())
-        identity = _make_agent(episode_dir)._identity(
-            episode["publish_approval"]["revision"], "short", "clip_0"
-        )
         scheduled_date = "2099-01-05T09:00:00-08:00"
+        _seed_episode(
+            episode_dir,
+            schedule=[{"clip_id": "clip_0", "scheduled_date": scheduled_date}],
+        )
+        agent = _make_agent(episode_dir)
+        request = _destination_request(
+            episode_dir,
+            _publish_config(),
+            request_id="7048a351-a198-4c05-9f2f-f51931b03ace",
+            destinations=["x"],
+        )
+        preview = agent.preview_short_destinations(request)
+        target = preview["targets"][0]
+        identity = target["external_id"]
+        agent.short_destination_request = preview["execute"]
         _write_json(
             episode_dir / "publish.json",
             {
                 "profile_username": "test_user",
                 "shorts": [
                     {
-                        "clip_id": "clip_0",
+                        **target,
                         "status": "unknown",
-                        "scheduled": True,
-                        "scheduled_date": scheduled_date,
                         "request_id": identity,
-                        "external_id": identity,
                         "idempotency_key": identity,
                     }
                 ],
@@ -2337,13 +2345,17 @@ class TestScheduleReservation:
                 {
                     "job_id": "remote-job",
                     "external_id": identity,
-                    "scheduled_date": "2099-01-05T17:00:00Z",
+                    "scheduled_date": target["scheduled_date"],
+                    "profile_username": "test_user",
+                    "platforms": ["x"],
+                    "source_filename": "clip_0.mp4",
+                    "fields": {"external_id": identity},
                 }
             ],
         )
 
         with patch("agents.publish.subprocess.run") as run:
-            result = _make_agent(episode_dir).execute()
+            result = agent.execute()
 
         run.assert_not_called()
         assert result["shorts"][0]["status"] == "submitted"
@@ -2367,7 +2379,15 @@ class TestScheduleReservation:
     def test_calendar_inspection_failure_blocks_before_upload(
         self, env, monkeypatch, episode_dir
     ):
-        _seed_episode(episode_dir)
+        _seed_episode(
+            episode_dir,
+            schedule=[
+                {
+                    "clip_id": "clip_0",
+                    "scheduled_date": "2099-07-01T09:00:00-07:00",
+                }
+            ],
+        )
 
         def unavailable(*_args):
             raise RuntimeError("Cannot inspect Upload-Post schedule")
@@ -2377,7 +2397,7 @@ class TestScheduleReservation:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="Cannot inspect"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
     def test_partial_explicit_schedule_does_not_publish_immediately(
@@ -2391,9 +2411,9 @@ class TestScheduleReservation:
         )
         with (
             patch("agents.publish.subprocess.run") as run,
-            pytest.raises(RuntimeError, match="missing schedule entries"),
+            pytest.raises(RuntimeError, match="explicit schedule entries"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
     def test_duplicate_explicit_schedule_blocks_before_upload(self, env, episode_dir):
@@ -2407,7 +2427,7 @@ class TestScheduleReservation:
             patch("agents.publish.subprocess.run") as run,
             pytest.raises(RuntimeError, match="duplicate entries"),
         ):
-            _make_agent(episode_dir).execute()
+            _explicit_agent(episode_dir, publish_now=False)
         run.assert_not_called()
 
 
@@ -2594,7 +2614,6 @@ class TestShortDestinationRequests:
         monkeypatch.setattr(agent, "_submit_short", submit)
         results = agent._publish_short_deliveries(
             specs,
-            None,
             stored,
             data["episode"],
             data["api_key"],
@@ -2928,7 +2947,7 @@ class TestShortDestinationRequests:
 
         with (
             patch("agents.publish.subprocess.run") as run,
-            pytest.raises(RuntimeError, match="reviewed explicit destination subset"),
+            pytest.raises(AggregatePublicationRetired),
         ):
             agent.execute()
 
@@ -3120,7 +3139,7 @@ class TestShortDestinationRequests:
         del agent.short_destination_request
         with (
             patch("agents.publish.subprocess.run") as run,
-            pytest.raises(RuntimeError, match="explicit destination subset"),
+            pytest.raises(AggregatePublicationRetired),
         ):
             agent.execute()
         run.assert_not_called()

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agents import AGENT_REGISTRY, PIPELINE_ORDER, RETIRED_AGENTS
+from agents.publish import AggregatePublicationRetired
 from lib.atomic_write import atomic_write_json
 from lib.paths import resolve_path
 
@@ -105,6 +106,8 @@ def run_pipeline(
     retired = sorted(set(requested_agents or ()) & RETIRED_AGENTS)
     if retired:
         raise ValueError(f"Retired agent(s): {retired}")
+    if "publish" in (requested_agents or ()):
+        raise AggregatePublicationRetired()
 
     config = load_config()
     output_dir = resolve_path(config["paths"]["output_dir"], "episodes")

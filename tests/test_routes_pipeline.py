@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from agents.publish import AggregatePublicationRetired
 from tests.test_routes_episodes import _create_episode
 
 pytest_plugins = ["tests.test_routes_episodes"]
@@ -90,6 +91,35 @@ class TestShortDestinationPreview:
             json={**request, "unexpected": True},
         )
         assert response.status_code == 422
+
+    def test_preserves_existing_request_normalization_and_schema(self, test_client):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        request_id = "E5753781-47F9-455E-9CE5-0EEAD48A19CD"
+        request = {
+            "destinations": ["youtube"],
+            "request_id": request_id,
+            "actor": " release operator ",
+            "reason": " approved motion release ",
+            "expected_release_revision": "sha256:release",
+        }
+        with patch(
+            "agents.publish.PublishAgent.preview_short_destinations",
+            return_value={"preview_revision": "sha256:preview"},
+        ) as preview:
+            response = client.post(
+                "/api/episodes/ep_001/publish-shorts/preview", json=request
+            )
+
+        assert response.status_code == 200
+        normalized = preview.call_args.args[0]
+        assert normalized["request_id"] == request_id.lower()
+        assert normalized["actor"] == request["actor"]
+        assert normalized["reason"] == request["reason"]
+        request_schema = client.get("/openapi.json").json()["components"]["schemas"][
+            "ShortDestinationRequest"
+        ]
+        assert request_schema["properties"]["request_id"]["format"] == "uuid"
 
 
 class TestRunPipeline:
@@ -198,6 +228,51 @@ class TestRunPipeline:
         assert error.value.detail["agents"] == [retired_agent]
         thread_class.assert_not_called()
         assert pipeline._running == running_before
+
+    @pytest.mark.parametrize(
+        ("path", "payload"),
+        (
+            ("run-pipeline", {"agents": ["ingest", "publish"]}),
+            ("resume-pipeline", {"agents": ["publish"]}),
+        ),
+    )
+    def test_generic_publish_rejects_before_worker_or_episode_mutation(
+        self, test_client, path, payload
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        episode_file = episode_dir / "episode.json"
+        before = episode_file.read_bytes()
+        from server.routes import pipeline
+
+        running_before = dict(pipeline._running)
+        cancelled_before = set(pipeline._cancel_requested)
+        with (
+            patch("server.routes.pipeline._start_pipeline_thread") as start_thread,
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+        ):
+            response = client.post(f"/api/episodes/ep_001/{path}", json=payload)
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == AggregatePublicationRetired.detail()
+        start_thread.assert_not_called()
+        thread_class.assert_not_called()
+        assert pipeline._running == running_before
+        assert pipeline._cancel_requested == cancelled_before
+        assert episode_file.read_bytes() == before
+
+    def test_thread_launcher_defensively_rejects_generic_publish(self):
+        from server.routes import pipeline
+
+        with (
+            patch("server.routes.pipeline.threading.Thread") as thread_class,
+            pytest.raises(HTTPException) as error,
+        ):
+            pipeline._start_pipeline_thread("ep_001", "/tmp/source", ["publish"])
+
+        assert error.value.status_code == 409
+        assert error.value.detail == AggregatePublicationRetired.detail()
+        thread_class.assert_not_called()
 
 
 class TestCancelPipeline:
@@ -385,33 +460,71 @@ class TestResumeAfterComplete:
 
 
 class TestPublishApproval:
-    def test_dispatches_only_enabled_publication_agents(self, test_client):
+    def test_openapi_requires_the_approval_only_body(self, test_client):
+        client, _ = test_client
+        operation = client.get("/openapi.json").json()["paths"][
+            "/api/episodes/{episode_id}/approve-publish"
+        ]["post"]
+        request_body = operation["requestBody"]
+        schema = request_body["content"]["application/json"]["schema"]
+
+        assert request_body["required"] is True
+        assert schema["required"] == ["start_publication"]
+        assert schema["additionalProperties"] is False
+        start_publication = schema["properties"]["start_publication"]
+        assert start_publication["type"] == "boolean"
+        assert start_publication["const"] is False
+        conflict = operation["responses"]["409"]["content"]["application/json"]
+        response_ref = conflict["schema"]["$ref"].rsplit("/", 1)[-1]
+        response_schema = client.get("/openapi.json").json()["components"]["schemas"][
+            response_ref
+        ]
+        assert response_schema["properties"]["detail"] == {"title": "Detail"}
+        retirement = conflict["examples"]["aggregate_publication_retired"]["value"]
+        assert retirement["detail"]["code"] == "aggregate_publication_retired"
+
+    @pytest.mark.parametrize(
+        ("body_kind", "body"),
+        (
+            ("omitted", None),
+            ("json", {}),
+            ("null", None),
+            ("json", {"start_publication": True}),
+            ("json", {"start_publication": 0}),
+            ("json", {"start_publication": "false"}),
+        ),
+    )
+    def test_ambiguous_or_aggregate_request_is_retired_before_writes(
+        self, test_client, body_kind, body
+    ):
         client, episodes_dir = test_client
-        episode_dir = _create_episode(
-            episodes_dir,
-            "ep_001",
-            {"publish_approved": True, "publish_approved_at": "legacy"},
-        )
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        before = (episode_dir / "episode.json").read_bytes()
 
         with (
             patch("server.routes.pipeline.quality_snapshot") as snapshot,
-            patch("server.routes.pipeline.threading.Thread") as thread_class,
-            patch("agents.pipeline.run_pipeline") as run_pipeline,
+            patch("server.routes.pipeline.atomic_write_json") as write_json,
+            patch("server.routes.pipeline._start_pipeline_thread") as start_thread,
         ):
-            snapshot.return_value = _release_snapshot(upload_post=True)
-            response = client.post("/api/episodes/ep_001/approve-publish")
-            thread_class.call_args.kwargs["target"]()
+            if body_kind == "omitted":
+                response = client.post("/api/episodes/ep_001/approve-publish")
+            elif body_kind == "null":
+                response = client.post(
+                    "/api/episodes/ep_001/approve-publish",
+                    content="null",
+                    headers={"content-type": "application/json"},
+                )
+            else:
+                response = client.post(
+                    "/api/episodes/ep_001/approve-publish", json=body
+                )
 
-        assert response.status_code == 200
-        assert run_pipeline.call_args.kwargs["agents"] == ["publish"]
-        episode = json.loads((episode_dir / "episode.json").read_text())
-        assert episode["publish_approval"]["revision"] == "sha256:approved-plan"
-        assert (
-            episode["publish_approval"]["plan"]
-            == snapshot.return_value["release_gate"]["publish_plan"]
-        )
-        assert "publish_approved" not in episode
-        assert "publish_approved_at" not in episode
+        assert response.status_code == 409
+        assert response.json()["detail"] == AggregatePublicationRetired.detail()
+        snapshot.assert_not_called()
+        write_json.assert_not_called()
+        start_thread.assert_not_called()
+        assert (episode_dir / "episode.json").read_bytes() == before
 
     def test_records_video_plan_without_starting_any_publisher(self, test_client):
         client, episodes_dir = test_client
@@ -468,7 +581,10 @@ class TestPublishApproval:
             snapshot.return_value = _release_snapshot(
                 upload_post=False, podcast_rss=True
             )
-            response = client.post("/api/episodes/ep_001/approve-publish")
+            response = client.post(
+                "/api/episodes/ep_001/approve-publish",
+                json={"start_publication": False},
+            )
 
         assert response.status_code == 409
         assert response.json()["detail"] == "No publication destinations are enabled"
@@ -486,12 +602,40 @@ class TestPublishApproval:
             snapshot.return_value = _release_snapshot(
                 upload_post=False, podcast_rss=False
             )
-            response = client.post("/api/episodes/ep_001/approve-publish")
+            response = client.post(
+                "/api/episodes/ep_001/approve-publish",
+                json={"start_publication": False},
+            )
 
         assert response.status_code == 409
         assert not thread_class.called
         episode = json.loads((episode_dir / "episode.json").read_text())
         assert "publish_approval" not in episode
+
+    def test_refuses_structured_release_gate_blocker(self, test_client):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        release = _release_snapshot()
+        release["release_gate"].update(
+            can_approve_publish=False,
+            blockers=[{"code": "qa_stale", "message": "QA is stale"}],
+        )
+
+        with patch("server.routes.pipeline.quality_snapshot", return_value=release):
+            response = client.post(
+                "/api/episodes/ep_001/approve-publish",
+                json={"start_publication": False},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "message": "Release prerequisites are not satisfied",
+            "quality_url": "/api/episodes/ep_001/quality",
+            "blockers": release["release_gate"]["blockers"],
+        }
+        assert "publish_approval" not in json.loads(
+            (episode_dir / "episode.json").read_text()
+        )
 
     def test_refuses_enabled_upload_post_without_bound_account(self, test_client):
         client, episodes_dir = test_client
@@ -505,7 +649,10 @@ class TestPublishApproval:
             patch("server.routes.pipeline.quality_snapshot", return_value=release),
             patch("server.routes.pipeline.threading.Thread") as thread_class,
         ):
-            response = client.post("/api/episodes/ep_001/approve-publish")
+            response = client.post(
+                "/api/episodes/ep_001/approve-publish",
+                json={"start_publication": False},
+            )
 
         assert response.status_code == 409
         assert "UPLOAD_POST_USER" in str(response.json()["detail"])
@@ -526,7 +673,10 @@ class TestPublishApproval:
             patch("server.routes.pipeline.quality_snapshot", return_value=release),
             patch("server.routes.pipeline.threading.Thread") as thread_class,
         ):
-            response = client.post("/api/episodes/ep_001/approve-publish")
+            response = client.post(
+                "/api/episodes/ep_001/approve-publish",
+                json={"start_publication": False},
+            )
 
         assert response.status_code == 409
         assert response.json()["detail"] == "No publication destinations are enabled"
@@ -1186,6 +1336,54 @@ class TestRunSingleAgent:
         client, _ = test_client
         resp = client.post("/api/episodes/nonexistent/run-agent/ingest", json={})
         assert resp.status_code == 404
+
+    @pytest.mark.parametrize("payload", ({}, {"publish": None}))
+    def test_empty_publish_rejects_before_construction_or_writes(
+        self, test_client, payload
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        episode_before = (episode_dir / "episode.json").read_bytes()
+        files_before = sorted(path.name for path in episode_dir.iterdir())
+        from server.routes import pipeline
+
+        running_before = dict(pipeline._running)
+        with (
+            patch("agents.pipeline.load_config") as load_config,
+            patch("server.routes.pipeline._SingleAgentWorker") as worker,
+        ):
+            response = client.post(
+                "/api/episodes/ep_001/run-agent/publish", json=payload
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == AggregatePublicationRetired.detail()
+        load_config.assert_not_called()
+        worker.assert_not_called()
+        assert pipeline._running == running_before
+        assert (episode_dir / "episode.json").read_bytes() == episode_before
+        assert sorted(path.name for path in episode_dir.iterdir()) == files_before
+
+    def test_publish_body_on_other_agent_is_rejected_before_construction(
+        self, test_client
+    ):
+        client, episodes_dir = test_client
+        _create_episode(episodes_dir, "ep_001")
+        publish = {
+            "destinations": ["x"],
+            "request_id": "e5753781-47f9-455e-9ce5-0eead48a19cd",
+            "actor": "operator",
+            "reason": "Approved exact release",
+            "expected_release_revision": "sha256:release",
+            "preview_revision": "sha256:preview",
+        }
+        with patch("agents.pipeline.load_config") as load_config:
+            response = client.post(
+                "/api/episodes/ep_001/run-agent/qa", json={"publish": publish}
+            )
+
+        assert response.status_code == 400
+        load_config.assert_not_called()
 
     def test_publish_execution_body_reaches_publish_agent(
         self, test_client, monkeypatch

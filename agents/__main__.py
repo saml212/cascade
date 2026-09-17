@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from agents import RETIRED_AGENTS
+from agents.publish import AggregatePublicationRetired
 
 BASE_URL = "http://localhost:8420"
 
@@ -169,7 +170,7 @@ def _poll_status(client, episode_id):
         if status == "awaiting_crop_setup":
             print()
             print("Pipeline paused: awaiting crop setup.")
-            print(f"Configure speaker crop points in the web UI, then resume:")
+            print("Configure speaker crop points in the web UI, then resume:")
             print(
                 f"  curl -X POST {BASE_URL}/api/episodes/{episode_id}/resume-pipeline"
             )
@@ -232,6 +233,8 @@ def main():
     retired = sorted(set(args.agents or ()) & RETIRED_AGENTS)
     if retired:
         parser.error(f"retired agent(s): {', '.join(retired)}")
+    if "publish" in (args.agents or ()):
+        parser.error(str(AggregatePublicationRetired()))
 
     # Validate all source paths exist
     source_paths = args.source_path
@@ -304,7 +307,7 @@ def main():
     print(f"Pipeline {status}: {episode_id}")
     print(f"Agents completed: {', '.join(completed) if completed else 'none'}")
     if errors:
-        print(f"Errors:")
+        print("Errors:")
         for agent, error in errors.items():
             print(f"  {agent}: {error}")
 

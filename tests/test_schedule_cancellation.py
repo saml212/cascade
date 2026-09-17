@@ -291,16 +291,29 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
     }
     from agents.publish import (
         receipt_terminal_destinations,
+        short_rerelease_state,
         validated_schedule_cancellation,
     )
 
     assert validated_schedule_cancellation(stored)["operation_id"] == REQUEST_ID
     assert receipt_terminal_destinations(stored, profile_username="up") is not None
+    rerelease_state = short_rerelease_state(
+        {"shorts": [stored]}, "clip_01", profile_username="up"
+    )
+    assert rerelease_state["allowed"] is True
+    assert rerelease_state["cancellation_request"] == {
+        "request_id": cancelled.json()["next"]["body"]["request_id"],
+        "actor": cancelled.json()["next"]["body"]["actor"],
+        "reason": cancelled.json()["next"]["body"]["reason"],
+        "variant_id": cancelled.json()["next"]["body"]["variant_id"],
+        "target_revision": body["target"]["revision"],
+        "render_fingerprint": body["target"]["render_fingerprint"],
+    }
     reconciled = client.post("/api/episodes/ep_001/check-upload-urls")
     assert reconciled.status_code == 200
     assert reconciled.json()["shorts"][0]["status"] == "cancelled"
 
-    from agents.publish import PublishAgent, ShortDeliverySpec
+    from agents.publish import PublishAgent
 
     assert PublishAgent(episode_dir, {})._occupied_schedule("secret", "up") == []
 
@@ -325,34 +338,6 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
     )
     assert wrong_clip.status_code == 409
     assert "different clip" in wrong_clip.json()["detail"]
-
-    # A cancelled same-identity receipt is history, never a reusable submission.
-    agent = PublishAgent(episode_dir, {})
-    version = {
-        "version": "base",
-        "variant_id": None,
-        "render_fingerprint": "sha256:base-render",
-        "revision": "sha256:base-approval",
-    }
-    spec = ShortDeliverySpec.create(
-        {"id": "clip_01"},
-        version,
-        ["youtube", "tiktok"],
-        stored["external_id"],
-        {
-            "youtube": {"title": "Title", "description": "Description"},
-            "tiktok": {"title": "Title"},
-        },
-    )
-    with pytest.raises(RuntimeError, match="explicit re-release"):
-        agent._publish_short_deliveries(
-            [spec],
-            {},
-            [stored],
-            {},
-            "secret",
-            "up",
-        )
 
     monkeypatch.setattr(clips, "_distribution_state", lambda *_args: _state(_args[1]))
     rerelease = client.post(
@@ -379,7 +364,7 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
         ],
     }
     merged = PublishAgent._merge_short_receipts([replacement], publish["shorts"])
-    from agents.publish import short_rerelease_state, validated_short_receipts
+    from agents.publish import validated_short_receipts
 
     validated_short_receipts({"shorts": merged})
     assert (

@@ -414,13 +414,6 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
         "_schedule_reference",
         lambda *_args, **_kwargs: datetime(2026, 9, 15, tzinfo=ZoneInfo("UTC")),
     )
-    monkeypatch.setattr(
-        agent,
-        "_generate_schedule",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("immediate publication must not generate a schedule")
-        ),
-    )
     commands = []
     monkeypatch.setattr(
         agent,
@@ -467,7 +460,6 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
     }
     result = agent._publish_short_deliveries(
         [spec],
-        [],
         [target, prior_background],
         {},
         "test-key",
@@ -481,7 +473,6 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
 
     retried = agent._publish_short_deliveries(
         [spec],
-        [],
         [prior_background, *result],
         {},
         "test-key",

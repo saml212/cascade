@@ -17,6 +17,7 @@ from agents.pipeline import (
     _slugify,
     run_pipeline,
 )
+from agents.publish import AggregatePublicationRetired
 
 
 class TestDagDependencies:
@@ -122,15 +123,28 @@ class TestNonCriticalAgents:
 
 
 class TestExplicitPublicationAgents:
-    def test_default_pipeline_omits_external_publication(self, tmp_path, monkeypatch):
+    def test_agents_none_runs_local_pipeline_without_publication(
+        self, tmp_path, monkeypatch
+    ):
         episodes_dir = tmp_path / "episodes"
         monkeypatch.setenv("CASCADE_OUTPUT_DIR", str(episodes_dir))
+        ran = []
+
+        class LocalAgent:
+            def __init__(self, *_args):
+                pass
+
+            def run(self):
+                ran.append("ingest")
+                return {}
 
         with (
             patch(
                 "agents.pipeline.PIPELINE_ORDER",
-                ["video_feed", "publish"],
+                ["ingest", "video_feed", "publish"],
             ),
+            patch("agents.pipeline.AGENT_REGISTRY", {"ingest": LocalAgent}),
+            patch("agents.pipeline.AGENT_DEPS", {"ingest": set()}),
             patch(
                 "agents.pipeline.load_config",
                 return_value={"paths": {"output_dir": str(episodes_dir)}},
@@ -138,7 +152,8 @@ class TestExplicitPublicationAgents:
         ):
             result = run_pipeline("/tmp/source", episode_id="ep_test")
 
-        assert result["pipeline"]["agents_requested"] == []
+        assert ran == ["ingest"]
+        assert result["pipeline"]["agents_requested"] == ["ingest"]
         assert EXPLICIT_PUBLICATION_AGENTS == {
             "video_feed",
             "publish",
@@ -258,6 +273,22 @@ def test_retired_agent_is_rejected_before_episode_mutation(tmp_path, retired_age
     load_config.assert_not_called()
     assert episode_file.read_bytes() == original
     assert sorted(path.name for path in episode_dir.iterdir()) == ["episode.json"]
+
+
+def test_generic_publish_is_rejected_before_episode_creation_or_mutation(tmp_path):
+    episodes_dir = tmp_path / "episodes"
+    episode_dir = episodes_dir / "ep_test"
+
+    with (
+        patch("agents.pipeline.load_config") as load_config,
+        patch("agents.pipeline._save_episode") as save_episode,
+        pytest.raises(AggregatePublicationRetired),
+    ):
+        run_pipeline("/tmp/source", episode_id="ep_test", agents=["publish"])
+
+    load_config.assert_not_called()
+    save_episode.assert_not_called()
+    assert not episode_dir.exists()
 
 
 class TestPipelinePauseAtCropSetup:

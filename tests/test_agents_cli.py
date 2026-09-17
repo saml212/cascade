@@ -34,6 +34,31 @@ def test_retired_agent_fails_before_episode_creation(tmp_path, capsys, retired_a
     check_server.assert_not_called()
 
 
+def test_generic_publish_fails_before_server_or_episode_creation(tmp_path, capsys):
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "agents",
+                "--source-path",
+                str(tmp_path),
+                "--agents",
+                "publish",
+            ],
+        ),
+        patch("agents.__main__._create_episode") as create_episode,
+        patch("agents.__main__._check_server") as check_server,
+        pytest.raises(SystemExit) as error,
+    ):
+        main()
+
+    assert error.value.code == 2
+    assert "Aggregate publication is retired" in capsys.readouterr().err
+    create_episode.assert_not_called()
+    check_server.assert_not_called()
+
+
 def test_start_pipeline_only_accepts_exact_already_running_conflict(capsys):
     response = MagicMock(status_code=409)
     response.json.return_value = {"detail": "Pipeline already running for this episode"}

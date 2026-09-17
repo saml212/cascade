@@ -837,6 +837,15 @@ class TestDistributionSelection:
         remote_submission_finished = threading.Event()
         allow_receipt_write = threading.Event()
         agent = publish_mod.PublishAgent(episode_dir, {})
+        agent.short_destination_request = {
+            "destinations": ["x"],
+            "request_id": "47db1913-4d32-4acf-bcfe-31763c50e9c2",
+            "actor": "release-operator",
+            "reason": "Exercise the explicit publication lock",
+            "expected_release_revision": "sha256:old-release",
+            "preview_revision": "sha256:explicit-preview",
+            "publish_now": True,
+        }
 
         def execute():
             remote_submission_finished.set()
