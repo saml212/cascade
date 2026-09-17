@@ -296,11 +296,7 @@ function renderSurface(initialEpisode: UnknownRecord, context: SurfaceContext): 
       'w-full h-11 bg-surface-2 border border-border rounded-md px-4 text-body text-ink-primary placeholder:text-ink-disabled focus:border-accent focus:outline-none',
     oninput: (event: Event) => backupPhrase.set((event.target as HTMLInputElement).value),
   });
-  effect(() => {
-    const episode = episodeDetail();
-    if (!episode) return;
-    backupBody.replaceChildren(renderBackup(episode, context.episodeId, backupBusy, backupPhrase, backupError, confirmationInput));
-  });
+  backupBody.replaceChildren(createBackupPanel(context.episodeId, backupBusy, backupPhrase, backupError, confirmationInput));
 
   return {
     root: h(
@@ -927,19 +923,86 @@ function renderScheduleEvidence(
   );
 }
 
-function renderBackup(
-  episode: UnknownRecord,
+function createBackupPanel(
   episodeId: string,
   approving: Signal<boolean>,
   phrase: Signal<string>,
   backupError: Signal<string | null>,
   confirmationInput: HTMLInputElement,
 ): HTMLElement {
-  const status = describeStatus(episode.status as string);
-  const canBackup = status.key === 'awaiting_backup';
-  const busy = approving();
-  const confirmed = backupConfirmationMatches(phrase());
-  const error = backupError();
+  const statusHost = h('div', { class: 'flex items-center gap-3' });
+  const durationHost = h('div');
+  const errorHost = h('div');
+  const actionHost = h('div');
+  const notReady = h('div', { class: 'panel p-5' });
+  const confirmation = h(
+    'div',
+    { class: 'panel p-5 flex flex-col gap-3 border-status-warning/30' },
+    h('div', { class: 'text-body text-status-warning font-medium' }, 'Confirm to run'),
+    h(
+      'p',
+      { class: 'text-body-sm text-ink-secondary' },
+      'Type ',
+      h(
+        'code',
+        {
+          class: 'bg-surface-inset px-1.5 py-0.5 rounded text-code-sm text-ink-primary',
+        },
+        'back it up',
+      ),
+      ' to enable the run button.',
+    ),
+    confirmationInput,
+    errorHost,
+    actionHost,
+  );
+
+  effect(() => {
+    const episode = episodeDetail();
+    if (!episode) return;
+    const status = describeStatus(episode.status as string);
+    const canBackup = status.key === 'awaiting_backup';
+    statusHost.replaceChildren(h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Paths'), StatusPill({ descriptor: status, size: 'sm' }));
+    durationHost.replaceChildren(pathRow('Duration', formatDuration(episode.duration_seconds as number)));
+    confirmation.hidden = !canBackup;
+    notReady.hidden = canBackup;
+    notReady.replaceChildren(
+      h('div', { class: 'text-body text-ink-primary font-medium mb-1' }, 'Not ready yet'),
+      h('p', { class: 'text-body-sm text-ink-secondary' }, `Current status: ${status.label}. ${status.hint}`),
+    );
+  });
+
+  effect(() => {
+    const busy = approving();
+    const error = backupError();
+    errorHost.replaceChildren(...(error ? [h('p', { class: 'text-body-sm text-status-danger', role: 'alert' }, `Could not start backup: ${error}`)] : []));
+    actionHost.replaceChildren(
+      Button({
+        variant: 'primary',
+        size: 'lg',
+        label: busy ? 'Backing up…' : 'Back it up',
+        loading: busy,
+        disabled: !backupConfirmationMatches(phrase()) || busy,
+        onClick: async () => {
+          approving.set(true);
+          backupError.set(null);
+          try {
+            await api.approveBackup(episodeId);
+            phrase.set('');
+            confirmationInput.value = '';
+            showToast('Backup started — pipeline is copying to Seagate.', 'success');
+            navigate(episodeSectionPath(episodeId, 'review'));
+          } catch (caught) {
+            const message = (caught as Error).message;
+            backupError.set(message);
+            showToast(message, 'error');
+          } finally {
+            approving.set(false);
+          }
+        },
+      }),
+    );
+  });
 
   return h(
     'div',
@@ -972,67 +1035,13 @@ function renderBackup(
       h(
         'div',
         { class: 'panel p-5 flex flex-col gap-3' },
-        h(
-          'div',
-          { class: 'flex items-center gap-3' },
-          h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Paths'),
-          StatusPill({ descriptor: status, size: 'sm' }),
-        ),
+        statusHost,
         pathRow('Source', `/Volumes/1TB_SSD/cascade/episodes/${episodeId}/`),
         pathRow('Target', BACKUP_TARGET_PATH),
-        pathRow('Duration', formatDuration(episode.duration_seconds as number)),
+        durationHost,
       ),
-      canBackup
-        ? h(
-            'div',
-            {
-              class: 'panel p-5 flex flex-col gap-3 border-status-warning/30',
-            },
-            h('div', { class: 'text-body text-status-warning font-medium' }, 'Confirm to run'),
-            h(
-              'p',
-              { class: 'text-body-sm text-ink-secondary' },
-              'Type ',
-              h(
-                'code',
-                {
-                  class: 'bg-surface-inset px-1.5 py-0.5 rounded text-code-sm text-ink-primary',
-                },
-                'back it up',
-              ),
-              ' to enable the run button.',
-            ),
-            confirmationInput,
-            error ? h('p', { class: 'text-body-sm text-status-danger', role: 'alert' }, `Could not start backup: ${error}`) : null,
-            Button({
-              variant: 'primary',
-              size: 'lg',
-              label: busy ? 'Backing up…' : 'Back it up',
-              loading: busy,
-              disabled: !confirmed || busy,
-              onClick: async () => {
-                approving.set(true);
-                backupError.set(null);
-                try {
-                  await api.approveBackup(episodeId);
-                  showToast('Backup started — pipeline is copying to Seagate.', 'success');
-                  navigate(episodeSectionPath(episodeId, 'review'));
-                } catch (caught) {
-                  const message = (caught as Error).message;
-                  backupError.set(message);
-                  showToast(message, 'error');
-                } finally {
-                  approving.set(false);
-                }
-              },
-            }),
-          )
-        : h(
-            'div',
-            { class: 'panel p-5' },
-            h('div', { class: 'text-body text-ink-primary font-medium mb-1' }, 'Not ready yet'),
-            h('p', { class: 'text-body-sm text-ink-secondary' }, `Current status: ${status.label}. ${status.hint}`),
-          ),
+      confirmation,
+      notReady,
     ),
   );
 }
