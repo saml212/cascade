@@ -40,13 +40,18 @@ from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
     BACKGROUND_VARIANT_IDS,
+    DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    DESTINATION_DISTRIBUTION_TARGETS,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
+    GAMEPLAY_SURROUND_VARIANT_ID,
     SPEAKER_PANEL_VARIANT_IDS,
     background_variant_output,
     background_variant_state,
     default_background_asset_id,
+    destination_distribution_release_revision,
     distribution_release_revision,
+    normalize_destination_distribution_targets,
     require_background_variant,
     save_background_variant_approval,
     selected_short_variant_id,
@@ -208,6 +213,26 @@ class ReReleaseRequest(DistributionSelectionRequest):
     request_id: UUID
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=3, max_length=500)
+    acknowledge_unresolved_history_revision: str | None = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+
+
+class DestinationReReleaseTargetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variant_id: str
+    expected_revision: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    destinations: list[str] = Field(min_length=1)
+
+
+class DestinationReReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=3, max_length=500)
+    targets: list[DestinationReReleaseTargetRequest] = Field(min_length=2, max_length=2)
     acknowledge_unresolved_history_revision: str | None = Field(
         default=None, pattern=r"^sha256:[0-9a-f]{64}$"
     )
@@ -515,6 +540,53 @@ _RELEASE_REQUEST_STRING_FIELDS = (
 
 
 def _valid_release_request(value: object) -> bool:
+    if isinstance(value, dict) and value.get("schema") == (
+        DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
+    ):
+        expected_fields = {
+            "schema",
+            "request_id",
+            "actor",
+            "reason",
+            "targets",
+            "receipt_history_revision",
+            "revision",
+            "created_at",
+        }
+        if "unresolved_history_acknowledgement" in value:
+            expected_fields.add("unresolved_history_acknowledgement")
+        if not (
+            set(value) == expected_fields
+            and all(
+                isinstance(value.get(field), str) and bool(value[field])
+                for field in _RELEASE_REQUEST_STRING_FIELDS
+                if field not in {"target_revision", "render_fingerprint"}
+            )
+            and normalize_destination_distribution_targets(value.get("targets"))
+            is not None
+        ):
+            return False
+        acknowledgement = value.get("unresolved_history_acknowledgement")
+        if acknowledgement is None:
+            return True
+        return bool(
+            isinstance(acknowledgement, dict)
+            and set(acknowledgement)
+            == {
+                "receipt_history_revision",
+                "obligations",
+            }
+            and acknowledgement.get("receipt_history_revision")
+            == value["receipt_history_revision"]
+            and isinstance(acknowledgement.get("obligations"), list)
+            and acknowledgement["obligations"]
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("receipt_revision"), str)
+                and item.get("artifact_identity") in {"known", "unknown"}
+                for item in acknowledgement["obligations"]
+            )
+        )
     if not (
         isinstance(value, dict)
         and all(
@@ -1057,8 +1129,39 @@ def _rerelease_target(
     return candidate, state
 
 
+def _rerelease_target_fields(
+    ep_dir: Path,
+    clip: dict,
+    req: ReReleaseRequest | DestinationReReleaseRequest,
+) -> tuple[dict, dict, dict, bool]:
+    if isinstance(req, DestinationReReleaseRequest):
+        candidate, state, targets = _destination_rerelease_targets(ep_dir, clip, req)
+        return (
+            candidate,
+            state,
+            {
+                "schema": DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+                "targets": targets,
+            },
+            True,
+        )
+    candidate, state = _rerelease_target(ep_dir, clip, req)
+    return (
+        candidate,
+        state,
+        {
+            "variant_id": req.variant_id,
+            "target_revision": state["revision"],
+            "render_fingerprint": state["render_fingerprint"],
+        },
+        False,
+    )
+
+
 def _prepare_clip_rerelease_locked(
-    episode_id: str, clip_id: str, req: ReReleaseRequest
+    episode_id: str,
+    clip_id: str,
+    req: ReReleaseRequest | DestinationReReleaseRequest,
 ) -> dict:
     from agents.publish import (
         publication_lock,
@@ -1087,7 +1190,9 @@ def _prepare_clip_rerelease_locked(
                 detail="Publication receipt history cannot be verified.",
             ) from exc
 
-        candidate, state = _rerelease_target(clips_file.parent, clip, req)
+        candidate, state, target_fields, destination_release = _rerelease_target_fields(
+            clips_file.parent, clip, req
+        )
 
         request_id = str(req.request_id)
         actor = req.actor.strip()
@@ -1116,14 +1221,21 @@ def _prepare_clip_rerelease_locked(
                 "request_id": request_id,
                 "actor": actor,
                 "reason": reason,
-                "variant_id": req.variant_id,
-                "target_revision": state["revision"],
-                "render_fingerprint": state["render_fingerprint"],
+                **target_fields,
                 "receipt_history_revision": parent_revision,
             }
-            expected = distribution_release_revision(
-                **expected_inputs,
-                unresolved_history_acknowledgement=acknowledgement,
+            revision_fields = {
+                **{
+                    field: value
+                    for field, value in expected_inputs.items()
+                    if field != "schema"
+                },
+                "unresolved_history_acknowledgement": acknowledgement,
+            }
+            expected = (
+                destination_distribution_release_revision(**revision_fields)
+                if destination_release
+                else distribution_release_revision(**revision_fields)
             )
             if (
                 req.acknowledge_unresolved_history_revision != acknowledged_revision
@@ -1170,15 +1282,18 @@ def _prepare_clip_rerelease_locked(
         if eligibility["allowed"] is not True:
             if req.acknowledge_unresolved_history_revision is None:
                 raise HTTPException(status_code=409, detail=eligibility["reason"])
-            if (
-                eligibility.get("unresolved_history_acknowledgement_allowed")
-                is not True
-                or req.variant_id not in BACKGROUND_VARIANT_IDS
+            if eligibility.get(
+                "unresolved_history_acknowledgement_allowed"
+            ) is not True or (
+                not destination_release and req.variant_id not in BACKGROUND_VARIANT_IDS
             ):
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Only pre-schema unresolved history can be acknowledged "
+                        "Only the exact current pre-schema unresolved history can be "
+                        "acknowledged for this approved destination release."
+                        if destination_release
+                        else "Only pre-schema unresolved history can be acknowledged "
                         "for a current approved short-variant replacement."
                     ),
                 )
@@ -1188,7 +1303,12 @@ def _prepare_clip_rerelease_locked(
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="Unresolved receipt history changed; refresh before re-release.",
+                    detail=(
+                        "Only the exact current pre-schema unresolved history can be "
+                        "acknowledged for this approved destination release."
+                        if destination_release
+                        else "Unresolved receipt history changed; refresh before re-release."
+                    ),
                 )
             acknowledgement = {
                 "receipt_history_revision": eligibility["history_revision"],
@@ -1200,36 +1320,43 @@ def _prepare_clip_rerelease_locked(
                 detail="There is no unresolved legacy history to acknowledge.",
             )
         cancellation_request = eligibility.get("cancellation_request")
-        if cancellation_request is not None and cancellation_request != {
+        expected_cancellation = {
             "request_id": request_id,
             "actor": actor,
             "reason": reason,
-            "variant_id": req.variant_id,
-            "target_revision": state["revision"],
-            "render_fingerprint": state["render_fingerprint"],
-        }:
+            **target_fields,
+        }
+        if cancellation_request is not None and (
+            destination_release or cancellation_request != expected_cancellation
+        ):
             raise HTTPException(
                 status_code=409,
-                detail="Use the exact request and target bound to the cancellation.",
+                detail=(
+                    "A cancelled schedule binds an exact single-target request; "
+                    "reconcile that request before preparing a destination pair."
+                    if destination_release
+                    else "Use the exact request and target bound to the cancellation."
+                ),
             )
         authorization = {
             "request_id": request_id,
             "actor": actor,
             "reason": reason,
-            "variant_id": req.variant_id,
-            "target_revision": state["revision"],
-            "render_fingerprint": state["render_fingerprint"],
+            **target_fields,
             "receipt_history_revision": eligibility["history_revision"],
         }
-        authorization["revision"] = distribution_release_revision(
-            request_id=request_id,
-            actor=actor,
-            reason=reason,
-            variant_id=req.variant_id,
-            target_revision=state["revision"],
-            render_fingerprint=state["render_fingerprint"],
-            receipt_history_revision=eligibility["history_revision"],
-            unresolved_history_acknowledgement=acknowledgement,
+        revision_fields = {
+            **{
+                field: value
+                for field, value in authorization.items()
+                if field != "schema"
+            },
+            "unresolved_history_acknowledgement": acknowledgement,
+        }
+        authorization["revision"] = (
+            destination_distribution_release_revision(**revision_fields)
+            if destination_release
+            else distribution_release_revision(**revision_fields)
         )
         if acknowledgement is not None:
             authorization["unresolved_history_acknowledgement"] = acknowledgement
@@ -1253,6 +1380,69 @@ async def prepare_clip_rerelease(
     episode_id: str, clip_id: str, req: ReReleaseRequest
 ) -> dict:
     """Prepare a new receipt-bound release without rewriting prior receipts."""
+    return await asyncio.to_thread(
+        _prepare_clip_rerelease_locked, episode_id, clip_id, req
+    )
+
+
+def _destination_rerelease_targets(
+    ep_dir: Path, clip: dict, req: DestinationReReleaseRequest
+) -> tuple[dict, dict, list[dict]]:
+    supplied = {
+        target.variant_id: target
+        for target in req.targets
+        if target.variant_id in DESTINATION_DISTRIBUTION_TARGETS
+    }
+    if len(supplied) != len(req.targets) or set(supplied) != set(
+        DESTINATION_DISTRIBUTION_TARGETS
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Targets must be the exact gameplay/non-X and clean/X variant pair."
+            ),
+        )
+    states = {}
+    candidates = {}
+    targets = []
+    for variant_id, destinations in DESTINATION_DISTRIBUTION_TARGETS.items():
+        requested = supplied[variant_id]
+        if requested.destinations != list(destinations):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{variant_id} must bind destinations: {', '.join(destinations)}",
+            )
+        candidate, state = _rerelease_target(
+            ep_dir,
+            clip,
+            DistributionSelectionRequest(
+                variant_id=variant_id,
+                expected_revision=requested.expected_revision,
+            ),
+        )
+        candidates[variant_id] = candidate
+        states[variant_id] = state
+        targets.append(
+            {
+                "variant_id": variant_id,
+                "target_revision": state["revision"],
+                "render_fingerprint": state["render_fingerprint"],
+                "destinations": list(destinations),
+            }
+        )
+    targets.sort(key=lambda target: target["variant_id"])
+    return (
+        candidates[GAMEPLAY_SURROUND_VARIANT_ID],
+        states[GAMEPLAY_SURROUND_VARIANT_ID],
+        targets,
+    )
+
+
+@router.post("/{clip_id}/re-release-targets")
+async def prepare_clip_destination_rerelease(
+    episode_id: str, clip_id: str, req: DestinationReReleaseRequest
+) -> dict:
+    """Bind the exact gameplay/non-X and clean/X release pair."""
     return await asyncio.to_thread(
         _prepare_clip_rerelease_locked, episode_id, clip_id, req
     )

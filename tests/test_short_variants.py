@@ -47,6 +47,7 @@ from lib.short_variants import (
     file_content_identity,
     load_background_asset,
     load_background_variant_asset,
+    normalize_destination_distribution_targets,
     record_background_variant,
     require_background_variant_asset,
     resolve_gameplay_variant_playback,
@@ -57,6 +58,30 @@ from lib.short_variants import (
     variant_record,
 )
 from lib.timeline import Timeline
+
+
+def test_destination_release_targets_require_exact_unique_variant_pair():
+    gameplay = {
+        "variant_id": GAMEPLAY_SURROUND_VARIANT_ID,
+        "target_revision": "sha256:" + "1" * 64,
+        "render_fingerprint": "sha256:" + "2" * 64,
+        "destinations": ["facebook", "instagram", "tiktok", "youtube"],
+    }
+    clean = {
+        "variant_id": SPEAKER_PANELS_VARIANT_ID,
+        "target_revision": "sha256:" + "3" * 64,
+        "render_fingerprint": "sha256:" + "4" * 64,
+        "destinations": ["x"],
+    }
+
+    assert normalize_destination_distribution_targets([gameplay, clean]) == [
+        gameplay,
+        clean,
+    ]
+    assert normalize_destination_distribution_targets([gameplay, gameplay]) is None
+    for unhashable in ([], {}):
+        malformed = {**clean, "variant_id": unhashable}
+        assert normalize_destination_distribution_targets([gameplay, malformed]) is None
 
 
 def _asset(tmp_path, monkeypatch):

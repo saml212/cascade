@@ -47,10 +47,13 @@ from lib.short_distribution import (
 )
 from lib.short_variants import (
     BACKGROUND_VARIANT_IDS,
+    DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
     background_variant_output,
+    destination_distribution_release_revision,
     distribution_release_revision,
+    normalize_destination_distribution_targets,
     require_background_variant,
 )
 
@@ -635,12 +638,26 @@ def _schedule_content_identity(
     return _document_revision(identity)
 
 
+def _schedule_placement_identity(episode_id: object, clip_id: object) -> str | None:
+    """Identify one episode/clip placement, independent of its media variant."""
+    if not (
+        isinstance(episode_id, str)
+        and episode_id
+        and isinstance(clip_id, str)
+        and clip_id
+    ):
+        return None
+    return _document_revision({"episode_id": episode_id, "clip_id": clip_id})
+
+
 def _schedule_capacity_count(records: list[dict]) -> int:
-    """Count disjoint destination jobs for one exact artifact as one slot."""
+    """Count disjoint waves for one episode/clip/time as one placement."""
     count = 0
     groups = {}
     for item in records:
-        identity = item.get("_schedule_content_identity")
+        identity = item.get("_schedule_placement_identity") or item.get(
+            "_schedule_content_identity"
+        )
         platforms = item.get("_schedule_platforms")
         if not (
             isinstance(identity, str)
@@ -1263,32 +1280,141 @@ def short_rerelease_state(
     }
 
 
-def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> bool:
+def _destination_release_target(
+    authorization: dict, version: dict, destinations: object
+) -> list[dict] | None:
+    expected_fields = {
+        "schema",
+        "request_id",
+        "actor",
+        "reason",
+        "targets",
+        "receipt_history_revision",
+        "revision",
+        "created_at",
+    }
+    if "unresolved_history_acknowledgement" in authorization:
+        expected_fields.add("unresolved_history_acknowledgement")
+    targets = normalize_destination_distribution_targets(authorization.get("targets"))
+    if (
+        set(authorization) != expected_fields
+        or targets is None
+        or not isinstance(destinations, list)
+        or not destinations
+        or destinations != sorted(set(destinations))
+    ):
+        return None
+    target = next(
+        (item for item in targets if item["variant_id"] == version.get("variant_id")),
+        None,
+    )
+    if target is None or (
+        target["destinations"],
+        target["target_revision"],
+        target["render_fingerprint"],
+    ) != (
+        destinations,
+        version.get("revision"),
+        version.get("render_fingerprint"),
+    ):
+        return None
+    return targets
+
+
+def _destination_release_receipts_valid(
+    publish: dict,
+    clip_id: str,
+    authorization: dict,
+    targets: list[dict],
+    acknowledgement: object,
+) -> bool:
+    seen_targets = set()
+    for receipt in validated_short_receipts(publish):
+        if (
+            receipt["clip_id"] != clip_id
+            or receipt.get("rerelease_request_id") != authorization["request_id"]
+        ):
+            continue
+        target = next(
+            (
+                item
+                for item in targets
+                if item["variant_id"] == receipt.get("variant_id")
+            ),
+            None,
+        )
+        if (
+            target is None
+            or target["variant_id"] in seen_targets
+            or (
+                receipt.get("platforms"),
+                receipt.get("approval_revision"),
+                receipt.get("render_fingerprint"),
+                receipt.get("rerelease_authorization_revision"),
+                receipt.get("parent_receipt_history_revision"),
+                receipt.get("unresolved_history_acknowledgement"),
+                receipt.get("rerelease_actor"),
+                receipt.get("rerelease_reason"),
+            )
+            != (
+                target["destinations"],
+                target["target_revision"],
+                target["render_fingerprint"],
+                authorization["revision"],
+                authorization["receipt_history_revision"],
+                acknowledgement,
+                authorization["actor"],
+                authorization["reason"],
+            )
+        ):
+            return False
+        seen_targets.add(target["variant_id"])
+    return True
+
+
+def valid_rerelease_authorization(
+    publish: dict,
+    clip: dict,
+    version: dict,
+    *,
+    destinations: list[str] | None = None,
+) -> bool:
     authorization = clip.get(DISTRIBUTION_RELEASE_FIELD)
-    if not isinstance(authorization, dict):
-        return False
     required = (
         "request_id",
         "actor",
         "reason",
-        "target_revision",
-        "render_fingerprint",
         "receipt_history_revision",
         "revision",
         "created_at",
     )
-    if any(
+    if not isinstance(authorization, dict) or any(
         not isinstance(authorization.get(field), str) or not authorization[field]
         for field in required
     ):
         return False
-    if (
-        "variant_id" not in authorization
-        or authorization.get("variant_id") != version.get("variant_id")
-        or authorization["target_revision"] != version.get("revision")
-        or authorization["render_fingerprint"] != version.get("render_fingerprint")
-    ):
-        return False
+    destination_release = authorization.get("schema") == (
+        DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
+    )
+    targets = None
+    if destination_release:
+        targets = _destination_release_target(authorization, version, destinations)
+        if targets is None:
+            return False
+    else:
+        target_revision = authorization.get("target_revision")
+        render_fingerprint = authorization.get("render_fingerprint")
+        if (
+            not isinstance(target_revision, str)
+            or not target_revision
+            or not isinstance(render_fingerprint, str)
+            or not render_fingerprint
+            or "variant_id" not in authorization
+            or authorization.get("variant_id") != version.get("variant_id")
+            or target_revision != version.get("revision")
+            or render_fingerprint != version.get("render_fingerprint")
+        ):
+            return False
     try:
         history_revision = short_receipt_history_revision(
             publish,
@@ -1297,19 +1423,35 @@ def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> b
         )
     except ValueError:
         return False
-    expected = distribution_release_revision(
-        request_id=authorization["request_id"],
-        actor=authorization["actor"],
-        reason=authorization["reason"],
-        variant_id=authorization.get("variant_id"),
-        target_revision=authorization["target_revision"],
-        render_fingerprint=authorization["render_fingerprint"],
-        receipt_history_revision=history_revision,
-        unresolved_history_acknowledgement=authorization.get(
-            "unresolved_history_acknowledgement"
-        ),
-    )
     acknowledgement = authorization.get("unresolved_history_acknowledgement")
+    if destination_release and not _destination_release_receipts_valid(
+        publish,
+        str(clip.get("id", "")),
+        authorization,
+        targets,
+        acknowledgement,
+    ):
+        return False
+    revision_inputs = {
+        "request_id": authorization["request_id"],
+        "actor": authorization["actor"],
+        "reason": authorization["reason"],
+        "receipt_history_revision": history_revision,
+        "unresolved_history_acknowledgement": acknowledgement,
+    }
+    expected = (
+        destination_distribution_release_revision(
+            **revision_inputs,
+            targets=authorization["targets"],
+        )
+        if destination_release
+        else distribution_release_revision(
+            **revision_inputs,
+            variant_id=authorization.get("variant_id"),
+            target_revision=authorization["target_revision"],
+            render_fingerprint=authorization["render_fingerprint"],
+        )
+    )
     obligations, acknowledgement_allowed = unresolved_receipt_obligations(
         publish,
         str(clip.get("id", "")),
@@ -1331,6 +1473,20 @@ def valid_rerelease_authorization(publish: dict, clip: dict, version: dict) -> b
         and authorization["revision"] == expected
         and acknowledgement_valid
     )
+
+
+def _authorized_rerelease_version(
+    publish: dict, clip: dict, version: dict, destinations: list[str]
+) -> tuple[dict, bool]:
+    authorized = valid_rerelease_authorization(
+        publish, clip, version, destinations=destinations
+    )
+    if not authorized:
+        return version, False
+    return {
+        **version,
+        "re_release_request": clip[DISTRIBUTION_RELEASE_FIELD],
+    }, True
 
 
 def valid_rerelease_copy_continuation(
@@ -1847,6 +2003,31 @@ class PublishAgent(BaseAgent):
             versions[clip_id] = version
         return versions
 
+    def _destination_execution_versions(self, data, plan):
+        versions = self._destination_versions(data, plan["variant_overrides"])
+        clips = {str(clip.get("id", "")): clip for clip in data["approved"]}
+        publish = {"shorts": data["previous_shorts"]}
+        for target in plan["targets"]:
+            clip_id = target["clip_id"]
+            version, authorized = _authorized_rerelease_version(
+                publish,
+                clips[clip_id],
+                versions[clip_id],
+                target["platforms"],
+            )
+            if (
+                target.get("rerelease_request_id") is not None and not authorized
+            ) or not (
+                self._receipt_matches_artifact(target, version)
+                and self._receipt_matches_version(target, version)
+            ):
+                raise RuntimeError(
+                    f"The reviewed destination plan for {clip_id} no longer matches "
+                    "its exact version and re-release lineage"
+                )
+            versions[clip_id] = version
+        return versions
+
     def _enforce_required_short_variants(
         self, clip_ids, short_versions, destinations
     ) -> None:
@@ -2007,6 +2188,13 @@ class PublishAgent(BaseAgent):
         co_schedule_ids = set()
         for clip_id in selected_ids:
             clip, version = by_id[clip_id], effective_versions[clip_id]
+            version, release_authorized = _authorized_rerelease_version(
+                {"shorts": prior},
+                clip,
+                version,
+                destinations,
+            )
+            effective_versions[clip_id] = version
             target = _short_target_fields(clip_id, version)
             target_revision = _document_revision(target)
             identity = _destination_external_id(
@@ -2076,7 +2264,7 @@ class PublishAgent(BaseAgent):
                 if item.get("status") != "cancelled"
                 for platform in item.get("platforms", [])
             } & set(destinations)
-            if historical_overlap and clip_id in overrides:
+            if historical_overlap and clip_id in overrides and not release_authorized:
                 raise RuntimeError(
                     f"{clip_id} already has historical receipts for: "
                     + ", ".join(sorted(historical_overlap))
@@ -2085,7 +2273,7 @@ class PublishAgent(BaseAgent):
                 historical
                 and clip_id not in overrides
                 and not (
-                    valid_rerelease_authorization({"shorts": prior}, clip, version)
+                    release_authorized
                     or valid_rerelease_copy_continuation(
                         {"shorts": prior}, clip, version, current_waves
                     )
@@ -2202,6 +2390,8 @@ class PublishAgent(BaseAgent):
                     tz_name,
                     weekday,
                     weekend,
+                    episode_id=self.episode_dir.name,
+                    platforms=target["platforms"],
                 )
         preview_revision = _document_revision(
             {
@@ -2330,9 +2520,7 @@ class PublishAgent(BaseAgent):
                 )
             if destination_request is not None:
                 plan = self._destination_plan(data, destination_request)
-                destination_versions = self._destination_versions(
-                    data, plan["variant_overrides"]
-                )
+                destination_versions = self._destination_execution_versions(data, plan)
                 previous_shorts = self._persist_destination_intents(
                     previous, plan["targets"]
                 )
@@ -2930,6 +3118,12 @@ class PublishAgent(BaseAgent):
                         tz_name,
                         weekday_limit,
                         weekend_limit,
+                        episode_id=self.episode_dir.name,
+                        platforms=(
+                            destination_target["platforms"]
+                            if destination_target
+                            else platforms
+                        ),
                     )
                 plans.append(
                     (clip, version, identity, scheduled_at, destination_target)
@@ -3509,6 +3703,12 @@ class PublishAgent(BaseAgent):
                         item, matching_remote.get("provider_record"), user
                     ):
                         matching_remote["_schedule_content_identity"] = content_identity
+                        matching_remote["_schedule_placement_identity"] = (
+                            _schedule_placement_identity(
+                                item.get("destination_episode_id"),
+                                item.get("clip_id"),
+                            )
+                        )
                         matching_remote["_schedule_platforms"] = tuple(
                             sorted(item["platforms"])
                         )
@@ -3610,31 +3810,71 @@ class PublishAgent(BaseAgent):
         tz_name,
         weekday_limit,
         weekend_limit,
+        *,
+        episode_id,
+        platforms,
     ):
         zone = ZoneInfo(tz_name)
         local = scheduled_at.astimezone(zone)
+        placement_identity = _schedule_placement_identity(episode_id, clip_id)
+        if (
+            placement_identity is None
+            or not isinstance(platforms, (list, tuple))
+            or not platforms
+            or any(
+                not isinstance(platform, str) or not platform for platform in platforms
+            )
+            or len(platforms) != len(set(platforms))
+        ):
+            raise TypeError("Schedule placement identity and platforms are required")
+        platform_set = set(platforms)
         same_day = [
             item
             for item in reservations
             if item["scheduled_at"].astimezone(zone).date() == local.date()
         ]
         limit = weekend_limit if local.weekday() >= 4 else weekday_limit
-        exact = any(
-            _instant(item["scheduled_at"]) == _instant(scheduled_at)
+        exact = [
+            item
             for item in same_day
-        )
-        if exact or _schedule_capacity_count(same_day) >= limit:
+            if _instant(item["scheduled_at"]) == _instant(scheduled_at)
+        ]
+        used_platforms = set()
+        exact_conflict = False
+        for item in exact:
+            item_platforms = item.get("_schedule_platforms")
+            if not (
+                item.get("_schedule_placement_identity") == placement_identity
+                and isinstance(item_platforms, (list, tuple))
+                and item_platforms
+                and all(
+                    isinstance(platform, str) and platform
+                    for platform in item_platforms
+                )
+                and len(item_platforms) == len(set(item_platforms))
+            ):
+                exact_conflict = True
+                break
+            item_platform_set = set(item_platforms)
+            if used_platforms & item_platform_set:
+                exact_conflict = True
+                break
+            used_platforms.update(item_platform_set)
+        if used_platforms & platform_set:
+            exact_conflict = True
+        candidate = {
+            "scheduled_at": scheduled_at,
+            "external_id": identity,
+            "source": "current-release",
+            "_schedule_placement_identity": placement_identity,
+            "_schedule_platforms": tuple(sorted(platform_set)),
+        }
+        if exact_conflict or _schedule_capacity_count([*same_day, candidate]) > limit:
             raise ShortDestinationConflict(
                 f"Schedule collision for {clip_id} at {local.isoformat()}; "
                 "no shorts were submitted"
             )
-        reservations.append(
-            {
-                "scheduled_at": scheduled_at,
-                "external_id": identity,
-                "source": "current-release",
-            }
-        )
+        reservations.append(candidate)
 
     def _generate_schedule(
         self,

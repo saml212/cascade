@@ -91,6 +91,7 @@ CLEAN_NEUTRAL_HEADER_POLICY = {
 BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
+DESTINATION_DISTRIBUTION_RELEASE_SCHEMA = "cascade.destination-release/v1"
 
 _VARIANT_LABELS = {
     BACKGROUND_VARIANT_ID: "Motion background",
@@ -122,6 +123,15 @@ GAMEPLAY_VARIANT_IDS = frozenset(
 SPEAKER_PANEL_VARIANT_IDS = frozenset(
     {GAMEPLAY_SURROUND_VARIANT_ID, SPEAKER_PANELS_VARIANT_ID}
 )
+DESTINATION_DISTRIBUTION_TARGETS = {
+    GAMEPLAY_SURROUND_VARIANT_ID: (
+        "facebook",
+        "instagram",
+        "tiktok",
+        "youtube",
+    ),
+    SPEAKER_PANELS_VARIANT_ID: ("x",),
+}
 
 _ASSET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -205,6 +215,70 @@ def distribution_release_revision(
         "variant_id": variant_id,
         "target_revision": target_revision,
         "render_fingerprint": render_fingerprint,
+        "receipt_history_revision": receipt_history_revision,
+    }
+    if unresolved_history_acknowledgement is not None:
+        inputs["unresolved_history_acknowledgement"] = (
+            unresolved_history_acknowledgement
+        )
+    return _json_revision(inputs)
+
+
+def normalize_destination_distribution_targets(value: object) -> list[dict] | None:
+    """Validate the exact gameplay/non-X and clean/X re-release pair."""
+    if not isinstance(value, list) or len(value) != len(
+        DESTINATION_DISTRIBUTION_TARGETS
+    ):
+        return None
+    normalized = []
+    for target in value:
+        if not isinstance(target, dict) or set(target) != {
+            "variant_id",
+            "target_revision",
+            "render_fingerprint",
+            "destinations",
+        }:
+            return None
+        variant_id = target.get("variant_id")
+        if not isinstance(variant_id, str):
+            return None
+        expected_destinations = DESTINATION_DISTRIBUTION_TARGETS.get(variant_id)
+        if (
+            expected_destinations is None
+            or target.get("destinations") != list(expected_destinations)
+            or not isinstance(target.get("target_revision"), str)
+            or _SHA256.fullmatch(target["target_revision"]) is None
+            or not isinstance(target.get("render_fingerprint"), str)
+            or _SHA256.fullmatch(target["render_fingerprint"]) is None
+        ):
+            return None
+        normalized.append(target)
+    if {target["variant_id"] for target in normalized} != set(
+        DESTINATION_DISTRIBUTION_TARGETS
+    ):
+        return None
+    normalized.sort(key=lambda target: target["variant_id"])
+    return normalized if value == normalized else None
+
+
+def destination_distribution_release_revision(
+    *,
+    request_id: str,
+    actor: str,
+    reason: str,
+    targets: list[dict],
+    receipt_history_revision: str,
+    unresolved_history_acknowledgement: dict | None = None,
+) -> str:
+    normalized = normalize_destination_distribution_targets(targets)
+    if normalized is None:
+        raise ValueError("invalid destination release targets")
+    inputs = {
+        "schema": DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+        "request_id": request_id,
+        "actor": actor,
+        "reason": reason,
+        "targets": normalized,
         "receipt_history_revision": receipt_history_revision,
     }
     if unresolved_history_acknowledgement is not None:

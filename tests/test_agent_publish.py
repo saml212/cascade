@@ -2436,6 +2436,241 @@ class TestShortDestinationRequests:
         assert plan["targets"][0]["variant_id"] == required_variant
         assert plan["variant_overrides"] == {"clip_0": required_variant}
 
+    def test_destination_release_binds_gameplay_and_clean_waves(
+        self, env, episode_dir, monkeypatch
+    ):
+        from agents.publish import (
+            short_receipt_history_revision,
+            valid_rerelease_authorization,
+        )
+        from lib.short_variants import destination_distribution_release_revision
+
+        config = _destination_config()
+        config["platforms"]["facebook"] = {
+            "enabled": True,
+            "account_username": "facebook-account-id",
+            "page_id": "facebook-page-id",
+        }
+        config["platforms"]["x"]["required_short_variant_id"] = "speaker_panels_v1"
+        self._seed(
+            episode_dir,
+            config,
+            extra_metadata={
+                "facebook": {
+                    "title": "A reviewed Reel title",
+                    "description": "A reviewed Reel description",
+                }
+            },
+        )
+        agent = _make_agent(episode_dir, config)
+        monkeypatch.setattr(agent, "_verify_destination_bindings", lambda *_args: None)
+        monkeypatch.setattr(
+            "agents.publish.validate_destination_media", lambda *_args: []
+        )
+        data = agent._inputs()
+        platforms = ["facebook", "instagram", "tiktok", "youtube", "x"]
+        legacy = {
+            "clip_id": "clip_0",
+            "status": "published",
+            "request_id": "legacy-request",
+            "platforms": platforms,
+            "response": {
+                "status": "completed",
+                "request_id": "legacy-request",
+                "results": [
+                    {
+                        "platform": platform,
+                        "success": True,
+                        "post_url": f"https://example.com/{platform}/old",
+                        "request_id": "legacy-request",
+                        "profile_username": "test_user",
+                    }
+                    for platform in platforms
+                ],
+            },
+        }
+        publish = {"shorts": [legacy]}
+        gameplay = {
+            **data["short_versions"]["clip_0"],
+            "version": "gameplay_surround_v1",
+            "variant_id": "gameplay_surround_v1",
+            "revision": "sha256:" + "1" * 64,
+            "render_fingerprint": "sha256:" + "2" * 64,
+        }
+        clean = {
+            **data["short_versions"]["clip_0"],
+            "version": "speaker_panels_v1",
+            "variant_id": "speaker_panels_v1",
+            "revision": "sha256:" + "3" * 64,
+            "render_fingerprint": "sha256:" + "4" * 64,
+        }
+        targets = [
+            {
+                "variant_id": "gameplay_surround_v1",
+                "target_revision": gameplay["revision"],
+                "render_fingerprint": gameplay["render_fingerprint"],
+                "destinations": ["facebook", "instagram", "tiktok", "youtube"],
+            },
+            {
+                "variant_id": "speaker_panels_v1",
+                "target_revision": clean["revision"],
+                "render_fingerprint": clean["render_fingerprint"],
+                "destinations": ["x"],
+            },
+        ]
+        history_revision = short_receipt_history_revision(publish, "clip_0")
+        authorization = {
+            "schema": "cascade.destination-release/v1",
+            "request_id": "44e87b22-6869-40cd-87a7-ce3b76468a87",
+            "actor": "release-operator",
+            "reason": "Release exact gameplay and clean destination waves",
+            "targets": targets,
+            "receipt_history_revision": history_revision,
+            "created_at": "2026-09-17T05:00:00+00:00",
+        }
+        authorization["revision"] = destination_distribution_release_revision(
+            request_id=authorization["request_id"],
+            actor=authorization["actor"],
+            reason=authorization["reason"],
+            targets=targets,
+            receipt_history_revision=history_revision,
+        )
+        clip = data["approved"][0]
+        clip["distribution_variant_id"] = "gameplay_surround_v1"
+        clip["distribution_release"] = authorization
+        data["previous_shorts"] = [legacy]
+
+        def versions(_data, overrides):
+            return {"clip_0": clean if overrides else gameplay}
+
+        monkeypatch.setattr(agent, "_destination_versions", versions)
+        gameplay_request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_A,
+            destinations=["facebook", "instagram", "tiktok", "youtube"],
+            clip_ids=["clip_0"],
+        )
+        gameplay_plan = agent._destination_plan(data, gameplay_request)
+        gameplay_intent = gameplay_plan["targets"][0]
+
+        assert gameplay_intent["rerelease_request_id"] == authorization["request_id"]
+        assert (
+            gameplay_intent["rerelease_authorization_revision"]
+            == authorization["revision"]
+        )
+        assert gameplay_intent["parent_receipt_history_revision"] == history_revision
+
+        data["previous_shorts"] = [legacy, gameplay_intent]
+        clean_request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_B,
+            destinations=["x"],
+            clip_ids=["clip_0"],
+        )
+        clean_request["variant_overrides"] = {"clip_0": "speaker_panels_v1"}
+        clean_plan = agent._destination_plan(data, clean_request)
+        clean_intent = clean_plan["targets"][0]
+
+        assert clean_intent["variant_id"] == "speaker_panels_v1"
+        assert clean_intent["rerelease_request_id"] == authorization["request_id"]
+        assert valid_rerelease_authorization(
+            {"shorts": [legacy, gameplay_intent]},
+            clip,
+            clean,
+            destinations=["x"],
+        )
+        tampered = {**gameplay_intent, "platforms": ["instagram", "x"]}
+        assert not valid_rerelease_authorization(
+            {"shorts": [legacy, tampered]},
+            clip,
+            clean,
+            destinations=["x"],
+        )
+        for field, value in (
+            ("rerelease_actor", "different-operator"),
+            ("rerelease_reason", "Different release reason"),
+        ):
+            altered = {**gameplay_intent, field: value}
+            assert not valid_rerelease_authorization(
+                {"shorts": [legacy, altered]},
+                clip,
+                clean,
+                destinations=["x"],
+            )
+        assert not valid_rerelease_authorization(
+            {"shorts": [legacy, gameplay_intent, gameplay_intent]},
+            clip,
+            clean,
+            destinations=["x"],
+        )
+
+        data["previous"] = {"profile_username": "test_user", "shorts": [legacy]}
+        data["previous_shorts"] = [legacy]
+        monkeypatch.setattr(agent, "_inputs", lambda **_kwargs: data)
+        monkeypatch.setattr(
+            "agents.publish.quality_snapshot",
+            lambda *_args, **_kwargs: data["snapshot"],
+        )
+        agent.short_destination_request = {
+            **gameplay_request,
+            "preview_revision": gameplay_plan["preview_revision"],
+        }
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"job_id": "gameplay-job"}))
+            first_result = agent.run()
+        assert run.call_count == 1
+        gameplay_receipt = first_result["shorts"][0]
+        assert gameplay_receipt["variant_id"] == "gameplay_surround_v1"
+        assert gameplay_receipt["rerelease_request_id"] == authorization["request_id"]
+        monkeypatch.setattr(
+            agent,
+            "_remote_schedule",
+            lambda *_args: [
+                {
+                    "job_id": gameplay_receipt["job_id"],
+                    "external_id": gameplay_receipt["external_id"],
+                    "scheduled_date": gameplay_receipt["scheduled_date"],
+                    "profile_username": "test_user",
+                    "platforms": gameplay_receipt["platforms"],
+                    "source_filename": "clip_0.mp4",
+                    "fields": {"external_id": gameplay_receipt["external_id"]},
+                }
+            ],
+        )
+
+        data["previous"] = first_result
+        data["previous_shorts"] = first_result["shorts"]
+        clean_plan = agent._destination_plan(data, clean_request)
+        agent.short_destination_request = {
+            **clean_request,
+            "preview_revision": clean_plan["preview_revision"],
+        }
+        with patch("agents.publish.subprocess.run") as run:
+            run.return_value = _mock_proc(stdout=json.dumps({"job_id": "clean-job"}))
+            second_result = agent.run()
+        assert run.call_count == 1
+        receipts = [
+            receipt
+            for receipt in second_result["shorts"]
+            if receipt.get("rerelease_request_id") == authorization["request_id"]
+        ]
+        assert {tuple(receipt["platforms"]) for receipt in receipts} == {
+            ("facebook", "instagram", "tiktok", "youtube"),
+            ("x",),
+        }
+        assert {receipt["variant_id"] for receipt in receipts} == {
+            "gameplay_surround_v1",
+            "speaker_panels_v1",
+        }
+        assert {receipt["rerelease_request_id"] for receipt in receipts} == {
+            authorization["request_id"]
+        }
+        assert {
+            receipt["rerelease_authorization_revision"] for receipt in receipts
+        } == {authorization["revision"]}
+
     @pytest.mark.parametrize("destinations", (["x"], ["youtube", "x"]))
     def test_wrong_required_variant_is_rejected_before_destination_preflight(
         self, env, episode_dir, monkeypatch, destinations
@@ -2781,6 +3016,8 @@ class TestShortDestinationRequests:
                 "America/Los_Angeles",
                 2,
                 2,
+                episode_id=episode_dir.name,
+                platforms=["instagram"],
             )
         current_agent._reserve(
             occupied,
@@ -2790,6 +3027,8 @@ class TestShortDestinationRequests:
             "America/Los_Angeles",
             2,
             2,
+            episode_id=episode_dir.name,
+            platforms=["instagram"],
         )
 
         conflicting = json.loads(json.dumps(remote))
@@ -2806,23 +3045,127 @@ class TestShortDestinationRequests:
                 "America/Los_Angeles",
                 2,
                 2,
+                episode_id=episode_dir.name,
+                platforms=["instagram"],
             )
 
-    def test_overlapping_destination_jobs_remain_distinct_capacity_slots(self):
-        from agents.publish import _schedule_capacity_count
+    def test_variant_waves_share_placement_but_platform_overlap_counts_again(self):
+        from agents.publish import (
+            _schedule_capacity_count,
+            _schedule_placement_identity,
+        )
 
         scheduled = datetime.fromisoformat("2099-01-05T09:00:00-08:00")
+        placement = _schedule_placement_identity("ep_one", "clip_0")
         records = [
             {
                 "scheduled_at": scheduled,
-                "_schedule_content_identity": "sha256:exact-motion-artifact",
+                "_schedule_content_identity": content,
+                "_schedule_placement_identity": placement,
                 "_schedule_platforms": platforms,
             }
-            for platforms in (["tiktok", "youtube"], ["x"], ["x"])
+            for content, platforms in (
+                (
+                    "sha256:gameplay-artifact",
+                    ["facebook", "instagram", "tiktok", "youtube"],
+                ),
+                ("sha256:clean-artifact", ["x"]),
+                ("sha256:duplicate-clean-artifact", ["x"]),
+            )
         ]
 
         assert _schedule_capacity_count(records[:2]) == 1
         assert _schedule_capacity_count(records) == 2
+
+    def test_reserve_allows_two_disjoint_variant_waves_per_placement_only(self):
+        from agents.publish import _schedule_capacity_count
+
+        morning = datetime.fromisoformat("2099-01-05T09:00:00-08:00")
+        evening = morning.replace(hour=18)
+        reservations = []
+
+        def reserve(
+            scheduled_at, episode_id, clip_id, platforms, identity="sha256:artifact"
+        ):
+            PublishAgent._reserve(
+                reservations,
+                scheduled_at,
+                identity,
+                clip_id,
+                "America/Los_Angeles",
+                2,
+                2,
+                episode_id=episode_id,
+                platforms=platforms,
+            )
+
+        gameplay = ["facebook", "instagram", "tiktok", "youtube"]
+        reserve(morning, "ep_one", "clip_0", gameplay, "sha256:gameplay-0")
+        gameplay_only = list(reservations)
+        reserve(morning, "ep_one", "clip_0", ["x"], "sha256:clean-0")
+        assert _schedule_capacity_count(reservations) == 1
+
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            reserve(morning, "ep_one", "clip_0", ["x"], "sha256:duplicate-x")
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            PublishAgent._reserve(
+                list(gameplay_only),
+                morning,
+                "sha256:other-clip",
+                "clip_1",
+                "America/Los_Angeles",
+                2,
+                2,
+                episode_id="ep_one",
+                platforms=["x"],
+            )
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            PublishAgent._reserve(
+                list(gameplay_only),
+                morning,
+                "sha256:other-episode",
+                "clip_0",
+                "America/Los_Angeles",
+                2,
+                2,
+                episode_id="ep_two",
+                platforms=["x"],
+            )
+
+        reserve(evening, "ep_one", "clip_1", gameplay, "sha256:gameplay-1")
+        reserve(evening, "ep_one", "clip_1", ["x"], "sha256:clean-1")
+        assert _schedule_capacity_count(reservations) == 2
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            reserve(
+                evening.replace(hour=19),
+                "ep_one",
+                "clip_2",
+                gameplay,
+                "sha256:third-placement",
+            )
+
+    def test_reserve_rejects_unbound_exact_provider_row(self):
+        scheduled = datetime.fromisoformat("2099-01-05T09:00:00-08:00")
+        reservations = [
+            {
+                "scheduled_at": scheduled,
+                "external_id": "unmatched-provider-job",
+                "source": "upload-post",
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="Schedule collision"):
+            PublishAgent._reserve(
+                reservations,
+                scheduled,
+                "sha256:clean-0",
+                "clip_0",
+                "America/Los_Angeles",
+                2,
+                2,
+                episode_id="ep_one",
+                platforms=["x"],
+            )
 
     def test_request_uuid_cannot_change_destinations_or_selected_clips(
         self, env, episode_dir

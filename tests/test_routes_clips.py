@@ -531,6 +531,25 @@ class TestDistributionSelection:
             "re_release_request": None,
         }
 
+    @staticmethod
+    def _destination_state(candidate):
+        variant_id = candidate.get("distribution_variant_id")
+        identities = {
+            "gameplay_surround_v1": ("1", "2"),
+            "speaker_panels_v1": ("3", "4"),
+        }
+        revision, fingerprint = identities[variant_id]
+        return {
+            "version": variant_id,
+            "variant_id": variant_id,
+            "label": variant_id,
+            "current": True,
+            "approval_current": True,
+            "revision": "sha256:" + revision * 64,
+            "render_fingerprint": "sha256:" + fingerprint * 64,
+            "re_release_request": None,
+        }
+
     def test_selects_exact_approved_variant_and_can_restore_base(
         self, test_client, monkeypatch
     ):
@@ -969,6 +988,226 @@ class TestDistributionSelection:
         consumed = clips_mod.publication_change_lock(episode_dir, "clip_01", request)
         assert consumed["re_release_request_consumed"] is True
         assert consumed["re_release_allowed"] is False
+
+    def test_prepares_exact_destination_pair_without_rewriting_history(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        platforms = ["facebook", "instagram", "tiktok", "youtube", "x"]
+        receipt = {
+            "clip_id": "clip_01",
+            "status": "published",
+            "request_id": "old-request",
+            "platforms": platforms,
+            "response": {
+                "status": "completed",
+                "request_id": "old-request",
+                "results": [
+                    {
+                        "platform": platform,
+                        "success": True,
+                        "post_url": f"https://example.com/{platform}/old",
+                        "request_id": "old-request",
+                        "profile_username": "up",
+                    }
+                    for platform in platforms
+                ],
+            },
+        }
+        publish_path = episode_dir / "publish.json"
+        publish_path.write_text(
+            json.dumps({"profile_username": "up", "shorts": [receipt]})
+        )
+        publish_before = publish_path.read_bytes()
+
+        from agents.publish import valid_rerelease_authorization
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._destination_state(candidate),
+        )
+        body = {
+            "request_id": "9d3722d3-1c5f-42b2-8f60-643d28ee274c",
+            "actor": "release-operator",
+            "reason": "Release exact gameplay and clean destination waves",
+            "targets": [
+                {
+                    "variant_id": "gameplay_surround_v1",
+                    "expected_revision": "sha256:" + "1" * 64,
+                    "destinations": [
+                        "facebook",
+                        "instagram",
+                        "tiktok",
+                        "youtube",
+                    ],
+                },
+                {
+                    "variant_id": "speaker_panels_v1",
+                    "expected_revision": "sha256:" + "3" * 64,
+                    "destinations": ["x"],
+                },
+            ],
+        }
+
+        wrong_destinations = json.loads(json.dumps(body))
+        wrong_destinations["targets"][1]["destinations"] = ["instagram", "x"]
+        rejected = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets",
+            json=wrong_destinations,
+        )
+        extra_field = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets",
+            json={**body, "scope": "all"},
+        )
+        prepared = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets", json=body
+        )
+        stored_after_first = (episode_dir / "clips.json").read_bytes()
+        repeated = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets", json=body
+        )
+
+        assert rejected.status_code == 422
+        assert extra_field.status_code == 422
+        assert prepared.status_code == 200
+        assert prepared.json()["status"] == "prepared"
+        assert repeated.status_code == 200
+        assert repeated.json()["status"] == "already_prepared"
+        assert (episode_dir / "clips.json").read_bytes() == stored_after_first
+        assert publish_path.read_bytes() == publish_before
+
+        stored_clip = json.loads(stored_after_first)["clips"][0]
+        authorization = stored_clip["distribution_release"]
+        assert stored_clip["distribution_variant_id"] == "gameplay_surround_v1"
+        assert authorization["schema"] == "cascade.destination-release/v1"
+        assert authorization["targets"] == [
+            {
+                "variant_id": "gameplay_surround_v1",
+                "target_revision": "sha256:" + "1" * 64,
+                "render_fingerprint": "sha256:" + "2" * 64,
+                "destinations": ["facebook", "instagram", "tiktok", "youtube"],
+            },
+            {
+                "variant_id": "speaker_panels_v1",
+                "target_revision": "sha256:" + "3" * 64,
+                "render_fingerprint": "sha256:" + "4" * 64,
+                "destinations": ["x"],
+            },
+        ]
+        publish = json.loads(publish_before)
+        gameplay = {
+            "variant_id": "gameplay_surround_v1",
+            "revision": "sha256:" + "1" * 64,
+            "render_fingerprint": "sha256:" + "2" * 64,
+        }
+        clean = {
+            "variant_id": "speaker_panels_v1",
+            "revision": "sha256:" + "3" * 64,
+            "render_fingerprint": "sha256:" + "4" * 64,
+        }
+        assert valid_rerelease_authorization(
+            publish,
+            stored_clip,
+            gameplay,
+            destinations=["facebook", "instagram", "tiktok", "youtube"],
+        )
+        assert valid_rerelease_authorization(
+            publish, stored_clip, clean, destinations=["x"]
+        )
+        assert not valid_rerelease_authorization(
+            publish, stored_clip, clean, destinations=["instagram", "x"]
+        )
+        assert not valid_rerelease_authorization(
+            publish,
+            {
+                **stored_clip,
+                "distribution_release": {**authorization, "scope": "all"},
+            },
+            clean,
+            destinations=["x"],
+        )
+
+    def test_destination_pair_acknowledges_only_exact_legacy_history(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [dict(SAMPLE_CLIPS[0], status="approved")])
+        publish = {
+            "shorts": [
+                {
+                    "clip_id": "clip_01",
+                    "status": "failed",
+                    "error": "Provider returned an unreadable response",
+                }
+            ]
+        }
+        (episode_dir / "publish.json").write_text(json.dumps(publish))
+
+        from agents.publish import short_receipt_history_revision
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._destination_state(candidate),
+        )
+        history_revision = short_receipt_history_revision(publish, "clip_01")
+        body = {
+            "request_id": "53802918-5a69-4af1-831e-b83395f9c95a",
+            "actor": "release-operator",
+            "reason": "Replace exact legacy destination publication",
+            "targets": [
+                {
+                    "variant_id": "gameplay_surround_v1",
+                    "expected_revision": "sha256:" + "1" * 64,
+                    "destinations": [
+                        "facebook",
+                        "instagram",
+                        "tiktok",
+                        "youtube",
+                    ],
+                },
+                {
+                    "variant_id": "speaker_panels_v1",
+                    "expected_revision": "sha256:" + "3" * 64,
+                    "destinations": ["x"],
+                },
+            ],
+        }
+
+        omitted = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets", json=body
+        )
+        wrong = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets",
+            json={
+                **body,
+                "acknowledge_unresolved_history_revision": "sha256:" + "0" * 64,
+            },
+        )
+        prepared = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets",
+            json={
+                **body,
+                "acknowledge_unresolved_history_revision": history_revision,
+            },
+        )
+
+        assert omitted.status_code == 409
+        assert wrong.status_code == 409
+        assert prepared.status_code == 200
+        stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        acknowledgement = stored["distribution_release"][
+            "unresolved_history_acknowledgement"
+        ]
+        assert acknowledgement["receipt_history_revision"] == history_revision
+        assert len(acknowledgement["obligations"]) == 1
+        assert acknowledgement["obligations"][0]["artifact_identity"] == "unknown"
 
     @pytest.mark.parametrize(
         "variant_id", ("background_motion_v1", "gameplay_surround_v1")
