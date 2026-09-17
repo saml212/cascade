@@ -521,14 +521,7 @@ function boundReviewAction(options: BoundReviewOptions): HTMLElement {
               episodeId,
               inspectionRequest.query
             );
-            const player = h('video', {
-              controls: true,
-              playsinline: true,
-              preload: 'metadata',
-              src: result.asset.url,
-              class: 'w-full rounded-md bg-black',
-            }) as HTMLVideoElement;
-            previewMap.set(identity, player);
+            previewMap.set(identity, inspectionPreviewVideo(result.asset.url));
             render();
           } catch (error) {
             showToast((error as Error).message, 'error');
@@ -891,16 +884,7 @@ function lazyInspectionPreview(
         load.disabled = true;
         try {
           const result = await api.inspectionPreview(episodeId, request.query);
-          previewMap.set(
-            identity,
-            h('video', {
-              controls: true,
-              playsinline: true,
-              preload: 'metadata',
-              src: result.asset.url,
-              class: 'w-full rounded-md bg-black',
-            }) as HTMLVideoElement
-          );
+          previewMap.set(identity, inspectionPreviewVideo(result.asset.url));
           render();
         } catch (error) {
           showToast((error as Error).message, 'error');
@@ -912,6 +896,17 @@ function lazyInspectionPreview(
   };
   render();
   return container;
+}
+
+
+function inspectionPreviewVideo(src: string): HTMLVideoElement {
+  return h('video', {
+    controls: true,
+    playsinline: true,
+    preload: 'metadata',
+    src,
+    class: 'w-full rounded-md bg-black',
+  }) as HTMLVideoElement;
 }
 
 
