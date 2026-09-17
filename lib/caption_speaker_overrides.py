@@ -15,7 +15,14 @@ from lib.ass import resolve_caption_speaker_targets
 from lib.ffprobe import file_fingerprint
 
 CAPTION_SPEAKER_OVERRIDES_SCHEMA = "cascade.short-caption-speaker-overrides/v1"
+CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA = "cascade.short-caption-speaker-overrides/v2"
 CAPTION_SPEAKER_OVERRIDES_DIR = "caption_speaker_overrides"
+
+# These keys exist only on the effective caption copy.  They let the ASS
+# compositor preserve an explicitly reviewed cross-panel overlap without
+# changing the legacy overlap policy for any other caption.
+CAPTION_DISPLAY_PHRASE_ID = "_caption_display_phrase_id"
+CAPTION_TEXT_REPLACEMENTS_APPLIED = "_caption_text_replacements_applied"
 
 _CLIP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -92,6 +99,161 @@ def _normalize_expected_word(value: object) -> dict:
     }
 
 
+def _normalize_display_word(value: object) -> dict:
+    word = _normalize_expected_word(value)
+    for field in ("word", "punctuated_word"):
+        text = word[field]
+        if not text.isprintable():
+            raise ValueError(f"Display caption {field} cannot contain control text")
+        if any(character in text for character in "{}\\"):
+            raise ValueError(f"Display caption {field} cannot contain ASS syntax")
+    return word
+
+
+def _normalize_display_phrase(
+    value: object, replacement_start: float, replacement_end: float
+) -> dict:
+    if not isinstance(value, Mapping):
+        raise TypeError("Each display caption phrase must be a mapping")
+    allowed = {"id", "to_asr_speaker", "target_crop", "words"}
+    if set(value) != allowed:
+        raise ValueError("Display caption phrase fields do not match the schema")
+    phrase_id = _bounded_text(value.get("id"), "display_phrases.id", max_length=128)
+    if not _CLIP_ID.fullmatch(phrase_id):
+        raise ValueError("Display caption phrase id is invalid")
+    target = _speaker_id(value.get("to_asr_speaker"), "to_asr_speaker")
+    target_crop = _bounded_text(value.get("target_crop"), "target_crop", max_length=64)
+    if not _CROP_SPEAKER.fullmatch(target_crop):
+        raise ValueError("target_crop must identify one reviewed crop speaker")
+    words = value.get("words")
+    if not isinstance(words, list) or not words:
+        raise ValueError("Display caption phrase needs words")
+    if len(words) > 12:
+        raise ValueError("Display caption phrase has too many words")
+    normalized_words = [_normalize_display_word(word) for word in words]
+    if normalized_words != sorted(
+        normalized_words,
+        key=lambda word: (word["start"], word["end"], word["word"]),
+    ):
+        raise ValueError("Display caption phrase words must be in source-time order")
+    if any(
+        word["start"] < replacement_start or word["end"] > replacement_end
+        for word in normalized_words
+    ):
+        raise ValueError("Every display word must be inside its text replacement")
+    return {
+        "id": phrase_id,
+        "to_asr_speaker": target,
+        "target_crop": target_crop,
+        "words": normalized_words,
+    }
+
+
+def _phrase_bounds(phrase: Mapping[str, object]) -> tuple[float, float]:
+    words = phrase["words"]
+    return (
+        min(word["start"] for word in words),
+        max(word["end"] for word in words),
+    )
+
+
+def _normalize_expected_words(
+    value: object, start: float, end: float, *, label: str
+) -> list[dict]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} needs expected words")
+    if len(value) > 100:
+        raise ValueError(f"{label} has too many expected words")
+    words = sorted(
+        (_normalize_expected_word(word) for word in value),
+        key=lambda word: (word["start"], word["end"], word["word"]),
+    )
+    if any(not (start <= (word["start"] + word["end"]) / 2 < end) for word in words):
+        raise ValueError(f"Every expected word midpoint must be inside its {label}")
+    return words
+
+
+def _normalize_display_phrases(value: object, start: float, end: float) -> list[dict]:
+    if not isinstance(value, list):
+        raise TypeError("Caption text replacement display_phrases must be a list")
+    if len(value) > 20:
+        raise ValueError("Caption text replacement has too many display phrases")
+    phrases = sorted(
+        (_normalize_display_phrase(phrase, start, end) for phrase in value),
+        key=lambda phrase: (*_phrase_bounds(phrase), phrase["id"]),
+    )
+    phrase_ids = [phrase["id"] for phrase in phrases]
+    if len(phrase_ids) != len(set(phrase_ids)):
+        raise ValueError("Display caption phrase ids must be unique per replacement")
+    return phrases
+
+
+def _reject_same_panel_overlaps(phrases: list[dict]) -> None:
+    for index, phrase in enumerate(phrases):
+        phrase_start, phrase_end = _phrase_bounds(phrase)
+        for other in phrases[index + 1 :]:
+            other_start, other_end = _phrase_bounds(other)
+            overlaps = other_start < phrase_end and phrase_start < other_end
+            if overlaps and phrase["target_crop"] == other["target_crop"]:
+                raise ValueError(
+                    "Overlapping display phrases must target different speaker panels"
+                )
+
+
+def _normalize_text_replacement(value: object) -> dict:
+    if not isinstance(value, Mapping):
+        raise TypeError("Each caption text replacement must be a mapping")
+    allowed = {
+        "id",
+        "start",
+        "end",
+        "from_asr_speaker",
+        "source_speaker",
+        "reason",
+        "expected_words",
+        "display_phrases",
+    }
+    if set(value) != allowed:
+        raise ValueError("Caption text replacement fields do not match the schema")
+    start = _finite_number(value.get("start"), "text_replacement.start")
+    end = _finite_number(value.get("end"), "text_replacement.end")
+    if end <= start:
+        raise ValueError("Caption text replacement end must be after its start")
+    replacement_id = _bounded_text(
+        value.get("id"), "text_replacement.id", max_length=128
+    )
+    if not _CLIP_ID.fullmatch(replacement_id):
+        raise ValueError("Caption text replacement id is invalid")
+    source = _speaker_id(value.get("from_asr_speaker"), "from_asr_speaker")
+    source_speaker = _bounded_text(
+        value.get("source_speaker"), "source_speaker", max_length=64
+    )
+    if not _CROP_SPEAKER.fullmatch(source_speaker):
+        raise ValueError("source_speaker must identify one reviewed crop speaker")
+    expected_words = _normalize_expected_words(
+        value.get("expected_words"), start, end, label="text replacement"
+    )
+    display_phrases = _normalize_display_phrases(
+        value.get("display_phrases"), start, end
+    )
+    _reject_same_panel_overlaps(display_phrases)
+    return {
+        "id": replacement_id,
+        "start": start,
+        "end": end,
+        "from_asr_speaker": source,
+        "source_speaker": source_speaker,
+        "reason": _bounded_text(
+            value.get("reason"),
+            "text_replacement.reason",
+            min_length=3,
+            max_length=1000,
+        ),
+        "expected_words": expected_words,
+        "display_phrases": display_phrases,
+    }
+
+
 def _normalize_override(value: object) -> dict:
     if not isinstance(value, Mapping):
         raise TypeError("Each caption speaker override must be a mapping")
@@ -156,10 +318,35 @@ def _normalize_override(value: object) -> dict:
     }
 
 
+def _normalize_text_replacements(value: object) -> list[dict]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("Version 2 caption overrides need text replacements")
+    if len(value) > 100:
+        raise ValueError("Caption override document has too many text replacements")
+    replacements = sorted(
+        (_normalize_text_replacement(item) for item in value),
+        key=lambda item: (item["start"], item["end"], item["id"]),
+    )
+    _reject_same_panel_overlaps(
+        [
+            phrase
+            for replacement in replacements
+            for phrase in replacement["display_phrases"]
+        ]
+    )
+    return replacements
+
+
 def normalize_caption_speaker_override_document(value: object, clip_id: str) -> dict:
     if not isinstance(value, Mapping):
         raise TypeError("Caption speaker override document must be a mapping")
-    allowed = {
+    schema = value.get("schema")
+    if schema not in {
+        CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA,
+    }:
+        raise ValueError("Unsupported caption speaker override schema")
+    v1_fields = {
         "schema",
         "clock",
         "clip_id",
@@ -169,10 +356,13 @@ def normalize_caption_speaker_override_document(value: object, clip_id: str) -> 
         "reason",
         "updated_at",
     }
+    allowed = (
+        v1_fields | {"text_replacements"}
+        if schema == CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA
+        else v1_fields
+    )
     if set(value) != allowed:
         raise ValueError("Caption speaker override document fields do not match schema")
-    if value.get("schema") != CAPTION_SPEAKER_OVERRIDES_SCHEMA:
-        raise ValueError("Unsupported caption speaker override schema")
     if value.get("clock") != "source":
         raise ValueError("Caption speaker overrides must use the source clock")
     if value.get("clip_id") != clip_id:
@@ -181,17 +371,26 @@ def normalize_caption_speaker_override_document(value: object, clip_id: str) -> 
     if not _SHA256.fullmatch(transcript_revision):
         raise ValueError("Caption speaker overrides need a transcript SHA-256")
     overrides = value.get("overrides")
-    if not isinstance(overrides, list) or not overrides:
+    if not isinstance(overrides, list):
+        raise TypeError("Stored caption speaker overrides must be a list")
+    if schema == CAPTION_SPEAKER_OVERRIDES_SCHEMA and not overrides:
         raise ValueError("Stored caption speaker overrides cannot be empty")
     normalized = sorted(
         (_normalize_override(override) for override in overrides),
         key=lambda override: (override["start"], override["end"], override["id"]),
     )
-    ids = [override["id"] for override in normalized]
+    text_replacements = (
+        _normalize_text_replacements(value.get("text_replacements"))
+        if schema == CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA
+        else []
+    )
+    ids = [override["id"] for override in normalized] + [
+        replacement["id"] for replacement in text_replacements
+    ]
     if len(ids) != len(set(ids)):
-        raise ValueError("Caption speaker override ids must be unique")
-    return {
-        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        raise ValueError("Caption override operation ids must be unique")
+    document = {
+        "schema": schema,
         "clock": "source",
         "clip_id": clip_id,
         "transcript_revision": transcript_revision,
@@ -202,12 +401,19 @@ def normalize_caption_speaker_override_document(value: object, clip_id: str) -> 
         ),
         "updated_at": _review_timestamp(value.get("updated_at")),
     }
+    if schema == CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA:
+        document["text_replacements"] = text_replacements
+    return document
 
 
 def caption_speaker_override_revision(clip_id: str, document: dict | None) -> str:
     """Return only the caption-pixel identity, excluding review metadata."""
     state = {
-        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        "schema": (
+            document.get("schema")
+            if document is not None
+            else CAPTION_SPEAKER_OVERRIDES_SCHEMA
+        ),
         "clock": "source",
         "clip_id": clip_id,
         "transcript_revision": (
@@ -222,6 +428,14 @@ def caption_speaker_override_revision(clip_id: str, document: dict | None) -> st
             else []
         ),
     }
+    if (
+        document is not None
+        and document.get("schema") == CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA
+    ):
+        state["text_replacements"] = [
+            {key: value for key, value in replacement.items() if key != "reason"}
+            for replacement in document.get("text_replacements", [])
+        ]
     return _json_revision(state)
 
 
@@ -266,6 +480,107 @@ def _clip_bounds(clip: Mapping[str, object]) -> tuple[float, float]:
     return start, end
 
 
+def _source_word_matches(
+    utterances: list, operation: Mapping[str, object]
+) -> list[tuple[int, int, dict]]:
+    matches = []
+    for utterance_index, utterance in enumerate(utterances):
+        if not isinstance(utterance, Mapping):
+            continue
+        utterance_speaker = utterance.get("speaker")
+        words = utterance.get("words")
+        if not isinstance(words, list):
+            continue
+        for word_index, word in enumerate(words):
+            if not isinstance(word, Mapping):
+                continue
+            identity = _word_identity(word)
+            midpoint = (identity["start"] + identity["end"]) / 2
+            speaker = word.get("speaker", utterance_speaker)
+            if (
+                operation["start"] <= midpoint < operation["end"]
+                and speaker == operation["from_asr_speaker"]
+            ):
+                matches.append((utterance_index, word_index, identity))
+    return matches
+
+
+def _select_operation_words(
+    utterances: list,
+    operation: Mapping[str, object],
+    label: str,
+    speaker_targets: Mapping[int, str],
+    clip_bounds: tuple[float, float],
+    used_words: set[tuple[int, int]],
+) -> list[tuple[int, int, dict]]:
+    clip_start, clip_end = clip_bounds
+    if operation["start"] < clip_start or operation["end"] > clip_end:
+        raise ValueError(f"{label} {operation['id']} is outside its clip")
+    source = operation["from_asr_speaker"]
+    if speaker_targets.get(source) != operation["source_speaker"]:
+        raise ValueError(
+            f"ASR speaker {source} no longer maps to {operation['source_speaker']}"
+        )
+    matches = _source_word_matches(utterances, operation)
+    if [match[2] for match in matches] != operation["expected_words"]:
+        raise ValueError(
+            f"{label} {operation['id']} no longer matches the reviewed source words"
+        )
+    selected = {
+        (utterance_index, word_index) for utterance_index, word_index, _ in matches
+    }
+    if selected & used_words:
+        raise ValueError("Caption speaker overrides select the same word twice")
+    used_words.update(selected)
+    return matches
+
+
+def _replacement_utterances(
+    replacement: Mapping[str, object], speaker_targets: Mapping[int, str]
+) -> list[dict]:
+    utterances = []
+    for phrase in replacement["display_phrases"]:
+        target = phrase["to_asr_speaker"]
+        if speaker_targets.get(target) != phrase["target_crop"]:
+            raise ValueError(
+                f"ASR speaker {target} no longer maps to {phrase['target_crop']}"
+            )
+        words = [
+            {
+                **word,
+                "speaker": target,
+                CAPTION_DISPLAY_PHRASE_ID: f"{replacement['id']}:{phrase['id']}",
+            }
+            for word in phrase["words"]
+        ]
+        phrase_start, phrase_end = _phrase_bounds(phrase)
+        utterances.append(
+            {
+                "speaker": target,
+                "start": phrase_start,
+                "end": phrase_end,
+                "transcript": " ".join(
+                    word["punctuated_word"] for word in phrase["words"]
+                ),
+                "words": words,
+            }
+        )
+    return utterances
+
+
+def _remove_replaced_words(
+    utterances: list, replaced_words: set[tuple[int, int]]
+) -> None:
+    for utterance_index, utterance in enumerate(utterances):
+        words = utterance.get("words") if isinstance(utterance, Mapping) else None
+        if isinstance(words, list):
+            utterance["words"] = [
+                word
+                for word_index, word in enumerate(words)
+                if (utterance_index, word_index) not in replaced_words
+            ]
+
+
 def _apply_document(
     diarized: dict,
     document: dict,
@@ -273,63 +588,58 @@ def _apply_document(
     clip: Mapping[str, object],
 ) -> tuple[dict, int]:
     reviewed = deepcopy(diarized)
-    clip_start, clip_end = _clip_bounds(clip)
+    clip_bounds = _clip_bounds(clip)
     selected: list[tuple[int, int, int]] = []
+    replaced_words: set[tuple[int, int]] = set()
+    replacement_utterances: list[dict] = []
     used_words: set[tuple[int, int]] = set()
     utterances = reviewed.get("utterances")
     if not isinstance(utterances, list):
         raise TypeError("Current transcript has no utterance list")
 
     for override in document["overrides"]:
-        if override["start"] < clip_start or override["end"] > clip_end:
-            raise ValueError(
-                f"Caption speaker override {override['id']} is outside its clip"
-            )
-        source = override["from_asr_speaker"]
         target = override["to_asr_speaker"]
-        if speaker_targets.get(source) != override["source_speaker"]:
-            raise ValueError(
-                f"ASR speaker {source} no longer maps to {override['source_speaker']}"
-            )
         if speaker_targets.get(target) != override["target_crop"]:
             raise ValueError(
                 f"ASR speaker {target} no longer maps to {override['target_crop']}"
             )
-        matches = []
-        for utterance_index, utterance in enumerate(utterances):
-            if not isinstance(utterance, Mapping):
-                continue
-            utterance_speaker = utterance.get("speaker")
-            words = utterance.get("words")
-            if not isinstance(words, list):
-                continue
-            for word_index, word in enumerate(words):
-                if not isinstance(word, Mapping):
-                    continue
-                identity = _word_identity(word)
-                midpoint = (identity["start"] + identity["end"]) / 2
-                speaker = word.get("speaker", utterance_speaker)
-                if (
-                    override["start"] <= midpoint < override["end"]
-                    and speaker == source
-                ):
-                    matches.append((utterance_index, word_index, identity))
-        observed = [match[2] for match in matches]
-        if observed != override["expected_words"]:
-            raise ValueError(
-                f"Caption speaker override {override['id']} no longer matches "
-                "the reviewed source words"
-            )
+        matches = _select_operation_words(
+            utterances,
+            override,
+            "Caption speaker override",
+            speaker_targets,
+            clip_bounds,
+            used_words,
+        )
         for utterance_index, word_index, _identity in matches:
-            key = (utterance_index, word_index)
-            if key in used_words:
-                raise ValueError("Caption speaker overrides select the same word twice")
-            used_words.add(key)
             selected.append((utterance_index, word_index, target))
+
+    for replacement in document.get("text_replacements", []):
+        matches = _select_operation_words(
+            utterances,
+            replacement,
+            "Caption text replacement",
+            speaker_targets,
+            clip_bounds,
+            used_words,
+        )
+        replaced_words.update(
+            (utterance_index, word_index)
+            for utterance_index, word_index, _identity in matches
+        )
+        replacement_utterances.extend(
+            _replacement_utterances(replacement, speaker_targets)
+        )
 
     for utterance_index, word_index, target in selected:
         reviewed["utterances"][utterance_index]["words"][word_index]["speaker"] = target
-    return reviewed, len(selected)
+    if replaced_words:
+        _remove_replaced_words(reviewed["utterances"], replaced_words)
+        reviewed["utterances"].extend(replacement_utterances)
+        reviewed[CAPTION_TEXT_REPLACEMENTS_APPLIED] = (
+            CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA
+        )
+    return reviewed, len(used_words)
 
 
 def _read_document(
@@ -430,18 +740,22 @@ def caption_speaker_override_state(
         {"asr_speaker": source, "target_speaker": target}
         for source, target in sorted(speaker_targets.items())
     ]
-    revision = _json_revision(
-        {
-            "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
-            "clip_id": clip_id,
-            "clip_source_window": list(clip_bounds),
-            "transcript_revision": transcript_revision,
-            "speaker_targets": binding_state,
-            "overrides_revision": overrides_revision,
-            "document_revision": document_revision,
-            "read_error": error,
-        }
+    schema = (
+        document.get("schema")
+        if document is not None
+        else CAPTION_SPEAKER_OVERRIDES_SCHEMA
     )
+    revision_state = {
+        "schema": schema,
+        "clip_id": clip_id,
+        "clip_source_window": list(clip_bounds),
+        "transcript_revision": transcript_revision,
+        "speaker_targets": binding_state,
+        "overrides_revision": overrides_revision,
+        "document_revision": document_revision,
+        "read_error": error,
+    }
+    revision = _json_revision(revision_state)
     effective = deepcopy(diarized)
     applied_word_count = 0
     if document is not None and error is None:
@@ -457,7 +771,7 @@ def caption_speaker_override_state(
 
     override_count = len(document["overrides"]) if document is not None else 0
     state = {
-        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+        "schema": schema,
         "clock": "source",
         "clip_id": clip_id,
         "clip_source_window": list(clip_bounds),
@@ -471,6 +785,9 @@ def caption_speaker_override_state(
         "overrides": document["overrides"] if document is not None else [],
         "speaker_targets": binding_state,
     }
+    if schema == CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA:
+        replacements = document.get("text_replacements", []) if document else []
+        state["text_replacements"] = replacements
     if document is not None:
         state["review"] = {
             key: document[key] for key in ("actor", "reason", "updated_at")
@@ -506,7 +823,10 @@ def caption_speaker_overrides_binding(state: Mapping[str, object]) -> dict | Non
         raise TypeError("Caption speaker override counts are invalid")
     if not isinstance(overrides, list) or len(overrides) != count:
         raise TypeError("Caption speaker override state is malformed")
-    if count == 0:
+    has_text_replacements = (
+        state.get("schema") == CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA
+    )
+    if count == 0 and not has_text_replacements:
         if applied != 0:
             raise TypeError("Empty caption speaker overrides changed words")
         return None
@@ -519,14 +839,29 @@ def caption_speaker_overrides_binding(state: Mapping[str, object]) -> dict | Non
     ]
     if any(not isinstance(operation_id, str) for operation_id in operation_ids):
         raise TypeError("Caption speaker override operation ids are invalid")
-    return {
-        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+    replacements = state.get("text_replacements") if has_text_replacements else []
+    if not isinstance(replacements, list) or (
+        has_text_replacements and not replacements
+    ):
+        raise TypeError("Caption text replacement identity is invalid")
+    replacement_ids = [
+        replacement.get("id") if isinstance(replacement, Mapping) else None
+        for replacement in replacements
+    ]
+    if any(not isinstance(operation_id, str) for operation_id in replacement_ids):
+        raise TypeError("Caption text replacement ids are invalid")
+    operation_ids.extend(replacement_ids)
+    binding = {
+        "schema": state.get("schema"),
         "clock": "source",
         "revision": revision,
         "operation_ids": operation_ids,
         "override_count": count,
         "applied_word_count": applied,
     }
+    if has_text_replacements:
+        binding["text_replacement_count"] = len(replacements)
+    return binding
 
 
 def apply_current_caption_speaker_overrides(

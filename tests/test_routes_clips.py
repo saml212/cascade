@@ -193,6 +193,62 @@ class TestCaptionSpeakerOverrides:
             ],
         }
 
+    @staticmethod
+    def _text_request(state):
+        return {
+            "expected_document_revision": state["document_revision"],
+            "expected_transcript_revision": state["transcript_revision"],
+            "actor": "caption-reviewer",
+            "reason": "Reviewed overlapping source picture and close microphones.",
+            "overrides": [],
+            "text_replacements": [
+                {
+                    "id": "review_parallel_sure",
+                    "start": 103.0,
+                    "end": 103.5,
+                    "from_asr_speaker": 1,
+                    "source_speaker": "speaker_1",
+                    "reason": "Reviewed source picture and both close microphones.",
+                    "expected_words": [
+                        {
+                            "word": "sure",
+                            "punctuated_word": "Sure.",
+                            "start": 103.0,
+                            "end": 103.5,
+                        }
+                    ],
+                    "display_phrases": [
+                        {
+                            "id": "speaker_one",
+                            "to_asr_speaker": 1,
+                            "target_crop": "speaker_1",
+                            "words": [
+                                {
+                                    "word": "sure",
+                                    "punctuated_word": "Sure—",
+                                    "start": 103.0,
+                                    "end": 103.35,
+                                }
+                            ],
+                        },
+                        {
+                            "id": "speaker_two",
+                            "to_asr_speaker": 2,
+                            "target_crop": "speaker_2",
+                            "words": [
+                                {
+                                    "word": "yes",
+                                    "punctuated_word": "Yes.",
+                                    "start": 103.2,
+                                    "end": 103.5,
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
     def test_put_is_cas_guarded_and_changes_only_caption_sidecar(
         self, test_client, monkeypatch
     ):
@@ -252,6 +308,38 @@ class TestCaptionSpeakerOverrides:
         assert response.status_code == 409
         assert "no longer matches" in response.json()["detail"]
         assert not (ep_dir / "caption_speaker_overrides" / "clip_04.json").exists()
+
+    def test_put_text_replacement_is_v2_cas_guarded_and_canonical_is_unchanged(
+        self, test_client, monkeypatch
+    ):
+        client, ep_dir = self._prepare(test_client, monkeypatch)
+        endpoint = "/api/episodes/ep_001/clips/clip_04/caption-speaker-overrides"
+        initial = client.get(endpoint).json()
+        canonical_paths = [
+            ep_dir / "episode.json",
+            ep_dir / "clips.json",
+            ep_dir / "diarized_transcript.json",
+            ep_dir / "segments.json",
+        ]
+        before = {path: path.read_bytes() for path in canonical_paths}
+
+        saved = client.put(endpoint, json=self._text_request(initial))
+
+        assert saved.status_code == 200
+        state = saved.json()
+        assert state["schema"] == "cascade.short-caption-speaker-overrides/v2"
+        assert state["override_count"] == 0
+        assert state["applied_word_count"] == 1
+        assert len(state["text_replacements"][0]["display_phrases"]) == 2
+        sidecar = json.loads(
+            (ep_dir / "caption_speaker_overrides" / "clip_04.json").read_text()
+        )
+        assert sidecar["schema"] == "cascade.short-caption-speaker-overrides/v2"
+        assert all(path.read_bytes() == before[path] for path in canonical_paths)
+
+        stale = client.put(endpoint, json=self._text_request(initial))
+        assert stale.status_code == 409
+        assert "changed" in stale.json()["detail"]
 
     def test_clip_change_during_validation_conflicts_before_write(
         self, test_client, monkeypatch

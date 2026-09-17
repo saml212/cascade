@@ -221,6 +221,8 @@ def escape_ass_text(text: str) -> str:
 
 # ── phrase grouping ─────────────────────────────────────────────────────────
 
+_CAPTION_PHRASE_KEY = "_caption_display_phrase_id"
+
 
 def _extract_words_in_range(diarized: dict, start: float, end: float) -> list[dict]:
     """Pull every Deepgram word inside [start, end). Includes per-word
@@ -245,12 +247,71 @@ def _extract_words_in_range(diarized: dict, start: float, end: float) -> list[di
     return out
 
 
+def _partition_reviewed_caption_words(
+    words: list[dict],
+) -> tuple[list[dict], dict[str, list[dict]]]:
+    ordinary = []
+    reviewed: dict[str, list[dict]] = {}
+    for word in words:
+        phrase_id = word.get(_CAPTION_PHRASE_KEY)
+        if isinstance(phrase_id, str):
+            reviewed.setdefault(phrase_id, []).append(word)
+        else:
+            ordinary.append(word)
+    return ordinary, reviewed
+
+
+def _append_reviewed_caption_phrases(
+    phrases: list[dict],
+    reviewed: Mapping[str, list[dict]],
+    clip_start: float,
+) -> None:
+    if not reviewed:
+        return
+    for phrase_id, words in reviewed.items():
+        words.sort(key=lambda word: (word["start"], word["end"]))
+        first, last = words[0], words[-1]
+        rel_start = max(0.0, first["start"] - clip_start)
+        rel_end = max(rel_start + MIN_PHRASE_DURATION, last["end"] - clip_start)
+        phrases.append(
+            {
+                "start": rel_start,
+                "end": min(rel_end, rel_start + MAX_PHRASE_DURATION),
+                "text": " ".join(
+                    word.get("punctuated_word") or word.get("word", "")
+                    for word in words
+                ).strip(),
+                "speaker": first.get("speaker"),
+                _CAPTION_PHRASE_KEY: phrase_id,
+            }
+        )
+    phrases.sort(
+        key=lambda phrase: (
+            phrase["start"],
+            phrase["end"],
+            str(phrase.get(_CAPTION_PHRASE_KEY, "")),
+        )
+    )
+
+
+def _is_reviewed_parallel_phrase_pair(current: dict, following: dict) -> bool:
+    current_identity = current.get(_CAPTION_PHRASE_KEY)
+    following_identity = following.get(_CAPTION_PHRASE_KEY)
+    return (
+        isinstance(current_identity, str)
+        and isinstance(following_identity, str)
+        and current_identity != following_identity
+        and current.get("speaker") != following.get("speaker")
+    )
+
+
 def group_words_into_phrases(
     words: list[dict],
     *,
     clip_start: float,
     words_per_phrase: int = DEFAULT_WORDS_PER_PHRASE,
     resolve_overlaps: bool = True,
+    preserve_reviewed_panel_overlaps: bool = False,
 ) -> list[dict]:
     """Group words into display phrases. Times are returned **relative to
     clip_start** (so 0.0 = start of the rendered short, not absolute episode
@@ -261,6 +322,12 @@ def group_words_into_phrases(
     """
     if not words:
         return []
+
+    ordinary_words, reviewed_groups = (
+        _partition_reviewed_caption_words(words)
+        if preserve_reviewed_panel_overlaps
+        else (words, {})
+    )
 
     phrases: list[dict] = []
     current: list[dict] = []
@@ -289,7 +356,7 @@ def group_words_into_phrases(
         )
         current.clear()
 
-    for i, w in enumerate(words):
+    for w in ordinary_words:
         if not current:
             current.append(w)
             continue
@@ -318,6 +385,8 @@ def group_words_into_phrases(
 
     _flush()
 
+    _append_reviewed_caption_phrases(phrases, reviewed_groups, clip_start)
+
     # Stretch through short pauses, then fit every event into one display lane.
     for i, ph in enumerate(phrases):
         if i + 1 < len(phrases):
@@ -328,7 +397,10 @@ def group_words_into_phrases(
         for index in range(len(phrases) - 1):
             current = phrases[index]
             following = phrases[index + 1]
-            if current["end"] <= following["start"]:
+            if current["end"] <= following["start"] or (
+                preserve_reviewed_panel_overlaps
+                and _is_reviewed_parallel_phrase_pair(current, following)
+            ):
                 continue
             if current.get("speaker") == following.get("speaker"):
                 midpoint = (current["end"] + following["start"]) / 2
@@ -484,6 +556,12 @@ def generate_ass_from_diarized(
         words,
         clip_start=start,
         words_per_phrase=style.words_per_phrase,
+        preserve_reviewed_panel_overlaps=(
+            diarized.get("_caption_text_replacements_applied")
+            == "cascade.short-caption-speaker-overrides/v2"
+            and speaker_targets is not None
+            and speaker_placements is not None
+        ),
     )
     if speaker_targets is not None and speaker_placements is not None:
         for phrase in phrases:

@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from lib.atomic_write import atomic_write_json
 from lib.caption_speaker_overrides import (
     CAPTION_SPEAKER_OVERRIDES_SCHEMA,
+    CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA,
     caption_speaker_override_document_revision,
     caption_speaker_override_state,
     caption_speaker_overrides_path,
@@ -147,6 +148,44 @@ class CaptionSpeakerOverrideInput(BaseModel):
         return self
 
 
+class CaptionDisplayPhraseInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+    )
+    to_asr_speaker: int = Field(ge=0, strict=True)
+    target_crop: str = Field(pattern=r"^speaker_[0-9]+$")
+    words: list[CaptionSpeakerExpectedWord] = Field(min_length=1, max_length=12)
+
+
+class CaptionTextReplacementInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+    )
+    start: float = Field(ge=0, strict=True)
+    end: float = Field(gt=0, strict=True)
+    from_asr_speaker: int = Field(ge=0, strict=True)
+    source_speaker: str = Field(pattern=r"^speaker_[0-9]+$")
+    reason: str = Field(min_length=3, max_length=1000)
+    expected_words: list[CaptionSpeakerExpectedWord] = Field(
+        min_length=1, max_length=100
+    )
+    display_phrases: list[CaptionDisplayPhraseInput] = Field(max_length=20)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("caption text replacement end must be after its start")
+        return self
+
+
 class CaptionSpeakerOverridesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
@@ -155,6 +194,9 @@ class CaptionSpeakerOverridesRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=3, max_length=1000)
     overrides: list[CaptionSpeakerOverrideInput] = Field(max_length=100)
+    text_replacements: list[CaptionTextReplacementInput] = Field(
+        default_factory=list, max_length=100
+    )
 
 
 class DistributionSelectionRequest(BaseModel):
@@ -407,6 +449,33 @@ def _public_caption_speaker_override_state(state: dict) -> dict:
         **state,
         "affected_variants": sorted(SPEAKER_PANEL_VARIANT_IDS),
     }
+
+
+def _caption_speaker_override_proposal(
+    clip_id: str, req: CaptionSpeakerOverridesRequest
+) -> dict | None:
+    if not (req.overrides or req.text_replacements):
+        return None
+    schema = (
+        CAPTION_SPEAKER_TEXT_REPLACEMENTS_SCHEMA
+        if req.text_replacements
+        else CAPTION_SPEAKER_OVERRIDES_SCHEMA
+    )
+    proposed = {
+        "schema": schema,
+        "clock": "source",
+        "clip_id": clip_id,
+        "transcript_revision": req.expected_transcript_revision,
+        "overrides": [override.model_dump() for override in req.overrides],
+        "actor": req.actor,
+        "reason": req.reason,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if req.text_replacements:
+        proposed["text_replacements"] = [
+            replacement.model_dump() for replacement in req.text_replacements
+        ]
+    return normalize_caption_speaker_override_document(proposed, clip_id)
 
 
 def _clear_final_approval(clip: dict) -> None:
@@ -734,24 +803,9 @@ async def put_caption_speaker_overrides(
                 detail="The canonical transcript changed; review the words again.",
             )
 
-        document = None
-        if req.overrides:
-            try:
-                document = normalize_caption_speaker_override_document(
-                    {
-                        "schema": CAPTION_SPEAKER_OVERRIDES_SCHEMA,
-                        "clock": "source",
-                        "clip_id": clip_id,
-                        "transcript_revision": req.expected_transcript_revision,
-                        "overrides": [
-                            override.model_dump() for override in req.overrides
-                        ],
-                        "actor": req.actor,
-                        "reason": req.reason,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    clip_id,
-                )
+        try:
+            document = _caption_speaker_override_proposal(clip_id, req)
+            if document is not None:
                 validate_caption_speaker_override_document(
                     document,
                     clip=clip,
@@ -760,8 +814,8 @@ async def put_caption_speaker_overrides(
                     crop_config=crop_config,
                     transcript_revision=state["transcript_revision"],
                 )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         latest_clips, _ = load_clips(episode_id)
         latest_clip, _ = find_clip(latest_clips, clip_id)
