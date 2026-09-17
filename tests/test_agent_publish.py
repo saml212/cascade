@@ -26,8 +26,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agents.publish import LongformPublishAgent, PublishAgent
+from agents.publish import (
+    ARTIFACT_SHORT_DESTINATION_SCHEMA,
+    LongformPublishAgent,
+    PublishAgent,
+    ShortDeliverySpec,
+    _destination_external_id,
+    _document_revision,
+)
 from agents.qa import (
+    SHORT_COPY_SCHEMA,
     clip_review_revision,
     editorial_revision,
     publication_identity,
@@ -98,6 +106,55 @@ def _publish_config() -> dict:
             "shorts_per_day_weekend": 2,
         },
     }
+
+
+def _destination_delivery_spec(clip, version, copy, bindings):
+    """Build the exact reviewed target required by expansion transport tests."""
+    platforms = sorted(copy)
+    request_id = "d3f8ce1b-535c-4602-8b8a-b866dc5ad0de"
+    target_revision = _document_revision(
+        ShortDeliverySpec.target_fields(str(clip["id"]), version)
+    )
+    identity = _destination_external_id(
+        "ep_test",
+        request_id,
+        platforms,
+        target_revision,
+        str(clip["id"]),
+        ARTIFACT_SHORT_DESTINATION_SCHEMA,
+    )
+    target = {
+        **ShortDeliverySpec.receipt_identity(
+            str(clip["id"]), version, identity, platforms
+        ),
+        "status": "intent_recorded",
+        "scheduled": False,
+        "scheduled_date": None,
+        "timezone": "America/Los_Angeles",
+        "destination_schema": ARTIFACT_SHORT_DESTINATION_SCHEMA,
+        "destination_episode_id": "ep_test",
+        "destination_profile_username": "test_user",
+        "destination_request_id": request_id,
+        "destination_actor": "release-operator",
+        "destination_reason": "Exercise the reviewed expansion transport",
+        "deferred_platforms": [],
+        "target_revision": target_revision,
+        "destination_copy": copy,
+        "copy_schema": SHORT_COPY_SCHEMA,
+        "copy_revision": _document_revision(copy),
+        "destination_bindings": bindings,
+    }
+    target["destination_request_revision"] = _document_revision(
+        ShortDeliverySpec.request_fields(target)
+    )
+    return ShortDeliverySpec.create(
+        clip,
+        version,
+        platforms,
+        identity,
+        copy,
+        target=target,
+    )
 
 
 def _seed_episode(
@@ -1343,7 +1400,6 @@ class TestVersionedShorts:
         run.assert_not_called()
 
     def test_fieldless_legacy_receipt_is_accepted_only_for_base(self, episode_dir):
-        agent = _make_agent(episode_dir)
         legacy_receipt = {"clip_id": "clip_0", "status": "submitted"}
         base = {
             "version": "base",
@@ -1357,8 +1413,10 @@ class TestVersionedShorts:
             "variant_id": "speaker_panels_v1",
         }
 
-        assert agent._receipt_matches_version(legacy_receipt, base) is True
-        assert agent._receipt_matches_version(legacy_receipt, variant) is False
+        assert ShortDeliverySpec.receipt_matches_version(legacy_receipt, base) is True
+        assert (
+            ShortDeliverySpec.receipt_matches_version(legacy_receipt, variant) is False
+        )
 
     def test_deferred_longform_run_preserves_prior_short_receipts(
         self, env, episode_dir
@@ -2456,6 +2514,65 @@ class TestShortDestinationRequests:
         assert plan["targets"][0]["variant_id"] == required_variant
         assert plan["variant_overrides"] == {"clip_0": required_variant}
 
+    def test_destination_execution_keeps_catalog_order_when_targets_are_reordered(
+        self, env, episode_dir, monkeypatch
+    ):
+        config = _destination_config()
+        self._seed(episode_dir, config, clip_count=3)
+        agent = _make_agent(episode_dir, config)
+        data = agent._inputs()
+        request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_A,
+            destinations=["youtube"],
+            clip_ids=["clip_2", "clip_0", "clip_1"],
+        )
+        plan = agent._destination_plan(data, request)
+        assert [item["clip_id"] for item in plan["targets"]] == [
+            "clip_0",
+            "clip_1",
+            "clip_2",
+        ]
+
+        plan["targets"].reverse()
+        specs = agent._destination_execution_specs(data, plan)
+        assert [spec.clip_id for spec in specs] == ["clip_0", "clip_1", "clip_2"]
+
+        stored = agent._persist_destination_intents(
+            {}, [spec.snapshot()["target"] for spec in specs]
+        )
+        assert [item["clip_id"] for item in stored] == [
+            "clip_0",
+            "clip_1",
+            "clip_2",
+        ]
+        submitted = []
+
+        def submit(spec, scheduled_at, _api_key, _user):
+            submitted.append(spec.clip_id)
+            return spec.receipt(
+                {"status": "submitted", "job_id": f"job-{spec.clip_id}"},
+                scheduled_at,
+                "America/Los_Angeles",
+            )
+
+        monkeypatch.setattr(agent, "_submit_short", submit)
+        results = agent._publish_short_deliveries(
+            specs,
+            None,
+            stored,
+            data["episode"],
+            data["api_key"],
+            data["user"],
+        )
+        assert submitted == ["clip_0", "clip_1", "clip_2"]
+        assert [item["clip_id"] for item in results] == [
+            "clip_0",
+            "clip_1",
+            "clip_2",
+        ]
+
     def test_destination_release_binds_gameplay_and_clean_waves(
         self, env, episode_dir, monkeypatch
     ):
@@ -2784,22 +2901,40 @@ class TestShortDestinationRequests:
         run.assert_not_called()
 
     def test_acknowledgement_is_copied_into_destination_receipt_fields(self):
-        from agents.publish import _rerelease_receipt_fields
-
         acknowledgement = {
             "receipt_history_revision": "sha256:legacy-history",
             "obligations": [{"receipt_revision": "sha256:legacy-receipt"}],
         }
-        assert _rerelease_receipt_fields(
+        fields = ShortDeliverySpec.receipt_identity(
+            "clip_0",
             {
-                "request_id": "b8c0b129-599c-48cb-b363-60a5fe4dc46c",
-                "actor": "release-operator",
-                "reason": "Publish approved Motion replacement",
-                "revision": "sha256:authorization",
-                "receipt_history_revision": "sha256:legacy-history",
-                "unresolved_history_acknowledgement": acknowledgement,
-            }
-        ) == {
+                "version": "base",
+                "variant_id": None,
+                "render_fingerprint": "sha256:render",
+                "revision": "sha256:approval",
+                "re_release_request": {
+                    "request_id": "b8c0b129-599c-48cb-b363-60a5fe4dc46c",
+                    "actor": "release-operator",
+                    "reason": "Publish approved Motion replacement",
+                    "revision": "sha256:authorization",
+                    "receipt_history_revision": "sha256:legacy-history",
+                    "unresolved_history_acknowledgement": acknowledgement,
+                },
+            },
+            "cascade:short",
+            ["youtube"],
+        )
+        assert {
+            key: fields[key]
+            for key in (
+                "rerelease_request_id",
+                "rerelease_actor",
+                "rerelease_reason",
+                "rerelease_authorization_revision",
+                "parent_receipt_history_revision",
+                "unresolved_history_acknowledgement",
+            )
+        } == {
             "rerelease_request_id": "b8c0b129-599c-48cb-b363-60a5fe4dc46c",
             "rerelease_actor": "release-operator",
             "rerelease_reason": "Publish approved Motion replacement",
@@ -3450,10 +3585,9 @@ class TestExpandedShortDestinations:
         from agents.publish import (
             SHORT_COPY_SCHEMA,
             SHORT_DESTINATION_SCHEMA,
+            ShortDeliverySpec,
             _destination_external_id,
-            _destination_request_fields,
             _document_revision,
-            _short_target_fields,
             short_receipt_history_revision,
             unresolved_receipt_obligations,
             valid_rerelease_copy_continuation,
@@ -3507,7 +3641,7 @@ class TestExpandedShortDestinations:
             "revision": authorization["target_revision"],
         }
         target_revision = _document_revision(
-            _short_target_fields("clip_0", original_version)
+            ShortDeliverySpec.target_fields("clip_0", original_version)
         )
         destinations = ["youtube"]
         destination_request_id = "ecf17f34-b5a5-4a03-a62d-49fca57b85df"
@@ -3552,7 +3686,7 @@ class TestExpandedShortDestinations:
             "unresolved_history_acknowledgement": acknowledgement,
         }
         wave["destination_request_revision"] = _document_revision(
-            _destination_request_fields(wave)
+            ShortDeliverySpec.request_fields(wave)
         )
         publish = {"shorts": [legacy, wave]}
         assert valid_rerelease_copy_continuation(publish, clip, version, [wave])
@@ -3973,30 +4107,22 @@ class TestExpandedShortDestinations:
                 "target_id": "pin-board",
             },
         }
-        target = {"destination_copy": copy, "destination_bindings": bindings}
-        platforms = sorted(copy)
+        spec = _destination_delivery_spec(
+            {"id": "clip_0", "title": "Clip"},
+            {
+                "path": "shorts/clip_0.mp4",
+                "version": "base",
+                "variant_id": None,
+                "render_fingerprint": "sha256:render",
+                "revision": "sha256:approval",
+            },
+            copy,
+            bindings,
+        )
         with patch.object(
             agent, "_submit", return_value={"status": "submitted"}
         ) as submit:
-            agent._submit_short(
-                {"id": "clip_0", "title": "Clip"},
-                {},
-                platforms,
-                None,
-                "https://youtube.example/full",
-                "https://spotify.example/full",
-                {
-                    "path": "shorts/clip_0.mp4",
-                    "version": "base",
-                    "variant_id": None,
-                    "render_fingerprint": "sha256:render",
-                    "revision": "sha256:approval",
-                },
-                "cascade-short-id",
-                "secret",
-                "test_user",
-                destination_target=target,
-            )
+            agent._submit_short(spec, None, "secret", "test_user")
         command = submit.call_args.args[0]
         for field in (
             "facebook_title=FB title",
@@ -4052,28 +4178,23 @@ class TestExpandedShortDestinations:
     ):
         agent = _make_agent(episode_dir)
         (episode_dir / "shorts" / "clip_0.mp4").write_bytes(b"video")
+        spec = ShortDeliverySpec.create(
+            {"id": "clip_0", "title": "Generic clip title"},
+            {
+                "path": "shorts/clip_0.mp4",
+                "version": "base",
+                "variant_id": None,
+                "render_fingerprint": "sha256:render",
+                "revision": "sha256:approval",
+            },
+            platforms,
+            "cascade-short-id",
+            copy,
+        )
         with patch.object(
             agent, "_submit", return_value={"status": "submitted"}
         ) as submit:
-            agent._submit_short(
-                {"id": "clip_0", "title": "Generic clip title"},
-                {},
-                platforms,
-                None,
-                "https://youtube.example/full",
-                "https://spotify.example/full",
-                {
-                    "path": "shorts/clip_0.mp4",
-                    "version": "base",
-                    "variant_id": None,
-                    "render_fingerprint": "sha256:render",
-                    "revision": "sha256:approval",
-                },
-                "cascade-short-id",
-                "secret",
-                "test_user",
-                destination_target={"destination_copy": copy},
-            )
+            agent._submit_short(spec, None, "secret", "test_user")
 
         fields = _multipart_values(submit.call_args.args[0])
         assert f"title={expected_title}" in fields
@@ -4083,38 +4204,30 @@ class TestExpandedShortDestinations:
         agent = _make_agent(episode_dir)
         path = episode_dir / "shorts" / "clip_0.mp4"
         path.write_bytes(b"video")
-        target = {
-            "destination_copy": {"threads": {"text": "</private/not-a-file"}},
-            "destination_bindings": {
-                "threads": {
-                    "account_id": "threads-account",
-                    "target_kind": "account",
-                    "target_id": "threads-account",
-                }
-            },
+        copy = {"threads": {"text": "</private/not-a-file"}}
+        bindings = {
+            "threads": {
+                "account_id": "threads-account",
+                "target_kind": "account",
+                "target_id": "threads-account",
+            }
         }
+        spec = _destination_delivery_spec(
+            {"id": "clip_0", "title": "@/private/not-a-file"},
+            {
+                "path": "shorts/clip_0.mp4",
+                "version": "base",
+                "variant_id": None,
+                "render_fingerprint": "sha256:render",
+                "revision": "sha256:approval",
+            },
+            copy,
+            bindings,
+        )
         with patch.object(
             agent, "_submit", return_value={"status": "submitted"}
         ) as submit:
-            agent._submit_short(
-                {"id": "clip_0", "title": "@/private/not-a-file"},
-                {},
-                ["threads"],
-                None,
-                "https://youtube.example/full",
-                "https://spotify.example/full",
-                {
-                    "path": "shorts/clip_0.mp4",
-                    "version": "base",
-                    "variant_id": None,
-                    "render_fingerprint": "sha256:render",
-                    "revision": "sha256:approval",
-                },
-                "cascade-short-id",
-                "secret",
-                "test_user",
-                destination_target=target,
-            )
+            agent._submit_short(spec, None, "secret", "test_user")
 
         command = submit.call_args.args[0]
         file_forms = [
@@ -4197,7 +4310,7 @@ def test_longform_only_agent_never_publishes_shorts_and_keeps_history(episode_di
             return_value={"youtube": "", "spotify": ""},
         ),
         patch.object(agent, "_publish_longform", return_value=new_receipt) as publish,
-        patch.object(agent, "_publish_shorts") as publish_shorts,
+        patch.object(agent, "_publish_short_deliveries") as publish_shorts,
     ):
         result = agent.execute()
 

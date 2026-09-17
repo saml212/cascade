@@ -13,6 +13,7 @@ import re
 import subprocess
 import uuid
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -71,6 +72,14 @@ EXACT_SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v2"
 SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v1"
 EXPANDED_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v2"
 ARTIFACT_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v3"
+_ARTIFACT_IDENTITY_FIELDS = (
+    "version",
+    "variant_id",
+    "render_fingerprint",
+    "rerelease_request_id",
+    "rerelease_authorization_revision",
+)
+_VERSION_IDENTITY_FIELDS = (*_ARTIFACT_IDENTITY_FIELDS[:3], "approval_revision")
 RECORDED_STATES = {
     "submitted",
     "published",
@@ -311,82 +320,6 @@ def _destination_external_id(
     return publication_identity(episode_id, revision, "short", clip_id)
 
 
-def _short_target_fields(clip_id, version):
-    rerelease = version.get("re_release_request")
-    return {
-        "clip_id": clip_id,
-        "version": version.get("version"),
-        "variant_id": version.get("variant_id"),
-        "render_fingerprint": version.get("render_fingerprint"),
-        "approval_revision": version.get("revision")
-        or version.get("approval_revision"),
-        "rerelease_request_id": (
-            rerelease.get("request_id")
-            if isinstance(rerelease, dict)
-            else version.get("rerelease_request_id")
-        ),
-        "rerelease_authorization_revision": (
-            rerelease.get("revision")
-            if isinstance(rerelease, dict)
-            else version.get("rerelease_authorization_revision")
-        ),
-    }
-
-
-def _rerelease_receipt_fields(request):
-    if not isinstance(request, dict):
-        return {}
-    fields = {
-        "rerelease_request_id": request.get("request_id"),
-        "rerelease_actor": request.get("actor"),
-        "rerelease_reason": request.get("reason"),
-        "rerelease_authorization_revision": request.get("revision"),
-        "parent_receipt_history_revision": request.get("receipt_history_revision"),
-    }
-    acknowledgement = request.get("unresolved_history_acknowledgement")
-    if acknowledgement is not None:
-        fields["unresolved_history_acknowledgement"] = acknowledgement
-    return fields
-
-
-def _short_receipt_identity(clip_id, version, identity, platforms):
-    return {
-        "clip_id": clip_id,
-        "platforms": platforms,
-        "request_id": identity,
-        "external_id": identity,
-        "idempotency_key": identity,
-        "version": version["version"],
-        "variant_id": version["variant_id"],
-        "render_fingerprint": version["render_fingerprint"],
-        "approval_revision": version["revision"],
-        **_rerelease_receipt_fields(version.get("re_release_request")),
-    }
-
-
-def _destination_request_fields(receipt):
-    fields = {
-        "schema": receipt["destination_schema"],
-        "episode_id": receipt["destination_episode_id"],
-        "profile_username": receipt["destination_profile_username"],
-        "request_id": receipt["destination_request_id"],
-        "actor": receipt["destination_actor"],
-        "reason": receipt["destination_reason"],
-        "destinations": receipt["platforms"],
-        "deferred_destinations": receipt["deferred_platforms"],
-        "target_revision": receipt["target_revision"],
-        "scheduled_date": receipt["scheduled_date"],
-        "timezone": receipt["timezone"],
-        "copy_revision": receipt["copy_revision"],
-        "external_id": receipt["external_id"],
-    }
-    if receipt["destination_schema"] == ARTIFACT_SHORT_DESTINATION_SCHEMA:
-        fields["scheduled"] = receipt["scheduled"]
-    if "destination_bindings" in receipt:
-        fields["destination_bindings"] = receipt["destination_bindings"]
-    return fields
-
-
 def _valid_destination_copy_shape(copy: object, platforms: list[str]) -> bool:
     if not isinstance(copy, dict) or set(copy) != set(platforms):
         return False
@@ -410,8 +343,8 @@ def _destination_receipt_valid(receipt: dict) -> bool:
         platforms = receipt["platforms"]
         deferred = receipt["deferred_platforms"]
         copy = receipt["destination_copy"]
-        target = _short_target_fields(receipt["clip_id"], receipt)
-        request = _destination_request_fields(receipt)
+        target = ShortDeliverySpec.target_fields(receipt["clip_id"], receipt)
+        request = ShortDeliverySpec.request_fields(receipt)
         schema = receipt.get("destination_schema")
         expanded = bool(set(platforms) & EXPANSION_DESTINATIONS)
         artifact_request = schema == ARTIFACT_SHORT_DESTINATION_SCHEMA
@@ -470,6 +403,180 @@ def _destination_receipt_valid(receipt: dict) -> bool:
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
+
+
+@dataclass(frozen=True)
+class ShortDeliverySpec:
+    """Immutable inputs for one short transport and its durable receipt."""
+
+    clip_id: str
+    identity: str
+    platforms: tuple[str, ...]
+    scheduled: bool
+    _snapshot: bytes
+
+    @classmethod
+    def create(
+        cls,
+        clip: dict,
+        version: dict,
+        platforms: list[str],
+        identity: str,
+        copy: dict,
+        *,
+        target: dict | None = None,
+    ) -> "ShortDeliverySpec":
+        clip_id = str(clip.get("id", ""))
+        if target is not None and not (
+            _destination_receipt_valid(target)
+            and target["clip_id"] == clip_id
+            and target["external_id"] == identity
+            and target["platforms"] == platforms
+            and target["destination_copy"] == copy
+            and cls.receipt_matches_artifact(target, version)
+            and cls.receipt_matches_version(target, version)
+        ):
+            raise ValueError("Short destination target is invalid")
+        scheduled = target["scheduled"] if target is not None else True
+        snapshot = json.dumps(
+            {"clip": clip, "version": version, "copy": copy, "target": target},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return cls(
+            clip_id=clip_id,
+            identity=identity,
+            platforms=tuple(platforms),
+            scheduled=scheduled,
+            _snapshot=snapshot,
+        )
+
+    def snapshot(self) -> dict:
+        return json.loads(self._snapshot)
+
+    @classmethod
+    def receipt_matches_artifact(cls, receipt: dict, version: dict) -> bool:
+        target = cls.target_fields(str(receipt.get("clip_id", "")), version)
+        return all(
+            receipt.get(field) == target[field] for field in _ARTIFACT_IDENTITY_FIELDS
+        )
+
+    def receipt(
+        self,
+        provider_receipt: dict,
+        scheduled_at: datetime | None,
+        timezone_name: str,
+        *,
+        include_copy: bool = True,
+    ) -> dict:
+        snapshot = self.snapshot()
+        version = snapshot["version"]
+        result = {**(snapshot["target"] or {}), **provider_receipt}
+        result.update(
+            self.receipt_identity(
+                self.clip_id, version, self.identity, list(self.platforms)
+            ),
+            scheduled=scheduled_at is not None,
+        )
+        if include_copy:
+            copy = snapshot["copy"]
+            result.update(destination_copy=copy, copy_revision=_document_revision(copy))
+        if scheduled_at is not None:
+            result.update(
+                scheduled_date=scheduled_at.isoformat(),
+                timezone=timezone_name,
+            )
+        return result
+
+    @classmethod
+    def receipt_matches_version(cls, receipt: dict, version: dict) -> bool:
+        present = set(_VERSION_IDENTITY_FIELDS).intersection(receipt)
+        if not present:
+            return (
+                version.get("version") == "base" and version.get("variant_id") is None
+            )
+        if present != set(_VERSION_IDENTITY_FIELDS):
+            return False
+        target = cls.target_fields(str(receipt.get("clip_id", "")), version)
+        return (
+            all(
+                receipt.get(field) == target[field]
+                for field in _VERSION_IDENTITY_FIELDS
+            )
+            and receipt.get("rerelease_request_id") == target["rerelease_request_id"]
+        )
+
+    @staticmethod
+    def target_fields(clip_id: str, version: dict) -> dict:
+        rerelease = version.get("re_release_request")
+        source = rerelease if isinstance(rerelease, dict) else version
+        return {
+            "clip_id": clip_id,
+            "version": version.get("version"),
+            "variant_id": version.get("variant_id"),
+            "render_fingerprint": version.get("render_fingerprint"),
+            "approval_revision": version.get("revision")
+            or version.get("approval_revision"),
+            "rerelease_request_id": source.get("request_id")
+            if source is rerelease
+            else source.get("rerelease_request_id"),
+            "rerelease_authorization_revision": source.get("revision")
+            if source is rerelease
+            else source.get("rerelease_authorization_revision"),
+        }
+
+    @staticmethod
+    def receipt_identity(
+        clip_id: str, version: dict, identity: str, platforms: list[str]
+    ) -> dict:
+        fields = {
+            "clip_id": clip_id,
+            "platforms": platforms,
+            "request_id": identity,
+            "external_id": identity,
+            "idempotency_key": identity,
+            "version": version["version"],
+            "variant_id": version["variant_id"],
+            "render_fingerprint": version["render_fingerprint"],
+            "approval_revision": version["revision"],
+        }
+        request = version.get("re_release_request")
+        if not isinstance(request, dict):
+            return fields
+        fields.update(
+            rerelease_request_id=request.get("request_id"),
+            rerelease_actor=request.get("actor"),
+            rerelease_reason=request.get("reason"),
+            rerelease_authorization_revision=request.get("revision"),
+            parent_receipt_history_revision=request.get("receipt_history_revision"),
+        )
+        acknowledgement = request.get("unresolved_history_acknowledgement")
+        if acknowledgement is not None:
+            fields["unresolved_history_acknowledgement"] = acknowledgement
+        return fields
+
+    @staticmethod
+    def request_fields(receipt: dict) -> dict:
+        fields = {
+            "schema": receipt["destination_schema"],
+            "episode_id": receipt["destination_episode_id"],
+            "profile_username": receipt["destination_profile_username"],
+            "request_id": receipt["destination_request_id"],
+            "actor": receipt["destination_actor"],
+            "reason": receipt["destination_reason"],
+            "destinations": receipt["platforms"],
+            "deferred_destinations": receipt["deferred_platforms"],
+            "target_revision": receipt["target_revision"],
+            "scheduled_date": receipt["scheduled_date"],
+            "timezone": receipt["timezone"],
+            "copy_revision": receipt["copy_revision"],
+            "external_id": receipt["external_id"],
+        }
+        if receipt["destination_schema"] == ARTIFACT_SHORT_DESTINATION_SCHEMA:
+            fields["scheduled"] = receipt["scheduled"]
+        if "destination_bindings" in receipt:
+            fields["destination_bindings"] = receipt["destination_bindings"]
+        return fields
 
 
 def _clean_caption(value: object) -> str:
@@ -2006,10 +2113,11 @@ class PublishAgent(BaseAgent):
             versions[clip_id] = version
         return versions
 
-    def _destination_execution_versions(self, data, plan):
+    def _destination_execution_specs(self, data, plan):
         versions = self._destination_versions(data, plan["variant_overrides"])
         clips = {str(clip.get("id", "")): clip for clip in data["approved"]}
         publish = {"shorts": data["previous_shorts"]}
+        specs = {}
         for target in plan["targets"]:
             clip_id = target["clip_id"]
             version, authorized = _authorized_rerelease_version(
@@ -2021,15 +2129,26 @@ class PublishAgent(BaseAgent):
             if (
                 target.get("rerelease_request_id") is not None and not authorized
             ) or not (
-                self._receipt_matches_artifact(target, version)
-                and self._receipt_matches_version(target, version)
+                ShortDeliverySpec.receipt_matches_artifact(target, version)
+                and ShortDeliverySpec.receipt_matches_version(target, version)
             ):
                 raise RuntimeError(
                     f"The reviewed destination plan for {clip_id} no longer matches "
                     "its exact version and re-release lineage"
                 )
-            versions[clip_id] = version
-        return versions
+            specs[clip_id] = ShortDeliverySpec.create(
+                clips[clip_id],
+                version,
+                target["platforms"],
+                target["external_id"],
+                target["destination_copy"],
+                target=target,
+            )
+        return [
+            specs[clip_id]
+            for clip in data["approved"]
+            if (clip_id := str(clip.get("id", ""))) in specs
+        ]
 
     def _enforce_required_short_variants(
         self, clip_ids, short_versions, destinations
@@ -2161,15 +2280,9 @@ class PublishAgent(BaseAgent):
                 data["api_key"], data["user"], destination_bindings
             )
 
-        schedule = data["metadata"].get("schedule", [])
-        schedule_by_clip = {}
-        for entry in schedule if isinstance(schedule, list) else []:
-            clip_id = str(entry.get("clip_id", "")) if isinstance(entry, dict) else ""
-            if clip_id not in selected_ids:
-                continue
-            if clip_id in schedule_by_clip:
-                raise RuntimeError(f"Schedule has duplicate entries for {clip_id}")
-            schedule_by_clip[clip_id] = entry
+        schedule_by_clip = self._schedule_by_clip(
+            data["metadata"].get("schedule", []), selected_ids=set(selected_ids)
+        )
         missing = [
             item
             for item in selected_ids
@@ -2180,11 +2293,7 @@ class PublishAgent(BaseAgent):
                 "Selected clips need explicit schedule entries: " + ", ".join(missing)
             )
 
-        tz_name = self.get_config("schedule", "timezone", default="America/Los_Angeles")
-        weekday = int(self.get_config("schedule", "shorts_per_day_weekday", default=1))
-        weekend = int(self.get_config("schedule", "shorts_per_day_weekend", default=2))
-        if not 1 <= weekday <= 3 or not 1 <= weekend <= 3:
-            raise RuntimeError("Shorts-per-day limits must be between 1 and 3")
+        tz_name, weekday, weekend = self._short_schedule_policy()
         reference = self._schedule_reference(data["episode"], tz_name)
         by_id = {str(clip.get("id", "")): clip for clip in data["approved"]}
         prior = data["previous_shorts"]
@@ -2199,8 +2308,7 @@ class PublishAgent(BaseAgent):
                 version,
                 destinations,
             )
-            effective_versions[clip_id] = version
-            target = _short_target_fields(clip_id, version)
+            target = ShortDeliverySpec.target_fields(clip_id, version)
             target_revision = _document_revision(target)
             identity = _destination_external_id(
                 self.episode_dir.name,
@@ -2229,7 +2337,7 @@ class PublishAgent(BaseAgent):
             current_waves = [
                 item
                 for item in recorded
-                if self._receipt_matches_artifact(item, version)
+                if ShortDeliverySpec.receipt_matches_artifact(item, version)
             ]
             covered = {
                 platform
@@ -2323,7 +2431,9 @@ class PublishAgent(BaseAgent):
                     + "; ".join(media_issues)
                 )
             intent = {
-                **_short_receipt_identity(clip_id, version, identity, destinations),
+                **ShortDeliverySpec.receipt_identity(
+                    clip_id, version, identity, destinations
+                ),
                 "status": "intent_recorded",
                 "scheduled": scheduled_at is not None,
                 "scheduled_date": (
@@ -2345,7 +2455,7 @@ class PublishAgent(BaseAgent):
             if destination_bindings:
                 intent["destination_bindings"] = destination_bindings
             intent["destination_request_revision"] = _document_revision(
-                _destination_request_fields(intent)
+                ShortDeliverySpec.request_fields(intent)
             )
             exact = next(
                 (item for item in recorded if item.get("external_id") == identity), None
@@ -2525,34 +2635,17 @@ class PublishAgent(BaseAgent):
                 )
             if destination_request is not None:
                 plan = self._destination_plan(data, destination_request)
-                destination_versions = self._destination_execution_versions(data, plan)
+                deliveries = self._destination_execution_specs(data, plan)
                 previous_shorts = self._persist_destination_intents(
-                    previous, plan["targets"]
+                    previous, [spec.snapshot()["target"] for spec in deliveries]
                 )
-                selected = set(plan["selected_clip_ids"])
-                shorts = self._publish_shorts(
-                    [clip for clip in approved if str(clip.get("id", "")) in selected],
-                    destination_versions,
-                    short_metadata,
-                    [
-                        {
-                            "clip_id": target["clip_id"],
-                            "scheduled_date": target["scheduled_date"],
-                        }
-                        for target in plan["targets"]
-                        if target["scheduled"]
-                    ],
+                shorts = self._publish_short_deliveries(
+                    deliveries,
+                    None,
                     previous_shorts,
                     episode,
-                    plan["requested_destinations"],
-                    youtube_url,
-                    funnel_urls["spotify"],
-                    revision,
                     api_key,
                     user,
-                    destination_targets={
-                        target["clip_id"]: target for target in plan["targets"]
-                    },
                 )
                 return self._result(
                     shorts,
@@ -2631,17 +2724,38 @@ class PublishAgent(BaseAgent):
                     next_action=next_action,
                 )
                 return result
-            shorts = self._publish_shorts(
-                approved,
+            self._enforce_required_short_variants(
+                [str(clip.get("id", "")) for clip in approved],
                 short_versions,
-                short_metadata,
+                platforms,
+            )
+            hub_url = episode_hub_url(self.config, self.episode_dir.name)
+            deliveries = [
+                ShortDeliverySpec.create(
+                    clip,
+                    short_versions[clip_id],
+                    platforms,
+                    self._identity(revision, "short", clip_id),
+                    short_destination_copy(
+                        short_metadata.get(clip_id, {}),
+                        platforms,
+                        title=str(clip.get("title") or f"Clip {clip_id}"),
+                        hub_url=hub_url,
+                        youtube_url=youtube_url,
+                        spotify_url=funnel_urls["spotify"],
+                        channel_handle=self.config.get("podcast", {}).get(
+                            "channel_handle", ""
+                        ),
+                    ),
+                )
+                for clip in approved
+                if (clip_id := str(clip.get("id", "")))
+            ]
+            shorts = self._publish_short_deliveries(
+                deliveries,
                 metadata.get("schedule", []),
                 previous_shorts,
                 episode,
-                platforms,
-                youtube_url,
-                funnel_urls["spotify"],
-                revision,
                 api_key,
                 user,
             )
@@ -2915,39 +3029,23 @@ class PublishAgent(BaseAgent):
         if changed:
             self.save_json("episode.json", episode)
 
-    def _publish_shorts(
+    def _publish_short_deliveries(
         self,
-        clips,
-        short_versions,
-        metadata,
+        deliveries,
         schedule,
         previous,
         episode,
-        platforms,
-        youtube_url,
-        spotify_url,
-        revision,
         api_key,
         user,
-        *,
-        destination_targets=None,
     ):
         previous = previous if isinstance(previous, list) else []
-        destination_targets = destination_targets or {}
-        self._enforce_required_short_variants(
-            [str(clip.get("id", "")) for clip in clips], short_versions, platforms
-        )
         results = []
         pending = []
-        for clip in clips:
-            clip_id = str(clip.get("id", ""))
-            version = short_versions[clip_id]
-            destination_target = destination_targets.get(clip_id)
-            identity = (
-                destination_target["external_id"]
-                if destination_target
-                else self._identity(revision, "short", clip_id)
-            )
+        snapshots = {spec: spec.snapshot() for spec in deliveries}
+        for spec in deliveries:
+            snapshot = snapshots[spec]
+            clip, version = snapshot["clip"], snapshot["version"]
+            clip_id, identity = spec.clip_id, spec.identity
             recorded_for_clip = [
                 item
                 for item in previous
@@ -2965,7 +3063,7 @@ class PublishAgent(BaseAgent):
             if (
                 receipt is None
                 and recorded_for_clip
-                and not destination_target
+                and snapshot["target"] is None
                 and not valid_rerelease_authorization(
                     {"shorts": previous}, clip, version
                 )
@@ -2975,7 +3073,9 @@ class PublishAgent(BaseAgent):
                     "prepare an explicit re-release identity before submitting "
                     "it again"
                 )
-            if receipt and not self._receipt_matches_version(receipt, version):
+            if receipt and not ShortDeliverySpec.receipt_matches_version(
+                receipt, version
+            ):
                 raise RuntimeError(
                     f"The recorded receipt for {clip_id} does not match its "
                     "selected version; nothing was submitted"
@@ -2991,33 +3091,30 @@ class PublishAgent(BaseAgent):
                         f"The selected short variant for {clip_id} is retired; "
                         "nothing was submitted"
                     )
-                pending.append((clip, version, identity, receipt, destination_target))
+                pending.append((spec, receipt))
         if not pending:
             return results
 
-        tz_name = self.get_config("schedule", "timezone", default="America/Los_Angeles")
-        weekday_limit = int(
-            self.get_config("schedule", "shorts_per_day_weekday", default=1)
-        )
-        weekend_limit = int(
-            self.get_config("schedule", "shorts_per_day_weekend", default=2)
-        )
-        if not 1 <= weekday_limit <= 3 or not 1 <= weekend_limit <= 3:
-            raise RuntimeError("Shorts-per-day limits must be between 1 and 3")
+        tz_name, weekday_limit, weekend_limit = self._short_schedule_policy()
         reference = self._schedule_reference(episode, tz_name)
 
         with self._schedule_lock():
             occupied = self._occupied_schedule(api_key, user)
             current_identities = {
-                item["external_id"] for item in destination_targets.values()
+                spec.identity
+                for spec in deliveries
+                if snapshots[spec]["target"] is not None
             }
             co_schedule_ids = {
                 receipt.get("external_id")
-                for target in destination_targets.values()
+                for spec in deliveries
+                if snapshots[spec]["target"] is not None
                 for receipt in previous
-                if receipt.get("clip_id") == target["clip_id"]
-                and self._receipt_matches_artifact(receipt, target)
-                and not set(receipt.get("platforms", [])) & set(platforms)
+                if receipt.get("clip_id") == spec.clip_id
+                and ShortDeliverySpec.receipt_matches_artifact(
+                    receipt, snapshots[spec]["version"]
+                )
+                and not set(receipt.get("platforms", [])) & set(spec.platforms)
             }
             occupied = [
                 item
@@ -3029,62 +3126,48 @@ class PublishAgent(BaseAgent):
                 and item.get("external_id") not in co_schedule_ids
             ]
             remaining = []
-            for clip, version, identity, uncertain, destination_target in pending:
+            for spec, uncertain in pending:
                 matches = [
-                    item for item in occupied if item.get("external_id") == identity
+                    item
+                    for item in occupied
+                    if item.get("external_id") == spec.identity
                 ]
                 existing = next(
                     (item for item in matches if item["source"] == "upload-post"),
                     matches[0] if matches else None,
                 )
                 if existing:
-                    results.append(
-                        self._scheduled_receipt(
-                            clip,
-                            version,
-                            identity,
-                            existing,
-                            platforms,
-                            tz_name,
-                            destination_target=destination_target,
-                        )
-                    )
+                    results.append(self._scheduled_receipt(spec, existing, tz_name))
                 elif uncertain and uncertain.get("status") != "intent_recorded":
                     results.append({**uncertain, "reused_receipt": True})
                 else:
-                    remaining.append((clip, version, identity, destination_target))
+                    remaining.append(spec)
 
-            scheduled_remaining = [
-                item
-                for item in remaining
-                if not item[3] or item[3].get("scheduled") is not False
-            ]
+            scheduled_remaining = [spec for spec in remaining if spec.scheduled]
+            if schedule is None:
+                schedule = [
+                    {
+                        "clip_id": spec.clip_id,
+                        "scheduled_date": snapshots[spec]["target"]["scheduled_date"],
+                    }
+                    for spec in scheduled_remaining
+                ]
             if not schedule and scheduled_remaining:
                 schedule = self._generate_schedule(
-                    [clip for clip, _, _, _ in scheduled_remaining],
+                    [snapshots[spec]["clip"] for spec in scheduled_remaining],
                     weekday_limit,
                     weekend_limit,
                     tz_name=tz_name,
                     reference=reference,
                     occupied=occupied,
                 )
-            schedule_by_clip = {}
-            for entry in schedule if isinstance(schedule, list) else []:
-                clip_id = entry.get("clip_id") if isinstance(entry, dict) else None
-                if clip_id is not None:
-                    clip_id = str(clip_id)
-                    if clip_id in schedule_by_clip:
-                        raise RuntimeError(
-                            f"Schedule has duplicate entries for {clip_id}; "
-                            "no shorts were submitted"
-                        )
-                    schedule_by_clip[clip_id] = entry
+            schedule_by_clip = self._schedule_by_clip(
+                schedule, duplicate_suffix="; no shorts were submitted"
+            )
             unscheduled = [
-                str(clip.get("id", ""))
-                for clip, _, _, destination_target in remaining
-                if not destination_target
-                or destination_target.get("scheduled") is not False
-                if str(clip.get("id", "")) not in schedule_by_clip
+                spec.clip_id
+                for spec in remaining
+                if spec.scheduled and spec.clip_id not in schedule_by_clip
             ]
             if unscheduled:
                 raise RuntimeError(
@@ -3094,15 +3177,12 @@ class PublishAgent(BaseAgent):
 
             plans = []
             reservations = list(occupied)
-            for clip, version, identity, destination_target in remaining:
-                clip_id = str(clip.get("id", ""))
+            for spec in remaining:
+                clip_id = spec.clip_id
                 entry = schedule_by_clip.get(clip_id)
-                immediate = bool(
-                    destination_target and destination_target.get("scheduled") is False
-                )
                 scheduled_at = (
                     None
-                    if immediate
+                    if not spec.scheduled
                     else self._schedule_to_datetime(entry, tz_name, reference=reference)
                     if entry
                     else None
@@ -3123,82 +3203,22 @@ class PublishAgent(BaseAgent):
                     self._reserve(
                         reservations,
                         scheduled_at,
-                        identity,
+                        spec.identity,
                         clip_id,
                         tz_name,
                         weekday_limit,
                         weekend_limit,
                         episode_id=self.episode_dir.name,
-                        platforms=(
-                            destination_target["platforms"]
-                            if destination_target
-                            else platforms
-                        ),
+                        platforms=spec.platforms,
                     )
-                plans.append(
-                    (clip, version, identity, scheduled_at, destination_target)
-                )
+                plans.append((spec, scheduled_at))
 
-            for index, (
-                clip,
-                version,
-                identity,
-                scheduled_at,
-                destination_target,
-            ) in enumerate(plans, 1):
-                clip_id = str(clip.get("id", ""))
-                self.report_progress(index, len(plans), f"Uploading {clip_id}")
-                result = self._submit_short(
-                    clip,
-                    metadata.get(clip_id, {}),
-                    platforms,
-                    scheduled_at,
-                    youtube_url,
-                    spotify_url,
-                    version,
-                    identity,
-                    api_key,
-                    user,
-                    destination_target=destination_target,
-                )
+            for index, (spec, scheduled_at) in enumerate(plans, 1):
+                self.report_progress(index, len(plans), f"Uploading {spec.clip_id}")
+                result = self._submit_short(spec, scheduled_at, api_key, user)
                 if result:
                     results.append(result)
         return results
-
-    @staticmethod
-    def _receipt_matches_artifact(receipt: dict, version: dict) -> bool:
-        """Match stable pixels and re-release lineage across fresh copy approval."""
-        target = _short_target_fields(str(receipt.get("clip_id", "")), version)
-        return all(
-            receipt.get(field) == target[field]
-            for field in (
-                "version",
-                "variant_id",
-                "render_fingerprint",
-                "rerelease_request_id",
-                "rerelease_authorization_revision",
-            )
-        )
-
-    @staticmethod
-    def _receipt_matches_version(receipt: dict, version: dict) -> bool:
-        identity_fields = {
-            "version",
-            "variant_id",
-            "render_fingerprint",
-            "approval_revision",
-        }
-        present = identity_fields.intersection(receipt)
-        if not present:
-            return (
-                version.get("version") == "base" and version.get("variant_id") is None
-            )
-        if present != identity_fields:
-            return False
-        target = _short_target_fields(str(receipt.get("clip_id", "")), version)
-        if not all(receipt.get(field) == target[field] for field in identity_fields):
-            return False
-        return receipt.get("rerelease_request_id") == target["rerelease_request_id"]
 
     @staticmethod
     def _validated_previous_shorts(previous: dict) -> list[dict]:
@@ -3211,52 +3231,33 @@ class PublishAgent(BaseAgent):
 
     def _submit_short(
         self,
-        clip,
-        metadata,
-        platforms,
+        spec,
         scheduled_at,
-        youtube_url,
-        spotify_url,
-        version,
-        identity,
         api_key,
         user,
-        *,
-        destination_target=None,
     ):
-        clip_id = str(clip.get("id", ""))
+        snapshot = spec.snapshot()
+        clip, version = snapshot["clip"], snapshot["version"]
+        clip_id, platforms = spec.clip_id, list(spec.platforms)
         path = self.episode_dir / version["path"]
         if not path.exists():
             self.logger.warning("Short not found: %s", clip_id)
             return None
         title = clip.get("title", f"Clip {clip_id}")
-        copy = (
-            destination_target["destination_copy"]
-            if destination_target
-            else short_destination_copy(
-                metadata,
-                platforms,
-                title=title,
-                hub_url=episode_hub_url(self.config, self.episode_dir.name),
-                youtube_url=youtube_url,
-                spotify_url=spotify_url,
-                channel_handle=self.config.get("podcast", {}).get("channel_handle", ""),
-            )
-        )
+        copy = snapshot["copy"]
         upload_title = (
             copy["instagram"]["text"] if platforms == ["instagram"] else title
         )
         command = self._base_command(
-            path, upload_title, platforms, identity, api_key, user, 600
+            path, upload_title, platforms, spec.identity, api_key, user, 600
+        )
+        destination_bindings = (snapshot["target"] or {}).get(
+            "destination_bindings", {}
         )
         for platform in platforms:
             for field, value in upload_fields(platform, copy.get(platform, {})).items():
                 command += ["--form-string", f"{field}={value}"]
-            binding = (
-                (destination_target or {})
-                .get("destination_bindings", {})
-                .get(platform, {})
-            )
+            binding = destination_bindings.get(platform, {})
             target = SHORT_PLATFORM_SPECS[platform].get("target")
             if target and binding.get("target_kind") in {"page", "board"}:
                 _config_key, provider_key, _required = target
@@ -3275,21 +3276,9 @@ class PublishAgent(BaseAgent):
             ]
         command += ["-X", "POST", UPLOAD_POST_URL]
 
-        result = self._submit(command, 600, identity)
-        if destination_target:
-            result = {**destination_target, **result}
-        result.update(
-            _short_receipt_identity(clip_id, version, identity, platforms),
-            scheduled=scheduled_at is not None,
-            destination_copy=copy,
-            copy_revision=_document_revision(copy),
+        return spec.receipt(
+            self._submit(command, 600, spec.identity), scheduled_at, tz_name
         )
-        if scheduled_at:
-            result.update(
-                scheduled_date=scheduled_at.isoformat(),
-                timezone=tz_name,
-            )
-        return result
 
     def _base_command(
         self,
@@ -3754,6 +3743,35 @@ class PublishAgent(BaseAgent):
         with publication_lock(self.episode_dir.parent):
             yield
 
+    def _short_schedule_policy(self):
+        timezone_name = self.get_config(
+            "schedule", "timezone", default="America/Los_Angeles"
+        )
+        limits = (
+            int(self.get_config("schedule", "shorts_per_day_weekday", default=1)),
+            int(self.get_config("schedule", "shorts_per_day_weekend", default=2)),
+        )
+        if any(not 1 <= limit <= 3 for limit in limits):
+            raise RuntimeError("Shorts-per-day limits must be between 1 and 3")
+        return timezone_name, *limits
+
+    @staticmethod
+    def _schedule_by_clip(schedule, *, selected_ids=None, duplicate_suffix=""):
+        mapped = {}
+        for entry in schedule if isinstance(schedule, list) else []:
+            raw_id = entry.get("clip_id") if isinstance(entry, dict) else None
+            if raw_id is None and selected_ids is None:
+                continue
+            clip_id = str(raw_id if raw_id is not None else "")
+            if selected_ids is not None and clip_id not in selected_ids:
+                continue
+            if clip_id in mapped:
+                raise RuntimeError(
+                    f"Schedule has duplicate entries for {clip_id}{duplicate_suffix}"
+                )
+            mapped[clip_id] = entry
+        return mapped
+
     @staticmethod
     def _schedule_reference(episode, tz_name):
         value = (episode.get("publish_approval") or {}).get("approved_at")
@@ -3774,16 +3792,12 @@ class PublishAgent(BaseAgent):
 
     @staticmethod
     def _scheduled_receipt(
-        clip,
-        version,
-        identity,
+        spec,
         existing,
-        platforms,
         tz_name,
-        *,
-        destination_target=None,
     ):
         scheduled_at = existing["scheduled_at"].astimezone(ZoneInfo(tz_name))
+        destination_target = spec.snapshot()["target"]
         if destination_target:
             candidate = {
                 **destination_target,
@@ -3795,21 +3809,19 @@ class PublishAgent(BaseAgent):
                 destination_target["destination_profile_username"],
             ):
                 raise RuntimeError("Existing provider schedule conflicts with preview")
-        receipt = {
-            **(destination_target or {}),
-            **_short_receipt_identity(
-                str(clip.get("id", "")), version, identity, platforms
-            ),
+        provider_receipt = {
             "status": existing.get("status", "submitted"),
-            "scheduled": True,
-            "scheduled_date": scheduled_at.isoformat(),
-            "timezone": tz_name,
             "reused_receipt": True,
             "receipt_source": existing["source"],
         }
         if existing.get("job_id"):
-            receipt["job_id"] = existing["job_id"]
-        return receipt
+            provider_receipt["job_id"] = existing["job_id"]
+        return spec.receipt(
+            provider_receipt,
+            scheduled_at,
+            tz_name,
+            include_copy=destination_target is not None,
+        )
 
     @staticmethod
     def _reserve(

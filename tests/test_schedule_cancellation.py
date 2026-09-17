@@ -300,7 +300,7 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
     assert reconciled.status_code == 200
     assert reconciled.json()["shorts"][0]["status"] == "cancelled"
 
-    from agents.publish import PublishAgent
+    from agents.publish import PublishAgent, ShortDeliverySpec
 
     assert PublishAgent(episode_dir, {})._occupied_schedule("secret", "up") == []
 
@@ -328,26 +328,28 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
 
     # A cancelled same-identity receipt is history, never a reusable submission.
     agent = PublishAgent(episode_dir, {})
-    monkeypatch.setattr(agent, "_identity", lambda *_args: stored["external_id"])
+    version = {
+        "version": "base",
+        "variant_id": None,
+        "render_fingerprint": "sha256:base-render",
+        "revision": "sha256:base-approval",
+    }
+    spec = ShortDeliverySpec.create(
+        {"id": "clip_01"},
+        version,
+        ["youtube", "tiktok"],
+        stored["external_id"],
+        {
+            "youtube": {"title": "Title", "description": "Description"},
+            "tiktok": {"title": "Title"},
+        },
+    )
     with pytest.raises(RuntimeError, match="explicit re-release"):
-        agent._publish_shorts(
-            [{"id": "clip_01"}],
-            {
-                "clip_01": {
-                    "version": "base",
-                    "variant_id": None,
-                    "render_fingerprint": "sha256:base-render",
-                    "revision": "sha256:base-approval",
-                }
-            },
-            {},
+        agent._publish_short_deliveries(
+            [spec],
             {},
             [stored],
             {},
-            ["youtube", "tiktok"],
-            "",
-            "",
-            "release-revision",
             "secret",
             "up",
         )
