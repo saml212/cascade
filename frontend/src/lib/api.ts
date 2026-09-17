@@ -335,29 +335,35 @@ export interface ClipReviewState extends UnknownRecord {
 }
 
 export interface ShortVariantReview extends UnknownRecord {
-  id: string;
+  id: ClipVariantId;
   label: string;
   asset_id: string | null;
   asset_ids?: string[];
   asset_free?: boolean;
+  active_for_new_writes: boolean;
   render: ReviewArtifact;
   approval: { status: string; current: boolean; revision: string };
   render_job: ClipReviewState['render_job'];
 }
 
+export type ClipVariantId =
+  | 'background_motion_v1'
+  | 'satisfying_motion_v1'
+  | 'minecraft_parkour_v1'
+  | 'subway_surfers_v1'
+  | 'gta_driving_v1'
+  | 'gameplay_surround_v1'
+  | 'speaker_panels_v1';
+
+export type ActiveClipVariantId =
+  | 'gameplay_surround_v1'
+  | 'speaker_panels_v1';
+
 export interface ClipDistributionState extends UnknownRecord {
-  version:
-    | 'base'
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1'
-    | 'invalid';
-  variant_id:
-    | null
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
+  version: 'base' | ClipVariantId | 'invalid';
+  variant_id: null | ClipVariantId;
   label: string;
+  active_for_new_writes: boolean;
   current: boolean;
   approval_current: boolean;
   revision: string;
@@ -373,11 +379,7 @@ export interface ClipReReleaseRequestState extends UnknownRecord {
   request_id: string;
   actor: string;
   reason: string;
-  variant_id:
-    | null
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
+  variant_id: null | ClipVariantId;
   target_revision: string;
   render_fingerprint: string;
   receipt_history_revision: string;
@@ -386,11 +388,7 @@ export interface ClipReReleaseRequestState extends UnknownRecord {
 }
 
 export interface PrepareClipReReleaseRequest {
-  variant_id:
-    | null
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
+  variant_id: null | ActiveClipVariantId;
   expected_revision: string;
   request_id: string;
   actor: string;
@@ -647,7 +645,7 @@ export const api = {
   renderClipVariant: (
     id: string,
     clipId: string,
-    variantId: string,
+    variantId: ActiveClipVariantId,
     assetId?: string
   ) =>
     request<UnknownRecord>(
@@ -658,7 +656,7 @@ export const api = {
   approveClipVariant: (
     id: string,
     clipId: string,
-    variantId: string,
+    variantId: ActiveClipVariantId,
     expectedRevision: string
   ) =>
     request<UnknownRecord>(
@@ -669,11 +667,7 @@ export const api = {
   selectClipDistribution: (
     id: string,
     clipId: string,
-    variantId:
-      | null
-      | 'background_motion_v1'
-      | 'gameplay_surround_v1'
-      | 'speaker_panels_v1',
+    variantId: null | ActiveClipVariantId,
     expectedRevision: string
   ) =>
     request<UnknownRecord>(

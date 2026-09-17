@@ -46,12 +46,14 @@ from lib.short_variants import (
     DISTRIBUTION_VARIANT_FIELD,
     GAMEPLAY_SURROUND_VARIANT_ID,
     SPEAKER_PANEL_VARIANT_IDS,
+    RetiredShortVariantError,
     background_variant_output,
     background_variant_state,
     default_background_asset_id,
     destination_distribution_release_revision,
     distribution_release_revision,
     normalize_destination_distribution_targets,
+    require_active_background_variant,
     require_background_variant,
     save_background_variant_approval,
     selected_short_variant_id,
@@ -68,6 +70,22 @@ _active_render_jobs: set[str] = set()
 _render_completion_tasks: set[asyncio.Task] = set()
 _RENDER_JOBS_PATH = Path("work/clip_render_jobs.json")
 _caption_speaker_overrides_lock = threading.Lock()
+
+
+def _require_active_variant(variant_id: str) -> None:
+    try:
+        require_active_background_variant(variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except RetiredShortVariantError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "short_variant_retired",
+                "variant_id": exc.variant_id,
+                "message": str(exc),
+            },
+        ) from exc
 
 
 def _release_render_task(task: asyncio.Task) -> None:
@@ -755,6 +773,7 @@ def _public_distribution(state: dict, change_lock: dict | None = None) -> dict:
             "label",
             "current",
             "approval_current",
+            "active_for_new_writes",
             "revision",
         )
     } | {
@@ -1030,6 +1049,8 @@ def _select_clip_distribution_locked(
 def _select_clip_distribution_unlocked(
     episode_id: str, clip_id: str, req: DistributionSelectionRequest
 ) -> dict:
+    if req.variant_id is not None:
+        _require_active_variant(req.variant_id)
     clips, clips_file = load_clips(episode_id)
     clip, index = find_clip(clips, clip_id)
     try:
@@ -1085,11 +1106,6 @@ async def select_clip_distribution(
     episode_id: str, clip_id: str, req: DistributionSelectionRequest
 ) -> dict:
     """Select one independently approved short version for distribution."""
-    if req.variant_id is not None:
-        try:
-            require_background_variant(req.variant_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     return await asyncio.to_thread(
         _select_clip_distribution_locked, episode_id, clip_id, req
     )
@@ -1169,6 +1185,9 @@ def _prepare_clip_rerelease_locked(
         short_rerelease_state,
         validated_short_receipts,
     )
+
+    if isinstance(req, ReReleaseRequest) and req.variant_id is not None:
+        _require_active_variant(req.variant_id)
 
     with publication_lock(EPISODES_DIR):
         clips, clips_file = load_clips(episode_id)
@@ -1637,7 +1656,10 @@ def _cancellation_response(episode_id: str, clip_id: str, operation: dict) -> di
         "prior_receipt_preserved": True,
     }
     target = operation["snapshot"].get("target")
-    if isinstance(target, dict):
+    if isinstance(target, dict) and (
+        target.get("variant_id") is None
+        or target.get("variant_id") in SPEAKER_PANEL_VARIANT_IDS
+    ):
         response["next"] = {
             "method": "POST",
             "path": f"/api/episodes/{episode_id}/clips/{clip_id}/re-release",
@@ -2253,6 +2275,8 @@ async def _run_clip_render_operation(
     asset_id: str | None = None,
 ) -> dict:
     """Run one serialized clip media operation and persist its review state."""
+    if variant_id is not None:
+        _require_active_variant(variant_id)
     from agents.pipeline import load_config
     from agents.shorts_render import (
         render_single_clip,
@@ -2374,10 +2398,6 @@ async def render_clip_variant(
     req: VariantRenderRequest | None = None,
 ) -> dict:
     """Render one optional review variant without changing the canonical short."""
-    try:
-        require_background_variant(variant_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     return await _run_clip_render_operation(
         episode_id,
         clip_id,
@@ -2391,10 +2411,7 @@ async def approve_clip_variant(
     episode_id: str, clip_id: str, variant_id: str, req: VariantApprovalRequest
 ) -> dict:
     """Approve the exact current variant pixels and current clip copy."""
-    try:
-        require_background_variant(variant_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    _require_active_variant(variant_id)
     clips, _ = load_clips(episode_id)
     clip, _ = find_clip(clips, clip_id)
     ep_dir = EPISODES_DIR / episode_id

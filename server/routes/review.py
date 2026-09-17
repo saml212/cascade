@@ -50,9 +50,9 @@ from lib.ffprobe import media_fingerprint, probe
 from lib.paths import get_episodes_dir
 from lib.short_distribution import PLATFORM_COPY_FIELDS, SHORT_PLATFORM_SPECS
 from lib.short_variants import (
+    ACTIVE_BACKGROUND_VARIANT_IDS,
     BACKGROUND_VARIANT_IDS,
     DISTRIBUTION_RELEASE_FIELD,
-    SATISFYING_VARIANT_ID,
     background_variant_approval_state,
     background_variant_asset_ids,
     background_variant_label,
@@ -828,7 +828,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 variant_record, variant_render, variant_revision
             )
             variant_states[variant_id] = (variant_render, variant_approval)
-            if variant_id == SATISFYING_VARIANT_ID and not variant_record:
+            if variant_id not in ACTIVE_BACKGROUND_VARIANT_IDS and not variant_record:
                 continue
             variant_asset = variant_record.get("asset")
             variant_asset_id = (
@@ -855,6 +855,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "asset_id": variant_asset_id,
                 "asset_ids": variant_asset_ids,
                 "asset_free": not variant_asset_ids,
+                "active_for_new_writes": (variant_id in ACTIVE_BACKGROUND_VARIANT_IDS),
                 "render": variant_render,
                 "approval": variant_approval,
                 "render_job": render_job_state(
@@ -880,6 +881,7 @@ def episode_review_state(episode_dir: Path) -> dict:
                 "label": "Invalid selection",
                 "current": False,
                 "approval_current": False,
+                "active_for_new_writes": False,
                 "revision": base_approval["revision"],
                 "re_release_request": release_request,
                 **change_lock,
@@ -900,6 +902,10 @@ def episode_review_state(episode_dir: Path) -> dict:
                 ),
                 "current": selected_render["current"],
                 "approval_current": selected_approval["current"],
+                "active_for_new_writes": (
+                    selected_variant_id is None
+                    or selected_variant_id in ACTIVE_BACKGROUND_VARIANT_IDS
+                ),
                 "revision": selected_approval["revision"],
                 "re_release_request": release_request,
                 **change_lock,

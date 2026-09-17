@@ -135,6 +135,13 @@ _VARIANT_ASSETS = {
     SPEAKER_PANELS_VARIANT_ID: None,
 }
 BACKGROUND_VARIANT_IDS = tuple(_VARIANT_LABELS)
+ACTIVE_BACKGROUND_VARIANT_IDS = (
+    GAMEPLAY_SURROUND_VARIANT_ID,
+    SPEAKER_PANELS_VARIANT_ID,
+)
+RETIRED_BACKGROUND_VARIANT_IDS = frozenset(BACKGROUND_VARIANT_IDS).difference(
+    ACTIVE_BACKGROUND_VARIANT_IDS
+)
 GAMEPLAY_VARIANT_IDS = frozenset(
     {
         MINECRAFT_PARKOUR_VARIANT_ID,
@@ -176,6 +183,22 @@ def background_assets_dir() -> Path:
 def require_background_variant(variant_id: str) -> None:
     if variant_id not in BACKGROUND_VARIANT_IDS:
         raise KeyError(f"Unknown short variant: {variant_id}")
+
+
+class RetiredShortVariantError(ValueError):
+    """A recognized historical variant cannot be used for new work."""
+
+    def __init__(self, variant_id: str):
+        self.variant_id = variant_id
+        super().__init__(
+            f"Short variant {variant_id} is retired; existing media and history only"
+        )
+
+
+def require_active_background_variant(variant_id: str) -> None:
+    require_background_variant(variant_id)
+    if variant_id not in ACTIVE_BACKGROUND_VARIANT_IDS:
+        raise RetiredShortVariantError(variant_id)
 
 
 def background_variant_label(variant_id: str) -> str:

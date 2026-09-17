@@ -10,6 +10,9 @@ pytest_plugins = ["tests.test_routes_episodes"]
 
 REQUEST_ID = "47db1913-4d32-4acf-bcfe-31763c50e9c2"
 SCHEDULED_DATE = "2099-01-05T09:00:00-08:00"
+ACTIVE_VARIANT_IDS = ("gameplay_surround_v1", "speaker_panels_v1")
+ACTIVE_VARIANT_ID = "speaker_panels_v1"
+RETIRED_VARIANT_ID = "background_motion_v1"
 
 
 def _receipt():
@@ -173,14 +176,22 @@ def _inert_tombstone_evidence():
 
 def _state(candidate):
     variant_id = candidate.get("distribution_variant_id")
+    labels = {
+        "gameplay_surround_v1": "Gameplay surround",
+        "speaker_panels_v1": "Clean speaker panels",
+        "background_motion_v1": "Motion background",
+    }
     return {
         "version": variant_id or "base",
         "variant_id": variant_id,
-        "label": "Motion background" if variant_id else "Base",
+        "label": labels.get(variant_id, "Base"),
         "current": True,
         "approval_current": True,
-        "revision": "sha256:motion-target",
-        "render_fingerprint": "sha256:motion-render",
+        "active_for_new_writes": (
+            variant_id is None or variant_id in ACTIVE_VARIANT_IDS
+        ),
+        "revision": "sha256:selected-target",
+        "render_fingerprint": "sha256:selected-render",
     }
 
 
@@ -234,11 +245,11 @@ def _setup(test_client, monkeypatch):
 
     monkeypatch.setattr(clips, "_delete_upload_post_schedule", delete)
     request = {
-        "variant_id": "background_motion_v1",
-        "expected_revision": "sha256:motion-target",
+        "variant_id": ACTIVE_VARIANT_ID,
+        "expected_revision": "sha256:selected-target",
         "request_id": REQUEST_ID,
         "actor": "release-operator",
-        "reason": "Replace the approved Base schedule with Motion",
+        "reason": "Replace the approved Base schedule with clean speaker panels",
     }
     return client, episode_dir, original, deleted, request
 
@@ -375,6 +386,48 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
         ]
         is None
     )
+
+
+def test_retired_historical_target_can_be_cancelled_without_rerelease_next(
+    test_client, monkeypatch
+):
+    client, episode_dir, _original, deleted, request = _setup(test_client, monkeypatch)
+    publish_path = episode_dir / "publish.json"
+    publish = json.loads(publish_path.read_text())
+    historical = {
+        **publish["shorts"][0],
+        "version": RETIRED_VARIANT_ID,
+        "variant_id": RETIRED_VARIANT_ID,
+        "render_fingerprint": "sha256:retired-render",
+        "approval_revision": "sha256:retired-approval",
+    }
+    publish["shorts"][0] = historical
+    publish_path.write_text(json.dumps(publish))
+    retired_request = {
+        **request,
+        "variant_id": RETIRED_VARIANT_ID,
+        "reason": "Cancel the retired historical scheduled target",
+    }
+
+    preview = client.post(
+        "/api/episodes/ep_001/clips/clip_01/schedule-cancellation/preview",
+        json=retired_request,
+    )
+    assert preview.status_code == 200
+    assert preview.json()["target"]["variant_id"] == RETIRED_VARIANT_ID
+
+    cancelled = client.post(
+        "/api/episodes/ep_001/clips/clip_01/schedule-cancellation",
+        json=preview.json()["execute"],
+    )
+
+    assert cancelled.status_code == 200
+    assert "next" not in cancelled.json()
+    assert deleted["calls"] == 1
+    stored = json.loads(publish_path.read_text())["shorts"][0]
+    assert stored["pre_cancellation_receipt"] == historical
+    assert stored["status"] == "cancelled"
+    assert stored["scheduled"] is False
 
 
 def test_exact_job_cancellation_handles_three_jobs_without_replacement(

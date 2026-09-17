@@ -60,6 +60,15 @@ SAMPLE_CLIPS = [
     },
 ]
 
+ACTIVE_VARIANT_IDS = ("gameplay_surround_v1", "speaker_panels_v1")
+RETIRED_VARIANT_IDS = (
+    "background_motion_v1",
+    "satisfying_motion_v1",
+    "minecraft_parkour_v1",
+    "subway_surfers_v1",
+    "gta_driving_v1",
+)
+
 
 class TestListClips:
     def test_list_clips(self, test_client):
@@ -520,12 +529,19 @@ class TestDistributionSelection:
     @staticmethod
     def _state(candidate, *, current=True, approval_current=True):
         variant_id = candidate.get("distribution_variant_id")
+        labels = {
+            "gameplay_surround_v1": "Gameplay surround",
+            "speaker_panels_v1": "Clean speaker panels",
+        }
         return {
             "version": variant_id or "base",
             "variant_id": variant_id,
-            "label": "Motion background" if variant_id else "Base",
+            "label": labels.get(variant_id, "Base"),
             "current": current,
             "approval_current": approval_current,
+            "active_for_new_writes": (
+                variant_id is None or variant_id in ACTIVE_VARIANT_IDS
+            ),
             "revision": "sha256:selected-review",
             "render_fingerprint": "sha256:selected-render",
             "re_release_request": None,
@@ -545,6 +561,7 @@ class TestDistributionSelection:
             "label": variant_id,
             "current": True,
             "approval_current": True,
+            "active_for_new_writes": True,
             "revision": "sha256:" + revision * 64,
             "render_fingerprint": "sha256:" + fingerprint * 64,
             "re_release_request": None,
@@ -574,7 +591,7 @@ class TestDistributionSelection:
         selected = client.put(
             "/api/episodes/ep_001/clips/clip_01/distribution",
             json={
-                "variant_id": "background_motion_v1",
+                "variant_id": "gameplay_surround_v1",
                 "expected_revision": "sha256:selected-review",
             },
         )
@@ -588,11 +605,12 @@ class TestDistributionSelection:
 
         assert selected.status_code == 200
         assert selected.json()["distribution"] == {
-            "version": "background_motion_v1",
-            "variant_id": "background_motion_v1",
-            "label": "Motion background",
+            "version": "gameplay_surround_v1",
+            "variant_id": "gameplay_surround_v1",
+            "label": "Gameplay surround",
             "current": True,
             "approval_current": True,
+            "active_for_new_writes": True,
             "revision": "sha256:selected-review",
             "re_release_request": None,
             "change_locked": False,
@@ -646,7 +664,7 @@ class TestDistributionSelection:
         response = client.put(
             "/api/episodes/ep_001/clips/clip_01/distribution",
             json={
-                "variant_id": "background_motion_v1",
+                "variant_id": "gameplay_surround_v1",
                 "expected_revision": "sha256:selected-review",
             },
         )
@@ -701,7 +719,7 @@ class TestDistributionSelection:
         response = client.put(
             "/api/episodes/ep_001/clips/clip_01/distribution",
             json={
-                "variant_id": "background_motion_v1",
+                "variant_id": "gameplay_surround_v1",
                 "expected_revision": "sha256:selected-review",
             },
         )
@@ -785,7 +803,7 @@ class TestDistributionSelection:
         response = client.put(
             "/api/episodes/ep_001/clips/clip_01/distribution",
             json={
-                "variant_id": "background_motion_v1",
+                "variant_id": "gameplay_surround_v1",
                 "expected_revision": "sha256:selected-review",
             },
         )
@@ -847,7 +865,7 @@ class TestDistributionSelection:
                     "ep_001",
                     "clip_01",
                     clips_mod.DistributionSelectionRequest(
-                        variant_id="background_motion_v1",
+                        variant_id="gameplay_surround_v1",
                         expected_revision="sha256:selected-review",
                     ),
                 )
@@ -1209,9 +1227,7 @@ class TestDistributionSelection:
         assert len(acknowledgement["obligations"]) == 1
         assert acknowledgement["obligations"][0]["artifact_identity"] == "unknown"
 
-    @pytest.mark.parametrize(
-        "variant_id", ("background_motion_v1", "gameplay_surround_v1")
-    )
+    @pytest.mark.parametrize("variant_id", ACTIVE_VARIANT_IDS)
     def test_acknowledges_exact_legacy_history_for_variant_rerelease(
         self, test_client, monkeypatch, variant_id
     ):
@@ -1411,7 +1427,7 @@ class TestDistributionSelection:
         response = client.post(
             "/api/episodes/ep_001/clips/clip_01/re-release",
             json={
-                "variant_id": "background_motion_v1",
+                "variant_id": "gameplay_surround_v1",
                 "expected_revision": "sha256:selected-review",
                 "request_id": "8331d825-b41b-4cdc-9274-5f58d5fd2719",
                 "actor": "release-operator",
@@ -1451,7 +1467,7 @@ class TestDistributionSelection:
         response = client.post(
             "/api/episodes/ep_001/clips/clip_01/re-release",
             json={
-                "variant_id": "background_motion_v1",
+                "variant_id": "gameplay_surround_v1",
                 "expected_revision": "sha256:selected-review",
                 "request_id": "fd3c4097-e10f-48ee-bb5e-3f27679242f2",
                 "actor": "release-operator",
@@ -1900,24 +1916,21 @@ class TestClipMutation:
         )
 
         response = client.post(
-            "/api/episodes/ep_001/clips/clip_01/variants/background_motion_v1/render",
-            json={"asset_id": "motion_v1"},
+            "/api/episodes/ep_001/clips/clip_01/variants/speaker_panels_v1/render",
+            json={},
         )
 
         assert response.status_code == 200
-        assert response.json()["asset_id"] == "motion_v1"
+        assert response.json()["asset_id"] is None
         assert json.loads((ep_dir / "clips.json").read_text())["clips"][0] == clip
         job = json.loads((ep_dir / "work" / "clip_render_jobs.json").read_text())[
             "jobs"
-        ]["clip_01@background_motion_v1"]
+        ]["clip_01@speaker_panels_v1"]
         assert job["status"] == "succeeded"
 
     @pytest.mark.parametrize(
         ("variant_id", "asset_id"),
         (
-            ("minecraft_parkour_v1", "spicy_sauce_minecraft_12_v1"),
-            ("subway_surfers_v1", "orbitalncg_subway_surfers_12_v1"),
-            ("gta_driving_v1", "orbitalncg_gta_driving_15_v1"),
             ("gameplay_surround_v1", "gameplay_surround_assets_v1"),
             ("speaker_panels_v1", None),
         ),
@@ -1961,8 +1974,71 @@ class TestClipMutation:
             "jobs"
         ]
         assert jobs[f"clip_01@{variant_id}"]["status"] == "succeeded"
-        assert "clip_01@background_motion_v1" not in jobs
-        assert "clip_01@satisfying_motion_v1" not in jobs
+
+    @pytest.mark.parametrize("variant_id", RETIRED_VARIANT_IDS)
+    def test_retired_variant_write_routes_fail_before_side_effects(
+        self, test_client, monkeypatch, variant_id
+    ):
+        client, episodes_dir = test_client
+        ep_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
+        clips_path = ep_dir / "clips.json"
+        clips_before = clips_path.read_bytes()
+
+        import agents.shorts_render as render_mod
+
+        render_calls = []
+
+        def unexpected_render(*args, **kwargs):
+            render_calls.append((args, kwargs))
+            raise AssertionError("retired variant reached the render adapter")
+
+        monkeypatch.setattr(
+            render_mod,
+            "render_single_clip_variant",
+            unexpected_render,
+        )
+        responses = (
+            client.post(
+                f"/api/episodes/ep_001/clips/clip_01/variants/{variant_id}/render",
+                json={},
+            ),
+            client.post(
+                f"/api/episodes/ep_001/clips/clip_01/variants/{variant_id}/approve",
+                json={"expected_revision": "sha256:retired-review"},
+            ),
+            client.put(
+                "/api/episodes/ep_001/clips/clip_01/distribution",
+                json={
+                    "variant_id": variant_id,
+                    "expected_revision": "sha256:retired-review",
+                },
+            ),
+            client.post(
+                "/api/episodes/ep_001/clips/clip_01/re-release",
+                json={
+                    "variant_id": variant_id,
+                    "expected_revision": "sha256:retired-review",
+                    "request_id": "793321a8-a45d-41d5-99b6-b4310bd6de90",
+                    "actor": "release-operator",
+                    "reason": "Attempt a retired short variant write",
+                },
+            ),
+        )
+
+        for response in responses:
+            assert response.status_code == 409
+            assert response.json()["detail"] == {
+                "code": "short_variant_retired",
+                "variant_id": variant_id,
+                "message": (
+                    f"Short variant {variant_id} is retired; existing media and "
+                    "history only"
+                ),
+            }
+        assert render_calls == []
+        assert clips_path.read_bytes() == clips_before
+        assert not (ep_dir / "work" / "clip_render_jobs.json").exists()
 
     def test_variant_routes_reject_unknown_id(self, test_client):
         client, episodes_dir = test_client
@@ -1970,16 +2046,14 @@ class TestClipMutation:
         _add_clips(episodes_dir, "ep_001", [SAMPLE_CLIPS[0]])
 
         response = client.post(
-            "/api/episodes/ep_001/clips/clip_01/variants/not_supported/render",
+            "/api/episodes/ep_001/clips/clip_01/variants/satisfying_background_v1/render",
             json={},
         )
 
         assert response.status_code == 404
         assert "Unknown short variant" in response.json()["detail"]
 
-    @pytest.mark.parametrize(
-        "variant_id", ("minecraft_parkour_v1", "speaker_panels_v1")
-    )
+    @pytest.mark.parametrize("variant_id", ACTIVE_VARIANT_IDS)
     def test_variant_approval_restores_candidate_without_approving_base(
         self, test_client, monkeypatch, variant_id
     ):
@@ -2149,8 +2223,8 @@ class TestClipMutation:
             clips_mod._run_clip_render_operation(
                 "ep_001",
                 "clip_01",
-                variant_id="background_motion_v1",
-                asset_id="motion_v1",
+                variant_id="gameplay_surround_v1",
+                asset_id="gameplay_surround_assets_v1",
             )
         )
         try:
@@ -2165,11 +2239,11 @@ class TestClipMutation:
 
             with pytest.raises(HTTPException) as blocked:
                 await clips_mod._run_clip_render_operation(
-                    "ep_001", "clip_01", variant_id="background_motion_v1"
+                    "ep_001", "clip_01", variant_id="gameplay_surround_v1"
                 )
             assert getattr(blocked.value, "status_code", None) == 409
             assert (
-                clips_mod.render_job_state(ep_dir, "clip_01@background_motion_v1")[
+                clips_mod.render_job_state(ep_dir, "clip_01@gameplay_surround_v1")[
                     "status"
                 ]
                 == "rendering"
@@ -2183,7 +2257,7 @@ class TestClipMutation:
             await asyncio.sleep(0.01)
         assert not clips_mod._active_render_jobs
         assert (
-            clips_mod.render_job_state(ep_dir, "clip_01@background_motion_v1")["status"]
+            clips_mod.render_job_state(ep_dir, "clip_01@gameplay_surround_v1")["status"]
             == "succeeded"
         )
 

@@ -94,12 +94,10 @@ def test_required_short_variant_is_bound_to_release_plan(tmp_path):
         tmp_path, episode, config=config, environment=environment
     )
 
-    config["platforms"]["x"]["required_short_variant_id"] = "satisfying_motion_v1"
+    config["platforms"]["x"]["required_short_variant_id"] = "speaker_panels_v1"
     plan = current_publish_plan(config, episode, environment=environment)
 
-    assert plan["upload_post"]["required_short_variants"] == {
-        "x": "satisfying_motion_v1"
-    }
+    assert plan["upload_post"]["required_short_variants"] == {"x": "speaker_panels_v1"}
     assert (
         release_revision(tmp_path, episode, config=config, environment=environment)
         != original
@@ -133,6 +131,17 @@ def test_required_short_variant_must_name_a_supported_variant():
     }
 
     with pytest.raises(ValueError, match="unknown short variant"):
+        current_publish_plan(config, _episode(), environment={})
+
+
+def test_required_short_variant_cannot_name_a_retired_variant():
+    config = _config()
+    config["platforms"]["x"] = {
+        "enabled": True,
+        "required_short_variant_id": "background_motion_v1",
+    }
+
+    with pytest.raises(ValueError, match="retired short variant"):
         current_publish_plan(config, _episode(), environment={})
 
 

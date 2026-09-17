@@ -1,6 +1,8 @@
 import type {
+  ActiveClipVariantId,
   ClipReReleaseRequestState,
   ClipReviewState,
+  ClipVariantId,
   PrepareClipReReleaseRequest,
   PrepareClipReReleaseResponse,
   ReviewArtifact,
@@ -8,34 +10,56 @@ import type {
 } from './api';
 import type { StatusDescriptor } from './format';
 
-export type ClipReviewSurface = 'base' | 'background' | 'gameplay' | 'panels';
-export type ClipVariantId =
-  | 'background_motion_v1'
-  | 'gameplay_surround_v1'
-  | 'speaker_panels_v1';
+export type ClipReviewSurface = 'base' | ClipVariantId;
 
-function isClipVariantId(value: unknown): value is ClipVariantId {
-  return (
-    value === 'background_motion_v1' ||
-    value === 'gameplay_surround_v1' ||
-    value === 'speaker_panels_v1'
-  );
+const CLIP_VARIANT_IDS: readonly ClipVariantId[] = [
+  'gameplay_surround_v1',
+  'speaker_panels_v1',
+  'background_motion_v1',
+  'satisfying_motion_v1',
+  'minecraft_parkour_v1',
+  'subway_surfers_v1',
+  'gta_driving_v1',
+];
+
+const CLIP_VARIANT_LABELS: Readonly<Record<ClipVariantId, string>> = {
+  background_motion_v1: 'Motion background',
+  satisfying_motion_v1: 'Satisfying footage',
+  minecraft_parkour_v1: 'Minecraft parkour',
+  subway_surfers_v1: 'Subway Surfers',
+  gta_driving_v1: 'GTA driving',
+  gameplay_surround_v1: 'Gameplay surround',
+  speaker_panels_v1: 'Clean speaker panels',
+};
+
+export const RETIRED_VARIANT_NOTICE =
+  'Retired \u2014 existing media and history only';
+
+export function isActiveClipVariantId(
+  value: unknown
+): value is ActiveClipVariantId {
+  return value === 'gameplay_surround_v1' || value === 'speaker_panels_v1';
 }
 
-function variantSurface(variantId: ClipVariantId): ClipReviewSurface {
-  if (variantId === 'gameplay_surround_v1') return 'gameplay';
-  if (variantId === 'speaker_panels_v1') return 'panels';
-  return 'background';
+function isClipVariantId(value: unknown): value is ClipVariantId {
+  return CLIP_VARIANT_IDS.some((variantId) => value === variantId);
 }
 
 export function clipVariantForSurface(
   review: ClipReviewState,
   surface: ClipReviewSurface
 ): ShortVariantReview | undefined {
-  if (surface === 'background') return review.variants?.background_motion_v1;
-  if (surface === 'gameplay') return review.variants?.gameplay_surround_v1;
-  if (surface === 'panels') return review.variants?.speaker_panels_v1;
-  return undefined;
+  if (surface === 'base' || !isClipVariantId(surface)) return undefined;
+  const variant = review.variants?.[surface];
+  return variant?.id === surface ? variant : undefined;
+}
+
+export function clipVariantSurfaces(
+  review: ClipReviewState
+): ClipVariantId[] {
+  return CLIP_VARIANT_IDS.filter((variantId) =>
+    Boolean(clipVariantForSurface(review, variantId))
+  );
 }
 
 export interface ClipVersionState {
@@ -43,6 +67,7 @@ export interface ClipVersionState {
   version: 'base' | ClipVariantId;
   variantId: null | ClipVariantId;
   label: string;
+  activeForNewWrites: boolean;
   render: ReviewArtifact;
   approval: { status: string; current: boolean; revision: string };
 }
@@ -57,26 +82,31 @@ export function clipVersionState(
       version: 'base',
       variantId: null,
       label: 'Base',
+      activeForNewWrites: true,
       render: review.render,
       approval: review.approval,
     };
   }
   const variant = clipVariantForSurface(review, surface);
-  if (!variant || !isClipVariantId(variant.id)) return null;
+  if (!variant) return null;
   return {
     surface,
     version: variant.id,
     variantId: variant.id,
-    label:
-      variant.label ||
-      (variant.id === 'gameplay_surround_v1'
-        ? 'Gameplay surround'
-        : variant.id === 'speaker_panels_v1'
-          ? 'Clean speaker panels'
-          : 'Motion background'),
+    label: variant.label || CLIP_VARIANT_LABELS[variant.id],
+    activeForNewWrites:
+      isActiveClipVariantId(variant.id) &&
+      variant.active_for_new_writes === true,
     render: variant.render,
     approval: variant.approval,
   };
+}
+
+export function clipVersionAllowsNewWrites(
+  review: ClipReviewState,
+  surface: ClipReviewSurface
+): boolean {
+  return clipVersionState(review, surface)?.activeForNewWrites === true;
 }
 
 export function selectedDistributionVersion(
@@ -91,7 +121,7 @@ export function selectedDistributionVersion(
     isClipVariantId(distribution.version) &&
     distribution.variant_id === distribution.version
   ) {
-    return clipVersionState(review, variantSurface(distribution.version));
+    return clipVersionState(review, distribution.version);
   }
   return null;
 }
@@ -102,6 +132,8 @@ export function clipDistributionReady(review: ClipReviewState): boolean {
   const distribution = review.distribution;
   return Boolean(
     version &&
+      clipVersionAllowsNewWrites(review, version.surface) &&
+      distribution.active_for_new_writes === true &&
       distribution.current &&
       distribution.approval_current &&
       version.render.current &&
@@ -142,6 +174,7 @@ export function clipDistributionSelectable(
   const version = clipVersionState(review, surface);
   return Boolean(
     version &&
+      clipVersionAllowsNewWrites(review, surface) &&
       selectedDistributionVersion(review)?.surface !== surface &&
       review.distribution.change_locked === false &&
       review.distribution.re_release_request === null &&
@@ -155,9 +188,7 @@ export function distributionVersionLabel(
   variantId: unknown
 ): string {
   if (isClipVariantId(version) && variantId === version) {
-    if (version === 'gameplay_surround_v1') return 'Gameplay surround';
-    if (version === 'speaker_panels_v1') return 'Clean speaker panels';
-    return 'Motion background';
+    return CLIP_VARIANT_LABELS[version];
   }
   if ((version == null || version === 'base') && variantId == null) return 'Base';
   return 'Unknown version';
@@ -325,7 +356,7 @@ export function clipReReleaseViewState(
 export interface ClipReReleaseDraftTarget {
   episodeId: string;
   clipId: string;
-  variantId: null | ClipVariantId;
+  variantId: null | ActiveClipVariantId;
   expectedRevision: string;
   previousRequestId: string | null;
 }

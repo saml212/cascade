@@ -323,7 +323,7 @@ class TestSafetyGate:
         self, env, episode_dir
     ):
         config = _publish_config()
-        config["platforms"]["x"]["required_short_variant_id"] = "satisfying_motion_v1"
+        config["platforms"]["x"]["required_short_variant_id"] = "speaker_panels_v1"
         _seed_episode(episode_dir, config=config)
 
         with (
@@ -1151,22 +1151,42 @@ class TestVersionedShorts:
         snapshot = quality_snapshot(episode_dir, config=config)
         snapshot["release_gate"]["revision"] = "sha256:release-with-variant"
         snapshot["release_gate"]["short_versions"]["clip_0"] = {
-            "version": "background_motion_v1",
-            "variant_id": "background_motion_v1",
+            "version": "speaker_panels_v1",
+            "variant_id": "speaker_panels_v1",
             "current": True,
             "approval_current": True,
+            "active_for_new_writes": True,
             "revision": "sha256:variant-review",
-            "path": ("short_variants/background_motion_v1/clip_0.mp4"),
+            "path": ("short_variants/speaker_panels_v1/clip_0.mp4"),
             "render_fingerprint": "sha256:variant-render",
         }
         return snapshot
+
+    def test_selected_retired_variant_blocks_before_provider_work(
+        self, env, episode_dir
+    ):
+        config = _publish_config()
+        _seed_episode(episode_dir, config=config)
+        snapshot = self._variant_snapshot(episode_dir, config)
+        snapshot["release_gate"]["short_versions"]["clip_0"][
+            "active_for_new_writes"
+        ] = False
+
+        with (
+            patch("agents.publish.quality_snapshot", return_value=snapshot),
+            patch("agents.publish.subprocess.run") as run,
+            pytest.raises(RuntimeError, match="unapproved, or retired"),
+        ):
+            _make_agent(episode_dir, config).execute()
+
+        run.assert_not_called()
 
     def test_selected_variant_path_and_identity_are_persisted_and_reused(
         self, env, episode_dir
     ):
         config = _publish_config()
         _seed_episode(episode_dir, config=config)
-        variant = episode_dir / "short_variants" / "background_motion_v1" / "clip_0.mp4"
+        variant = episode_dir / "short_variants" / "speaker_panels_v1" / "clip_0.mp4"
         variant.parent.mkdir(parents=True)
         variant.write_bytes(b"approved variant")
         snapshot = self._variant_snapshot(episode_dir, config)
@@ -1186,8 +1206,8 @@ class TestVersionedShorts:
         assert len(commands) == 1
         assert f"video=@{variant}" in commands[0]
         receipt = first["shorts"][0]
-        assert receipt["version"] == "background_motion_v1"
-        assert receipt["variant_id"] == "background_motion_v1"
+        assert receipt["version"] == "speaker_panels_v1"
+        assert receipt["variant_id"] == "speaker_panels_v1"
         assert receipt["render_fingerprint"] == "sha256:variant-render"
         assert receipt["approval_revision"] == "sha256:variant-review"
         assert second["shorts"][0]["reused_receipt"] is True
@@ -1205,7 +1225,7 @@ class TestVersionedShorts:
     ):
         config = _publish_config()
         _seed_episode(episode_dir, config=config, youtube_url=None)
-        variant = episode_dir / "short_variants" / "background_motion_v1" / "clip_0.mp4"
+        variant = episode_dir / "short_variants" / "speaker_panels_v1" / "clip_0.mp4"
         variant.parent.mkdir(parents=True)
         variant.write_bytes(b"approved variant")
         snapshot = self._variant_snapshot(episode_dir, config)
@@ -1279,8 +1299,8 @@ class TestVersionedShorts:
         (
             {"version": "base"},
             {
-                "version": "background_motion_v1",
-                "variant_id": "background_motion_v1",
+                "version": "speaker_panels_v1",
+                "variant_id": "speaker_panels_v1",
                 "render_fingerprint": "sha256:replaced-render",
                 "approval_revision": "sha256:variant-review",
             },
@@ -1291,7 +1311,7 @@ class TestVersionedShorts:
     ):
         config = _publish_config()
         _seed_episode(episode_dir, config=config)
-        variant = episode_dir / "short_variants" / "background_motion_v1" / "clip_0.mp4"
+        variant = episode_dir / "short_variants" / "speaker_panels_v1" / "clip_0.mp4"
         variant.parent.mkdir(parents=True)
         variant.write_bytes(b"approved variant")
         snapshot = self._variant_snapshot(episode_dir, config)
@@ -1333,8 +1353,8 @@ class TestVersionedShorts:
         }
         variant = {
             **base,
-            "version": "background_motion_v1",
-            "variant_id": "background_motion_v1",
+            "version": "speaker_panels_v1",
+            "variant_id": "speaker_panels_v1",
         }
 
         assert agent._receipt_matches_version(legacy_receipt, base) is True
@@ -2407,7 +2427,7 @@ class TestShortDestinationRequests:
         self, env, episode_dir, monkeypatch
     ):
         config = _destination_config()
-        required_variant = "satisfying_motion_v1"
+        required_variant = "speaker_panels_v1"
         config["platforms"]["x"]["required_short_variant_id"] = required_variant
         self._seed(episode_dir, config)
         agent = _make_agent(episode_dir, config)
@@ -2676,14 +2696,14 @@ class TestShortDestinationRequests:
         self, env, episode_dir, monkeypatch, destinations
     ):
         config = _destination_config()
-        config["platforms"]["x"]["required_short_variant_id"] = "satisfying_motion_v1"
+        config["platforms"]["x"]["required_short_variant_id"] = "speaker_panels_v1"
         self._seed(episode_dir, config)
         agent = _make_agent(episode_dir, config)
         data = agent._inputs()
         wrong = {
             **data["short_versions"]["clip_0"],
-            "version": "minecraft_parkour_v1",
-            "variant_id": "minecraft_parkour_v1",
+            "version": "gameplay_surround_v1",
+            "variant_id": "gameplay_surround_v1",
         }
         monkeypatch.setattr(
             agent,
@@ -2704,7 +2724,7 @@ class TestShortDestinationRequests:
             destinations=destinations,
             clip_ids=["clip_0"],
         )
-        request["variant_overrides"] = {"clip_0": "minecraft_parkour_v1"}
+        request["variant_overrides"] = {"clip_0": "gameplay_surround_v1"}
 
         with pytest.raises(
             RuntimeError, match="Submit a separate x destination request"
@@ -3457,7 +3477,7 @@ class TestExpandedShortDestinations:
             "request_id": "811e01ca-6c83-4b52-9d88-3341c56560ec",
             "actor": "release-operator",
             "reason": "Release the approved Motion replacement",
-            "variant_id": "background_motion_v1",
+            "variant_id": "speaker_panels_v1",
             "target_revision": "sha256:original-copy-approval",
             "render_fingerprint": "sha256:motion-pixels",
             "receipt_history_revision": history_revision,
@@ -3476,8 +3496,8 @@ class TestExpandedShortDestinations:
         )
         clip = {"id": "clip_0", "distribution_release": authorization}
         version = {
-            "version": "background_motion_v1",
-            "variant_id": "background_motion_v1",
+            "version": "speaker_panels_v1",
+            "variant_id": "speaker_panels_v1",
             "render_fingerprint": "sha256:motion-pixels",
             "revision": "sha256:fresh-copy-approval",
             "re_release_request": authorization,

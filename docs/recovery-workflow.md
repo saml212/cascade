@@ -221,9 +221,12 @@ publication.
 
 ## Select a short version for distribution
 
-Preview and approve **Base** and **Motion background** independently. Approval
-does not select a version, and selection does not approve it. A clip with no
-saved selection uses Base.
+Preview and approve **Base**, **Gameplay surround**, and **Clean speaker panels**
+independently. Approval does not select a version, and selection does not
+approve it. A clip with no saved selection uses Base. The five older lower-panel
+variants remain readable for historical media and receipts, but their review
+records report `active_for_new_writes: false`; render, approval, selection, and
+re-release attempts for them return `409 short_variant_retired`.
 
 Read `review.distribution` from
 `GET /api/episodes/{episode_id}/review`, then select with:
@@ -232,7 +235,7 @@ Read `review.distribution` from
 PUT /api/episodes/{episode_id}/clips/{clip_id}/distribution
 {"variant_id":null,"expected_revision":"sha256:..."}
 PUT /api/episodes/{episode_id}/clips/{clip_id}/distribution
-{"variant_id":"background_motion_v1","expected_revision":"sha256:..."}
+{"variant_id":"gameplay_surround_v1","expected_revision":"sha256:..."}
 ```
 
 The selected file must be current and separately approved. Its exact media,
@@ -256,7 +259,7 @@ exact cancellation:
 
 ```text
 POST /api/episodes/{episode_id}/clips/{clip_id}/schedule-cancellation/preview
-{"variant_id":"background_motion_v1","expected_revision":"sha256:...","request_id":"<new UUID>","actor":"...","reason":"..."}
+{"variant_id":"gameplay_surround_v1","expected_revision":"sha256:...","request_id":"<new UUID>","actor":"...","reason":"..."}
 ```
 
 Review the returned local receipt, provider job, profile, date, platforms, and
@@ -265,14 +268,17 @@ target. Send the response's `execute` body unchanged to the same path without
 original receipt, and marks it cancelled only after an exact successful delete,
 calendar absence, and exact status/history evidence. If the response is
 ambiguous, do not issue another delete; reconcile the stored operation. On
-success, send the returned `next.body` to the returned re-release path.
+success, send `next.body` to the returned re-release path only when the response
+contains `next`. Cancellation of a recognized retired historical target remains
+supported, but intentionally returns no follow-up re-release request; do not
+reconstruct or submit one for that retired identity.
 
 When `review.distribution.re_release_allowed` is true, prepare the exact approved
 target with:
 
 ```text
 POST /api/episodes/{episode_id}/clips/{clip_id}/re-release
-{"variant_id":"background_motion_v1","expected_revision":"sha256:...","request_id":"<new UUID>","actor":"...","reason":"..."}
+{"variant_id":"gameplay_surround_v1","expected_revision":"sha256:...","request_id":"<new UUID>","actor":"...","reason":"..."}
 ```
 
 Use `variant_id: null` to release Base again. Keep the same request ID when
@@ -290,7 +296,7 @@ or destination identity. The review response exposes each such receipt under
 `unresolved_receipt_obligations`, labels an absent artifact identity as
 `unknown`, and returns `re_release_history_revision`. If
 `unresolved_history_acknowledgement_allowed` is true, an operator may prepare
-only the current separately approved Motion replacement by adding:
+only a current separately approved active short-variant replacement by adding:
 
 ```text
 "acknowledge_unresolved_history_revision":"sha256:..."

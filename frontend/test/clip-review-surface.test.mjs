@@ -11,11 +11,15 @@ const {
   clipDistributionReady,
   clipDistributionSelectable,
   clipReReleaseViewState,
+  clipVersionAllowsNewWrites,
   clipVersionState,
+  clipVariantForSurface,
+  clipVariantSurfaces,
   confirmsClipReRelease,
   distributionChangeLockReason,
   distributionVersionLabel,
   publicationEvidenceStatusLabel,
+  RETIRED_VARIANT_NOTICE,
   selectedDistributionVersion,
 } = await importTs(
   new URL('../src/lib/clip-review-surface.ts', import.meta.url)
@@ -37,6 +41,7 @@ function reviewState({ distributionVersion = 'base', backgroundApproved = false 
         distributionVersion === 'background_motion_v1'
           ? 'Motion background'
           : 'Base',
+      active_for_new_writes: distributionVersion !== 'background_motion_v1',
       current: true,
       approval_current: true,
       revision:
@@ -54,7 +59,12 @@ function reviewState({ distributionVersion = 'base', backgroundApproved = false 
       background_motion_v1: {
         id: 'background_motion_v1',
         label: 'Motion background',
-        render: { current: true, playable: true },
+        active_for_new_writes: false,
+        render: {
+          current: true,
+          playable: true,
+          url: '/media/background_motion_v1/clip_11.mp4',
+        },
         approval: {
           status: backgroundApproved ? 'current' : 'unapproved',
           current: backgroundApproved,
@@ -68,40 +78,64 @@ function reviewState({ distributionVersion = 'base', backgroundApproved = false 
 test('preserves the chosen preview surface through next and previous navigation', () => {
   const memory = new ClipReviewSurfaceMemory();
 
-  const variants = new Set(['base', 'background', 'gameplay']);
+  const variants = new Set([
+    'base',
+    'background_motion_v1',
+    'gameplay_surround_v1',
+  ]);
   assert.equal(memory.get('clip_11', variants, 'base'), 'base');
-  memory.select('clip_11', 'background');
-  assert.equal(memory.get('clip_11', variants, 'base'), 'background');
-  assert.equal(memory.get('clip_12', variants, 'base'), 'background');
-  assert.equal(memory.get('clip_11', variants, 'base'), 'background');
+  memory.select('clip_11', 'background_motion_v1');
+  assert.equal(
+    memory.get('clip_11', variants, 'base'),
+    'background_motion_v1'
+  );
+  assert.equal(
+    memory.get('clip_12', variants, 'base'),
+    'background_motion_v1'
+  );
+  assert.equal(
+    memory.get('clip_11', variants, 'base'),
+    'background_motion_v1'
+  );
 
   memory.select('clip_12', 'base');
-  assert.equal(memory.get('clip_11', variants, 'background'), 'base');
+  assert.equal(memory.get('clip_11', variants, 'background_motion_v1'), 'base');
 });
 
 test('temporarily falls back to base without losing background preference', () => {
   const memory = new ClipReviewSurfaceMemory();
 
-  memory.select('clip_11', 'background');
+  memory.select('clip_11', 'background_motion_v1');
   assert.equal(memory.get('clip_12', new Set(['base']), 'base'), 'base');
   assert.equal(
-    memory.get('clip_13', new Set(['base', 'background']), 'base'),
-    'background'
+    memory.get(
+      'clip_13',
+      new Set(['base', 'background_motion_v1']),
+      'base'
+    ),
+    'background_motion_v1'
   );
 });
 
 test('defaults each clip preview to its selected distribution until the user chooses', () => {
   const memory = new ClipReviewSurfaceMemory();
-  const variants = new Set(['base', 'background', 'gameplay']);
+  const variants = new Set([
+    'base',
+    'background_motion_v1',
+    'gameplay_surround_v1',
+  ]);
 
-  assert.equal(memory.get('clip_01', variants, 'background'), 'background');
+  assert.equal(
+    memory.get('clip_01', variants, 'background_motion_v1'),
+    'background_motion_v1'
+  );
   assert.equal(memory.get('clip_02', variants, 'base'), 'base');
 
   memory.select('clip_02', 'base');
-  assert.equal(memory.get('clip_03', variants, 'background'), 'base');
+  assert.equal(memory.get('clip_03', variants, 'background_motion_v1'), 'base');
 });
 
-test('uses the persisted exact version as the distribution identity', () => {
+test('preserves a retired persisted version as historical distribution identity', () => {
   const base = reviewState();
   assert.equal(clipDistributionReady(base), true);
   assert.equal(clipDistributionLabel(base), 'Base');
@@ -111,9 +145,20 @@ test('uses the persisted exact version as the distribution identity', () => {
     distributionVersion: 'background_motion_v1',
     backgroundApproved: true,
   });
-  assert.equal(clipDistributionReady(background), true);
+  assert.equal(clipDistributionReady(background), false);
   assert.equal(clipDistributionLabel(background), 'Motion background');
-  assert.equal(selectedDistributionVersion(background).surface, 'background');
+  assert.equal(
+    selectedDistributionVersion(background).surface,
+    'background_motion_v1'
+  );
+  assert.equal(
+    selectedDistributionVersion(background).render.url,
+    '/media/background_motion_v1/clip_11.mp4'
+  );
+  assert.equal(
+    RETIRED_VARIANT_NOTICE,
+    'Retired \u2014 existing media and history only'
+  );
 });
 
 test('uses the gameplay surround variant as the review and distribution identity', () => {
@@ -122,6 +167,7 @@ test('uses the gameplay surround variant as the review and distribution identity
   review.variants.gameplay_surround_v1 = {
     id: 'gameplay_surround_v1',
     label: 'Gameplay surround',
+    active_for_new_writes: true,
     asset_id: 'gameplay_surround_assets_v1',
     asset_ids: [
       'orbitalncg_subway_surfers_12_v1',
@@ -160,6 +206,7 @@ test('uses clean speaker panels as an independent review and distribution identi
   review.variants.speaker_panels_v1 = {
     id: 'speaker_panels_v1',
     label: 'Clean speaker panels',
+    active_for_new_writes: true,
     asset_id: null,
     asset_ids: [],
     asset_free: true,
@@ -176,9 +223,9 @@ test('uses clean speaker panels as an independent review and distribution identi
 
   assert.equal(clipDistributionReady(review), true);
   assert.equal(clipDistributionLabel(review), 'Clean speaker panels');
-  assert.equal(selectedDistributionVersion(review).surface, 'panels');
+  assert.equal(selectedDistributionVersion(review).surface, 'speaker_panels_v1');
   assert.equal(
-    clipVersionState(review, 'panels').variantId,
+    clipVersionState(review, 'speaker_panels_v1').variantId,
     'speaker_panels_v1'
   );
   assert.equal(
@@ -195,6 +242,7 @@ test('keeps a selected legacy variant distinct while exposing gameplay review', 
   review.variants.gameplay_surround_v1 = {
     id: 'gameplay_surround_v1',
     label: 'Gameplay surround',
+    active_for_new_writes: true,
     render: { current: true, playable: true },
     approval: {
       status: 'unapproved',
@@ -208,9 +256,129 @@ test('keeps a selected legacy variant distinct while exposing gameplay review', 
     'background_motion_v1'
   );
   assert.equal(
-    clipVersionState(review, 'gameplay').variantId,
+    clipVersionState(review, 'gameplay_surround_v1').variantId,
     'gameplay_surround_v1'
   );
+});
+
+test('exposes every recognized retired record without enabling new writes', () => {
+  const review = reviewState();
+  const retired = [
+    ['background_motion_v1', 'Motion background'],
+    ['satisfying_motion_v1', 'Satisfying footage'],
+    ['minecraft_parkour_v1', 'Minecraft parkour'],
+    ['subway_surfers_v1', 'Subway Surfers'],
+    ['gta_driving_v1', 'GTA driving'],
+  ];
+  review.variants = Object.fromEntries(
+    retired.map(([id, label]) => [
+      id,
+      {
+        id,
+        label,
+        active_for_new_writes: false,
+        asset_id: `${id}_asset`,
+        render: {
+          current: true,
+          playable: true,
+          url: `/media/${id}/clip_11.mp4`,
+        },
+        approval: {
+          status: 'current',
+          current: true,
+          revision: `sha256:${id}`,
+        },
+      },
+    ])
+  );
+
+  assert.deepEqual(
+    clipVariantSurfaces(review),
+    retired.map(([id]) => id)
+  );
+  for (const [id, label] of retired) {
+    const state = clipVersionState(review, id);
+    assert.equal(state.variantId, id);
+    assert.equal(state.label, label);
+    assert.equal(state.activeForNewWrites, false);
+    assert.equal(clipVersionAllowsNewWrites(review, id), false);
+    assert.equal(state.render.playable, true);
+    assert.equal(state.render.url, `/media/${id}/clip_11.mp4`);
+    assert.equal(clipDistributionSelectable(review, id), false);
+    assert.equal(distributionVersionLabel(id, id), label);
+
+    review.distribution = {
+      ...review.distribution,
+      version: id,
+      variant_id: id,
+      label,
+      active_for_new_writes: false,
+      revision: state.approval.revision,
+    };
+    assert.equal(selectedDistributionVersion(review).variantId, id);
+    assert.equal(clipDistributionLabel(review), label);
+    assert.equal(clipDistributionReady(review), false);
+  }
+});
+
+test('fails closed for unknown, mismatched, and unclassified variant records', () => {
+  const review = reviewState();
+  review.variants.background_motion_v1.active_for_new_writes = true;
+  review.variants.unknown_v1 = {
+    id: 'unknown_v1',
+    label: 'Unknown',
+    active_for_new_writes: true,
+    render: { current: true, playable: true },
+    approval: { status: 'current', current: true, revision: 'sha256:unknown' },
+  };
+  review.variants.satisfying_motion_v1 = {
+    id: 'gta_driving_v1',
+    label: 'Mismatched',
+    active_for_new_writes: true,
+    render: { current: true, playable: true },
+    approval: { status: 'current', current: true, revision: 'sha256:mismatch' },
+  };
+  review.variants.gta_driving_v1 = {
+    id: 'gta_driving_v1',
+    label: 'GTA driving',
+    render: { current: true, playable: true },
+    approval: {
+      status: 'current',
+      current: true,
+      revision: 'sha256:missing-active-flag',
+    },
+  };
+
+  assert.deepEqual(clipVariantSurfaces(review), [
+    'background_motion_v1',
+    'gta_driving_v1',
+  ]);
+  assert.equal(clipVariantForSurface(review, 'unknown_v1'), undefined);
+  assert.equal(
+    clipVersionAllowsNewWrites(review, 'background_motion_v1'),
+    false
+  );
+  assert.equal(clipVariantForSurface(review, 'satisfying_motion_v1'), undefined);
+  assert.equal(
+    clipVersionState(review, 'gta_driving_v1').activeForNewWrites,
+    false
+  );
+  assert.equal(clipVersionAllowsNewWrites(review, 'gta_driving_v1'), false);
+  assert.equal(clipDistributionSelectable(review, 'gta_driving_v1'), false);
+
+  review.distribution = {
+    ...review.distribution,
+    version: 'satisfying_motion_v1',
+    variant_id: 'satisfying_motion_v1',
+    active_for_new_writes: false,
+  };
+  assert.equal(selectedDistributionVersion(review), null);
+  assert.equal(clipDistributionReady(review), false);
+
+  review.distribution.version = 'unknown_v1';
+  review.distribution.variant_id = 'unknown_v1';
+  assert.equal(selectedDistributionVersion(review), null);
+  assert.equal(clipDistributionLabel(review), 'Unknown version');
 });
 
 test('never substitutes a base approval for a background approval', () => {
@@ -239,7 +407,21 @@ test('fails closed when distribution identity is malformed or incomplete', () =>
 
 test('shows the backend publication-history reason before changing versions', () => {
   const baseSelected = reviewState({ backgroundApproved: true });
-  assert.equal(clipDistributionSelectable(baseSelected, 'background'), true);
+  baseSelected.variants.gameplay_surround_v1 = {
+    id: 'gameplay_surround_v1',
+    label: 'Gameplay surround',
+    active_for_new_writes: true,
+    render: { current: true, playable: true },
+    approval: {
+      status: 'current',
+      current: true,
+      revision: 'sha256:gameplay-surround-copy',
+    },
+  };
+  assert.equal(
+    clipDistributionSelectable(baseSelected, 'gameplay_surround_v1'),
+    true
+  );
   baseSelected.distribution.change_locked = true;
   baseSelected.distribution.re_release_allowed = true;
   baseSelected.distribution.change_lock_reason =
@@ -249,7 +431,10 @@ test('shows the backend publication-history reason before changing versions', ()
     distributionChangeLockReason(baseSelected),
     'A scheduled Base receipt exists. Start an explicit re-release to change it.'
   );
-  assert.equal(clipDistributionSelectable(baseSelected, 'background'), false);
+  assert.equal(
+    clipDistributionSelectable(baseSelected, 'gameplay_surround_v1'),
+    false
+  );
 
   const backgroundSelected = reviewState({
     distributionVersion: 'background_motion_v1',
@@ -271,7 +456,10 @@ test('shows the backend publication-history reason before changing versions', ()
 
   delete baseSelected.distribution.change_locked;
   assert.match(distributionChangeLockReason(baseSelected), /status is unavailable/);
-  assert.equal(clipDistributionSelectable(baseSelected, 'background'), false);
+  assert.equal(
+    clipDistributionSelectable(baseSelected, 'gameplay_surround_v1'),
+    false
+  );
 });
 
 test('shows exact blocked re-release reason and validates prepared state', () => {

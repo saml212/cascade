@@ -61,13 +61,17 @@ import {
   clipDistributionLabel,
   clipDistributionSelectable,
   clipReReleaseViewState,
+  clipVersionAllowsNewWrites,
   clipVersionState,
   clipVariantForSurface,
+  clipVariantSurfaces,
   confirmsClipReRelease,
   ClipReReleaseDraftStore,
   ClipReviewSurfaceMemory,
   distributionChangeLockReason,
   distributionVersionLabel,
+  isActiveClipVariantId,
+  RETIRED_VARIANT_NOTICE,
   selectedDistributionVersion,
   type ClipReviewSurface,
 } from '../lib/clip-review-surface';
@@ -90,8 +94,6 @@ interface ClipNavigation {
   previousId?: string;
   nextId?: string;
 }
-
-const VARIANT_SURFACES = ['background', 'gameplay', 'panels'] as const;
 
 export const CLIP_METADATA_PLATFORMS: PlatformSpec[] = [
   {
@@ -1038,9 +1040,7 @@ function clipExpanded(
   navigation: ClipNavigation | undefined,
   setExpanded: (clipId: string | null, focusPlayer?: boolean) => void
 ): HTMLElement {
-  const variantSurfaces = VARIANT_SURFACES.filter(
-    (candidate) => Boolean(clipVariantForSurface(review, candidate))
-  );
+  const variantSurfaces = clipVariantSurfaces(review);
   const availableSurfaces = new Set<ClipReviewSurface>([
     'base',
     ...variantSurfaces,
@@ -1144,7 +1144,10 @@ function renderReviewChoice(
         return Button({
           variant: selected === candidate ? 'primary' : 'secondary',
           size: 'sm',
-          label: candidateVersion?.label ?? 'Variant',
+          label:
+            candidateVersion?.activeForNewWrites === false
+              ? `${candidateVersion.label} \u00b7 Retired`
+              : candidateVersion?.label ?? 'Variant',
           onClick: () => selectSurface(candidate),
         });
       }),
@@ -1165,7 +1168,16 @@ function renderReviewChoice(
         'span',
         { class: 'chip text-ink-primary' },
         `Distribution: ${clipDistributionLabel(review)}`
-      )
+      ),
+      ...(version?.activeForNewWrites === false
+        ? [
+            h(
+              'span',
+              { class: 'chip text-status-warning' },
+              RETIRED_VARIANT_NOTICE
+            ),
+          ]
+        : [])
     );
     const versionLabel =
       selected === 'base'
@@ -1343,29 +1355,27 @@ function renderChoiceActions(
     approvalFeedback,
     reload
   );
-  const variants = variantSurfaces.flatMap(
-    (candidate) => {
-      const variant = clipVariantForSurface(review, candidate);
-      return variant
-        ? [
-            {
-              surface: candidate,
-              element: renderVariantActions(
-                episodeId,
-                clipId,
-                variant,
-                candidate,
-                review,
-                review.render.current,
-                rendering,
-                selectingDistribution,
-                reload
-              ),
-            },
-          ]
-        : [];
-    }
-  );
+  const variants = variantSurfaces.flatMap((candidate) => {
+    const variant = clipVariantForSurface(review, candidate);
+    return variant
+      ? [
+          {
+            surface: candidate,
+            element: renderVariantActions(
+              episodeId,
+              clipId,
+              variant,
+              candidate,
+              review,
+              review.render.current,
+              rendering,
+              selectingDistribution,
+              reload
+            ),
+          },
+        ]
+      : [];
+  });
   if (variants.length === 0) return base;
   effect(() => {
     base.classList.toggle('hidden', surface() !== 'base');
@@ -1389,6 +1399,37 @@ function renderVariantActions(
 ): HTMLElement {
   const label = variant.label || 'Variant';
   const lowerLabel = label.toLowerCase();
+  const variantId = variant.id;
+  const assetIds = (
+    variant.asset_ids?.length ? variant.asset_ids : [variant.asset_id]
+  ).filter((assetId): assetId is string => Boolean(assetId));
+  const provenance = variant.asset_free
+    ? 'Podcast-only speaker panels.'
+    : assetIds.length
+      ? `Uses ${assetIds
+        .map((assetId) => assetId.replaceAll('_', ' '))
+        .join(', ')}.`
+      : 'Archived variant media.';
+  if (
+    !isActiveClipVariantId(variantId) ||
+    variantId !== surface ||
+    !clipVersionAllowsNewWrites(review, surface)
+  ) {
+    return h(
+      'div',
+      { class: 'flex items-center gap-3 px-5 py-4 flex-wrap' },
+      h(
+        'strong',
+        { class: 'text-body-sm text-status-warning' },
+        RETIRED_VARIANT_NOTICE
+      ),
+      h(
+        'span',
+        { class: 'text-body-sm text-ink-tertiary' },
+        `${provenance} This archived version remains available for playback and publication history.`
+      )
+    );
+  }
   const action = h('span');
   effect(() => {
     const active = rendering();
@@ -1416,7 +1457,7 @@ function renderVariantActions(
                 api.approveClipVariant(
                   episodeId,
                   clipId,
-                  variant.id,
+                  variantId,
                   variant.approval.revision
                 ),
               succeeded: `${label} approved for this render and copy.`,
@@ -1428,7 +1469,7 @@ function renderVariantActions(
               api.renderClipVariant(
                 episodeId,
                 clipId,
-                variant.id,
+                variantId,
                 variant.asset_id ?? undefined
               ),
             busy: rendering,
@@ -1455,14 +1496,7 @@ function renderVariantActions(
     h(
       'span',
       { class: 'text-body-sm text-ink-tertiary' },
-      variant.asset_free
-        ? 'Podcast-only speaker panels. Base approval and delivery stay separate.'
-        : `Uses ${(
-            variant.asset_ids?.length ? variant.asset_ids : [variant.asset_id]
-          )
-            .filter((assetId): assetId is string => Boolean(assetId))
-            .map((assetId) => assetId.replaceAll('_', ' '))
-            .join(', ')}. Base approval and delivery stay separate.`
+      `${provenance} Base approval and delivery stay separate.`
     )
   );
 }
@@ -1500,6 +1534,9 @@ function renderDistributionAction(
     const approved = version?.approval.current === true;
     const selectable = clipDistributionSelectable(review, surface);
     const label = version?.label ?? 'Unknown version';
+    const targetVariantId = version?.variantId;
+    const validTarget =
+      targetVariantId === null || isActiveClipVariantId(targetVariantId);
     host.replaceChildren(
       Button({
         variant: selected ? 'secondary' : 'ghost',
@@ -1511,7 +1548,7 @@ function renderDistributionAction(
             : !approved
               ? `Approve ${label.toLowerCase()} first`
               : `Use ${label} for distribution`,
-        disabled: !selectable || active,
+        disabled: !selectable || !validTarget || active,
         loading: active,
         title:
           lockReason ??
@@ -1519,13 +1556,13 @@ function renderDistributionAction(
             ? `${label} is the version that will be published and scheduled`
             : `Select the current, separately approved ${label.toLowerCase()} version for publication and scheduling`),
         onClick: () => {
-          if (!version) return;
+          if (!version || !validTarget) return;
           return runReviewMutation({
             run: () =>
               api.selectClipDistribution(
                 episodeId,
                 clipId,
-                version.variantId,
+                targetVariantId,
                 version.approval.revision
               ),
             busy: selecting,
@@ -1554,6 +1591,12 @@ function renderReReleaseControl(
   surface: ClipReviewSurface,
   reload: () => Promise<void>
 ): HTMLElement | null {
+  const version = clipVersionState(review, surface);
+  if (!version || !clipVersionAllowsNewWrites(review, surface)) return null;
+  const targetVariantId = version.variantId;
+  if (targetVariantId !== null && !isActiveClipVariantId(targetVariantId)) {
+    return null;
+  }
   const state = clipReReleaseViewState(review);
   if (state.kind === 'unneeded' || state.kind === 'blocked') return null;
   if (state.kind === 'prepared') {
@@ -1574,12 +1617,10 @@ function renderReReleaseControl(
     );
   }
 
-  const version = clipVersionState(review, surface);
-  if (!version) return null;
   const target = {
     episodeId,
     clipId,
-    variantId: version.variantId,
+    variantId: targetVariantId,
     expectedRevision: version.approval.revision,
     previousRequestId: state.previousRequest?.request_id ?? null,
   };

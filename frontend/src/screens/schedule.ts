@@ -4,7 +4,7 @@
 
 import { h, mount } from '../lib/dom';
 import { signal, effect } from '../lib/signals';
-import { api, type UnknownRecord } from '../lib/api';
+import { api, type ClipVariantId, type UnknownRecord } from '../lib/api';
 import { pluralize } from '../lib/format';
 import { link } from '../lib/router';
 import {
@@ -33,16 +33,8 @@ interface ScheduleItem {
   request_id?: string;
   error?: string;
   artifact_current?: boolean | null;
-  version?:
-    | 'base'
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
-  variant_id?:
-    | null
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
+  version?: 'base' | ClipVariantId;
+  variant_id?: null | ClipVariantId;
 }
 
 interface ScheduleDay {
@@ -70,16 +62,8 @@ interface PublicationEvidence {
   job_id?: string;
   request_id?: string;
   error?: string;
-  version?:
-    | 'base'
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
-  variant_id?:
-    | null
-    | 'background_motion_v1'
-    | 'gameplay_surround_v1'
-    | 'speaker_panels_v1';
+  version?: 'base' | ClipVariantId;
+  variant_id?: null | ClipVariantId;
 }
 
 const TYPE_COLOR: Record<string, string> = {

@@ -21,8 +21,8 @@ from agents.qa import SHORT_COPY_SCHEMA
 
 def _facebook_receipt(*, schema: str, scheduled: bool, scheduled_date: str | None):
     version = {
-        "version": "portrait_over_motion_v4",
-        "variant_id": "satisfying_motion_v1",
+        "version": "speaker_panels_v1",
+        "variant_id": "speaker_panels_v1",
         "render_fingerprint": "sha256:render",
         "revision": "sha256:approval",
     }
@@ -98,9 +98,11 @@ def test_destination_copy_requires_provider_fields_as_strings():
 
 @pytest.mark.parametrize(
     "variant_id",
-    ("minecraft_parkour_v1", "subway_surfers_v1", "gta_driving_v1"),
+    ("gameplay_surround_v1", "speaker_panels_v1"),
 )
-def test_gameplay_variant_overrides_preserve_saved_selection(tmp_path, variant_id):
+def test_active_variant_overrides_preserve_saved_historical_selection(
+    tmp_path, variant_id
+):
     agent = PublishAgent(tmp_path, {})
     approved = [{"id": "clip_04", "distribution_variant_id": "background_motion_v1"}]
     data = {"approved": approved}
@@ -114,10 +116,35 @@ def test_gameplay_variant_overrides_preserve_saved_selection(tmp_path, variant_i
     assert approved[0]["distribution_variant_id"] == "background_motion_v1"
 
 
+@pytest.mark.parametrize(
+    "variant_id",
+    (
+        "background_motion_v1",
+        "satisfying_motion_v1",
+        "minecraft_parkour_v1",
+        "subway_surfers_v1",
+        "gta_driving_v1",
+    ),
+)
+def test_retired_variant_overrides_are_rejected_without_mutating_selection(
+    tmp_path, variant_id
+):
+    agent = PublishAgent(tmp_path, {})
+    approved = [{"id": "clip_04", "distribution_variant_id": "speaker_panels_v1"}]
+
+    with pytest.raises(RuntimeError, match="existing media and history only"):
+        agent._validated_variant_overrides(
+            {"approved": approved},
+            {"variant_overrides": {"clip_04": variant_id}},
+        )
+
+    assert approved[0]["distribution_variant_id"] == "speaker_panels_v1"
+
+
 def test_variant_currentness_uses_the_frozen_approval_metadata(tmp_path, monkeypatch):
     agent = PublishAgent(tmp_path, {})
     frozen = {"id": "clip_04", "facebook": {"title": "reviewed"}}
-    gameplay_variant = "minecraft_parkour_v1"
+    gameplay_variant = "gameplay_surround_v1"
     data = {
         "episode": {},
         "approved": [{"id": "clip_04", "distribution_variant_id": "old"}],
@@ -141,12 +168,12 @@ def test_variant_currentness_uses_the_frozen_approval_metadata(tmp_path, monkeyp
 
 
 def test_required_variant_does_not_affect_other_destinations_or_absent_policy(tmp_path):
-    versions = {"clip_04": {"variant_id": "minecraft_parkour_v1"}}
+    versions = {"clip_04": {"variant_id": "gameplay_surround_v1"}}
     configured = PublishAgent(
         tmp_path,
         {
             "platforms": {
-                "x": {"required_short_variant_id": "satisfying_motion_v1"},
+                "x": {"required_short_variant_id": "speaker_panels_v1"},
             }
         },
     )
@@ -162,7 +189,7 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
     tmp_path, monkeypatch
 ):
     episode_dir = tmp_path / "ep_test"
-    media = episode_dir / "short_variants" / "satisfying_motion_v1" / "clip_04.mp4"
+    media = episode_dir / "short_variants" / "speaker_panels_v1" / "clip_04.mp4"
     media.parent.mkdir(parents=True)
     media.write_bytes(b"reviewed video")
     config = {
@@ -197,11 +224,12 @@ def test_immediate_destination_uses_override_media_without_schedule_fields(
     )
 
     version = {
-        "version": "portrait_over_motion_v4",
-        "variant_id": "satisfying_motion_v1",
+        "version": "speaker_panels_v1",
+        "variant_id": "speaker_panels_v1",
         "path": str(media.relative_to(episode_dir)),
         "render_fingerprint": "sha256:render",
         "revision": "sha256:approval",
+        "active_for_new_writes": True,
     }
     target = {
         "clip_id": "clip_04",

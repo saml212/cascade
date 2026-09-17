@@ -51,14 +51,16 @@ from lib.ffprobe import file_fingerprint, get_audio_stream
 from lib.ffprobe import probe as ffprobe
 from lib.short_distribution import PLATFORM_COPY_FIELDS, SHORT_PLATFORM_SPECS
 from lib.short_variants import (
+    ACTIVE_BACKGROUND_VARIANT_IDS,
     BASE_SHORT_VERSION,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
+    RetiredShortVariantError,
     background_variant_approval_state,
     background_variant_label,
     background_variant_output,
     background_variant_state,
-    require_background_variant,
+    require_active_background_variant,
     selected_short_variant_id,
     variant_record,
 )
@@ -115,11 +117,16 @@ def required_short_variants(
                 "non-empty variant ID"
             )
         try:
-            require_background_variant(value)
+            require_active_background_variant(value)
         except KeyError as exc:
             raise ValueError(
                 f"platforms.{destination}.required_short_variant_id names an "
                 f"unknown short variant: {value}"
+            ) from exc
+        except RetiredShortVariantError as exc:
+            raise ValueError(
+                f"platforms.{destination}.required_short_variant_id names a "
+                f"retired short variant: {value}"
             ) from exc
         required[destination] = value
     return required
@@ -908,6 +915,7 @@ def short_distribution_state(
             "label": "Invalid selection",
             "current": False,
             "approval_current": False,
+            "active_for_new_writes": False,
             "revision": base_revision,
             "path": None,
             "render_fingerprint": None,
@@ -929,6 +937,7 @@ def short_distribution_state(
                 == base_record.get("fingerprint")
                 and clip.get("approved_revision") == base_revision
             ),
+            "active_for_new_writes": True,
             "revision": base_revision,
             "path": f"shorts/{clip.get('id')}.mp4",
             "render_fingerprint": base_record.get("fingerprint"),
@@ -954,6 +963,7 @@ def short_distribution_state(
         "label": background_variant_label(variant_id),
         "current": render.get("current") is True,
         "approval_current": approval.get("current") is True,
+        "active_for_new_writes": variant_id in ACTIVE_BACKGROUND_VARIANT_IDS,
         "revision": revision,
         "path": str(
             background_variant_output(
@@ -1878,6 +1888,23 @@ def quality_snapshot(
                     "the current render and copy."
                 ),
                 "clip_ids": stale_clip_approvals,
+            }
+        )
+    retired_short_versions = [
+        str(clip["id"])
+        for clip in approved
+        if short_versions[str(clip["id"])]["active_for_new_writes"] is not True
+    ]
+    if retired_short_versions:
+        blockers.append(
+            {
+                "code": "short_variant_retired",
+                "severity": "error",
+                "message": (
+                    f"{len(retired_short_versions)} selected short variant(s) are "
+                    "retired from new distribution."
+                ),
+                "clip_ids": retired_short_versions,
             }
         )
     try:

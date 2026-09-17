@@ -17,6 +17,7 @@ from lib.caption_speaker_overrides import (
 from lib.crop import visual_crop_state
 from lib.ffprobe import file_fingerprint
 from lib.short_variants import (
+    ACTIVE_BACKGROUND_VARIANT_IDS,
     BACKGROUND_VARIANT_ID,
     BACKGROUND_VARIANT_IDS,
     CLEAN_NEUTRAL_HEADER_POLICY,
@@ -31,6 +32,7 @@ from lib.short_variants import (
     GTA_DRIVING_VARIANT_ID,
     MINECRAFT_PARKOUR_ASSET_ID,
     MINECRAFT_PARKOUR_VARIANT_ID,
+    RETIRED_BACKGROUND_VARIANT_IDS,
     SATISFYING_BACKGROUND_ASSET_ID,
     SATISFYING_VARIANT_ID,
     SPEAKER_PANELS_LAYOUT_VERSION,
@@ -38,6 +40,7 @@ from lib.short_variants import (
     SPEAKER_PANELS_VARIANT_ID,
     SUBWAY_SURFERS_ASSET_ID,
     SUBWAY_SURFERS_VARIANT_ID,
+    RetiredShortVariantError,
     background_variant_asset_ids,
     background_variant_fingerprint,
     background_variant_label,
@@ -50,6 +53,7 @@ from lib.short_variants import (
     load_background_variant_asset,
     normalize_destination_distribution_targets,
     record_background_variant,
+    require_active_background_variant,
     require_background_variant_asset,
     resolve_gameplay_variant_playback,
     save_background_variant_approval,
@@ -59,6 +63,26 @@ from lib.short_variants import (
     variant_record,
 )
 from lib.timeline import Timeline
+
+
+def test_active_and_retired_variant_catalogs_are_exact_and_fail_closed():
+    assert ACTIVE_BACKGROUND_VARIANT_IDS == (
+        GAMEPLAY_SURROUND_VARIANT_ID,
+        SPEAKER_PANELS_VARIANT_ID,
+    )
+    assert RETIRED_BACKGROUND_VARIANT_IDS == frozenset(BACKGROUND_VARIANT_IDS) - set(
+        ACTIVE_BACKGROUND_VARIANT_IDS
+    )
+
+    for variant_id in ACTIVE_BACKGROUND_VARIANT_IDS:
+        require_active_background_variant(variant_id)
+    for variant_id in RETIRED_BACKGROUND_VARIANT_IDS:
+        with pytest.raises(
+            RetiredShortVariantError, match="existing media and history"
+        ):
+            require_active_background_variant(variant_id)
+    with pytest.raises(KeyError, match="Unknown short variant"):
+        require_active_background_variant("satisfying_background_v1")
 
 
 def test_destination_release_targets_require_exact_unique_variant_pair():

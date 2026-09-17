@@ -50,11 +50,12 @@ from lib.short_variants import (
     DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
+    RetiredShortVariantError,
     background_variant_output,
     destination_distribution_release_revision,
     distribution_release_revision,
     normalize_destination_distribution_targets,
-    require_background_variant,
+    require_active_background_variant,
 )
 
 UPLOAD_POST_URL = "https://api.upload-post.com/api/upload"
@@ -1898,6 +1899,19 @@ class PublishAgent(BaseAgent):
 
         clips = self.load_json("clips.json").get("clips", [])
         approved = [clip for clip in clips if clip.get("status") == "approved"]
+        short_versions = gate.get("short_versions")
+        if not isinstance(short_versions, dict) or any(
+            not isinstance(short_versions.get(str(clip.get("id", ""))), dict)
+            or short_versions[str(clip.get("id", ""))].get("current") is not True
+            or short_versions[str(clip.get("id", ""))].get("approval_current")
+            is not True
+            or short_versions[str(clip.get("id", ""))].get("active_for_new_writes")
+            is not True
+            for clip in approved
+        ):
+            raise RuntimeError(
+                "The selected short versions are unavailable, unapproved, or retired"
+            )
         metadata = canonical_release_metadata(self.episode_dir, episode, clips)
         issues = release_metadata_issues(metadata, approved, self.config)
         if issues:
@@ -1941,17 +1955,6 @@ class PublishAgent(BaseAgent):
             ).get("clips", [])
             if isinstance(item, dict) and item.get("id")
         }
-        short_versions = gate.get("short_versions")
-        if not isinstance(short_versions, dict) or any(
-            not isinstance(short_versions.get(str(clip.get("id", ""))), dict)
-            or short_versions[str(clip.get("id", ""))].get("current") is not True
-            or short_versions[str(clip.get("id", ""))].get("approval_current")
-            is not True
-            for clip in approved
-        ):
-            raise RuntimeError(
-                "The selected short versions are unavailable or unapproved"
-            )
         return {
             "episode": episode,
             "snapshot": snapshot,
@@ -2064,9 +2067,11 @@ class PublishAgent(BaseAgent):
             )
         try:
             for variant_id in overrides.values():
-                require_background_variant(variant_id)
+                require_active_background_variant(variant_id)
         except KeyError as exc:
             raise RuntimeError(str(exc).strip("'")) from exc
+        except RetiredShortVariantError as exc:
+            raise RuntimeError(str(exc)) from exc
         return overrides
 
     def _destination_plan(self, data, value):
@@ -2981,6 +2986,11 @@ class PublishAgent(BaseAgent):
             }:
                 results.append({**receipt, "reused_receipt": True})
             else:
+                if version.get("active_for_new_writes") is not True:
+                    raise RuntimeError(
+                        f"The selected short variant for {clip_id} is retired; "
+                        "nothing was submitted"
+                    )
                 pending.append((clip, version, identity, receipt, destination_target))
         if not pending:
             return results

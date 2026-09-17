@@ -19,8 +19,8 @@ test('sends exact revision-bound distribution selections', async () => {
     await api.selectClipDistribution(
       'episode-id',
       'clip-id',
-      'background_motion_v1',
-      'sha256:background-revision'
+      'gameplay_surround_v1',
+      'sha256:gameplay-surround-revision'
     );
     await api.selectClipDistribution(
       'episode-id',
@@ -33,8 +33,8 @@ test('sends exact revision-bound distribution selections', async () => {
         path: '/api/episodes/episode-id/clips/clip-id/distribution',
         method: 'PUT',
         body: {
-          variant_id: 'background_motion_v1',
-          expected_revision: 'sha256:background-revision',
+          variant_id: 'gameplay_surround_v1',
+          expected_revision: 'sha256:gameplay-surround-revision',
         },
       },
       {
@@ -62,15 +62,15 @@ test('sends an exact idempotent re-release preparation request', async () => {
         clip_id: 'clip-id',
         requires_publish_approval: true,
         distribution: {
-          variant_id: 'background_motion_v1',
-          revision: 'sha256:background-revision',
+          variant_id: 'speaker_panels_v1',
+          revision: 'sha256:speaker-panels-revision',
           re_release_request_consumed: false,
           re_release_request: {
             request_id: '323e4567-e89b-12d3-a456-426614174000',
             actor: 'Sam',
-            reason: 'Prepare a reviewed motion version',
-            variant_id: 'background_motion_v1',
-            target_revision: 'sha256:background-revision',
+            reason: 'Prepare reviewed speaker panels',
+            variant_id: 'speaker_panels_v1',
+            target_revision: 'sha256:speaker-panels-revision',
             render_fingerprint: 'sha256:render',
             receipt_history_revision: 'sha256:history',
             revision: 'sha256:request',
@@ -82,11 +82,11 @@ test('sends an exact idempotent re-release preparation request', async () => {
     );
   };
   const body = {
-    variant_id: 'background_motion_v1',
-    expected_revision: 'sha256:background-revision',
+    variant_id: 'speaker_panels_v1',
+    expected_revision: 'sha256:speaker-panels-revision',
     request_id: '323e4567-e89b-12d3-a456-426614174000',
     actor: 'Sam',
-    reason: 'Prepare a reviewed motion version',
+    reason: 'Prepare reviewed speaker panels',
   };
   try {
     await api.prepareClipReRelease('episode-id', 'clip-id', body);

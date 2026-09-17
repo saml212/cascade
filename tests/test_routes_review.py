@@ -374,13 +374,7 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
         GAMEPLAY_SURROUND_ASSET_SET_ID,
         GAMEPLAY_SURROUND_ASSETS,
         GAMEPLAY_SURROUND_VARIANT_ID,
-        GTA_DRIVING_ASSET_ID,
-        GTA_DRIVING_VARIANT_ID,
-        MINECRAFT_PARKOUR_ASSET_ID,
-        MINECRAFT_PARKOUR_VARIANT_ID,
         SPEAKER_PANELS_VARIANT_ID,
-        SUBWAY_SURFERS_ASSET_ID,
-        SUBWAY_SURFERS_VARIANT_ID,
     )
     from server.routes import review
 
@@ -401,15 +395,6 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
     assert response.status_code == 200
     variants = response.json()["clips"][0]["review"]["variants"]
     expected = {
-        MINECRAFT_PARKOUR_VARIANT_ID: (
-            "Minecraft parkour",
-            MINECRAFT_PARKOUR_ASSET_ID,
-        ),
-        SUBWAY_SURFERS_VARIANT_ID: (
-            "Subway Surfers",
-            SUBWAY_SURFERS_ASSET_ID,
-        ),
-        GTA_DRIVING_VARIANT_ID: ("GTA driving", GTA_DRIVING_ASSET_ID),
         GAMEPLAY_SURROUND_VARIANT_ID: (
             "Gameplay surround",
             GAMEPLAY_SURROUND_ASSET_SET_ID,
@@ -419,12 +404,17 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
     for variant_id, (label, asset_id) in expected.items():
         assert variants[variant_id]["label"] == label
         assert variants[variant_id]["asset_id"] == asset_id
+        assert variants[variant_id]["active_for_new_writes"] is True
         assert variants[variant_id]["render"]["status"] == "missing"
     assert variants[GAMEPLAY_SURROUND_VARIANT_ID]["asset_ids"] == [
         asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS
     ]
     assert variants[SPEAKER_PANELS_VARIANT_ID]["asset_ids"] == []
     assert variants[SPEAKER_PANELS_VARIANT_ID]["asset_free"] is True
+    assert set(variants) == {
+        GAMEPLAY_SURROUND_VARIANT_ID,
+        SPEAKER_PANELS_VARIANT_ID,
+    }
     assert "satisfying_motion_v1" not in variants
 
 
@@ -475,6 +465,7 @@ def test_review_exposes_background_variant_as_separate_media(test_client, monkey
     assert response.status_code == 200
     variant = response.json()["clips"][0]["review"]["variants"]["background_motion_v1"]
     assert variant["asset_id"] == "original_block_parkour_v1"
+    assert variant["active_for_new_writes"] is False
     assert variant["render"]["current"] is True
     assert (
         "/short_variants/background_motion_v1/clip_01.mp4?v="
@@ -489,6 +480,7 @@ def test_review_exposes_background_variant_as_separate_media(test_client, monkey
         "label": "Motion background",
         "current": True,
         "approval_current": False,
+        "active_for_new_writes": False,
         "revision": variant["approval"]["revision"],
         "re_release_request": None,
         "change_locked": False,
