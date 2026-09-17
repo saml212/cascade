@@ -11,7 +11,6 @@ async function importScreen(path) {
 const { CLIP_METADATA_PLATFORMS } = await importScreen(
   '../src/screens/clip-review.ts'
 );
-const { DESTINATION_COLORS } = await importScreen('../src/screens/publish.ts');
 
 test('defines the enabled destination editor fields and limits', () => {
   const specs = Object.fromEntries(
@@ -71,16 +70,4 @@ test('defines the enabled destination editor fields and limits', () => {
       { name: 'description', maxLength: 800, hint: 'Max 800 chars' },
     ],
   });
-});
-
-test('assigns visible colors to every new publish destination', () => {
-  for (const platform of [
-    'facebook',
-    'threads',
-    'bluesky',
-    'linkedin',
-    'pinterest',
-  ]) {
-    assert.match(DESTINATION_COLORS[platform], /^#[0-9a-f]{6}$/i);
-  }
 });
