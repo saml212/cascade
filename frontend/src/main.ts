@@ -23,11 +23,16 @@ root.replaceChildren(shell);
 
 function episodeRoute(
   pattern: string,
-  handler: (id: string, params: Record<string, string>) => void
+  handler: (id: string, params: Record<string, string>) => void,
+  preserveEpisodeScreen = false
 ): void {
   route(pattern, (params) => {
     watchEpisode(params.id);
     handler(params.id, params);
+  }, {
+    screenIdentity: preserveEpisodeScreen
+      ? (params) => `episode:${params.id}`
+      : undefined,
   });
 }
 
@@ -44,11 +49,11 @@ route('/schedule', () => {
   Schedule(main);
 });
 
-episodeRoute('/episodes/:id', (id) => Episode(main, id));
-episodeRoute('/episodes/:id/longform', (id) => Episode(main, id));
-episodeRoute('/episodes/:id/clips', (id) => Episode(main, id));
-episodeRoute('/episodes/:id/audio', (id) => Episode(main, id));
-episodeRoute('/episodes/:id/metadata', (id) => Episode(main, id));
+episodeRoute('/episodes/:id', (id) => Episode(main, id), true);
+episodeRoute('/episodes/:id/longform', (id) => Episode(main, id), true);
+episodeRoute('/episodes/:id/clips', (id) => Episode(main, id), true);
+episodeRoute('/episodes/:id/audio', (id) => Episode(main, id), true);
+episodeRoute('/episodes/:id/metadata', (id) => Episode(main, id), true);
 
 episodeRoute('/episodes/:id/crop-setup', (id) => CropSetup(main, id));
 episodeRoute('/episodes/:id/clips/review/:clipId', (id, { clipId }) =>
