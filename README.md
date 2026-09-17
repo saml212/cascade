@@ -170,20 +170,15 @@ All settings live in `config/config.toml`. Key sections:
 - **`[podcast]`** — RSS feed metadata (title, author, artwork)
 - **`[podcast.links]`** — Link-in-bio page URLs (see below)
 
-## Links Page (Link-in-Bio)
+## Episode Hub (Link-in-Bio)
 
-Cascade includes a built-in link-in-bio page generator. Fill in the `[podcast.links]` section of your config with your platform URLs, then generate the static HTML:
+The canonical `thelocalpod.link` site combines show-level platform links with
+revision-bound pages for episodes that have current full-episode destinations.
+Configure the show URLs under `[podcast.links]` and the R2 destination under
+`[podcast.r2]`.
 
-```bash
-python -m links.generate
-```
-
-This produces `links/index.html` — a single-file, dark-themed page with your podcast artwork, platform links, and an embedded Spotify player. Deploy it to Cloudflare Pages, GitHub Pages, Netlify, or any static host.
-
-Supported platforms: Spotify, Apple Podcasts, YouTube, Instagram, X, TikTok, iHeartRadio, GitHub. Empty URLs are automatically excluded.
-
-To prepare revision-bound landing pages for each episode, write a reviewable site to
-a separate directory. An optional Apple catalog supplies exact Apple episode URLs
+Prepare the reviewable site in a separate directory. An optional Apple catalog
+supplies exact Apple episode URLs
 only for entries with a matching `episode_id`; otherwise the page labels its Apple
 destination as a show-level fallback.
 

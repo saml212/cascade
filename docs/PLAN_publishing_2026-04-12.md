@@ -133,14 +133,9 @@ Each item explains *why* it's deferred so we don't drift back into half-builds.
   critical path to "stop manually publishing to Spotify." Defer.
 
 ### Link-tree integration with the RSS feed
-- **What user means**: `links/index.html` is generated separately from the RSS
-  feed. The user's "unified RSS feed thing" is vague — most likely they want
-  one single public landing page that surfaces both the latest episode and the
-  social platform links (currently two separate things).
-- **Why deferred**: The tactical answer is not RSS-related at all — it's a
-  landing-page change in `links/template.html` to embed the feed's latest item
-  via JS. Defer until the user clarifies what "unified" means or until the RSS
-  hardening is shipped and we can revisit holistically.
+- **Status: superseded.** The canonical `links.episode_hub` site now combines
+  exact episode destinations with the configured show-level platform links.
+  RSS and media delivery remain independent R2 artifacts.
 
 ### Analytics collection / request-id polling
 - **What user wants**: per-post impressions, engagement, click-throughs, growth
