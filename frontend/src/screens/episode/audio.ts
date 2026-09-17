@@ -414,7 +414,7 @@ function repairDescription(
   return [
     'Grounded repair selected',
     selection.release_safe === false
-      ? 'The repair is selected for future renders, while the current release still requires review.'
+      ? 'This repair is selected as the audio source for future renders.'
       : 'Future renders use the revision-bound repair selection.',
   ];
 }
