@@ -561,6 +561,80 @@ def _validated_source_window(
     return start, end
 
 
+class AudioWindowOutOfRange(ValueError):
+    """The requested source window has no corresponding source audio."""
+
+
+def _bounded_audio_window_filters(
+    tracks: list[dict],
+    start: float,
+    end: float,
+    offset: float,
+    tempo: float,
+    source_kind: Literal["recorder", "camera"],
+    channel: Literal["left", "right"] | None,
+) -> tuple[list[str], list[str]]:
+    """Build the seek-bounded MP3 preview inputs and filter graph."""
+    audio_start = start * tempo + offset
+    leading_silence = min(end - start, max(0.0, -audio_start / tempo))
+    remaining = (end - start - leading_silence) * tempo
+    cursor = max(0.0, audio_start)
+    slices: list[tuple[Path, float, float]] = []
+    for track in tracks:
+        track_duration = float(track.get("duration_seconds") or 0)
+        if track_duration <= 0:
+            if len(tracks) == 1:
+                slices = [(Path(track["dest_path"]), cursor, remaining)]
+                break
+            continue
+        if cursor >= track_duration:
+            cursor -= track_duration
+            continue
+        slice_duration = min(remaining, track_duration - cursor)
+        slices.append((Path(track["dest_path"]), cursor, slice_duration))
+        remaining -= slice_duration
+        cursor = 0
+        if remaining <= 1e-6:
+            break
+    if not slices and leading_silence <= 0:
+        raise AudioWindowOutOfRange("Source window starts after audio ends")
+
+    inputs: list[str] = []
+    filters: list[str] = []
+    labels = []
+    if leading_silence > 0:
+        inputs += [
+            "-f",
+            "lavfi",
+            "-t",
+            str(leading_silence * tempo),
+            "-i",
+            "anullsrc=r=44100:cl=mono",
+        ]
+        labels.append("[part0]")
+        filters.append("[0:a]anull[part0]")
+    for path, local_start, slice_duration in slices:
+        index = len(labels)
+        inputs += ["-ss", str(local_start), "-t", str(slice_duration), "-i", str(path)]
+        if source_kind == "camera":
+            side = "c0" if channel == "left" else "c1"
+            chain = f"{CAMERA_AUDIO_TIMELINE_FILTER},pan=mono|c0={side}"
+        else:
+            chain = "aformat=channel_layouts=mono"
+        label = f"part{index}"
+        filters.append(f"[{index}:a]{chain}[{label}]")
+        labels.append(f"[{label}]")
+    join = (
+        f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1"
+        if len(labels) > 1
+        else f"{labels[0]}anull"
+    )
+    filters.append(f"{join}[joined]")
+    timing = f"atempo={tempo:.8f}" if abs(tempo - 1.0) > 1e-7 else "anull"
+    filters.append(f"[joined]{timing}[out]")
+    return inputs, filters
+
+
 def export_logical_track_window(
     episode_dir: Path,
     episode: dict,
@@ -571,6 +645,7 @@ def export_logical_track_window(
     *,
     source_kind: Literal["recorder", "camera"] = "recorder",
     channel: Literal["left", "right"] | None = None,
+    tracks: list[dict] | None = None,
 ) -> dict:
     """Export one bounded recorder track or camera channel on the source clock.
 
@@ -580,21 +655,30 @@ def export_logical_track_window(
     """
     episode_dir = Path(episode_dir)
     output_path = Path(output_path)
-    if output_path.suffix.casefold() != ".flac":
-        raise ValueError("Track review audio must use a .flac destination")
+    output_suffix = output_path.suffix.casefold()
+    if output_suffix not in {".flac", ".mp3"}:
+        raise ValueError("Track review audio must use a .flac or .mp3 destination")
+    explicit_tracks = tracks is not None
+    sample_rate = 44100 if output_suffix == ".mp3" else 16000
+    codec_name = output_suffix.removeprefix(".")
     start, end = _validated_source_window(episode, start, end)
     if source_kind == "recorder":
-        if not isinstance(logical_track, int) or isinstance(logical_track, bool):
+        if tracks is None and (
+            not isinstance(logical_track, int) or isinstance(logical_track, bool)
+        ):
             raise TypeError("logical_track must be an integer")
         if channel is not None:
             raise ValueError("channel is only valid for camera audio")
-        groups = logical_track_groups(
-            episode_dir, episode, recorder_only=True, existing_only=True
-        )
-        tracks = groups.get(logical_track, [])
+        if tracks is None:
+            groups = logical_track_groups(
+                episode_dir, episode, recorder_only=True, existing_only=True
+            )
+            tracks = groups.get(logical_track, [])
         if not tracks:
             raise FileNotFoundError(f"Logical track {logical_track} is unavailable")
         paths = [Path(track["dest_path"]) for track in tracks]
+        if any(not path.is_file() for path in paths):
+            raise FileNotFoundError("Audio source is unavailable")
         sync = episode.get("audio_sync", {})
         offset = float(sync.get("offset_seconds", 0))
         tempo = (
@@ -611,9 +695,15 @@ def export_logical_track_window(
             "source_window": {"start": start, "end": end},
             "audio_sync": sync,
             "sources": [_file_identity(path) for path in paths],
-            "codec": {"name": "flac", "sample_rate": 16000, "channels": 1},
+            "codec": {
+                "name": codec_name,
+                "sample_rate": sample_rate,
+                "channels": 1,
+            },
         }
     elif source_kind == "camera":
+        if tracks is not None:
+            raise ValueError("tracks are only valid for recorder audio")
         if logical_track is not None:
             raise ValueError("logical_track is only valid for recorder audio")
         if channel not in {"left", "right"}:
@@ -622,6 +712,8 @@ def export_logical_track_window(
         if not paths[0].is_file():
             raise FileNotFoundError("Camera source is unavailable")
         sync = {}
+        offset = 0.0
+        tempo = 1.0
         fingerprint_state = {
             "version": _TRACK_WINDOW_VERSION,
             "clock": "source",
@@ -630,7 +722,11 @@ def export_logical_track_window(
             "source_window": {"start": start, "end": end},
             "timeline_filter": CAMERA_AUDIO_TIMELINE_FILTER,
             "sources": [_file_identity(paths[0])],
-            "codec": {"name": "flac", "sample_rate": 16000, "channels": 1},
+            "codec": {
+                "name": codec_name,
+                "sample_rate": sample_rate,
+                "channels": 1,
+            },
         }
     else:
         raise ValueError(f"Unsupported audio source kind: {source_kind}")
@@ -649,23 +745,26 @@ def export_logical_track_window(
         return cached
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_tracks = (
+        tracks if source_kind == "recorder" else [{"dest_path": str(paths[0])}]
+    )
+    full_timeline = output_suffix == ".flac" and not explicit_tracks
     inputs: list[str] = []
     filters: list[str] = []
-    if source_kind == "camera":
-        inputs.extend(["-i", str(paths[0])])
-        channel_index = 0 if channel == "left" else 1
+    if full_timeline and source_kind == "camera":
+        inputs += ["-i", str(paths[0])]
+        side = "c0" if channel == "left" else "c1"
         filters.append(
-            f"[0:a]{CAMERA_AUDIO_TIMELINE_FILTER},pan=mono|c0=c{channel_index},"
+            f"[0:a]{CAMERA_AUDIO_TIMELINE_FILTER},pan=mono|c0={side},"
             f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,"
-            "aresample=16000[out]"
+            f"aresample={sample_rate}[out]"
         )
-    else:
-        labels: list[str] = []
+    elif full_timeline:
+        labels = []
         for index, path in enumerate(paths):
-            inputs.extend(["-i", str(path)])
-            label = f"part{index}"
-            filters.append(f"[{index}:a]aformat=channel_layouts=mono[{label}]")
-            labels.append(f"[{label}]")
+            inputs += ["-i", str(path)]
+            labels.append(f"[part{index}]")
+            filters.append(f"[{index}:a]aformat=channel_layouts=mono[part{index}]")
         if len(labels) > 1:
             filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[joined]")
         else:
@@ -677,14 +776,23 @@ def export_logical_track_window(
             chain += f",adelay={round(abs(offset) * 1000)}"
         if abs(tempo - 1.0) > 1e-7:
             chain += f",atempo={tempo:.8f}"
-        chain += (
-            f",atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
-            ",aresample=16000[out]"
+        filters.append(
+            f"{chain},atrim=start={start:.6f}:end={end:.6f},"
+            f"asetpts=PTS-STARTPTS,aresample={sample_rate}[out]"
         )
-        filters.append(chain)
+    else:
+        inputs, filters = _bounded_audio_window_filters(
+            source_tracks,
+            start,
+            end,
+            offset,
+            tempo,
+            source_kind,
+            channel,
+        )
     with tempfile.NamedTemporaryFile(
         prefix=f".{output_path.stem}.",
-        suffix=".tmp.flac",
+        suffix=f".tmp{output_suffix}",
         dir=output_path.parent,
         delete=False,
     ) as handle:
@@ -697,12 +805,11 @@ def export_logical_track_window(
         ";".join(filters),
         "-map",
         "[out]",
-        "-c:a",
-        "flac",
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
+        *(
+            ["-ac", "1", "-ar", "44100", "-b:a", "128k"]
+            if codec_name == "mp3"
+            else ["-c:a", "flac", "-ar", "16000", "-ac", "1"]
+        ),
         str(temporary),
     ]
     try:
@@ -740,9 +847,9 @@ def export_logical_track_window(
             "size_bytes": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
             "sha256": _file_sha256(output_path),
-            "sample_rate": 16000,
+            "sample_rate": sample_rate,
             "channels": 1,
-            "codec": "flac",
+            "codec": codec_name,
         },
     }
     atomic_write_json(manifest_path, manifest)

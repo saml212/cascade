@@ -1203,7 +1203,7 @@ class TestAudioPreview:
         resp = client.get("/api/episodes/nonexistent/audio-preview/track")
         assert resp.status_code == 404
 
-    @patch("server.routes.episodes._run_ffmpeg")
+    @patch("agents.transcribe.subprocess.run")
     def test_audio_preview_applies_sync_offset(self, mock_run, test_client):
         """Audio preview should add sync offset to the start time."""
         client, episodes_dir = test_client
@@ -1227,7 +1227,7 @@ class TestAudioPreview:
         audio_dir.mkdir(exist_ok=True)
         (audio_dir / "260311_TrLR.WAV").write_bytes(b"\x00" * 1000)
 
-        async def fake_ffmpeg(cmd):
+        def fake_ffmpeg(cmd, **_kwargs):
             Path(cmd[-1]).write_bytes(b"\xff\xfb\x90")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -1237,7 +1237,7 @@ class TestAudioPreview:
             "/api/episodes/ep_001/audio-preview/260311_TrLR?start=30&duration=60"
         )
         assert resp.status_code == 200
-        cmd = mock_run.await_args.args[0]
+        cmd = mock_run.call_args.args[0]
         assert cmd[cmd.index("-ss") + 1] == "32.5"
 
 

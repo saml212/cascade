@@ -3,7 +3,7 @@
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import Mock
 
 import pytest
 from fastapi import FastAPI
@@ -54,18 +54,18 @@ def test_logical_preview_crosses_segment_boundary_once(preview_client, monkeypat
     ]
     _write_episode(episode_dir, tracks, offset=5)
 
-    async def fake_ffmpeg(cmd):
+    def fake_ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"mp3")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    run = AsyncMock(side_effect=fake_ffmpeg)
-    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    run = Mock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr("agents.transcribe.subprocess.run", run)
     response = client.get(
         "/api/episodes/ep_test/audio-preview/track/1?start=85&duration=30"
     )
 
     assert response.status_code == 200
-    cmd = run.await_args.args[0]
+    cmd = run.call_args.args[0]
     first_seek = cmd[cmd.index("-ss") + 1]
     second_seek_index = cmd.index("-ss", cmd.index("-ss") + 1)
     assert first_seek == "90.0"
@@ -78,20 +78,20 @@ def test_preview_cache_changes_when_source_changes(preview_client, monkeypatch):
     tracks = [_track(episode_dir, "session_Tr2.WAV", 2, 100)]
     _write_episode(episode_dir, tracks)
 
-    async def fake_ffmpeg(cmd):
+    def fake_ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"mp3")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    run = AsyncMock(side_effect=fake_ffmpeg)
-    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    run = Mock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr("agents.transcribe.subprocess.run", run)
     url = "/api/episodes/ep_test/audio-preview/track/2?start=10&duration=20"
     assert client.get(url).status_code == 200
     assert client.get(url).status_code == 200
-    assert run.await_count == 1
+    assert run.call_count == 1
 
     Path(tracks[0]["dest_path"]).write_bytes(b"changed source")
     assert client.get(url).status_code == 200
-    assert run.await_count == 2
+    assert run.call_count == 2
 
 
 def test_negative_sync_offset_keeps_leading_silence(preview_client, monkeypatch):
@@ -99,18 +99,18 @@ def test_negative_sync_offset_keeps_leading_silence(preview_client, monkeypatch)
     tracks = [_track(episode_dir, "session_Tr1.WAV", 1, 100)]
     _write_episode(episode_dir, tracks, offset=-2.5)
 
-    async def fake_ffmpeg(cmd):
+    def fake_ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"mp3")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    run = AsyncMock(side_effect=fake_ffmpeg)
-    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    run = Mock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr("agents.transcribe.subprocess.run", run)
     response = client.get(
         "/api/episodes/ep_test/audio-preview/track/1?start=0&duration=10"
     )
 
     assert response.status_code == 200
-    cmd = run.await_args.args[0]
+    cmd = run.call_args.args[0]
     assert "anullsrc=r=44100:cl=mono" in cmd
     silence_input = cmd.index("anullsrc=r=44100:cl=mono")
     assert cmd[silence_input - 2 : silence_input] == ["2.5", "-i"]
@@ -179,12 +179,12 @@ def test_channel_preview_cache_keeps_fractional_windows_distinct(
     _write_episode(episode_dir, [])
     (episode_dir / "source_merged.mp4").write_bytes(b"video")
 
-    async def fake_ffmpeg(cmd):
+    def fake_ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"mp3")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    run = AsyncMock(side_effect=fake_ffmpeg)
-    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    run = Mock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr("agents.transcribe.subprocess.run", run)
     first = client.get(
         "/api/episodes/ep_test/channel-preview/right?start=10.1&duration=1.1"
     )
@@ -193,8 +193,8 @@ def test_channel_preview_cache_keeps_fractional_windows_distinct(
     )
 
     assert first.status_code == second.status_code == 200
-    assert run.await_count == 2
-    for call in run.await_args_list:
+    assert run.call_count == 2
+    for call in run.call_args_list:
         command = call.args[0]
         graph = command[command.index("-filter_complex") + 1]
         assert "aresample=async=1000" in graph
@@ -208,17 +208,17 @@ def test_track_preview_applies_reliable_tempo_drift(preview_client, monkeypatch)
     episode["audio_sync"].update({"tempo_factor": 1.01, "r_squared": 0.9})
     (episode_dir / "episode.json").write_text(json.dumps(episode))
 
-    async def fake_ffmpeg(cmd):
+    def fake_ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"mp3")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    run = AsyncMock(side_effect=fake_ffmpeg)
-    monkeypatch.setattr(episodes, "_run_ffmpeg", run)
+    run = Mock(side_effect=fake_ffmpeg)
+    monkeypatch.setattr("agents.transcribe.subprocess.run", run)
     response = client.get(
         "/api/episodes/ep_test/audio-preview/track/1?start=10&duration=5"
     )
 
     assert response.status_code == 200
-    command = run.await_args.args[0]
+    command = run.call_args.args[0]
     assert command[command.index("-ss") + 1] == "12.1"
     assert "atempo=1.01000000" in command[command.index("-filter_complex") + 1]

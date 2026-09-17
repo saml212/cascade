@@ -8,7 +8,6 @@ import math
 import re
 import shutil
 import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,12 +20,9 @@ from agents.pipeline import load_config
 from agents.podcast_feed import current_podcast_audio
 from agents.qa import editorial_revision, quality_snapshot
 from agents.speaker_cut import current_speaker_segments, rebind_visual_crop_segments
+from agents.transcribe import AudioWindowOutOfRange, export_logical_track_window
 from lib.atomic_write import atomic_write_json
-from lib.audio_mix import (
-    CAMERA_AUDIO_TIMELINE_FILTER,
-    audio_selection_settings,
-    selected_audio_source,
-)
+from lib.audio_mix import audio_selection_settings, selected_audio_source
 from lib.clips import (
     clip_selection_status,
     is_selected_clip,
@@ -36,27 +32,11 @@ from lib.clips import normalize_clip as _normalize_clip
 from lib.crop import speaker_crop_state, visual_crop_state
 from lib.delivery_video import migrate_unchanged_short_crop_fingerprints
 from lib.ffprobe import get_dimensions
+from lib.paths import get_episodes_dir
 from server.routes.delivery import (
     current_delivery_video_fields,
     migrate_unchanged_delivery_audio_fingerprint,
 )
-
-
-async def _run_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess:
-    """Run an ffmpeg (or similar blocking subprocess) on a thread so the
-    asyncio event loop stays responsive. ffmpeg on large 32-bit float WAVs
-    can take minutes; calling subprocess.run inline wedges uvicorn and
-    starves every other request until it finishes.
-    """
-    return await asyncio.to_thread(
-        subprocess.run,
-        cmd,
-        capture_output=True,
-        text=True,
-    )
-
-
-from lib.paths import get_episodes_dir
 
 logger = logging.getLogger(__name__)
 
@@ -660,78 +640,6 @@ def _validate_preview_window(start: float, duration: float) -> tuple[float, floa
     return start, duration
 
 
-def _preview_cache_path(
-    ep_dir: Path,
-    cache_name: str,
-    tracks: list[dict],
-    start: float,
-    duration: float,
-    offset: float,
-    tempo: float = 1.0,
-    channel: str | None = None,
-    preserve_timestamps: bool = False,
-) -> Path:
-    """Key previews by exact sources and timeline parameters."""
-    sources = []
-    for track in tracks:
-        path = Path(track["dest_path"])
-        stat = path.stat()
-        sources.append(
-            {
-                "path": str(path.resolve()),
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-                "duration": track.get("duration_seconds"),
-            }
-        )
-    payload = json.dumps(
-        {
-            "sources": sources,
-            "start": start,
-            "duration": duration,
-            "offset": offset,
-            "tempo": tempo,
-            "channel": channel,
-            "preserve_timestamps": preserve_timestamps,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
-    cache_dir = ep_dir / "work" / "audio_preview"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", cache_name)
-    return cache_dir / f"{safe_name}_{digest}.mp3"
-
-
-def _preview_slices(
-    tracks: list[dict], audio_start: float, duration: float
-) -> list[tuple[Path, float, float]]:
-    """Resolve a logical time window into local slices of consecutive files."""
-    if duration <= 0:
-        return []
-    remaining = duration
-    cursor = audio_start
-    result = []
-    for track in tracks:
-        track_duration = float(track.get("duration_seconds") or 0)
-        if track_duration <= 0:
-            # Unknown duration is safe for a single legacy file.
-            if len(tracks) == 1:
-                return [(Path(track["dest_path"]), cursor, remaining)]
-            continue
-        if cursor >= track_duration:
-            cursor -= track_duration
-            continue
-        slice_duration = min(remaining, track_duration - cursor)
-        result.append((Path(track["dest_path"]), cursor, slice_duration))
-        remaining -= slice_duration
-        cursor = 0
-        if remaining <= 1e-6:
-            break
-    return result
-
-
 async def _render_audio_preview(
     ep_dir: Path,
     cache_name: str,
@@ -751,100 +659,40 @@ async def _render_audio_preview(
         if not Path(track["dest_path"]).exists():
             raise HTTPException(status_code=404, detail="Audio file not found on disk")
 
-    cache_file = _preview_cache_path(
-        ep_dir,
-        cache_name,
-        tracks,
-        start,
-        duration,
-        offset,
-        tempo,
-        channel,
-        preserve_timestamps,
+    digest = hashlib.sha256(
+        repr((start, duration, offset, tempo, channel, preserve_timestamps)).encode()
+    ).hexdigest()[:16]
+    cache_file = (
+        ep_dir
+        / "work"
+        / "audio_preview"
+        / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', cache_name)}_{digest}.mp3"
     )
-    if cache_file.exists() and cache_file.stat().st_size > 0:
-        return cache_file
-
-    timeline_audio_start = start * tempo + offset
-    leading_silence = min(duration, max(0.0, -timeline_audio_start / tempo))
-    slices = _preview_slices(
-        tracks,
-        max(0.0, timeline_audio_start),
-        (duration - leading_silence) * tempo,
-    )
-    if not slices and leading_silence <= 0:
-        raise HTTPException(status_code=416, detail="Preview starts after audio ends")
-
-    inputs: list[str] = []
-    filters: list[str] = []
-    labels: list[str] = []
-    if leading_silence > 0:
-        inputs.extend(
-            [
-                "-f",
-                "lavfi",
-                "-t",
-                str(leading_silence * tempo),
-                "-i",
-                "anullsrc=r=44100:cl=mono",
-            ]
+    try:
+        await asyncio.to_thread(
+            export_logical_track_window,
+            ep_dir,
+            {
+                "audio_sync": {
+                    "offset_seconds": offset,
+                    "tempo_factor": tempo,
+                    "r_squared": 1.0,
+                }
+            },
+            tracks[0].get("track_number"),
+            start,
+            start + duration,
+            cache_file,
+            source_kind="camera" if channel else "recorder",
+            channel=channel,
+            tracks=None if channel else tracks,
         )
-        labels.append("[p0]")
-        filters.append("[0:a]anull[p0]")
-    for path, local_start, slice_duration in slices:
-        index = len(labels)
-        inputs.extend(
-            ["-ss", str(local_start), "-t", str(slice_duration), "-i", str(path)]
-        )
-        input_filter = f"[{index}:a]"
-        if preserve_timestamps:
-            input_filter += CAMERA_AUDIO_TIMELINE_FILTER + ","
-        if channel:
-            channel_name = "FL" if channel == "left" else "FR"
-            input_filter += f"pan=mono|c0={channel_name}"
-        else:
-            input_filter += "aformat=channel_layouts=mono"
-        label = f"p{index}"
-        filters.append(f"{input_filter}[{label}]")
-        labels.append(f"[{label}]")
-
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{cache_file.stem}.",
-        suffix=".mp3",
-        dir=cache_file.parent,
-        delete=False,
-    ) as temp_handle:
-        temp_file = Path(temp_handle.name)
-    output_label = labels[0]
-    if len(labels) > 1:
-        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[joined]")
-        output_label = "[joined]"
-    if abs(tempo - 1.0) > 1e-7:
-        filters.append(f"{output_label}atempo={tempo:.8f}[timed]")
-        output_label = "[timed]"
-    cmd = [
-        "ffmpeg",
-        "-y",
-        *inputs,
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        output_label,
-        "-ac",
-        "1",
-        "-ar",
-        "44100",
-        "-b:a",
-        "128k",
-        str(temp_file),
-    ]
-    result = await _run_ffmpeg(cmd)
-    if result.returncode != 0:
-        temp_file.unlink(missing_ok=True)
+    except AudioWindowOutOfRange as exc:
         raise HTTPException(
-            status_code=500, detail=f"ffmpeg error: {result.stderr[:300]}"
-        )
-    temp_file.replace(cache_file)
+            status_code=416, detail="Preview starts after audio ends"
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"ffmpeg error: {exc}") from exc
     return cache_file
 
 
@@ -895,8 +743,8 @@ async def get_audio_preview(
     start/duration are in video time; the sync offset from episode.json is
     applied automatically so the audio lines up with what's on screen.
 
-    ffmpeg runs on a thread (via _run_ffmpeg) so the asyncio event loop
-    stays responsive. WAVs here are often 1-2GB 32-bit float and the
+    ffmpeg runs on a worker thread so the asyncio event loop stays responsive.
+    WAVs here are often 1-2GB 32-bit float and the
     transcode can take 30-60s on first call; running sync would block
     every other request for that duration.
     """
@@ -962,8 +810,8 @@ async def get_channel_preview(
 
     channel: "left" or "right"
 
-    ffmpeg runs on a thread (via _run_ffmpeg) so the event loop stays
-    responsive even if source_merged.mp4 seek + transcode takes seconds.
+    ffmpeg runs on a worker thread so the event loop stays responsive even if
+    source_merged.mp4 seek + transcode takes seconds.
     """
     if channel not in ("left", "right"):
         raise HTTPException(status_code=400, detail="channel must be 'left' or 'right'")
