@@ -637,59 +637,121 @@ def _schedule_capacity_count(records: list[dict]) -> int:
     return count
 
 
+_CANCELLATION_FIELDS = {
+    "delete_started": set(),
+    "outcome_uncertain": {"delete"},
+    "delete_confirmed": {"delete"},
+    "cancelled": {"delete", "post_delete", "completed_at", "terminal_event"},
+}
+_CANCELLATION_BASE_FIELDS = {
+    "schema",
+    "operation_id",
+    "clip_id",
+    "actor",
+    "reason",
+    "state",
+    "snapshot",
+    "pre_delete",
+    "started_at",
+}
+
+
+def _delete_attempt_state(deletion: object, job_id: str) -> str | None:
+    """Classify an exact durable DELETE result as uncertain or confirmed."""
+    if not (
+        isinstance(deletion, dict)
+        and deletion.get("job_id") == job_id
+        and isinstance(deletion.get("attempted_at"), str)
+        and deletion["attempted_at"]
+    ):
+        return None
+    if _has_exact_keys(deletion, {"job_id", "attempted_at", "error"}):
+        error = deletion.get("error")
+        return "uncertain" if isinstance(error, str) and error else None
+    if _has_exact_keys(
+        deletion,
+        {"job_id", "attempted_at", "http_status", "response", "confirmed_at"},
+    ):
+        if (
+            deletion.get("http_status") == 200
+            and isinstance(deletion.get("response"), dict)
+            and deletion["response"].get("success") is True
+            and isinstance(deletion.get("confirmed_at"), str)
+            and deletion["confirmed_at"]
+        ):
+            return "confirmed"
+        return None
+    response_fields = {"job_id", "attempted_at", "http_status"}
+    if "response" in deletion:
+        response_fields.add("response")
+    if not _has_exact_keys(deletion, response_fields):
+        return None
+    status = deletion.get("http_status")
+    response = deletion.get("response")
+    if (
+        type(status) is not int
+        or ("response" in deletion and not isinstance(response, dict))
+        or status == 200
+        and isinstance(response, dict)
+        and response.get("success") is True
+    ):
+        return None
+    return "uncertain"
+
+
 def validated_schedule_cancellation(receipt: dict) -> dict | None:
     """Validate the durable operation embedded in a scheduled receipt."""
     operation = receipt.get("schedule_cancellation")
     original = receipt.get("pre_cancellation_receipt")
     if not isinstance(operation, dict) or not isinstance(original, dict):
         return None
+    state = operation.get("state")
+    state_fields = _CANCELLATION_FIELDS.get(state)
+    if state_fields is None:
+        return None
+    expected_fields = _CANCELLATION_BASE_FIELDS | state_fields
+    if state == "delete_confirmed" and "post_delete" in operation:
+        expected_fields.add("post_delete")
+    pre_delete = operation.get("pre_delete")
+    if not (
+        _has_exact_keys(operation, expected_fields)
+        and _has_exact_keys(pre_delete, {"checked_at", "evidence"})
+    ):
+        return None
+
     schema = operation.get("schema")
     snapshot = operation.get("snapshot")
     target = snapshot.get("target") if isinstance(snapshot, dict) else None
     remote = snapshot.get("remote_job") if isinstance(snapshot, dict) else None
-    state = operation.get("state")
-    base_keys = {
-        "schema",
-        "operation_id",
-        "clip_id",
-        "actor",
-        "reason",
-        "state",
-        "snapshot",
-        "pre_delete",
-        "started_at",
-    }
-    if not isinstance(state, str) or state not in {
-        "delete_started",
-        "outcome_uncertain",
-        "delete_confirmed",
-        "cancelled",
-    }:
-        return None
-    expected_keys = {
-        "delete_started": base_keys,
-        "outcome_uncertain": base_keys | {"delete"},
-        "delete_confirmed": base_keys | {"delete"},
-        "cancelled": base_keys
-        | {"delete", "post_delete", "completed_at", "terminal_event"},
-    }[state]
-    if state == "delete_confirmed" and "post_delete" in operation:
-        expected_keys = expected_keys | {"post_delete"}
-    if not (
-        _has_exact_keys(operation, expected_keys)
-        and _has_exact_keys(operation.get("pre_delete"), {"checked_at", "evidence"})
-        and (
-            _has_exact_keys(target, {"variant_id", "revision", "render_fingerprint"})
-            if schema == SCHEDULE_CANCELLATION_SCHEMA
-            else target is None
-        )
+    legacy_target = schema == SCHEDULE_CANCELLATION_SCHEMA
+    if schema not in {
+        SCHEDULE_CANCELLATION_SCHEMA,
+        EXACT_SCHEDULE_CANCELLATION_SCHEMA,
+    } or not (
+        _has_exact_keys(target, {"variant_id", "revision", "render_fingerprint"})
+        if legacy_target
+        else target is None
     ):
         return None
+    if legacy_target and not (
+        target["variant_id"] is None or isinstance(target["variant_id"], str)
+    ):
+        return None
+    if legacy_target and not all(
+        isinstance(target.get(key), str) and target[key]
+        for key in ("revision", "render_fingerprint")
+    ):
+        return None
+
+    required_text = ("operation_id", "clip_id", "actor", "reason", "started_at")
+    cancelled_destinations = {
+        platform: {"state": "cancelled"}
+        for platform in (original.get("platforms") or [])
+    }
     if not (
-        schema in {SCHEDULE_CANCELLATION_SCHEMA, EXACT_SCHEDULE_CANCELLATION_SCHEMA}
-        and all(
+        all(
             isinstance(operation.get(key), str) and operation[key]
-            for key in ("operation_id", "clip_id", "actor", "reason", "started_at")
+            for key in required_text
         )
         and operation["actor"] == operation["actor"].strip()
         and operation["reason"] == operation["reason"].strip()
@@ -699,11 +761,7 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
         and "pre_cancellation_receipt" not in original
         and original.get("scheduled") is True
         and validated_terminal_destinations(
-            original.get("platforms"),
-            {
-                platform: {"state": "cancelled"}
-                for platform in (original.get("platforms") or [])
-            },
+            original.get("platforms"), cancelled_destinations
         )
         is not None
         and isinstance(snapshot, dict)
@@ -714,121 +772,70 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
         == cancellation_snapshot(
             original,
             snapshot["history_revision"],
-            snapshot.get("profile_username"),
+            snapshot["profile_username"],
             target,
             remote,
         )
-        and (
-            schema == EXACT_SCHEDULE_CANCELLATION_SCHEMA
-            or (
-                isinstance(target, dict)
-                and "variant_id" in target
-                and (
-                    target["variant_id"] is None
-                    or isinstance(target["variant_id"], str)
-                )
-                and all(
-                    isinstance(target.get(key), str) and target[key]
-                    for key in ("revision", "render_fingerprint")
-                )
-            )
-        )
         and _matching_schedule_row(original, remote, snapshot["profile_username"])
-        and isinstance(operation.get("pre_delete"), dict)
-        and isinstance(operation["pre_delete"].get("checked_at"), str)
+        and isinstance(pre_delete.get("checked_at"), str)
         and schedule_cancellation_provider_safe(
             original,
-            operation["pre_delete"].get("evidence"),
+            pre_delete.get("evidence"),
             profile_username=snapshot["profile_username"],
             after_delete=False,
         )[0]
     ):
         return None
-    if state != "cancelled" and not _matches_exact_receipt(
-        receipt,
-        {
-            **original,
-            "pre_cancellation_receipt": original,
-            "schedule_cancellation": operation,
-        },
-    ):
+
+    pending_receipt = {
+        **original,
+        "pre_cancellation_receipt": original,
+        "schedule_cancellation": operation,
+    }
+    if state != "cancelled" and not _matches_exact_receipt(receipt, pending_receipt):
         return None
-    deletion = operation.get("delete")
     if state == "delete_started":
         return operation
-    if not (
-        isinstance(deletion, dict)
-        and deletion.get("job_id") == original["job_id"]
-        and isinstance(deletion.get("attempted_at"), str)
-        and deletion["attempted_at"]
-    ):
-        return None
-    error_shape = (
-        _has_exact_keys(deletion, {"job_id", "attempted_at", "error"})
-        and isinstance(deletion.get("error"), str)
-        and bool(deletion["error"])
-    )
-    response_keys = {"job_id", "attempted_at", "http_status"}
-    if "response" in deletion:
-        response_keys.add("response")
-    response_shape = (
-        _has_exact_keys(deletion, response_keys)
-        and isinstance(deletion.get("http_status"), int)
-        and not isinstance(deletion.get("http_status"), bool)
-        and ("response" not in deletion or isinstance(deletion["response"], dict))
-        and not (
-            deletion["http_status"] == 200
-            and isinstance(deletion.get("response"), dict)
-            and deletion["response"].get("success") is True
-        )
-    )
-    uncertain_deletion = error_shape or response_shape
+
+    deletion_state = _delete_attempt_state(operation.get("delete"), original["job_id"])
     if state == "outcome_uncertain":
-        return operation if uncertain_deletion else None
-    confirmed_deletion = (
-        _has_exact_keys(
-            deletion,
-            {"job_id", "attempted_at", "http_status", "response", "confirmed_at"},
-        )
-        and deletion.get("http_status") == 200
-        and isinstance(deletion.get("response"), dict)
-        and deletion["response"].get("success") is True
-        and isinstance(deletion.get("confirmed_at"), str)
-        and deletion["confirmed_at"]
-    )
-    if not confirmed_deletion and not (
+        return operation if deletion_state == "uncertain" else None
+    if deletion_state != "confirmed" and not (
         state == "cancelled"
         and schema == EXACT_SCHEDULE_CANCELLATION_SCHEMA
-        and uncertain_deletion
+        and deletion_state == "uncertain"
     ):
         return None
-    if state == "delete_confirmed" and "post_delete" not in operation:
-        return operation
+
+    post = operation.get("post_delete")
     if state == "delete_confirmed":
-        post = operation["post_delete"]
+        if post is None:
+            return operation
         if not (
             _has_exact_keys(post, {"checked_at", "calendar", "evidence"})
             and isinstance(post["checked_at"], str)
             and post["checked_at"]
             and (
                 post["calendar"] is None
-                or (
-                    isinstance(post["calendar"], list)
-                    and all(isinstance(item, dict) for item in post["calendar"])
-                )
+                or isinstance(post["calendar"], list)
+                and all(isinstance(item, dict) for item in post["calendar"])
             )
             and (post["evidence"] is None or isinstance(post["evidence"], dict))
         ):
             return None
-    if state != "cancelled":
         return operation
 
-    post = operation.get("post_delete")
-    destinations = {
-        platform: {"state": "cancelled"} for platform in original["platforms"]
-    }
-    event = operation.get("terminal_event")
     history = original.get("status_history", [])
+    event = operation.get("terminal_event")
+    expected_event = {
+        "observed_at": operation.get("completed_at"),
+        "previous_status": original.get("status"),
+        "status": "cancelled",
+        "provider_status": "cancelled",
+        "profile_username": snapshot["profile_username"],
+        "evidence_source": "schedule_cancellation",
+        "terminal_destinations": cancelled_destinations,
+    }
     if not (
         _has_exact_keys(post, {"checked_at", "calendar", "evidence"})
         and isinstance(post.get("checked_at"), str)
@@ -847,23 +854,14 @@ def validated_schedule_cancellation(receipt: dict) -> dict | None:
         )[0]
         and isinstance(history, list)
         and isinstance(operation.get("completed_at"), str)
-        and event
-        == {
-            "observed_at": operation["completed_at"],
-            "previous_status": original.get("status"),
-            "status": "cancelled",
-            "provider_status": "cancelled",
-            "profile_username": snapshot["profile_username"],
-            "evidence_source": "schedule_cancellation",
-            "terminal_destinations": destinations,
-        }
+        and event == expected_event
         and _matches_exact_receipt(
             receipt,
             {
                 **original,
                 "status": "cancelled",
                 "scheduled": False,
-                "terminal_destinations": destinations,
+                "terminal_destinations": cancelled_destinations,
                 "status_history": [*history, event],
                 "pre_cancellation_receipt": original,
                 "schedule_cancellation": operation,
@@ -1703,6 +1701,21 @@ class PublishAgent(BaseAgent):
             finally:
                 self._publication_lock_held = False
 
+    def _previous_publish(self) -> dict:
+        try:
+            previous = self.load_json("publish.json")
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "Cannot inspect the current publish receipt; nothing was submitted"
+            ) from error
+        if not isinstance(previous, dict):
+            raise TypeError(
+                "Cannot inspect the current publish receipt; nothing was submitted"
+            )
+        return previous
+
     def _inputs(self, *, bind_legacy=False):
         episode = self.load_json_safe("episode.json")
         snapshot = quality_snapshot(self.episode_dir, config=self.config)
@@ -1740,18 +1753,7 @@ class PublishAgent(BaseAgent):
         if not platforms:
             raise RuntimeError("No platforms enabled in config")
 
-        try:
-            previous = self.load_json("publish.json")
-        except FileNotFoundError:
-            previous = {}
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError(
-                "Cannot inspect the current publish receipt; nothing was submitted"
-            ) from error
-        if not isinstance(previous, dict):
-            raise TypeError(
-                "Cannot inspect the current publish receipt; nothing was submitted"
-            )
+        previous = self._previous_publish()
         previous_shorts = self._validated_previous_shorts(previous)
         funnel_urls = current_funnel_urls(
             episode,
@@ -2963,23 +2965,16 @@ class PublishAgent(BaseAgent):
     @staticmethod
     def _receipt_matches_artifact(receipt: dict, version: dict) -> bool:
         """Match stable pixels and re-release lineage across fresh copy approval."""
-        request = version.get("re_release_request")
-        rerelease_id = (
-            request.get("request_id")
-            if isinstance(request, dict)
-            else version.get("rerelease_request_id")
-        )
-        rerelease_revision = (
-            request.get("revision")
-            if isinstance(request, dict)
-            else version.get("rerelease_authorization_revision")
-        )
-        return bool(
-            receipt.get("version") == version.get("version")
-            and receipt.get("variant_id") == version.get("variant_id")
-            and receipt.get("render_fingerprint") == version.get("render_fingerprint")
-            and receipt.get("rerelease_request_id") == rerelease_id
-            and receipt.get("rerelease_authorization_revision") == rerelease_revision
+        target = _short_target_fields(str(receipt.get("clip_id", "")), version)
+        return all(
+            receipt.get(field) == target[field]
+            for field in (
+                "version",
+                "variant_id",
+                "render_fingerprint",
+                "rerelease_request_id",
+                "rerelease_authorization_revision",
+            )
         )
 
     @staticmethod
@@ -2997,18 +2992,10 @@ class PublishAgent(BaseAgent):
             )
         if present != identity_fields:
             return False
-        expected = {
-            "version": version.get("version"),
-            "variant_id": version.get("variant_id"),
-            "render_fingerprint": version.get("render_fingerprint"),
-            "approval_revision": version.get("revision"),
-        }
-        if not all(receipt.get(key) == value for key, value in expected.items()):
+        target = _short_target_fields(str(receipt.get("clip_id", "")), version)
+        if not all(receipt.get(field) == target[field] for field in identity_fields):
             return False
-        request = version.get("re_release_request")
-        if isinstance(request, dict):
-            return receipt.get("rerelease_request_id") == request.get("request_id")
-        return receipt.get("rerelease_request_id") is None
+        return receipt.get("rerelease_request_id") == target["rerelease_request_id"]
 
     @staticmethod
     def _validated_previous_shorts(previous: dict) -> list[dict]:
@@ -3811,27 +3798,25 @@ class PublishAgent(BaseAgent):
         previous_shorts=None,
         deferred_destinations=None,
     ):
-        active_shorts = shorts
+        counts = {
+            "shorts_submitted": 0,
+            "shorts_reused": 0,
+            "shorts_published": 0,
+            "shorts_failed": 0,
+            "shorts_unknown": 0,
+        }
+        for item in shorts:
+            reused = bool(item.get("reused_receipt"))
+            status = item.get("status")
+            counts["shorts_submitted"] += status == "submitted" and not reused
+            counts["shorts_reused"] += reused
+            counts["shorts_published"] += status == "published"
+            counts["shorts_failed"] += status in {"failed", "partial_failure"}
+            counts["shorts_unknown"] += status == "unknown"
         result = {
             "shorts": cls._merge_short_receipts(shorts, previous_shorts),
             "longform": longform,
-            "shorts_submitted": sum(
-                item.get("status") == "submitted" and not item.get("reused_receipt")
-                for item in active_shorts
-            ),
-            "shorts_reused": sum(
-                bool(item.get("reused_receipt")) for item in active_shorts
-            ),
-            "shorts_published": sum(
-                item.get("status") == "published" for item in active_shorts
-            ),
-            "shorts_failed": sum(
-                item.get("status") in {"failed", "partial_failure"}
-                for item in active_shorts
-            ),
-            "shorts_unknown": sum(
-                item.get("status") == "unknown" for item in active_shorts
-            ),
+            **counts,
             "platforms": platforms,
             "release_revision": revision,
             "profile_username": user,
@@ -3860,11 +3845,9 @@ class PublishAgent(BaseAgent):
                     "attempting another submission."
                 ),
             )
-        elif active_shorts and all(
-            item.get("reused_receipt") for item in active_shorts
-        ):
+        elif shorts and counts["shorts_reused"] == len(shorts):
             result["publish_status"] = "already_submitted"
-        elif active_shorts and result["shorts_published"] == len(active_shorts):
+        elif shorts and counts["shorts_published"] == len(shorts):
             result["publish_status"] = "published"
         else:
             result["publish_status"] = "submitted"
@@ -3902,18 +3885,7 @@ class LongformPublishAgent(PublishAgent):
             raise RuntimeError(
                 "Longform YouTube copy is missing: " + ", ".join(missing)
             )
-        try:
-            previous = self.load_json("publish.json")
-        except FileNotFoundError:
-            previous = {}
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError(
-                "Cannot inspect the current publish receipt; nothing was submitted"
-            ) from error
-        if not isinstance(previous, dict):
-            raise TypeError(
-                "Cannot inspect the current publish receipt; nothing was submitted"
-            )
+        previous = self._previous_publish()
 
         longform_revision = str(gate["editorial_revision"])
         release_revision = str(gate["source_release_revision"])
