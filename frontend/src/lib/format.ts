@@ -207,8 +207,8 @@ const STATUS: Record<StatusKey, Omit<StatusDescriptor, 'key'>> = {
   },
   awaiting_publish: {
     tone: 'waiting',
-    label: 'Ready to publish',
-    hint: 'Clips approved — confirm to go live.',
+    label: 'Release approval ready',
+    hint: 'Review the current release and record approval.',
   },
   awaiting_backup: {
     tone: 'waiting',

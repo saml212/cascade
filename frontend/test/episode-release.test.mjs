@@ -50,6 +50,7 @@ test('maps every consolidated alias to a stable episode section', () => {
   ]) {
     const path = `/episodes/episode%20%2F%2001${suffix}`;
     assert.equal(episodeSectionFromPath(path, episodeId), section);
+    assert.equal(episodeSectionFromPath(`${path}/`, episodeId), section);
     assert.equal(episodeSectionPath(episodeId, section), path);
   }
 });

@@ -62,11 +62,12 @@ export const BACKUP_TARGET_PATH = '/Volumes/Seagate Portable Drive/podcast/';
 
 export function episodeSectionFromPath(path: string, episodeId: string): EpisodeSection {
   const base = `/episodes/${encodeURIComponent(episodeId)}`;
-  if (path === `${base}/audio`) return 'audio';
-  if (path === `${base}/delivery`) return 'delivery';
-  if (path === `${base}/metadata`) return 'metadata';
-  if (path === `${base}/publish`) return 'publication';
-  if (path === `${base}/backup`) return 'backup';
+  const normalized = path.length > 1 ? path.replace(/\/+$/, '') : path;
+  if (normalized === `${base}/audio`) return 'audio';
+  if (normalized === `${base}/delivery`) return 'delivery';
+  if (normalized === `${base}/metadata`) return 'metadata';
+  if (normalized === `${base}/publish`) return 'publication';
+  if (normalized === `${base}/backup`) return 'backup';
   return 'review';
 }
 

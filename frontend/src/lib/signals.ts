@@ -13,17 +13,24 @@ export function effectScope(fn: () => void): () => void {
   const owner: Owner = { cleanups: new Set(), disposed: false };
   const previousOwner = currentOwner;
   const previousListener = currentListener;
+  const dispose = () => {
+    if (owner.disposed) return;
+    owner.disposed = true;
+    for (const cleanup of owner.cleanups) cleanup();
+    owner.cleanups.clear();
+  };
   currentOwner = owner;
   currentListener = null;
-  try { fn(); } finally {
+  try {
+    fn();
+  } catch (error) {
+    dispose();
+    throw error;
+  } finally {
     currentOwner = previousOwner;
     currentListener = previousListener;
   }
-  return () => {
-    owner.disposed = true;
-    for (const dispose of owner.cleanups) dispose();
-    owner.cleanups.clear();
-  };
+  return dispose;
 }
 
 function cleanup(l: Listener): void {

@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { importTs } from './load-ts.mjs';
 
-const { stableControl } = await importTs(
+const { mountStableControl, stableControl } = await importTs(
   new URL('../src/lib/stable-control.ts', import.meta.url)
 );
 
@@ -23,4 +23,25 @@ test('a newly generated output replaces the cached control', () => {
 
   assert.notStrictEqual(regenerated.value, first.value);
   assert.equal(regenerated.value.id, 2);
+});
+
+test('projection refreshes keep the same media node attached to the same host', () => {
+  const media = { parent: null, released: false };
+  const host = {
+    firstChild: null,
+    replacements: 0,
+    replaceChildren(...nodes) {
+      if (this.firstChild) this.firstChild.parent = null;
+      this.firstChild = nodes[0] ?? null;
+      if (this.firstChild) this.firstChild.parent = this;
+      this.replacements += 1;
+    },
+  };
+
+  mountStableControl(host, media);
+  mountStableControl(host, media, (node) => { node.released = true; });
+
+  assert.strictEqual(media.parent, host);
+  assert.equal(host.replacements, 1);
+  assert.equal(media.released, false);
 });

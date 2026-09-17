@@ -5,7 +5,8 @@ import { StepProgress } from '../../components/StepProgress';
 import { Icon } from '../../components/icons';
 import { api, type DeliveryStatus, type EpisodeReviewState, type QualitySnapshot, type UnknownRecord } from '../../lib/api';
 import { clipDistributionReady, publicationEvidenceStatusLabel } from '../../lib/clip-review-surface';
-import { h, mount } from '../../lib/dom';
+import { coalescedRefresh } from '../../lib/coalesced-refresh';
+import { h, mount, releaseMediaElement } from '../../lib/dom';
 import {
   BACKUP_ARTIFACTS,
   BACKUP_TARGET_PATH,
@@ -33,8 +34,8 @@ import {
 import { acceptSavedPatch, buildMetadataPatch, metadataValues, type MetadataField, type MetadataValues } from '../../lib/metadata-draft';
 import { currentPath, link, navigate } from '../../lib/router';
 import { effect, onCleanup, signal, type Signal } from '../../lib/signals';
-import { stableControl, type StableControl } from '../../lib/stable-control';
-import { episodeDetail, episodeDetailError } from '../../state/episodes';
+import { mountStableControl, stableControl, type StableControl } from '../../lib/stable-control';
+import { episodeDetail, episodeDetailError, refreshEpisode } from '../../state/episodes';
 import { showToast } from '../../state/ui';
 
 type ProjectionKey = 'review' | 'quality' | 'delivery' | 'schedule';
@@ -63,6 +64,7 @@ interface SurfaceContext {
   errors: Signal<ProjectionErrors>;
   controls: SurfaceControls;
   refreshAll: () => Promise<void>;
+  refreshCanonical: () => Promise<void>;
   prepareVideo: () => Promise<void>;
   saveTrim: (start: number, end: number) => Promise<void>;
 }
@@ -86,7 +88,6 @@ export function Episode(target: HTMLElement, episodeId: string): void {
   const surfaceReady = signal(false);
   const sections = new Map<EpisodeSection, HTMLElement>();
   let deliveryTimer: number | undefined;
-  let deliveryRequestPending = false;
   let disposed = false;
   let initialized = false;
 
@@ -110,42 +111,32 @@ export function Episode(target: HTMLElement, episodeId: string): void {
     }
   }
 
-  async function refreshDelivery(): Promise<void> {
-    if (deliveryRequestPending || disposed) return;
-    deliveryRequestPending = true;
-    try {
-      const next = await api.deliveryStatus(episodeId);
+  function projectionRefresh<T>(key: ProjectionKey, load: () => Promise<T>, accept: (next: T) => void): () => Promise<void> {
+    return coalescedRefresh(async () => {
       if (disposed) return;
-      acceptDelivery(next);
-      updateError('delivery');
-    } catch (error) {
-      if (!disposed) updateError('delivery', (error as Error).message);
-    } finally {
-      deliveryRequestPending = false;
-    }
+      try {
+        const next = await load();
+        if (disposed) return;
+        accept(next);
+        updateError(key);
+      } catch (error) {
+        if (!disposed) updateError(key, errorMessage(error));
+      }
+    });
+  }
+
+  const refreshReview = projectionRefresh('review', () => api.review(episodeId), (next) => review.set(next));
+  const refreshQuality = projectionRefresh('quality', () => api.quality(episodeId), (next) => quality.set(next));
+  const refreshDelivery = projectionRefresh('delivery', () => api.deliveryStatus(episodeId), acceptDelivery);
+  const refreshSchedule = projectionRefresh('schedule', () => api.schedule(), (next) => schedule.set(next));
+
+  async function refreshCanonical(): Promise<void> {
+    await Promise.all([refreshReview(), refreshQuality(), refreshDelivery()]);
   }
 
   async function refreshAll(): Promise<void> {
-    const results = await Promise.allSettled([api.review(episodeId), api.quality(episodeId), api.deliveryStatus(episodeId), api.schedule()] as const);
-    if (disposed) return;
-
-    const [reviewResult, qualityResult, deliveryResult, scheduleResult] = results;
-    if (reviewResult.status === 'fulfilled') {
-      review.set(reviewResult.value);
-      updateError('review');
-    } else updateError('review', errorMessage(reviewResult.reason));
-    if (qualityResult.status === 'fulfilled') {
-      quality.set(qualityResult.value);
-      updateError('quality');
-    } else updateError('quality', errorMessage(qualityResult.reason));
-    if (deliveryResult.status === 'fulfilled') {
-      acceptDelivery(deliveryResult.value);
-      updateError('delivery');
-    } else updateError('delivery', errorMessage(deliveryResult.reason));
-    if (scheduleResult.status === 'fulfilled') {
-      schedule.set(scheduleResult.value);
-      updateError('schedule');
-    } else updateError('schedule', errorMessage(scheduleResult.reason));
+    await refreshCanonical();
+    void refreshSchedule();
   }
 
   async function prepareVideo(): Promise<void> {
@@ -153,6 +144,7 @@ export function Episode(target: HTMLElement, episodeId: string): void {
       acceptDelivery(await api.prepareDeliveryVideo(episodeId));
       updateError('delivery');
       showToast('Upload video preparation started.', 'success');
+      await refreshDelivery();
     } catch (error) {
       const message = (error as Error).message;
       updateError('delivery', message);
@@ -182,11 +174,12 @@ export function Episode(target: HTMLElement, episodeId: string): void {
     errors,
     controls,
     refreshAll,
+    refreshCanonical,
     prepareVideo,
     saveTrim,
   };
   const header = h('header', {
-    class: 'px-4 sm:px-6 lg:px-10 pt-6 pb-4 border-b border-border-subtle sticky top-0 bg-canvas/95 backdrop-blur-sm z-20',
+    class: 'px-4 sm:px-6 lg:px-10 pt-6 pb-4 border-b border-border-subtle sm:sticky sm:top-0 bg-canvas/95 backdrop-blur-sm z-20',
   });
   const content = h('div', {
     class: 'px-4 sm:px-6 lg:px-10 py-8 max-w-[1280px] mx-auto',
@@ -241,7 +234,9 @@ function renderSurface(initialEpisode: UnknownRecord, context: SurfaceContext): 
     'metadata',
     'Episode copy',
     'Edit the saved episode and platform copy.',
-    createMetadataEditor(initialEpisode, context.episodeId),
+    createMetadataEditor(initialEpisode, context.episodeId, async () => {
+      await Promise.all([refreshEpisode(context.episodeId), context.refreshCanonical()]);
+    }),
   );
   const publicationSection = detailsSection(
     'publication',
@@ -254,6 +249,8 @@ function renderSurface(initialEpisode: UnknownRecord, context: SurfaceContext): 
   for (const element of [reviewSection, audioSection, deliverySection, metadataSection, publicationSection, backupSection]) {
     sections.set(element.dataset.section as EpisodeSection, element);
   }
+  audioSection.replaceChildren(createAudioView(context));
+  deliverySection.replaceChildren(createDeliveryView(context));
 
   effect(() => {
     const currentErrors = context.errors();
@@ -266,16 +263,6 @@ function renderSurface(initialEpisode: UnknownRecord, context: SurfaceContext): 
     const episode = episodeDetail();
     if (!episode) return;
     reviewSection.replaceChildren(renderReview(episode, context.review(), context.quality(), context.schedule(), context));
-  });
-
-  effect(() => {
-    const episode = episodeDetail();
-    if (!episode) return;
-    audioSection.replaceChildren(renderAudio(episode, context.quality(), context.delivery(), context.controls));
-  });
-
-  effect(() => {
-    deliverySection.replaceChildren(renderDelivery(context));
   });
 
   const publicationBody = publicationSection.lastElementChild as HTMLElement;
@@ -328,13 +315,14 @@ function renderHeader(episode: UnknownRecord, context: SurfaceContext): HTMLElem
   const errors = (pipeline?.errors as Record<string, string>) ?? {};
   const currentAgent = (pipeline?.current_agent as string) ?? null;
   const active = episodeSectionFromPath(currentPath(), context.episodeId);
+  const action = primaryAction(status.key, context.episodeId, context.delivery());
 
   return h(
     'div',
     { class: 'max-w-[1280px] mx-auto' },
     h(
       'div',
-      { class: 'flex items-start gap-4 sm:gap-6' },
+      { class: 'flex flex-wrap sm:flex-nowrap items-start gap-4 sm:gap-6' },
       h(
         'a',
         {
@@ -362,7 +350,7 @@ function renderHeader(episode: UnknownRecord, context: SurfaceContext): HTMLElem
         ),
         h('p', { class: 'text-body text-ink-secondary mt-1' }, 'Episode review and release'),
       ),
-      primaryAction(status.key, context.episodeId, context.delivery()),
+      action ? h('div', { class: 'w-full sm:w-auto pl-12 sm:pl-0' }, action) : null,
     ),
     rawStatus.key === 'processing' && agents.length
       ? h(
@@ -606,31 +594,12 @@ function renderReleaseFacts(
   );
 }
 
-function renderAudio(episode: UnknownRecord, quality: QualitySnapshot | null, delivery: DeliveryStatus | null, controls: SurfaceControls): HTMLElement {
-  const inventory = audioInventory(episode);
-  const selection = quality?.audio_quality.repair_selection;
-  const selectedRepair = selection?.status && selection.status !== 'not_selected' ? selection : null;
-  const [sourceLabel, sourceDetail] = selectedRepair ? repairDescription(selectedRepair) : baseSourceDescription(inventory);
-  const selectedUrl = delivery?.selected_audio_download_url;
-  const historicalUrl = delivery?.download_url;
-  const provenance = delivery?.selected_audio?.provenance;
-  const playable = Boolean(selectedUrl || historicalUrl);
-  const title = selectedUrl
-    ? provenance?.kind === 'selected_repair'
-      ? 'Current selected repair master'
-      : 'Available base mix · currentness unverified'
-    : historicalUrl
-      ? 'Historical podcast MP3'
-      : 'Audio master unavailable';
-  const detail = selectedUrl
-    ? provenance?.kind === 'selected_repair'
-      ? 'SOURCE CLOCK · Revision-validated selected repair at full length. Editorial cuts are not applied.'
-      : 'SOURCE CLOCK · Existing base mix with unverified currentness. Editorial cuts are not applied.'
-    : historicalUrl
-      ? 'HISTORICAL OUTPUT · This retired export may reflect an earlier delivery cut.'
-      : delivery?.selected_audio_review_error || 'The selected or mixed full-length master has not been created yet.';
-
-  return h(
+function createAudioView(context: SurfaceContext): HTMLElement {
+  const sourceHost = h('div');
+  const referenceHost = h('div');
+  const metricsHost = h('div', { class: 'grid grid-cols-2 gap-3' });
+  const playerHost = h('div');
+  const root = h(
     'section',
     { class: 'flex flex-col gap-4' },
     h(
@@ -646,37 +615,73 @@ function renderAudio(episode: UnknownRecord, quality: QualitySnapshot | null, de
         'div',
         { class: 'panel p-6' },
         h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Selected source'),
-        h('div', { class: 'text-heading-lg text-ink-primary mt-2' }, sourceLabel),
-        h('p', { class: 'text-body-sm text-ink-secondary mt-2' }, sourceDetail),
+        sourceHost,
       ),
       h(
         'div',
         { class: 'panel p-6 flex flex-col gap-4' },
-        h(
-          'div',
-          null,
-          h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Full-length audio reference'),
-          h('div', { class: 'text-heading-lg text-ink-primary mt-2' }, title),
-          h('p', { class: 'text-body-sm text-ink-secondary mt-2' }, detail),
-        ),
-        delivery && playable
-          ? h(
-              'div',
-              { class: 'grid grid-cols-2 gap-3' },
-              metric('File', selectedUrl ? delivery.selected_audio?.filename || 'Selected audio' : delivery.filename || 'Historical MP3'),
-              metric('Size', formatBytes(selectedUrl ? delivery.selected_audio?.size_bytes : delivery.size_bytes)),
-            )
-          : null,
-        delivery && playable ? audioPlayer(delivery, controls) : null,
+        referenceHost,
+        metricsHost,
+        playerHost,
       ),
     ),
   );
+
+  effect(() => {
+    const episode = episodeDetail();
+    const quality = context.quality();
+    const delivery = context.delivery();
+    if (!episode) return;
+    const inventory = audioInventory(episode);
+    const selection = quality?.audio_quality.repair_selection;
+    const selectedRepair = selection?.status && selection.status !== 'not_selected' ? selection : null;
+    const [sourceLabel, sourceDetail] = selectedRepair ? repairDescription(selectedRepair) : baseSourceDescription(inventory);
+    const selectedUrl = delivery?.selected_audio_download_url;
+    const historicalUrl = delivery?.download_url;
+    const playable = Boolean(delivery && (selectedUrl || historicalUrl));
+    const title = selectedUrl
+      ? delivery?.selected_audio?.provenance.kind === 'selected_repair'
+        ? 'Current selected repair master'
+        : 'Available base mix · currentness unverified'
+      : historicalUrl
+        ? 'Historical podcast MP3'
+        : 'Audio master unavailable';
+    const detail = selectedUrl
+      ? delivery?.selected_audio?.provenance.kind === 'selected_repair'
+        ? 'SOURCE CLOCK · Revision-validated selected repair at full length. Editorial cuts are not applied.'
+        : 'SOURCE CLOCK · Existing base mix with unverified currentness. Editorial cuts are not applied.'
+      : historicalUrl
+        ? 'HISTORICAL OUTPUT · This retired export may reflect an earlier delivery cut.'
+        : delivery?.selected_audio_review_error || 'The selected or mixed full-length master has not been created yet.';
+
+    sourceHost.replaceChildren(
+      h('div', { class: 'text-heading-lg text-ink-primary mt-2' }, sourceLabel),
+      h('p', { class: 'text-body-sm text-ink-secondary mt-2' }, sourceDetail),
+    );
+    referenceHost.replaceChildren(
+      h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Full-length audio reference'),
+      h('div', { class: 'text-heading-lg text-ink-primary mt-2' }, title),
+      h('p', { class: 'text-body-sm text-ink-secondary mt-2' }, detail),
+    );
+    metricsHost.hidden = !playable;
+    metricsHost.replaceChildren(
+      ...(delivery && playable
+        ? [
+            metric('File', selectedUrl ? delivery.selected_audio?.filename || 'Selected audio' : delivery.filename || 'Historical MP3'),
+            metric('Size', formatBytes(selectedUrl ? delivery.selected_audio?.size_bytes : delivery.size_bytes)),
+          ]
+        : []),
+    );
+    mountStableControl(playerHost, delivery && playable ? audioPlayer(delivery, context.controls) : null, releaseMediaNode);
+  });
+  return root;
 }
 
-function renderDelivery(context: SurfaceContext): HTMLElement {
-  const delivery = context.delivery();
-  const quality = context.quality();
-  return h(
+function createDeliveryView(context: SurfaceContext): HTMLElement {
+  const qualityHost = h('div');
+  const clipHost = h('div');
+  const trimHost = h('div');
+  const root = h(
     'section',
     { class: 'flex flex-col gap-5' },
     h(
@@ -685,19 +690,33 @@ function renderDelivery(context: SurfaceContext): HTMLElement {
       h('div', { class: 'text-heading-sm uppercase text-ink-tertiary' }, 'Quality and release'),
       h('h2', { class: 'font-display text-display-md text-ink-primary mt-1' }, 'Current release files'),
     ),
-    QualityReview({
-      episodeId: context.episodeId,
-      quality,
-      onUpdated: context.refreshAll,
-      controls: context.controls.quality,
-    }),
-    clipReviewEntry(context.episodeId, quality),
-    delivery ? trimDetails(delivery, context.controls, context.saveTrim) : loadingPanel('Loading episode range…'),
-    delivery ? videoDetails(delivery, quality, context.controls, context.prepareVideo) : loadingPanel('Loading release video…'),
+    qualityHost,
+    clipHost,
+    trimHost,
+    createVideoView(context),
   );
+
+  effect(() => {
+    const quality = context.quality();
+    qualityHost.replaceChildren(
+      QualityReview({
+        episodeId: context.episodeId,
+        quality,
+        onUpdated: context.refreshCanonical,
+        controls: context.controls.quality,
+      }),
+    );
+    const entry = clipReviewEntry(context.episodeId, quality);
+    clipHost.replaceChildren(...(entry ? [entry] : []));
+  });
+  effect(() => {
+    const delivery = context.delivery();
+    trimHost.replaceChildren(delivery ? trimDetails(delivery, context.controls, context.saveTrim) : loadingPanel('Loading episode range…'));
+  });
+  return root;
 }
 
-function createMetadataEditor(initialEpisode: UnknownRecord, episodeId: string): HTMLElement {
+function createMetadataEditor(initialEpisode: UnknownRecord, episodeId: string, afterSave: () => Promise<void>): HTMLElement {
   let saved = metadataValues(initialEpisode);
   const draft = signal<DraftState>({
     ...saved,
@@ -731,6 +750,7 @@ function createMetadataEditor(initialEpisode: UnknownRecord, episodeId: string):
         saving: false,
         dirty: changedDuringSave || stillChanged,
       });
+      await afterSave();
       showToast('Metadata saved.', 'success');
     } catch (error) {
       const message = (error as Error).message;
@@ -1036,7 +1056,7 @@ function createBackupPanel(
         'div',
         { class: 'panel p-5 flex flex-col gap-3' },
         statusHost,
-        pathRow('Source', `/Volumes/1TB_SSD/cascade/episodes/${episodeId}/`),
+        pathRow('Episode workspace', `/Volumes/1TB_SSD/cascade/episodes/${episodeId}/`),
         pathRow('Target', BACKUP_TARGET_PATH),
         durationHost,
       ),
@@ -1107,106 +1127,144 @@ function trimDetails(delivery: DeliveryStatus, controls: SurfaceControls, saveTr
   );
 }
 
-function videoDetails(delivery: DeliveryStatus, quality: QualitySnapshot | null, controls: SurfaceControls, prepareVideo: () => Promise<void>): HTMLElement {
-  const state = delivery.video_status ?? 'not_prepared';
-  const busy = state === 'preparing';
-  const progress = Math.min(99, Math.max(0, delivery.video_progress ?? 0));
-  const video = delivery.video;
-  const releaseArtifact = quality?.artifacts.release_video;
-  return h(
+function createVideoView(context: SurfaceContext): HTMLElement {
+  const summaryHost = h('div');
+  const progressHost = h('div');
+  const errorHost = h('div');
+  const artifactHost = h('div');
+  const playerHost = h('div');
+  const factsHost = h('div', { class: 'grid grid-cols-2 sm:grid-cols-3 gap-4' });
+  const downloadHost = h('div');
+  const mediaHost = h('div', { class: 'border-t border-border pt-5 flex flex-col gap-4' }, playerHost, factsHost, downloadHost);
+  const root = h(
     'div',
     { class: 'panel p-6 flex flex-col gap-5' },
-    h(
-      'div',
-      { class: 'flex items-start justify-between gap-4 flex-wrap' },
+    summaryHost,
+    progressHost,
+    errorHost,
+    artifactHost,
+    mediaHost,
+  );
+
+  effect(() => {
+    const delivery = context.delivery();
+    const quality = context.quality();
+    const state = delivery?.video_status ?? 'not_prepared';
+    const busy = state === 'preparing';
+    const progress = Math.min(99, Math.max(0, delivery?.video_progress ?? 0));
+    const video = delivery?.video;
+    const releaseArtifact = quality?.artifacts.release_video;
+    summaryHost.replaceChildren(
       h(
         'div',
-        null,
+        { class: 'flex items-start justify-between gap-4 flex-wrap' },
         h(
           'div',
-          { class: 'text-heading-md text-ink-primary' },
-          state === 'ready' ? 'Rendered video available' : busy ? 'Preparing release video' : state === 'failed' ? 'Video preparation failed' : 'Release video',
-        ),
-        h(
-          'p',
-          { class: 'text-body-sm text-ink-tertiary mt-1 max-w-[680px]' },
-          busy
-            ? `${delivery.video_detail || 'Encoding'} · ${progress.toFixed(0)}%`
-            : state === 'ready' && video?.render_mode === 'speaker_cut'
-              ? 'Speaker-cut 1080p render with saved edits and mastered audio.'
-              : state === 'ready'
-                ? 'An earlier render is available. Prepare again to build the current speaker-cut video.'
-                : 'Prepare a speaker-cut 1080p video with saved edits and mastered audio.',
-        ),
-      ),
-      Button({
-        variant: 'primary',
-        size: 'lg',
-        label: busy ? 'Preparing…' : state === 'ready' ? 'Prepare again' : 'Prepare video',
-        loading: busy,
-        disabled: busy,
-        onClick: () => void prepareVideo(),
-      }),
-    ),
-    busy
-      ? h(
-          'div',
-          { class: 'h-2 rounded-full bg-surface-3 overflow-hidden' },
-          h('div', {
-            class: 'h-full bg-accent transition-all',
-            style: { width: `${Math.max(1, progress)}%` },
-          }),
-        )
-      : null,
-    delivery.video_error
-      ? h(
-          'div',
-          {
-            class: 'rounded-md bg-status-danger/10 border border-status-danger/30 p-4 text-body text-status-danger',
-          },
-          delivery.video_error,
-        )
-      : null,
-    releaseArtifact
-      ? h(
-          'div',
-          {
-            class: [
-              'rounded-md border px-4 py-3 text-body-sm',
-              releaseArtifact.ready
-                ? 'border-status-success/30 bg-status-success/10 text-ink-secondary'
-                : 'border-status-warning/30 bg-status-warning/10 text-status-warning',
-            ].join(' '),
-          },
-          releaseArtifact.detail,
-        )
-      : null,
-    state === 'ready' && video
-      ? h(
-          'div',
-          { class: 'border-t border-border pt-5 flex flex-col gap-4' },
-          videoPlayer(delivery, controls),
+          null,
           h(
             'div',
-            { class: 'grid grid-cols-2 sm:grid-cols-3 gap-4' },
+            { class: 'text-heading-md text-ink-primary' },
+            !delivery
+              ? 'Loading release video…'
+              : state === 'ready'
+                ? 'Rendered video available'
+                : busy
+                  ? 'Preparing release video'
+                  : state === 'failed'
+                    ? 'Video preparation failed'
+                    : 'Release video',
+          ),
+          delivery
+            ? h(
+                'p',
+                { class: 'text-body-sm text-ink-tertiary mt-1 max-w-[680px]' },
+                busy
+                  ? `${delivery.video_detail || 'Encoding'} · ${progress.toFixed(0)}%`
+                  : state === 'ready' && video?.render_mode === 'speaker_cut'
+                    ? 'Speaker-cut 1080p render with saved edits and mastered audio.'
+                    : state === 'ready'
+                      ? 'An earlier render is available. Prepare again to build the current speaker-cut video.'
+                      : 'Prepare a speaker-cut 1080p video with saved edits and mastered audio.',
+              )
+            : null,
+        ),
+        delivery
+          ? Button({
+              variant: 'primary',
+              size: 'lg',
+              label: busy ? 'Preparing…' : state === 'ready' ? 'Prepare again' : 'Prepare video',
+              loading: busy,
+              disabled: busy,
+              onClick: () => void context.prepareVideo(),
+            })
+          : null,
+      ),
+    );
+    progressHost.replaceChildren(
+      ...(busy
+        ? [
+            h(
+              'div',
+              { class: 'h-2 rounded-full bg-surface-3 overflow-hidden' },
+              h('div', { class: 'h-full bg-accent transition-all', style: { width: `${Math.max(1, progress)}%` } }),
+            ),
+          ]
+        : []),
+    );
+    errorHost.replaceChildren(
+      ...(delivery?.video_error
+        ? [h('div', { class: 'rounded-md bg-status-danger/10 border border-status-danger/30 p-4 text-body text-status-danger' }, delivery.video_error)]
+        : []),
+    );
+    artifactHost.replaceChildren(
+      ...(releaseArtifact
+        ? [
+            h(
+              'div',
+              {
+                class: [
+                  'rounded-md border px-4 py-3 text-body-sm',
+                  releaseArtifact.ready
+                    ? 'border-status-success/30 bg-status-success/10 text-ink-secondary'
+                    : 'border-status-warning/30 bg-status-warning/10 text-status-warning',
+                ].join(' '),
+              },
+              releaseArtifact.detail,
+            ),
+          ]
+        : []),
+    );
+    const ready = Boolean(delivery && state === 'ready' && video);
+    mediaHost.hidden = !ready;
+    mountStableControl(playerHost, ready && delivery ? videoPlayer(delivery, context.controls) : null, releaseMediaNode);
+    factsHost.replaceChildren(
+      ...(ready && video
+        ? [
             metric('Duration', formatDuration(video.duration_seconds)),
             metric('File size', formatBytes(video.size_bytes)),
             metric('Resolution', `${video.width}×${video.height}`),
             metric('Codecs', `${video.video_codec.toUpperCase()} / ${video.audio_codec.toUpperCase()}`),
             metric('Saved edits applied', String(video.edit_count)),
-          ),
-          h(
-            'a',
-            {
-              href: delivery.video_download_url,
-              download: video.filename,
-              class: 'inline-flex h-11 px-5 items-center justify-center self-start rounded-md bg-accent text-ink-on-accent font-medium hover:brightness-110',
-            },
-            'Download rendered video',
-          ),
-        )
-      : null,
-  );
+          ]
+        : []),
+    );
+    downloadHost.replaceChildren(
+      ...(ready && video && delivery
+        ? [
+            h(
+              'a',
+              {
+                href: delivery.video_download_url,
+                download: video.filename,
+                class: 'inline-flex h-11 px-5 items-center justify-center self-start rounded-md bg-accent text-ink-on-accent font-medium hover:brightness-110',
+              },
+              'Download rendered video',
+            ),
+          ]
+        : []),
+    );
+  });
+  return root;
 }
 
 function clipReviewEntry(episodeId: string, quality: QualitySnapshot | null): HTMLElement | null {
@@ -1280,6 +1338,10 @@ function videoPlayer(delivery: DeliveryStatus, controls: SurfaceControls): HTMLV
       }) as HTMLVideoElement,
   );
   return controls.video.value;
+}
+
+function releaseMediaNode(node: Node): void {
+  if (node instanceof HTMLMediaElement) releaseMediaElement(node);
 }
 
 function detailsSection(key: EpisodeSection, title: string, description: string, body: HTMLElement): HTMLDetailsElement {

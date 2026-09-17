@@ -1,114 +1,108 @@
 # Native review fixture for Episode Review/Release
 
-Create a fresh disposable target with the aggregate-publication harness, then run this candidate
-through its fail-closed adapter. The target contains clone-local JSON and variant outputs plus a
-bounded inventory of production-backed media symlinks for real playback. Its adapter permits
-GET/HEAD and the exact approval-only POST; every other write is rejected before route execution.
-This supports actual audio/video review, alias/history checks, unsaved metadata drafts, and
-visible write-error checks without production, provider, or media writes.
+Native review uses fresh disposable targets prepared by the aggregate-publication harness. A
+target contains clone-local JSON and APFS-cloned outputs plus a bounded set of production-backed
+media symlinks for playback. The two adapters divide write coverage:
 
-The earlier `aggregate-publication-retirement-5c6124b-v2` target has already recorded its one
-approval and cannot be reused. Prepare a new target name; the preparation script refuses to
-replace an existing directory.
+- The original approval adapter permits GET/HEAD and the exact approval-only publish POST.
+- The supplemental metadata/backup adapter permits GET/HEAD and one exact ten-field episode
+  PATCH. It forces only the copied episode to `awaiting_backup`; every POST, including backup,
+  returns 405 before route execution.
 
-## Prepare a fresh copied episode
+Both run without provider credentials. Never reuse a target that has recorded its one approval.
+The preparation script refuses to replace an existing directory.
+
+## Prepare and bind a disposable target
 
 ```bash
-EVIDENCE=/Volumes/1TB_SSD/cascade/release-ready/2026-09-14-approved-release/code-simplification-audit-2026-09-16/aggregate-publication-retirement-implementation-2026-09-17
+AGGREGATE_EVIDENCE=/Volumes/1TB_SSD/cascade/release-ready/2026-09-14-approved-release/code-simplification-audit-2026-09-16/aggregate-publication-retirement-implementation-2026-09-17
 AGGREGATE_WORKTREE=/private/tmp/cascade-aggregate-publication-retirement-sol
+WORKTREE=/private/tmp/cascade-frontend-episode-release-fixes-sol
 MAIN_REPO=/Volumes/1TB_SSD/root-disk-offload/2026-08-04/Local/Github/cascade
 MAIN_VENV="$MAIN_REPO/.venv"
-HARNESS=/Volumes/1TB_SSD/cascade/review-harnesses/frontend-episode-release-ab0d4e0
+HARNESS=/Volumes/1TB_SSD/cascade/review-harnesses/frontend-episode-release-fresh
 
 test "$(git -C "$AGGREGATE_WORKTREE" rev-parse HEAD)" = \
   5c6124b4ba925dc348e5d98098e7beb78875c5e4
 test ! -e "$HARNESS"
-"$MAIN_VENV/bin/python" "$EVIDENCE/ui-harness/prepare.py" \
+"$MAIN_VENV/bin/python" "$AGGREGATE_EVIDENCE/ui-harness/prepare.py" \
   --worktree "$AGGREGATE_WORKTREE" "$HARNESS"
-```
-
-Preparation reads the audited production episode, APFS-clones its episode tree, replaces the 14
-review media inputs with exact production-backed symlinks, and rebases only clone-local approval
-and currentness records. The resulting paths are:
-
-```text
-/Volumes/1TB_SSD/cascade/review-harnesses/frontend-episode-release-ab0d4e0
-```
-
-Its preparation and immutable-state evidence are documented in:
-
-```text
-/Volumes/1TB_SSD/cascade/release-ready/2026-09-14-approved-release/code-simplification-audit-2026-09-16/aggregate-publication-retirement-implementation-2026-09-17/UI-HARNESS.md
-```
-
-## Bind and build
-
-```bash
-WORKTREE=/private/tmp/cascade-frontend-episode-release-sol
-MAIN_REPO=/Volumes/1TB_SSD/root-disk-offload/2026-08-04/Local/Github/cascade
-HARNESS=/Volumes/1TB_SSD/cascade/review-harnesses/frontend-episode-release-ab0d4e0
-EVIDENCE=/Volumes/1TB_SSD/cascade/release-ready/2026-09-14-approved-release/code-simplification-audit-2026-09-16/aggregate-publication-retirement-implementation-2026-09-17
-
-git -C "$WORKTREE" merge-base --is-ancestor 8d1635a HEAD
-test -f "$HARNESS/manifest.json"
 ln -sfn "$HARNESS/config.toml" "$WORKTREE/config/config.toml"
 test -e "$WORKTREE/frontend/node_modules" || \
   ln -s "$MAIN_REPO/frontend/node_modules" "$WORKTREE/frontend/node_modules"
 npm --prefix "$WORKTREE/frontend" run build
 ```
 
-## Launch through the fail-closed adapter
+The preparation and immutable-state checks are documented in
+`aggregate-publication-retirement-implementation-2026-09-17/UI-HARNESS.md`.
 
-The original launcher is pinned to the earlier aggregate commit, so launch its unchanged adapter
-directly with the candidate first on `PYTHONPATH`. The environment is cleared before start and
-contains no provider key or token. The Cloudflare account ID is a non-secret release identity
-needed by the read-only quality projection.
+## Launch approval-only review
+
+Follow that harness document to launch its unchanged `approval_harness_app` on port 18420. Use
+this path to verify current publication evidence and the exact
+`{ "start_publication": false }` write. All other writes must remain blocked.
+
+## Launch metadata and backup-guard review
+
+The supplemental adapter and machine-readable verification live in:
+
+```text
+/Volumes/1TB_SSD/cascade/release-ready/2026-09-14-approved-release/code-simplification-audit-2026-09-16/frontend-episode-release-consolidation-review-2026-09-17
+```
+
+Launch it only against a disposable target with the explicit write opt-in:
 
 ```bash
-MAIN_VENV="$MAIN_REPO/.venv"
-ACCOUNT_ID="$($MAIN_VENV/bin/python - <<'PY'
-from dotenv import dotenv_values
-print(dotenv_values('/Volumes/1TB_SSD/root-disk-offload/2026-08-04/Local/Github/cascade/.env')['CLOUDFLARE_ACCOUNT_ID'])
-PY
-)"
-
+REVIEW_EVIDENCE=/Volumes/1TB_SSD/cascade/release-ready/2026-09-14-approved-release/code-simplification-audit-2026-09-16/frontend-episode-release-consolidation-review-2026-09-17
 mkdir -p "$HARNESS/home/.config"
-cd "$EVIDENCE/ui-harness"
+cd "$REVIEW_EVIDENCE"
 env -i \
   PATH="$PATH" \
   HOME="$HARNESS/home" \
   XDG_CONFIG_HOME="$HARNESS/home/.config" \
   CASCADE_OUTPUT_DIR="$HARNESS/episodes" \
   CASCADE_BACKGROUND_ASSETS_DIR="/Users/samuellarson/Library/Application Support/Cascade/background-assets" \
+  CASCADE_ENABLE_DISPOSABLE_FIXTURE_WRITES=1 \
   UPLOAD_POST_USER=up \
-  CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" \
-  PYTHONPATH="$WORKTREE:$EVIDENCE/ui-harness" \
-  "$MAIN_VENV/bin/python" -m uvicorn approval_harness_app:app \
-    --host 127.0.0.1 --port 18420
+  PYTHONPATH="$WORKTREE:$REVIEW_EVIDENCE" \
+  "$MAIN_VENV/bin/python" -m uvicorn metadata_backup_fixture_app:app \
+    --host 127.0.0.1 --port 18421
 ```
 
-The adapter refuses production output roots, validates the copied-state manifest and input links,
-and verifies that its release gate is approval-ready before opening the socket.
+The adapter exits before its import-time clone write unless the configured output root is
+outside production, the exact opt-in is present, and the output root, episode directory, and
+`episode.json` are non-symlinks with resolved containment. The episode PATCH route writes only
+that checked `episode.json`. Backup POST remains blocked with 405.
 
 ## Review matrix
 
-Open `http://127.0.0.1:18420/#/episodes/ep_2026-02-17_234937` and review at desktop
-and narrow widths.
+Open `http://127.0.0.1:18421/#/episodes/ep_2026-02-17_234937` at desktop width and 430×900.
 
-1. Play the full-length audio and prepared video; seek, pause, resume, and confirm provenance and currentness copy.
-2. Navigate through Review, Audio, Release files, Episode copy, Publication, and Backup. Use browser back/forward and confirm playback position, metadata drafts, QualityReview state, and delivery polling do not restart on aliases.
-3. Enter unsaved text in several metadata fields, move among aliases, and confirm all ten values remain. Saving should return the adapter's visible 405 error and retain the draft for retry.
-4. Confirm the release facts keep longform proof, selected-short readiness, and Schedule queue/provider evidence separate. Inspect any `artifact_current: false` warning as supplied by Schedule.
-5. Enter partial backup text, confirm the action stays disabled, then enter `BACK IT UP`. The enabled POST should return the adapter's visible 405 error and must not start backup work.
-6. Open `/episodes/ep_2026-02-17_234937/longform` and `/episodes/ep_2026-02-17_234937/clips`; confirm they mount the existing specialist reviews. Returning to the episode route should create a fresh episode screen as designed.
-7. Confirm Source Setup, Longform Review, Clip Review, Schedule/history, AgentPanel, and EventFeed remain reachable and the browser console has no errors.
-8. Review Publication last. The adapter permits the exact `{ "start_publication": false }` approval once and writes only cloned `episode.json`; follow the existing harness document to verify receipts and progress remain byte-identical.
+1. Play audio and prepared video, seek and pause, then move through all six aliases. Playback
+   nodes and draft inputs must stay mounted while projection reads update.
+2. Edit all ten metadata fields and save. Confirm the PATCH succeeds, exact values read back,
+   the header updates, and review/quality/delivery revision state refreshes immediately. A
+   partial API PATCH must return 422.
+3. In Backup, confirm six inventory rows, the `Episode workspace` path, target, and duration.
+   The displayed paths are inert production configuration text; all fixture writes remain under
+   the disposable target.
+4. Enter partial confirmation text and verify the button is disabled. Enter `BACK IT UP`, verify
+   it enables, and confirm its POST returns a visible 405 without creating backup state.
+5. Verify `/audio/`, `/delivery/`, `/metadata/`, `/publish/`, and `/backup/` trailing-slash aliases
+   focus their matching sections. Visit specialist source, longform, and clip screens and return.
+6. At 430×900, confirm no horizontal overflow, the action wraps below the title, the header does
+   not consume the scroll viewport, and every section remains reachable.
+7. Observe cadence: episode detail reads at four seconds, delivery at two seconds only while
+   video preparation is active, and Schedule only after local initial projections or publication
+   approval.
 
-Stop the server before verification. Remove the ignored config binding when native review is done:
+Stop the server and compare protected hashes. The completed run is recorded in
+`fixture-verification-final.json`; it includes exact ten-field readback, 422/405 guards, clone
+sidecar stability, protected production equality, native responsive measurements, and symlink
+boundary checks.
+
+Remove ignored bindings when review is complete:
 
 ```bash
-rm -f "$WORKTREE/config/config.toml"
+rm -f "$WORKTREE/config/config.toml" "$WORKTREE/frontend/node_modules"
 ```
-
-Keep the worktree commit unchanged throughout review and record its exact final SHA with the
-native decision.

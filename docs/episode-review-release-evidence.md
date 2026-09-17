@@ -1,90 +1,81 @@
 # Episode review/release consolidation evidence
 
-This record covers the frontend consolidation based on frozen aggregate-publication candidate
+This record covers the frontend consolidation based on aggregate-publication candidate
 `5c6124b4ba925dc348e5d98098e7beb78875c5e4` and production
 `222b1a709d7ce74142d20e9616accac91e836a1d`.
 
 ## Source reduction
 
-The production selector is every `.ts` and `.css` file below `frontend/src`. Tests,
-documentation, generated bundles, and dependency files are excluded. Counts use Git blobs so
-ignored build output cannot affect them.
+The production selector is every `.ts` and `.css` file below `frontend/src`. Counts use Git
+blobs for the two bases and filesystem bytes for this revision; tests, docs, dependencies, and
+generated bundles are excluded.
 
 | Revision | Production files | Production lines |
 |---|---:|---:|
 | Deployed `222b1a7` | 47 | 15,118 |
-| Frozen aggregate candidate `5c6124b` | 47 | 15,120 |
-| Consolidated code through `8d1635a` | 40 | 13,823 |
+| Aggregate candidate `5c6124b` | 47 | 15,120 |
+| Corrected consolidated revision | 41 | 13,943 |
 
-The consolidation removes 1,297 production lines from its frozen base and leaves 1,295 fewer
-production lines than deployed `222b1a7`. The audited nine-file surface was 3,072 lines at
-`222b1a7` and 3,074 lines at `5c6124b`. Its replacement is 1,740 lines: 1,630 in
-`screens/episode/index.ts` and 110 in `lib/episode-release.ts`. Shared router and route-table
-support accounts for a net 37 lines outside that replacement.
+The corrected consolidation removes 1,177 production lines from its frozen base and leaves
+1,175 fewer lines than deployed. The main replacement is 1,830 lines: 1,692 in
+`screens/episode/index.ts`, 111 in `lib/episode-release.ts`, and 27 in the shared coalesced
+refresh helper. The extra lines beyond the frozen consolidation fix request ordering, media
+lifetime, route disposal, and narrow layout findings found during independent review.
 
-The deleted destination-color assertion belonged only to the removed Publish layout. The clip
-metadata destination-field test remains. That test change is excluded from every production
-line claim above.
+## Canonical reads and refresh cadence
 
-## Canonical read projections
-
-| UI fact or control | Canonical source | Presentation rule |
+| UI fact or control | Canonical source | Refresh behavior |
 |---|---|---|
-| Episode identity, pipeline, backup readiness, metadata baseline | `GET /api/episodes/{id}` | The existing episode-detail poll remains the authority. |
-| Longform proof and approval | `GET /api/episodes/{id}/review` | Uses `longform.canonical_render` and `longform.approval`; it does not derive proof from episode status. |
-| Selected-short readiness | `GET /api/episodes/{id}/review` | Counts only selected clips for which `clipDistributionReady` validates the chosen version and current approval. |
-| Quality findings and release gate | `GET /api/episodes/{id}/quality` | Exactly one full `QualityReview` owns finding, repair, preview, and decision controls. Publication blockers come from `release_gate.blockers`. |
-| Selected/base audio and provenance | `GET /api/episodes/{id}/delivery` | Plays `selected_audio_download_url` when present, otherwise labels the historical output explicitly. Source-clock and currentness wording follows delivery provenance. |
-| Trim, prepared video, metrics, and download | `GET /api/episodes/{id}/delivery` | Stateful media and trim controls are retained while their artifact identity is unchanged. |
-| Queue and provider evidence | `GET /api/schedule` | Items and evidence are filtered only by exact `episode_id`. States, URLs, errors, and `artifact_current` are displayed from the API without recomputation. |
+| Episode identity, pipeline, backup readiness, metadata baseline | `GET /api/episodes/{id}` | One request at mount and every four seconds. In-flight calls coalesce; an explicit post-save read queues one latest rerun. |
+| Longform proof and selected-short readiness | `GET /api/episodes/{id}/review` | Loaded at mount and after a relevant write. |
+| Quality findings and release gate | `GET /api/episodes/{id}/quality` | Loaded at mount and after a relevant write. Exactly one `QualityReview` owns findings, repair, preview, and decisions. |
+| Selected/base audio, trim, video, and provenance | `GET /api/episodes/{id}/delivery` | Loaded at mount and after a relevant write; only a preparing video polls every two seconds. |
+| Queue and provider evidence | `GET /api/schedule` | Loaded after local projections at mount and after publication approval. It never blocks local projections and is absent from four-second and two-second polling. |
 
-Schedule currentness fix `02380302a0e6eb6dac0a065c5db426d3cc9fb8cd` was integrated as
-`916f092`. The frontend preserves both `false` and unknown values; it never substitutes the
-episode status, a receipt count, or the globally selected gameplay variant.
+Each projection has one active request and at most one coalesced rerun. A slow Schedule read
+cannot delay review, quality, or delivery. Leaving the screen stops queued projection and
+episode-detail work from issuing another request. Schedule currentness fix
+`02380302a0e6eb6dac0a065c5db426d3cc9fb8cd` remains integrated; the frontend preserves both
+`false` and unknown currentness values.
 
 ## Preserved writes and guards
 
-| Control | Existing API contract retained |
+| Control | API contract retained |
 |---|---|
-| Metadata | `PATCH /api/episodes/{id}` with only changed fields from the saved baseline. All ten fields, unsaved state, edits made during an in-flight save, success, and visible error state remain. |
+| Metadata | `PATCH /api/episodes/{id}` with only changed fields. All ten fields, unsaved drafts, edits made during an in-flight save, success, and visible error state remain. Success explicitly rereads episode, review, quality, and delivery before reporting completion. |
 | Trim | `PUT /api/episodes/{id}/delivery/trim`; invalid and non-finite ranges are rejected before the request. |
-| Prepare video | `POST /api/episodes/{id}/delivery/video/prepare`; delivery polling continues only while the returned state is preparing. |
+| Prepare video | `POST /api/episodes/{id}/delivery/video/prepare`; delivery polls only while the video is preparing. |
 | Quality decisions | Existing `QualityReview` APIs and revision bindings are unchanged. |
-| Publication approval | `POST /api/episodes/{id}/approve-publish` with exactly `{ "start_publication": false }`. The screen exposes no aggregate publication execution. |
-| Backup | `POST /api/episodes/{id}/approve-backup` only after the canonical awaiting-backup gate and a case-insensitive exact `back it up` match. The input remains mounted while typing and resets after success. |
+| Publication approval | `POST /api/episodes/{id}/approve-publish` with exactly `{ "start_publication": false }`; the surface exposes no aggregate publication execution. |
+| Backup | `POST /api/episodes/{id}/approve-backup` only for canonical `awaiting_backup` and a case-insensitive exact `back it up` match. The six inventory rows, episode workspace, configured Seagate destination text, and duration remain visible. |
 
-The six backup rows, exact SSD source, exact Seagate target, and duration remain visible. Source
-Setup, Longform Review, and Clip Review keep their existing routes and APIs.
+Source Setup, Longform Review, and Clip Review retain their specialist routes and APIs. Active
+audio and video nodes keep the same host across projection updates, preserving playback state;
+a changed artifact identity releases the prior media element before replacement. Metadata and
+backup inputs remain mounted while their surrounding projections update.
 
-## Route and lifetime evidence
+## Route, lifetime, and responsive evidence
 
-The following aliases share `episode:{decoded-id}` and update the focused section without
-remounting the episode screen:
+The six aliases `/episodes/:id`, `/audio`, `/delivery`, `/metadata`, `/publish`, and `/backup`
+share one decoded episode identity. Alias changes focus the selected section without remounting.
+Optional trailing slashes select the same section. `/longform` and `/clips` still mount the
+specialist reviews. A different episode or specialist screen disposes the current effect scope.
+If a first mount throws, that scope now disposes all effects and cleanups before the router
+allows an alias retry.
 
-- `/episodes/:id`
-- `/episodes/:id/audio`
-- `/episodes/:id/delivery`
-- `/episodes/:id/metadata`
-- `/episodes/:id/publish`
-- `/episodes/:id/backup`
-
-`/episodes/:id/longform` mounts the existing Longform Review and
-`/episodes/:id/clips` mounts the existing Clip Review. A different episode, a specialist screen,
-or another top-level screen disposes the current effect scope. Shared identity is committed only
-after a successful mount, so an initial handler failure can be retried through another alias.
-
-The router tests cover all aliases, simulated browser history, decoded IDs, different-episode
-disposal, both specialist handoffs, and first-mount failure followed by retry. The single mount
-also proves that alias changes do not recreate projection requests, the delivery timer, metadata
-draft state, or stable-control registries.
+At 430×900, native review measured a 430 px document width with no horizontal overflow. The
+header is non-sticky below the small breakpoint, the 220 px title fit on one line in the fixture,
+the primary action wrapped below it, and every section remained reachable. Desktop behavior
+retains the sticky header and wide grids.
 
 ## Validation
 
-- Frontend: 70/70 Node tests passed after removal of the obsolete layout-only assertion.
-- TypeScript: `npx tsc --noEmit` passed.
-- Production bundle: Vite built 42 modules; JavaScript 184.62 kB (55.82 kB gzip), CSS 27.75 kB (6.70 kB gzip).
-- Schedule integration: `tests/test_routes_schedule.py` passed 21/21 with the installed project virtual environment.
-- `/clean`: staged static checks, diff checks, and the manual touched-file audit passed before every implementation commit.
+- Frontend: 77/77 Node tests passed, including the exact Schedule call-order and polling policy.
+- TypeScript and bundle: `npx tsc --noEmit` and Vite passed; 43 modules, JavaScript 185.76 kB (56.31 kB gzip), CSS 27.85 kB (6.72 kB gzip).
+- Schedule integration: unchanged backend passed 21/21 focused Python tests in the frozen review.
+- Native disposable fixture: exact ten-field PATCH/readback succeeded; partial PATCH returned 422; an eligible exact uppercase backup confirmation reached a visible 405 while backup work stayed blocked. Clone progress/publish/backup files and all protected production hashes stayed unchanged.
+- Fixture boundary: output root, target episode directory, and `episode.json` must be regular non-symlinks resolving below the declared disposable root before the import-time status write. Negative import checks rejected all three symlink cases.
+- Static review: specialist editors and APIs, clip approvals/history and actual media state, longform source-clock controls, stable drafts, Schedule/history, AgentPanel, and EventFeed remain reachable.
 
-All implementation and validation work used the isolated worktree. No production episode,
-provider, media, installed configuration, or running production process was written.
+All implementation and validation used isolated worktrees and a disposable cloned episode. No
+provider, production episode, installed configuration, or production process was written.

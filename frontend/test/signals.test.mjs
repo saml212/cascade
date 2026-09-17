@@ -22,6 +22,25 @@ test('leaving an episode disposes screen effects and resources', () => {
   assert.equal(cleaned, true);
 });
 
+test('a failed scope disposes registered effects and cleanups before rethrowing', () => {
+  const source = signal('initial');
+  const visits = [];
+  let cleanups = 0;
+
+  assert.throws(
+    () => effectScope(() => {
+      effect(() => visits.push(source()));
+      onCleanup(() => { cleanups += 1; });
+      throw new Error('mount failed');
+    }),
+    /mount failed/,
+  );
+  source.set('after failure');
+
+  assert.deepEqual(visits, ['initial']);
+  assert.equal(cleanups, 1);
+});
+
 test('a canvas installed once stays reactive when its parent checks loading state', () => {
   const loaded = signal(false);
   const values = [];

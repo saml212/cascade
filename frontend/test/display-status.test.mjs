@@ -62,16 +62,16 @@ test('a current failed report presents rendered delivery as blocked', () => {
 });
 
 test('passed quality still requires explicit publish approval', () => {
-  assert.equal(
-    describeEpisodeStatus({
-      delivery: { video_status: 'ready' },
-      quality: {
-        quality: { status: 'passed' },
-        release_gate: { status: 'awaiting_publish_approval' },
-      },
-    }).key,
-    'awaiting_publish'
-  );
+  const status = describeEpisodeStatus({
+    delivery: { video_status: 'ready' },
+    quality: {
+      quality: { status: 'passed' },
+      release_gate: { status: 'awaiting_publish_approval' },
+    },
+  });
+  assert.equal(status.key, 'awaiting_publish');
+  assert.equal(status.label, 'Release approval ready');
+  assert.equal(status.hint, 'Review the current release and record approval.');
 });
 
 test('passed technical QA labels pending editorial decisions as approval work', () => {
