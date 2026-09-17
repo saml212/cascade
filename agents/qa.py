@@ -1135,7 +1135,17 @@ def _continuity_target(
     proof: object,
     stale_detail: str,
     clip_id: str | None = None,
+    render_mapping: tuple[str, float] | None = None,
 ) -> dict:
+    source_mapping = None
+    mapping_failed = False
+    if render_mapping is not None and proof is not None:
+        try:
+            timeline, source_mapping = _render_audio_mapping(
+                path, proof, *render_mapping
+            )
+        except ValueError as exc:
+            current, mapping_failed, stale_detail = False, True, str(exc)
     target = {
         "role": role,
         "path": str(path.absolute()),
@@ -1170,6 +1180,10 @@ def _continuity_target(
         status="current" if current else "stale",
         detail="Current artifact is ready for analysis." if current else stale_detail,
     )
+    if source_mapping is not None:
+        target["source_mapping"] = source_mapping
+    if mapping_failed:
+        target["status"] = "unavailable"
     return target
 
 
@@ -1228,34 +1242,18 @@ def _output_continuity_targets(
         if master_ready
         else (None, {})
     )
-    longform_timeline = timeline
-    longform_mapping = None
-    longform_mapping_error = None
-    if longform_record is not None:
-        try:
-            longform_timeline, longform_mapping = _render_audio_mapping(
-                episode_dir / "upload_video.mp4",
-                longform_record,
-                "keep_intervals",
-                timeline.source_duration,
-            )
-        except ValueError as exc:
-            longform_mapping_error = str(exc)
-    upload_target = _continuity_target(
-        episode_dir / "upload_video.mp4",
-        role="upload_video",
-        clock="output",
-        timeline=longform_timeline,
-        current=longform_record is not None and longform_mapping_error is None,
-        proof=longform_record,
-        stale_detail=longform_mapping_error
-        or "Canonical upload video is stale for current release inputs.",
+    targets.append(
+        _continuity_target(
+            episode_dir / "upload_video.mp4",
+            role="upload_video",
+            clock="output",
+            timeline=timeline,
+            current=longform_record is not None,
+            proof=longform_record,
+            stale_detail="Canonical upload video is stale for current release inputs.",
+            render_mapping=("keep_intervals", timeline.source_duration),
+        )
     )
-    if longform_mapping is not None:
-        upload_target["source_mapping"] = longform_mapping
-    if longform_mapping_error is not None and upload_target["status"] != "missing":
-        upload_target["status"] = "unavailable"
-    targets.append(upload_target)
 
     for clip in selected_clips:
         clip_id = str(clip["id"])
@@ -1278,34 +1276,19 @@ def _output_continuity_targets(
             )
             continue
         short_record = short_records.get(clip_id)
-        short_mapping = None
-        short_mapping_error = None
-        if short_record is not None:
-            try:
-                clip_timeline, short_mapping = _render_audio_mapping(
-                    episode_dir / "shorts" / f"{clip_id}.mp4",
-                    short_record,
-                    "clip_source_intervals",
-                    timeline.source_duration,
-                )
-            except ValueError as exc:
-                short_mapping_error = str(exc)
-        short_target = _continuity_target(
-            episode_dir / "shorts" / f"{clip_id}.mp4",
-            role="short",
-            clip_id=clip_id,
-            clock="output",
-            timeline=clip_timeline,
-            current=short_record is not None and short_mapping_error is None,
-            proof=short_record,
-            stale_detail=short_mapping_error
-            or "Selected short is stale for current release inputs.",
+        targets.append(
+            _continuity_target(
+                episode_dir / "shorts" / f"{clip_id}.mp4",
+                role="short",
+                clip_id=clip_id,
+                clock="output",
+                timeline=clip_timeline,
+                current=short_record is not None,
+                proof=short_record,
+                stale_detail="Selected short is stale for current release inputs.",
+                render_mapping=("clip_source_intervals", timeline.source_duration),
+            )
         )
-        if short_mapping is not None:
-            short_target["source_mapping"] = short_mapping
-        if short_mapping_error is not None and short_target["status"] != "missing":
-            short_target["status"] = "unavailable"
-        targets.append(short_target)
 
     podcast_path = episode_dir / "podcast_audio.mp3"
     rss_enabled = (

@@ -622,7 +622,7 @@ def test_artifact_replaced_during_decode_is_not_certified(tmp_path):
         "scan_identity": _scan_identity(path),
     }
 
-    def replace_artifact(*args, **kwargs):
+    def replace_artifact(*_args, **_kwargs):
         replacement = tmp_path / "replacement.mp4"
         replacement.write_bytes(b"after!")
         os.utime(
@@ -804,6 +804,63 @@ def test_video_targets_use_exact_manifest_source_intervals(tmp_path):
         short_target["source_mapping"]["timing_provenance"]["method"]
         == "render-manifest/v1"
     )
+
+
+def test_video_target_mapping_failure_preserves_missing_and_unavailable(tmp_path):
+    episode_dir = tmp_path / "episode"
+    (episode_dir / "work").mkdir(parents=True)
+    (episode_dir / "shorts").mkdir()
+    selected = episode_dir / "work" / "audio_repair_selected.wav"
+    upload = episode_dir / "upload_video.mp4"
+    selected.write_bytes(b"selected")
+    upload.write_bytes(b"longform")
+    selected_stat = selected.stat()
+    selection = {
+        "fingerprint": "sha256:selection",
+        "selected_output": {
+            "path": str(selected),
+            "fingerprint": {
+                "size_bytes": selected_stat.st_size,
+                "mtime_ns": selected_stat.st_mtime_ns,
+            },
+        },
+    }
+    record = {"fingerprint": "sha256:render"}
+    timeline = Timeline.from_edits(12, [])
+    clips = [
+        {
+            "id": "clip_01",
+            "start_seconds": 2,
+            "end_seconds": 5,
+            "selection_status": "selected",
+        }
+    ]
+
+    with (
+        patch("agents.qa.current_audio_selection", return_value=selection),
+        patch(
+            "agents.qa._render_status",
+            return_value=(record, {"clip_01": record}),
+        ),
+        patch(
+            "agents.qa._render_audio_mapping",
+            side_effect=ValueError("Invalid render source mapping."),
+        ),
+    ):
+        targets = _output_continuity_targets(
+            episode_dir, {}, clips, {"platforms": {}}, timeline
+        )
+
+    upload_target = next(item for item in targets if item["role"] == "upload_video")
+    short_target = next(item for item in targets if item["role"] == "short")
+    assert upload_target["status"] == "unavailable"
+    assert upload_target["detail"] == "Invalid render source mapping."
+    assert list(upload_target["timeline"].keep_intervals) == [(0.0, 12.0)]
+    assert "source_mapping" not in upload_target
+    assert short_target["status"] == "missing"
+    assert short_target["detail"] == "clip_01.mp4 is missing."
+    assert list(short_target["timeline"].keep_intervals) == [(2.0, 5.0)]
+    assert "source_mapping" not in short_target
 
 
 @pytest.mark.parametrize(
