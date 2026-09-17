@@ -9,6 +9,17 @@ import { onCleanup } from './signals';
 type Child = Node | string | number | null | undefined | false | Child[];
 type Props = Record<string, unknown>;
 
+type ReleasableMedia = Pick<
+  HTMLMediaElement,
+  'pause' | 'removeAttribute' | 'load'
+>;
+
+export function releaseMediaElement(el: ReleasableMedia): void {
+  el.pause();
+  el.removeAttribute('src');
+  el.load();
+}
+
 function applyProp(el: Element, key: string, value: unknown): void {
   if (value == null || value === false) return;
 
@@ -75,7 +86,9 @@ export function h<K extends keyof HTMLElementTagNameMap>(
 export function h(tag: string, props?: Props | null, ...children: Child[]): HTMLElement;
 export function h(tag: string, props?: Props | null, ...children: Child[]): HTMLElement {
   const el = document.createElement(tag);
-  if (el instanceof HTMLMediaElement) onCleanup(() => el.pause());
+  if (el instanceof HTMLMediaElement) {
+    onCleanup(() => releaseMediaElement(el));
+  }
   if (props) {
     for (const [key, val] of Object.entries(props)) applyProp(el, key, val);
   }

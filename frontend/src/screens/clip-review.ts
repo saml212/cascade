@@ -1104,6 +1104,8 @@ function renderReviewChoice(
     'aria-label': 'Video version',
   });
   const player = h('div');
+  let disposePlayer: (() => void) | undefined;
+  onCleanup(() => disposePlayer?.());
   effect(() => {
     const selected = surface();
     const version = clipVersionState(review, selected);
@@ -1147,20 +1149,22 @@ function renderReviewChoice(
         `Distribution: ${clipDistributionLabel(review)}`
       )
     );
-    player.querySelector('video')?.pause();
     const versionLabel =
       selected === 'base'
         ? 'base render'
         : `${version?.label ?? 'variant'} render`;
-    player.replaceChildren(
-      renderReviewPlayer(
+    disposePlayer?.();
+    let nextPlayer!: HTMLElement;
+    disposePlayer = effectScope(() => {
+      nextPlayer = renderReviewPlayer(
         clipId,
         version?.render ?? base,
         navigation,
         setExpanded,
         versionLabel
-      )
-    );
+      );
+    });
+    player.replaceChildren(nextPlayer);
   });
   return h('div', null, controls, player);
 }
