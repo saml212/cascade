@@ -8,6 +8,10 @@ import { effect, onCleanup, signal } from '../lib/signals';
 import { showToast } from '../state/ui';
 import { stableControl, type StableControl } from '../lib/stable-control';
 import {
+  canPrepareDeliveryVideo,
+  showDeliveryVideoSection,
+} from '../lib/delivery-view';
+import {
   QualityReview,
   type QualityReviewControls,
 } from '../components/QualityReview';
@@ -169,7 +173,9 @@ function renderPage(
         : null,
       delivery?.status === 'ready' ? readyDetails(delivery, controls) : null
     ),
-    delivery?.status === 'ready' ? videoDetails(delivery, controls, prepareVideo) : null
+    showDeliveryVideoSection(delivery)
+      ? videoDetails(delivery, controls, prepareVideo)
+      : null
   );
 }
 
@@ -278,6 +284,7 @@ function videoDetails(
 ): HTMLElement {
   const videoState = delivery.video_status ?? 'not_prepared';
   const busy = videoState === 'preparing';
+  const canPrepare = canPrepareDeliveryVideo(delivery);
   const progress = Math.min(99, Math.max(0, delivery.video_progress ?? 0));
   const video = delivery.video;
   return h(
@@ -298,14 +305,16 @@ function videoDetails(
                 : 'Prepare a speaker-cut 1080p video with the saved edits and mastered audio.'
         )
       ),
-      Button({
-        variant: 'primary',
-        size: 'lg',
-        label: busy ? 'Preparing…' : videoState === 'ready' ? 'Prepare again' : 'Prepare video',
-        loading: busy,
-        disabled: busy,
-        onClick: () => void prepareVideo(),
-      })
+      canPrepare
+        ? Button({
+            variant: 'primary',
+            size: 'lg',
+            label: busy ? 'Preparing…' : videoState === 'ready' ? 'Prepare again' : 'Prepare video',
+            loading: busy,
+            disabled: busy,
+            onClick: () => void prepareVideo(),
+          })
+        : null
     ),
     busy
       ? h('div', { class: 'h-2 rounded-full bg-surface-3 overflow-hidden' },
