@@ -52,6 +52,8 @@ from lib.short_variants import (
     DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
+    MINECRAFT_SURROUND_DESTINATIONS,
+    MINECRAFT_SURROUND_VARIANT_ID,
     RetiredShortVariantError,
     background_variant_output,
     destination_distribution_release_revision,
@@ -2162,6 +2164,21 @@ class PublishAgent(BaseAgent):
                 )
 
     @staticmethod
+    def _enforce_variant_destinations(clip_ids, short_versions, destinations) -> None:
+        unsupported = sorted(set(destinations) - set(MINECRAFT_SURROUND_DESTINATIONS))
+        if not unsupported:
+            return
+        for clip_id in clip_ids:
+            if (
+                short_versions.get(clip_id, {}).get("variant_id")
+                == MINECRAFT_SURROUND_VARIANT_ID
+            ):
+                raise RuntimeError(
+                    f"{MINECRAFT_SURROUND_VARIANT_ID} does not support "
+                    f"destinations: {', '.join(unsupported)}"
+                )
+
+    @staticmethod
     def _validated_variant_overrides(data, value):
         overrides = value.get("variant_overrides", {})
         approved_ids = {str(clip.get("id", "")) for clip in data["approved"]}
@@ -2224,6 +2241,9 @@ class PublishAgent(BaseAgent):
         if not set(copy_overrides) <= set(selected_ids):
             raise RuntimeError("copy_overrides must name selected clips")
         effective_versions = self._destination_versions(data, overrides)
+        self._enforce_variant_destinations(
+            selected_ids, effective_versions, destinations
+        )
         self._enforce_required_short_variants(
             selected_ids, effective_versions, destinations
         )

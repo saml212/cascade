@@ -353,10 +353,12 @@ export type ClipVariantId =
   | 'subway_surfers_v1'
   | 'gta_driving_v1'
   | 'gameplay_surround_v1'
+  | 'minecraft_surround_v1'
   | 'speaker_panels_v1';
 
 export type ActiveClipVariantId =
   | 'gameplay_surround_v1'
+  | 'minecraft_surround_v1'
   | 'speaker_panels_v1';
 
 export interface ClipDistributionState extends UnknownRecord {

@@ -374,6 +374,7 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
         GAMEPLAY_SURROUND_ASSET_SET_ID,
         GAMEPLAY_SURROUND_ASSETS,
         GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
         SPEAKER_PANELS_VARIANT_ID,
     )
     from server.routes import review
@@ -399,6 +400,10 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
             "Gameplay surround",
             GAMEPLAY_SURROUND_ASSET_SET_ID,
         ),
+        MINECRAFT_SURROUND_VARIANT_ID: (
+            "Minecraft surround",
+            GAMEPLAY_SURROUND_ASSET_SET_ID,
+        ),
         SPEAKER_PANELS_VARIANT_ID: ("Clean speaker panels", None),
     }
     for variant_id, (label, asset_id) in expected.items():
@@ -409,10 +414,14 @@ def test_review_advertises_gameplay_variants_before_render(test_client, monkeypa
     assert variants[GAMEPLAY_SURROUND_VARIANT_ID]["asset_ids"] == [
         asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS
     ]
+    assert variants[MINECRAFT_SURROUND_VARIANT_ID]["asset_ids"] == [
+        asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS
+    ]
     assert variants[SPEAKER_PANELS_VARIANT_ID]["asset_ids"] == []
     assert variants[SPEAKER_PANELS_VARIANT_ID]["asset_free"] is True
     assert set(variants) == {
         GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
         SPEAKER_PANELS_VARIANT_ID,
     }
     assert "satisfying_motion_v1" not in variants

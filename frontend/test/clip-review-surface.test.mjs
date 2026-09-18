@@ -200,6 +200,49 @@ test('uses the gameplay surround variant as the review and distribution identity
   );
 });
 
+test('uses Minecraft surround as an independent active review identity', () => {
+  const review = reviewState();
+  const revision = 'sha256:minecraft-surround-copy';
+  review.variants.minecraft_surround_v1 = {
+    id: 'minecraft_surround_v1',
+    label: 'Minecraft surround',
+    active_for_new_writes: true,
+    asset_id: 'gameplay_surround_assets_v1',
+    asset_ids: [
+      'orbitalncg_subway_surfers_12_v1',
+      'orbitalncg_gta_driving_15_v1',
+      'spicy_sauce_minecraft_12_v1',
+    ],
+    render: { current: true, playable: true },
+    approval: { status: 'current', current: true, revision },
+  };
+  review.distribution = {
+    ...review.distribution,
+    version: 'minecraft_surround_v1',
+    variant_id: 'minecraft_surround_v1',
+    label: 'Minecraft surround',
+    revision,
+  };
+
+  assert.equal(clipDistributionReady(review), true);
+  assert.equal(clipDistributionLabel(review), 'Minecraft surround');
+  assert.equal(
+    selectedDistributionVersion(review).variantId,
+    'minecraft_surround_v1'
+  );
+  assert.equal(
+    clipVersionState(review, 'minecraft_surround_v1').activeForNewWrites,
+    true
+  );
+  assert.equal(
+    distributionVersionLabel(
+      'minecraft_surround_v1',
+      'minecraft_surround_v1'
+    ),
+    'Minecraft surround'
+  );
+});
+
 test('uses clean speaker panels as an independent review and distribution identity', () => {
   const review = reviewState();
   const revision = 'sha256:speaker-panels-copy';

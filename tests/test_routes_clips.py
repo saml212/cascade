@@ -60,7 +60,11 @@ SAMPLE_CLIPS = [
     },
 ]
 
-ACTIVE_VARIANT_IDS = ("gameplay_surround_v1", "speaker_panels_v1")
+ACTIVE_VARIANT_IDS = (
+    "gameplay_surround_v1",
+    "minecraft_surround_v1",
+    "speaker_panels_v1",
+)
 RETIRED_VARIANT_IDS = (
     "background_motion_v1",
     "satisfying_motion_v1",
@@ -285,6 +289,7 @@ class TestCaptionSpeakerOverrides:
         assert state["applied_word_count"] == 1
         assert state["affected_variants"] == [
             "gameplay_surround_v1",
+            "minecraft_surround_v1",
             "speaker_panels_v1",
         ]
         assert all(path.read_bytes() == before[path] for path in canonical_paths)
@@ -1941,6 +1946,7 @@ class TestClipMutation:
         ("variant_id", "asset_id"),
         (
             ("gameplay_surround_v1", "gameplay_surround_assets_v1"),
+            ("minecraft_surround_v1", "gameplay_surround_assets_v1"),
             ("speaker_panels_v1", None),
         ),
     )

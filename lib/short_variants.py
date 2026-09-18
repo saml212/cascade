@@ -43,11 +43,14 @@ MINECRAFT_PARKOUR_VARIANT_ID = "minecraft_parkour_v1"
 SUBWAY_SURFERS_VARIANT_ID = "subway_surfers_v1"
 GTA_DRIVING_VARIANT_ID = "gta_driving_v1"
 GAMEPLAY_SURROUND_VARIANT_ID = "gameplay_surround_v1"
+MINECRAFT_SURROUND_VARIANT_ID = "minecraft_surround_v1"
 SPEAKER_PANELS_VARIANT_ID = "speaker_panels_v1"
 BACKGROUND_VARIANT_MODE = "speaker_cut_short_background_motion_v1"
 BACKGROUND_LAYOUT_VERSION = "portrait-over-motion/v4"
 GAMEPLAY_SURROUND_VARIANT_MODE = "podcast_gameplay_surround_v1"
 GAMEPLAY_SURROUND_LAYOUT_VERSION = "gameplay-surround/v1"
+MINECRAFT_SURROUND_VARIANT_MODE = "podcast_minecraft_surround_v1"
+MINECRAFT_SURROUND_LAYOUT_VERSION = "minecraft-surround/v1"
 GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION = "source-speaker-panel/v1"
 GAMEPLAY_CAPTION_FONT_SIZE = 52
 GAMEPLAY_CAPTION_FALLBACK_FONT_SIZE = 24
@@ -81,6 +84,13 @@ GAMEPLAY_SURROUND_RENDER_PLAN = {
     "brand": "thelocalpod.link",
     "brand_font_size": 36,
     "brand_y": 1286,
+}
+MINECRAFT_SURROUND_RENDER_PLAN = {
+    **GAMEPLAY_SURROUND_RENDER_PLAN,
+    "visible_asset_roles": ["minecraft"],
+    "upper_side_treatment": "neutral_gutters",
+    "gutter_color": "0x10151d",
+    "gutter_boxes": [[0, 0, 270, 1216], [810, 0, 270, 1216]],
 }
 SPEAKER_PANELS_RENDER_PLAN = {
     "canvas": [1080, 1920],
@@ -123,6 +133,7 @@ _VARIANT_LABELS = {
     SUBWAY_SURFERS_VARIANT_ID: "Subway Surfers",
     GTA_DRIVING_VARIANT_ID: "GTA driving",
     GAMEPLAY_SURROUND_VARIANT_ID: "Gameplay surround",
+    MINECRAFT_SURROUND_VARIANT_ID: "Minecraft surround",
     SPEAKER_PANELS_VARIANT_ID: "Clean speaker panels",
 }
 _VARIANT_ASSETS = {
@@ -132,11 +143,13 @@ _VARIANT_ASSETS = {
     SUBWAY_SURFERS_VARIANT_ID: SUBWAY_SURFERS_ASSET_ID,
     GTA_DRIVING_VARIANT_ID: GTA_DRIVING_ASSET_ID,
     GAMEPLAY_SURROUND_VARIANT_ID: GAMEPLAY_SURROUND_ASSET_SET_ID,
+    MINECRAFT_SURROUND_VARIANT_ID: GAMEPLAY_SURROUND_ASSET_SET_ID,
     SPEAKER_PANELS_VARIANT_ID: None,
 }
 BACKGROUND_VARIANT_IDS = tuple(_VARIANT_LABELS)
 ACTIVE_BACKGROUND_VARIANT_IDS = (
     GAMEPLAY_SURROUND_VARIANT_ID,
+    MINECRAFT_SURROUND_VARIANT_ID,
     SPEAKER_PANELS_VARIANT_ID,
 )
 RETIRED_BACKGROUND_VARIANT_IDS = frozenset(BACKGROUND_VARIANT_IDS).difference(
@@ -148,10 +161,20 @@ GAMEPLAY_VARIANT_IDS = frozenset(
         SUBWAY_SURFERS_VARIANT_ID,
         GTA_DRIVING_VARIANT_ID,
         GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
     }
 )
+GAMEPLAY_SURROUND_VARIANT_IDS = frozenset(
+    {GAMEPLAY_SURROUND_VARIANT_ID, MINECRAFT_SURROUND_VARIANT_ID}
+)
 SPEAKER_PANEL_VARIANT_IDS = frozenset(
-    {GAMEPLAY_SURROUND_VARIANT_ID, SPEAKER_PANELS_VARIANT_ID}
+    {*GAMEPLAY_SURROUND_VARIANT_IDS, SPEAKER_PANELS_VARIANT_ID}
+)
+MINECRAFT_SURROUND_DESTINATIONS = (
+    "facebook",
+    "instagram",
+    "tiktok",
+    "youtube",
 )
 DESTINATION_DISTRIBUTION_TARGETS = {
     GAMEPLAY_SURROUND_VARIANT_ID: (
@@ -227,7 +250,7 @@ def background_variant_asset_ids(variant_id: str) -> tuple[str, ...]:
     require_background_variant(variant_id)
     if variant_id == SPEAKER_PANELS_VARIANT_ID:
         return ()
-    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+    if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS:
         return tuple(asset_id for _, asset_id in GAMEPLAY_SURROUND_ASSETS)
     return (_VARIANT_ASSETS[variant_id],)
 
@@ -495,7 +518,7 @@ def load_background_variant_asset(
     require_background_variant(variant_id)
     if variant_id == SPEAKER_PANELS_VARIANT_ID:
         return None
-    if variant_id != GAMEPLAY_SURROUND_VARIANT_ID:
+    if variant_id not in GAMEPLAY_SURROUND_VARIANT_IDS:
         return load_background_asset(
             default_background_asset_id(variant_id), verify_content=verify_content
         )
@@ -510,7 +533,11 @@ def load_background_variant_asset(
     return {
         "asset_id": GAMEPLAY_SURROUND_ASSET_SET_ID,
         "assets": assets,
-        "render_plan": GAMEPLAY_SURROUND_RENDER_PLAN,
+        "render_plan": (
+            MINECRAFT_SURROUND_RENDER_PLAN
+            if variant_id == MINECRAFT_SURROUND_VARIANT_ID
+            else GAMEPLAY_SURROUND_RENDER_PLAN
+        ),
     }
 
 
@@ -532,7 +559,7 @@ def resolve_gameplay_variant_playback(
     resolved = deepcopy(asset)
     media_assets = (
         resolved.get("assets")
-        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
         else [resolved]
     )
     if not isinstance(media_assets, list) or not media_assets:
@@ -549,12 +576,16 @@ def resolve_gameplay_variant_playback(
                 media_asset,
                 episode_id=episode_id,
                 clip_id=clip_id,
-                variant_id=variant_id,
+                variant_id=(
+                    GAMEPLAY_SURROUND_VARIANT_ID
+                    if variant_id == MINECRAFT_SURROUND_VARIANT_ID
+                    else variant_id
+                ),
                 clip_duration_seconds=clip_duration_seconds,
                 source_duration_seconds=source_durations[source_id],
             )
         )
-    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+    if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS:
         resolved["assets"] = resolved_assets
         return resolved
     return resolved_assets[0]
@@ -564,7 +595,7 @@ def _require_gameplay_variant_playback(asset: dict, variant_id: str) -> None:
     if variant_id not in GAMEPLAY_VARIANT_IDS:
         return
     media_assets = (
-        asset.get("assets") if variant_id == GAMEPLAY_SURROUND_VARIANT_ID else [asset]
+        asset.get("assets") if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS else [asset]
     )
     if not isinstance(media_assets, list) or not media_assets:
         raise ValueError("Gameplay variant has no resolved source assets")
@@ -617,7 +648,7 @@ def _asset_record(asset: dict, *, include_provenance: bool) -> dict:
 
 
 def _variant_asset_record(
-    asset: dict | None, *, include_provenance: bool
+    asset: dict | None, *, include_provenance: bool, variant_id: str
 ) -> dict | None:
     if asset is None:
         return None
@@ -639,7 +670,11 @@ def _variant_asset_record(
             _asset_record(item, include_provenance=include_provenance)
             for item in assets
         ],
-        "render_plan": GAMEPLAY_SURROUND_RENDER_PLAN,
+        "render_plan": (
+            MINECRAFT_SURROUND_RENDER_PLAN
+            if variant_id == MINECRAFT_SURROUND_VARIANT_ID
+            else GAMEPLAY_SURROUND_RENDER_PLAN
+        ),
     }
 
 
@@ -698,6 +733,8 @@ def _recorded_asset_identity(recorded: dict | None) -> dict | None:
 def _variant_layout(variant_id: str) -> str:
     if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
         return GAMEPLAY_SURROUND_LAYOUT_VERSION
+    if variant_id == MINECRAFT_SURROUND_VARIANT_ID:
+        return MINECRAFT_SURROUND_LAYOUT_VERSION
     if variant_id == SPEAKER_PANELS_VARIANT_ID:
         return SPEAKER_PANELS_LAYOUT_VERSION
     return BACKGROUND_LAYOUT_VERSION
@@ -706,6 +743,8 @@ def _variant_layout(variant_id: str) -> str:
 def _variant_mode(variant_id: str) -> str:
     if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
         return GAMEPLAY_SURROUND_VARIANT_MODE
+    if variant_id == MINECRAFT_SURROUND_VARIANT_ID:
+        return MINECRAFT_SURROUND_VARIANT_MODE
     if variant_id == SPEAKER_PANELS_VARIANT_ID:
         return SPEAKER_PANELS_VARIANT_MODE
     return BACKGROUND_VARIANT_MODE
@@ -908,7 +947,7 @@ def _current_speaker_panel_caption_state(
             crop_config,
             base_record.get("clip_source_intervals"),
         )
-        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
         else None
     )
     revision = speaker_panel_caption_context_revision(
@@ -962,13 +1001,15 @@ def background_variant_fingerprint(
             "render_fingerprint": base_record.get("fingerprint"),
             "scan_identity": base_identity,
         },
-        "asset": _variant_asset_record(asset, include_provenance=False),
+        "asset": _variant_asset_record(
+            asset, include_provenance=False, variant_id=variant_id
+        ),
         "encoding": encoding,
     }
     if variant_id in SPEAKER_PANEL_VARIANT_IDS:
         caption_context_revision = (
             require_gameplay_caption_context_revision(caption_context_revision)
-            if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+            if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
             else require_speaker_panel_caption_context_revision(
                 caption_context_revision
             )
@@ -1029,7 +1070,9 @@ def record_background_variant(
             "fingerprint": base_record["fingerprint"],
             "scan_identity": base_identity,
         },
-        "asset": _variant_asset_record(asset, include_provenance=True),
+        "asset": _variant_asset_record(
+            asset, include_provenance=True, variant_id=variant_id
+        ),
         **(
             {"render_plan": SPEAKER_PANELS_RENDER_PLAN}
             if variant_id == SPEAKER_PANELS_VARIANT_ID
@@ -1115,7 +1158,7 @@ def background_variant_state(
                 None
                 if asset_free
                 else load_background_variant_asset(variant_id)
-                if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
                 else load_background_asset(str(asset_id))
             )
             if variant_id in GAMEPLAY_VARIANT_IDS:
@@ -1178,13 +1221,13 @@ def background_variant_state(
                 stale_detail = (
                     "The canonical base short changed after this variant was rendered."
                 )
-            elif _variant_asset_record(asset, include_provenance=False) != (
-                _recorded_asset_identity(recorded_asset)
-            ):
+            elif _variant_asset_record(
+                asset, include_provenance=False, variant_id=variant_id
+            ) != (_recorded_asset_identity(recorded_asset)):
                 stale_detail = (
                     "A gameplay surround asset or its render plan changed after "
                     "this variant was rendered."
-                    if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+                    if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
                     else "The background asset changed after this variant was rendered."
                 )
             elif variant_id in SPEAKER_PANEL_VARIANT_IDS and (

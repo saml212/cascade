@@ -35,6 +35,7 @@ from lib.short_variants import (
     CLEAN_NEUTRAL_HEADER_POLICY,
     CONTAIN_BLUR_FIT_MODE,
     GAMEPLAY_SURROUND_VARIANT_ID,
+    MINECRAFT_SURROUND_VARIANT_ID,
     SPEAKER_PANELS_RENDER_PLAN,
     SPEAKER_PANELS_VARIANT_ID,
 )
@@ -287,9 +288,21 @@ def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
         "30/1",
         ["-c:v", "libx264"],
     )
+    agent._compose_gameplay_surround_variant(
+        tmp_episode_dir / "podcast.mp4",
+        assets,
+        tmp_episode_dir / "base.mp4",
+        tmp_episode_dir / "captions.ass",
+        tmp_episode_dir / "minecraft-variant.mp4",
+        "30/1",
+        ["-c:v", "libx264"],
+        neutral_gutters=True,
+    )
 
     command = commands[0]
     graph = command[command.index("-filter_complex") + 1]
+    minecraft_command = commands[1]
+    minecraft_graph = minecraft_command[minecraft_command.index("-filter_complex") + 1]
     assert "-stream_loop" not in command
     assert "[1:v]trim=start=7.250000,setpts=PTS-STARTPTS" in graph
     assert "[2:v]trim=start=11.500000,setpts=PTS-STARTPTS" in graph
@@ -302,20 +315,35 @@ def test_gameplay_surround_graph_uses_manifest_playback_and_focus(
         "drawtext=text='thelocalpod.link':fontcolor=white:fontsize=36:"
         "x=(w-text_w)/2:y=1286" in graph
     )
+    gutter_filter = (
+        ",drawbox=x=0:y=0:w=270:h=1216:color=0x10151d:t=fill"
+        ",drawbox=x=810:y=0:w=270:h=1216:color=0x10151d:t=fill"
+    )
+    assert gutter_filter not in graph
+    assert gutter_filter in minecraft_graph
+    assert minecraft_graph.replace(gutter_filter, "") == graph
+    assert minecraft_command[minecraft_command.index("-map") + 1] == "[variant]"
+    assert "4:a:0" in minecraft_command
 
 
 def test_gameplay_surround_captions_stay_inside_center_column(
     tmp_episode_dir, sample_config
 ):
     agent = ShortsRenderAgent(tmp_episode_dir, sample_config)
-    style = agent._caption_style({"variant_id": GAMEPLAY_SURROUND_VARIANT_ID})
+    for variant_id in (
+        GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
+    ):
+        style = agent._caption_style({"variant_id": variant_id})
 
-    assert style.margin_l == 300
-    assert style.margin_r == 300
-    assert style.font_size == 52
-    ass = build_ass([], style)
-    style_line = next(line for line in ass.splitlines() if line.startswith("Style:"))
-    assert ",2,300,300,840,1" in style_line
+        assert style.margin_l == 300
+        assert style.margin_r == 300
+        assert style.font_size == 52
+        ass = build_ass([], style)
+        style_line = next(
+            line for line in ass.splitlines() if line.startswith("Style:")
+        )
+        assert ",2,300,300,840,1" in style_line
 
 
 @pytest.mark.parametrize(
@@ -794,7 +822,12 @@ def test_clean_speaker_panel_pixels_follow_speaker_and_neutral_header(
 
 
 @pytest.mark.parametrize(
-    "variant_id", (GAMEPLAY_SURROUND_VARIANT_ID, SPEAKER_PANELS_VARIANT_ID)
+    "variant_id",
+    (
+        GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
+        SPEAKER_PANELS_VARIANT_ID,
+    ),
 )
 def test_speaker_panel_render_requires_caption_context_before_writing(
     tmp_episode_dir, sample_config, variant_id
@@ -862,6 +895,7 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     base = tmp_episode_dir / "base-surround.mp4"
     captions = tmp_episode_dir / "surround.ass"
     output = tmp_episode_dir / "surround.mp4"
+    neutral_output = tmp_episode_dir / "minecraft-surround.mp4"
     for path, color, size in (
         (podcast, "yellow", "540x1144"),
         (gta, "red", "160x284"),
@@ -975,6 +1009,27 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
             "4M",
         ],
     )
+    agent._compose_gameplay_surround_variant(
+        podcast,
+        assets,
+        base,
+        captions,
+        neutral_output,
+        "30/1",
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            "1M",
+            "-maxrate",
+            "2M",
+            "-bufsize",
+            "4M",
+        ],
+        neutral_gutters=True,
+    )
 
     stream = next(
         item
@@ -1004,6 +1059,30 @@ def test_gameplay_surround_composition_has_four_panels_and_exact_base_audio(
     assert right_after_wrap[0] > right_after_wrap[2] + 80
     assert bottom_after_wrap[1] > bottom_after_wrap[0] + 40
     assert bottom_after_wrap[1] > bottom_after_wrap[2] + 40
+
+    neutral_stream = next(
+        item
+        for item in ffprobe_probe(neutral_output)["streams"]
+        if item["codec_type"] == "video"
+    )
+    assert (neutral_stream["width"], neutral_stream["height"]) == (1080, 1920)
+    assert audio_packet_signature(neutral_output) == audio_packet_signature(base)
+    for pixel in (
+        _sample_rgb(ffmpeg, neutral_output, 135, 36),
+        _sample_rgb(ffmpeg, neutral_output, 135, 608),
+        _sample_rgb(ffmpeg, neutral_output, 945, 608),
+    ):
+        assert all(
+            abs(actual - expected) <= 16
+            for actual, expected in zip(pixel, (16, 21, 29))
+        )
+    neutral_center = _sample_rgb(ffmpeg, neutral_output, 540, 600)
+    neutral_bottom = _sample_rgb(ffmpeg, neutral_output, 540, 1500)
+    assert (
+        neutral_center[0] > 180 and neutral_center[1] > 180 and neutral_center[2] < 80
+    )
+    assert neutral_bottom[1] > neutral_bottom[0] + 40
+    assert neutral_bottom[1] > neutral_bottom[2] + 40
 
 
 def test_gameplay_surround_caption_margin_stays_above_gameplay_panels():

@@ -10,7 +10,11 @@ pytest_plugins = ["tests.test_routes_episodes"]
 
 REQUEST_ID = "47db1913-4d32-4acf-bcfe-31763c50e9c2"
 SCHEDULED_DATE = "2099-01-05T09:00:00-08:00"
-ACTIVE_VARIANT_IDS = ("gameplay_surround_v1", "speaker_panels_v1")
+ACTIVE_VARIANT_IDS = (
+    "gameplay_surround_v1",
+    "minecraft_surround_v1",
+    "speaker_panels_v1",
+)
 ACTIVE_VARIANT_ID = "speaker_panels_v1"
 RETIRED_VARIANT_ID = "background_motion_v1"
 
@@ -583,12 +587,8 @@ def test_exact_job_cancellation_keeps_v3_history_valid_for_next_job(
     client, episodes_dir = test_client
     episode_dir = _create_episode(episodes_dir, "ep_001")
     receipts = [
-        _artifact_x_receipt_for(
-            "job-x-one", "10000000-0000-4000-8000-000000000001"
-        ),
-        _artifact_x_receipt_for(
-            "job-x-two", "10000000-0000-4000-8000-000000000002"
-        ),
+        _artifact_x_receipt_for("job-x-one", "10000000-0000-4000-8000-000000000001"),
+        _artifact_x_receipt_for("job-x-two", "10000000-0000-4000-8000-000000000002"),
     ]
     (episode_dir / "publish.json").write_text(
         json.dumps({"profile_username": "up", "shorts": receipts})

@@ -62,7 +62,9 @@ from lib.short_variants import (
     CONTAIN_BLUR_FIT_MODE,
     GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
-    GAMEPLAY_SURROUND_VARIANT_ID,
+    GAMEPLAY_SURROUND_VARIANT_IDS,
+    MINECRAFT_SURROUND_RENDER_PLAN,
+    MINECRAFT_SURROUND_VARIANT_ID,
     SPEAKER_PANELS_RENDER_PLAN,
     SPEAKER_PANELS_VARIANT_ID,
     background_variant_fingerprint,
@@ -221,7 +223,7 @@ class ShortsRenderAgent(BaseAgent):
             source_durations[str(media_asset["asset_id"])] = float(
                 asset_probe["format"]["duration"]
             )
-        if variant_id == GAMEPLAY_SURROUND_VARIANT_ID:
+        if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS:
             asset = resolve_gameplay_variant_playback(
                 asset,
                 episode_id=self.episode_dir.name,
@@ -256,7 +258,7 @@ class ShortsRenderAgent(BaseAgent):
                 episode.get("crop_config") or {},
                 timeline.keep_intervals,
             )
-            if variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+            if variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
             else None
         )
         caption_context_revision = speaker_panel_caption_context_revision(
@@ -359,13 +361,19 @@ class ShortsRenderAgent(BaseAgent):
         output: Path,
         fps: str,
         encoder_args: list[str],
+        *,
+        neutral_gutters: bool = False,
     ) -> None:
         """Compose the approved four-panel layout without touching base audio."""
         by_role = {item["role"]: item for item in assets}
         required = {"subway", "gta", "minecraft"}
         if set(by_role) != required:
             raise ValueError("Gameplay surround requires subway, gta, and minecraft")
-        plan = GAMEPLAY_SURROUND_RENDER_PLAN
+        plan = (
+            MINECRAFT_SURROUND_RENDER_PLAN
+            if neutral_gutters
+            else GAMEPLAY_SURROUND_RENDER_PLAN
+        )
         upper_h = plan["upper_height"]
         bottom_h = plan["bottom_height"]
         side_w = plan["left_width"]
@@ -380,6 +388,13 @@ class ShortsRenderAgent(BaseAgent):
         subway = by_role["subway"]
         gta = by_role["gta"]
         minecraft = by_role["minecraft"]
+        gutter_filter = ""
+        if neutral_gutters:
+            gutter_filter = "".join(
+                f",drawbox=x={x}:y={y}:w={width}:h={height}:"
+                f"color={plan['gutter_color']}:t=fill"
+                for x, y, width, height in plan["gutter_boxes"]
+            )
 
         def source_input(asset: dict) -> list[str]:
             policy = asset.get("playback_policy")
@@ -462,7 +477,7 @@ class ShortsRenderAgent(BaseAgent):
             "color=black@0.88:t=fill,"
             f"drawtext=text='{brand}':fontcolor=white:fontsize={brand_font_size}:"
             f"x=(w-text_w)/2:y={brand_y}:box=1:boxcolor=black@0.72:"
-            f"boxborderw=14,{subtitle_filter},format=yuv420p[variant]"
+            f"boxborderw=14{gutter_filter},{subtitle_filter},format=yuv420p[variant]"
         )
         self._run_ffmpeg(
             [
@@ -581,7 +596,7 @@ class ShortsRenderAgent(BaseAgent):
         asset = background["asset"]
         base_signature = audio_packet_signature(base_path, runner=self._run_ffmpeg)
         with staged_render_output(output) as staged:
-            if background["variant_id"] == GAMEPLAY_SURROUND_VARIANT_ID:
+            if background["variant_id"] in GAMEPLAY_SURROUND_VARIANT_IDS:
                 self._compose_gameplay_surround_variant(
                     podcast_video,
                     asset["assets"],
@@ -590,6 +605,9 @@ class ShortsRenderAgent(BaseAgent):
                     staged,
                     fps,
                     encoder_args,
+                    neutral_gutters=(
+                        background["variant_id"] == MINECRAFT_SURROUND_VARIANT_ID
+                    ),
                 )
             elif background["variant_id"] == SPEAKER_PANELS_VARIANT_ID:
                 self._compose_speaker_panels_variant(
@@ -942,7 +960,7 @@ class ShortsRenderAgent(BaseAgent):
             require_active_background_variant(background.get("variant_id"))
         speaker_panel_variant = background is not None
         gameplay_surround = bool(
-            background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID
+            background and background.get("variant_id") in GAMEPLAY_SURROUND_VARIANT_IDS
         )
         speaker_panels = bool(
             background and background.get("variant_id") == SPEAKER_PANELS_VARIANT_ID
@@ -1248,7 +1266,7 @@ class ShortsRenderAgent(BaseAgent):
 
     @staticmethod
     def _caption_style(background: dict | None) -> CaptionStyle:
-        if background and background.get("variant_id") == GAMEPLAY_SURROUND_VARIANT_ID:
+        if background and background.get("variant_id") in GAMEPLAY_SURROUND_VARIANT_IDS:
             style = gameplay_caption_style()
             style.margin_v = GAMEPLAY_SURROUND_CAPTION_MARGIN_V
             return style
@@ -1328,7 +1346,7 @@ class ShortsRenderAgent(BaseAgent):
         neutral_header_policy: dict | None = None,
     ) -> tuple[dict[str, CaptionPlacement], CaptionPlacement]:
         """Place known speakers in their row and unknown speech in the header."""
-        gameplay = variant_id == GAMEPLAY_SURROUND_VARIANT_ID
+        gameplay = variant_id in GAMEPLAY_SURROUND_VARIANT_IDS
         plan = GAMEPLAY_SURROUND_RENDER_PLAN if gameplay else SPEAKER_PANELS_RENDER_PLAN
         width = plan["podcast_width"] if gameplay else plan["panel_width"]
         height = (

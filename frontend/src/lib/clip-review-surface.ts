@@ -14,6 +14,7 @@ export type ClipReviewSurface = 'base' | ClipVariantId;
 
 const CLIP_VARIANT_IDS: readonly ClipVariantId[] = [
   'gameplay_surround_v1',
+  'minecraft_surround_v1',
   'speaker_panels_v1',
   'background_motion_v1',
   'satisfying_motion_v1',
@@ -29,6 +30,7 @@ const CLIP_VARIANT_LABELS: Readonly<Record<ClipVariantId, string>> = {
   subway_surfers_v1: 'Subway Surfers',
   gta_driving_v1: 'GTA driving',
   gameplay_surround_v1: 'Gameplay surround',
+  minecraft_surround_v1: 'Minecraft surround',
   speaker_panels_v1: 'Clean speaker panels',
 };
 
@@ -38,7 +40,11 @@ export const RETIRED_VARIANT_NOTICE =
 export function isActiveClipVariantId(
   value: unknown
 ): value is ActiveClipVariantId {
-  return value === 'gameplay_surround_v1' || value === 'speaker_panels_v1';
+  return (
+    value === 'gameplay_surround_v1' ||
+    value === 'minecraft_surround_v1' ||
+    value === 'speaker_panels_v1'
+  );
 }
 
 function isClipVariantId(value: unknown): value is ClipVariantId {

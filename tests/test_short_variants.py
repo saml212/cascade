@@ -28,10 +28,15 @@ from lib.short_variants import (
     GAMEPLAY_SURROUND_LAYOUT_VERSION,
     GAMEPLAY_SURROUND_RENDER_PLAN,
     GAMEPLAY_SURROUND_VARIANT_ID,
+    GAMEPLAY_SURROUND_VARIANT_IDS,
     GTA_DRIVING_ASSET_ID,
     GTA_DRIVING_VARIANT_ID,
     MINECRAFT_PARKOUR_ASSET_ID,
     MINECRAFT_PARKOUR_VARIANT_ID,
+    MINECRAFT_SURROUND_DESTINATIONS,
+    MINECRAFT_SURROUND_LAYOUT_VERSION,
+    MINECRAFT_SURROUND_RENDER_PLAN,
+    MINECRAFT_SURROUND_VARIANT_ID,
     RETIRED_BACKGROUND_VARIANT_IDS,
     SATISFYING_BACKGROUND_ASSET_ID,
     SATISFYING_VARIANT_ID,
@@ -68,6 +73,7 @@ from lib.timeline import Timeline
 def test_active_and_retired_variant_catalogs_are_exact_and_fail_closed():
     assert ACTIVE_BACKGROUND_VARIANT_IDS == (
         GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
         SPEAKER_PANELS_VARIANT_ID,
     )
     assert RETIRED_BACKGROUND_VARIANT_IDS == frozenset(BACKGROUND_VARIANT_IDS) - set(
@@ -358,6 +364,65 @@ def test_gameplay_surround_binds_all_assets_and_layout(tmp_path, monkeypatch):
     require_background_variant_asset(
         GAMEPLAY_SURROUND_VARIANT_ID, GAMEPLAY_SURROUND_ASSET_SET_ID
     )
+
+
+def test_minecraft_surround_reuses_exact_gameplay_clocks_with_its_own_identity(
+    tmp_path, monkeypatch
+):
+    gameplay = _gameplay_asset_set(tmp_path, monkeypatch)
+    minecraft = load_background_variant_asset(
+        MINECRAFT_SURROUND_VARIANT_ID, verify_content=True
+    )
+    durations = {item["asset_id"]: 180 for item in gameplay["assets"]}
+    inputs = {
+        "episode_id": "ep_test",
+        "clip_id": "clip_01",
+        "clip_duration_seconds": 42.25,
+        "source_durations": durations,
+    }
+
+    gameplay = resolve_gameplay_variant_playback(
+        gameplay, variant_id=GAMEPLAY_SURROUND_VARIANT_ID, **inputs
+    )
+    minecraft = resolve_gameplay_variant_playback(
+        minecraft, variant_id=MINECRAFT_SURROUND_VARIANT_ID, **inputs
+    )
+
+    assert gameplay["render_plan"] == GAMEPLAY_SURROUND_RENDER_PLAN
+    assert minecraft["render_plan"] == MINECRAFT_SURROUND_RENDER_PLAN
+    assert [item["role"] for item in minecraft["assets"]] == [
+        "subway",
+        "gta",
+        "minecraft",
+    ]
+    assert [
+        (
+            item["playback_start_seconds"],
+            item["playback_policy"]["selection_key_revision"],
+        )
+        for item in minecraft["assets"]
+    ] == [
+        (
+            item["playback_start_seconds"],
+            item["playback_policy"]["selection_key_revision"],
+        )
+        for item in gameplay["assets"]
+    ]
+    assert GAMEPLAY_SURROUND_VARIANT_IDS == {
+        GAMEPLAY_SURROUND_VARIANT_ID,
+        MINECRAFT_SURROUND_VARIANT_ID,
+    }
+    assert MINECRAFT_SURROUND_DESTINATIONS == (
+        "facebook",
+        "instagram",
+        "tiktok",
+        "youtube",
+    )
+    assert MINECRAFT_SURROUND_RENDER_PLAN["gutter_boxes"] == [
+        [0, 0, 270, 1216],
+        [810, 0, 270, 1216],
+    ]
+    assert MINECRAFT_SURROUND_RENDER_PLAN["gutter_color"] == "0x10151d"
 
 
 def test_gameplay_surround_currentness_binds_assets_and_effective_caption_context(
@@ -659,6 +724,99 @@ def test_gameplay_surround_currentness_binds_assets_and_effective_caption_contex
         base_record=base_record,
         encoding=encoding,
         variant_id=GAMEPLAY_SURROUND_VARIANT_ID,
+    )
+    assert stale["current"] is False
+    assert "asset or its render plan changed" in stale["detail"]
+
+
+def test_minecraft_surround_currentness_binds_all_assets_and_caption_context(
+    tmp_path, monkeypatch
+):
+    episode_dir = tmp_path / "episode"
+    base = episode_dir / "shorts" / "clip_01.mp4"
+    output = background_variant_output(
+        episode_dir, "clip_01", MINECRAFT_SURROUND_VARIANT_ID
+    )
+    for path, content in ((base, b"base"), (output, b"minecraft surround")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (episode_dir / "captions.ass").write_text("[Script Info]\n")
+    _write_gameplay_caption_context(episode_dir)
+    caption_context_revision = speaker_panel_caption_context_revision(episode_dir)
+    _gameplay_asset_set(tmp_path, monkeypatch)
+    asset_set = load_background_variant_asset(
+        MINECRAFT_SURROUND_VARIANT_ID, verify_content=True
+    )
+    asset_set = resolve_gameplay_variant_playback(
+        asset_set,
+        episode_id=episode_dir.name,
+        clip_id="clip_01",
+        variant_id=MINECRAFT_SURROUND_VARIANT_ID,
+        clip_duration_seconds=1,
+        source_durations={item["asset_id"]: 180 for item in asset_set["assets"]},
+    )
+    from lib import short_variants as short_variants_module
+
+    monkeypatch.setattr(
+        short_variants_module,
+        "probe",
+        lambda path: {"format": {"duration": "1" if Path(path) == base else "180"}},
+    )
+    base_record = {
+        "fingerprint": "sha256:base",
+        "clip_source_intervals": [[0, 1]],
+    }
+    base_identity = file_content_identity(base)["scan_identity"]
+    encoding = {"video_bitrate": "10M", "audio_bitrate": "192k"}
+    fingerprint = background_variant_fingerprint(
+        base_record,
+        base_identity,
+        asset_set,
+        encoding,
+        variant_id=MINECRAFT_SURROUND_VARIANT_ID,
+        caption_context_revision=caption_context_revision,
+    )
+    record = record_background_variant(
+        episode_dir,
+        "clip_01",
+        fingerprint=fingerprint,
+        timeline=Timeline.from_edits(1),
+        media={"duration_seconds": 1, "width": 1080, "height": 1920},
+        base_record=base_record,
+        base_identity=base_identity,
+        asset=asset_set,
+        encoding=encoding,
+        captions={
+            "path": "captions.ass",
+            "format": "ass",
+            "burned_in": True,
+            "placement_policy": GAMEPLAY_SURROUND_CAPTION_POLICY_VERSION,
+            "context_revision": caption_context_revision,
+        },
+        variant_id=MINECRAFT_SURROUND_VARIANT_ID,
+    )
+
+    assert record["layout_version"] == MINECRAFT_SURROUND_LAYOUT_VERSION
+    assert record["asset"]["render_plan"] == MINECRAFT_SURROUND_RENDER_PLAN
+    _, current = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=MINECRAFT_SURROUND_VARIANT_ID,
+    )
+    assert current["current"] is True
+
+    manifest = tmp_path / "assets" / f"{SUBWAY_SURFERS_ASSET_ID}.json"
+    changed = json.loads(manifest.read_text())
+    changed["description"] = "paired-control dependency changed"
+    manifest.write_text(json.dumps(changed))
+    _, stale = background_variant_state(
+        episode_dir,
+        "clip_01",
+        base_record=base_record,
+        encoding=encoding,
+        variant_id=MINECRAFT_SURROUND_VARIANT_ID,
     )
     assert stale["current"] is False
     assert "asset or its render plan changed" in stale["detail"]

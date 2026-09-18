@@ -250,7 +250,11 @@ def test_delivery_spec_rejects_inputs_that_do_not_match_reviewed_target():
 
 @pytest.mark.parametrize(
     "variant_id",
-    ("gameplay_surround_v1", "speaker_panels_v1"),
+    (
+        "gameplay_surround_v1",
+        "minecraft_surround_v1",
+        "speaker_panels_v1",
+    ),
 )
 def test_active_variant_overrides_preserve_saved_historical_selection(
     tmp_path, variant_id
@@ -338,6 +342,25 @@ def test_required_variant_does_not_affect_other_destinations_or_absent_policy(tm
     )
     PublishAgent(tmp_path, {})._enforce_required_short_variants(
         ["clip_04"], versions, ["x"]
+    )
+
+
+def test_minecraft_surround_is_bounded_to_four_experiment_destinations(tmp_path):
+    agent = PublishAgent(tmp_path, {})
+    versions = {"clip_04": {"variant_id": "minecraft_surround_v1"}}
+    allowed = ["facebook", "instagram", "tiktok", "youtube"]
+
+    agent._enforce_variant_destinations(["clip_04"], versions, allowed)
+    with pytest.raises(
+        RuntimeError,
+        match="minecraft_surround_v1 does not support destinations: x",
+    ):
+        agent._enforce_variant_destinations(["clip_04"], versions, [*allowed, "x"])
+
+    agent._enforce_variant_destinations(
+        ["clip_04"],
+        {"clip_04": {"variant_id": "speaker_panels_v1"}},
+        ["x"],
     )
 
 
