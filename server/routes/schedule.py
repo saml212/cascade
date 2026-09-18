@@ -142,6 +142,12 @@ def _publication_evidence(ep_dir: Path, episode: dict, config: dict) -> list[dic
         destinations = short.get("platforms")
         if not isinstance(destinations, list) or not destinations:
             destinations = ["unknown"]
+        from agents.publish import effective_scheduled_date
+
+        try:
+            scheduled_date = effective_scheduled_date(short)
+        except ValueError:
+            scheduled_date = None
         record = {
             "episode_id": episode_id,
             "name": name,
@@ -156,7 +162,7 @@ def _publication_evidence(ep_dir: Path, episode: dict, config: dict) -> list[dic
             "scheduled": (
                 False if cancellation_pending else short.get("scheduled") is True
             ),
-            "scheduled_date": short.get("scheduled_date"),
+            "scheduled_date": scheduled_date,
             "request_id": short.get("request_id"),
             "job_id": short.get("job_id"),
             "error": short.get("error"),
@@ -492,6 +498,8 @@ def _get_approved_items(
         } - prepared_ids
         short_versions = gate.get("short_versions", {})
         short_versions = short_versions if isinstance(short_versions, dict) else {}
+        from agents.publish import effective_scheduled_date
+
         for receipt in receipts:
             receipt_state = (
                 _receipt_state(receipt) if isinstance(receipt, dict) else None
@@ -515,9 +523,13 @@ def _get_approved_items(
                 receipt.get("platforms") or ["unknown"],
                 receipt,
             )
+            try:
+                scheduled_date = effective_scheduled_date(receipt)
+            except ValueError:
+                continue
             item.update(
                 state=receipt_state,
-                scheduled_date=receipt["scheduled_date"],
+                scheduled_date=scheduled_date,
                 planned_date=(plan or {}).get("scheduled_date"),
                 job_id=receipt.get("job_id"),
                 request_id=receipt.get("request_id"),

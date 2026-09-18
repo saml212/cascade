@@ -1768,6 +1768,8 @@ def _preview_schedule_cancellation_locked(
             external_id=req.expected_external_id if job_id is not None else None,
         )
         receipt, snapshot = context["receipt"], context["snapshot"]
+        from agents.publish import effective_scheduled_date
+
         response = {
             "status": "cancellable",
             "clip_id": clip_id,
@@ -1777,7 +1779,7 @@ def _preview_schedule_cancellation_locked(
                 "job_id": receipt["job_id"],
                 "external_id": receipt["external_id"],
                 "profile_username": snapshot["profile_username"],
-                "scheduled_date": receipt["scheduled_date"],
+                "scheduled_date": effective_scheduled_date(receipt),
                 "platforms": receipt["platforms"],
             },
             "remote_job": snapshot["remote_job"],

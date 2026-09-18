@@ -5,6 +5,7 @@ shorts are reserved against the Upload-Post calendar and local episode
 receipts; the calendar lock serializes Cascade publishers on this filesystem.
 """
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents.base import BaseAgent
 from agents.qa import (
@@ -74,6 +75,7 @@ LINKEDIN_PAGE_PIN_URL = f"{PROFILE_URL}/linkedin-page"
 PINTEREST_BOARD_URL = "https://api.upload-post.com/api/uploadposts/pinterest/boards"
 SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v1"
 EXACT_SCHEDULE_CANCELLATION_SCHEMA = "cascade.schedule-cancellation/v2"
+SCHEDULE_RESCHEDULE_SCHEMA = "cascade.schedule-reschedule/v1"
 SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v1"
 EXPANDED_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v2"
 ARTIFACT_SHORT_DESTINATION_SCHEMA = "cascade.short-destination/v3"
@@ -206,6 +208,16 @@ def validated_short_receipts(publish: dict) -> list[dict]:
         )
     ):
         raise ValueError("Schedule cancellation history cannot be verified")
+    reschedules = [
+        validated_schedule_reschedule(receipt)
+        for receipt in receipts
+        if "schedule_reschedule" in receipt or "pre_reschedule_receipt" in receipt
+    ]
+    if any(operation is None for operation in reschedules) or any(
+        len({operation[key] for operation in reschedules}) != len(reschedules)
+        for key in ("operation_id", "job_id")
+    ):
+        raise ValueError("Schedule reschedule history cannot be verified")
     return receipts
 
 
@@ -715,20 +727,10 @@ def cancellation_snapshot(
 
 def _matching_schedule_row(receipt: dict, remote: object, profile: str) -> bool:
     try:
-        platforms = receipt["platforms"]
-        fields = remote.get("fields")
+        scheduled_date = effective_scheduled_date(receipt)
         return bool(
-            isinstance(remote, dict)
-            and remote.get("job_id") == receipt["job_id"]
-            and remote.get("external_id") == receipt["external_id"]
-            and remote.get("profile_username") == profile
-            and isinstance(remote.get("platforms"), list)
-            and len(remote["platforms"]) == len(set(remote["platforms"]))
-            and set(remote["platforms"]) == set(platforms)
-            and remote.get("source_filename") == f"{receipt['clip_id']}.mp4"
-            and (fields is None or fields.get("external_id") == receipt["external_id"])
-            and _instant(_parse_remote_schedule_time(remote["scheduled_date"]))
-            == _instant(_parse_time(receipt["scheduled_date"]))
+            scheduled_date
+            and _matching_schedule_row_at(receipt, remote, profile, scheduled_date)
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
@@ -1698,6 +1700,353 @@ def _instant(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(microsecond=0)
 
 
+def _remote_schedule_content_identity(value: object) -> dict | None:
+    """Return provider fields a date-only PATCH is not allowed to change."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: child
+        for key, child in value.items()
+        if key not in {"scheduled_date", "original_scheduled_str"}
+    }
+
+
+def _matching_schedule_row_at(
+    receipt: dict,
+    remote: object,
+    profile: str,
+    scheduled_date: str,
+) -> bool:
+    try:
+        platforms = receipt["platforms"]
+        fields = remote.get("fields")
+        return bool(
+            isinstance(remote, dict)
+            and remote.get("job_id") == receipt["job_id"]
+            and remote.get("external_id") == receipt["external_id"]
+            and remote.get("profile_username") == profile
+            and isinstance(remote.get("platforms"), list)
+            and len(remote["platforms"]) == len(set(remote["platforms"]))
+            and set(remote["platforms"]) == set(platforms)
+            and remote.get("source_filename") == f"{receipt['clip_id']}.mp4"
+            and (fields is None or fields.get("external_id") == receipt["external_id"])
+            and _instant(_parse_remote_schedule_time(remote["scheduled_date"]))
+            == _instant(_parse_time(scheduled_date))
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def validated_schedule_reschedule(receipt: dict) -> dict | None:
+    """Validate one durable scheduled-date amendment state machine."""
+    if "schedule_cancellation" in receipt or "pre_cancellation_receipt" in receipt:
+        prior = receipt.get("pre_cancellation_receipt")
+        if not (
+            isinstance(prior, dict)
+            and receipt.get("schedule_reschedule") == prior.get("schedule_reschedule")
+            and receipt.get("pre_reschedule_receipt")
+            == prior.get("pre_reschedule_receipt")
+        ):
+            return None
+        return validated_schedule_reschedule(prior)
+    operation = receipt.get("schedule_reschedule")
+    original = receipt.get("pre_reschedule_receipt")
+    if not isinstance(operation, dict) or not isinstance(original, dict):
+        return None
+    state = operation.get("state")
+    base_fields = {
+        "schema",
+        "operation_id",
+        "state",
+        "job_id",
+        "external_id",
+        "clip_id",
+        "actor",
+        "reason",
+        "profile_username",
+        "from_scheduled_date",
+        "to_scheduled_date",
+        "timezone",
+        "original_receipt_revision",
+        "before",
+        "before_revision",
+        "content_revision",
+        "request",
+        "started_at",
+        "revision",
+    }
+    state_fields = {
+        "intent_recorded": set(),
+        "complete": {"patch", "after", "after_revision", "completed_at"},
+    }.get(state)
+    if state_fields is None or not _has_exact_keys(
+        operation, base_fields | state_fields
+    ):
+        return None
+    base = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"schedule_reschedule", "pre_reschedule_receipt"}
+    }
+    mutable_terminal_fields = {"status", "status_history", "terminal_destinations"}
+    wrapper_fields = {"schedule_reschedule", "pre_reschedule_receipt"}
+    if (
+        {
+            key: value
+            for key, value in base.items()
+            if key not in mutable_terminal_fields
+        }
+        != {
+            key: value
+            for key, value in original.items()
+            if key not in mutable_terminal_fields | wrapper_fields
+        }
+        or "schedule_cancellation" in original
+        or "pre_cancellation_receipt" in original
+        or operation.get("schema") != SCHEDULE_RESCHEDULE_SCHEMA
+        or operation.get("job_id") != original.get("job_id")
+        or operation.get("external_id") != original.get("external_id")
+        or operation.get("clip_id") != original.get("clip_id")
+        or operation.get("original_receipt_revision") != _document_revision(original)
+        or operation.get("revision")
+        != _document_revision(
+            {key: value for key, value in operation.items() if key != "revision"}
+        )
+    ):
+        return None
+    if not all(
+        isinstance(operation.get(field), str) and operation[field]
+        for field in (
+            "operation_id",
+            "job_id",
+            "external_id",
+            "clip_id",
+            "actor",
+            "reason",
+            "profile_username",
+            "from_scheduled_date",
+            "to_scheduled_date",
+            "timezone",
+            "started_at",
+        )
+    ) or (
+        operation["actor"] != operation["actor"].strip()
+        or operation["reason"] != operation["reason"].strip()
+        or len(operation["reason"]) < 3
+    ):
+        return None
+    try:
+        zone = ZoneInfo(operation["timezone"])
+        source = _parse_time(operation["from_scheduled_date"])
+        target = _parse_time(operation["to_scheduled_date"])
+        started = _parse_time(operation["started_at"])
+        if (
+            operation["from_scheduled_date"] != effective_scheduled_date(original)
+            or source.utcoffset() != source.astimezone(zone).utcoffset()
+            or target.utcoffset() != target.astimezone(zone).utcoffset()
+            or _instant(source) == _instant(target)
+        ):
+            return None
+        if state == "complete":
+            completed = _parse_time(operation["completed_at"])
+            attempted = _parse_time(operation["patch"]["attempted_at"])
+            if not _instant(started) <= _instant(attempted) <= _instant(completed):
+                return None
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return None
+    before = operation.get("before")
+    request = operation.get("request")
+    if not (
+        _matching_schedule_row_at(
+            original,
+            before,
+            operation["profile_username"],
+            operation["from_scheduled_date"],
+        )
+        and before.get("has_preview") is True
+        and operation.get("before_revision") == _document_revision(before)
+        and operation.get("content_revision")
+        == _document_revision(_remote_schedule_content_identity(before))
+        and before.get("original_timezone") == operation["timezone"]
+        and _has_exact_keys(request, {"scheduled_date", "timezone"})
+        and request.get("timezone") == operation["timezone"]
+        and request.get("scheduled_date")
+        == target.astimezone(zone).replace(tzinfo=None).isoformat()
+    ):
+        return None
+    if state == "intent_recorded":
+        return operation
+    after, patch = operation.get("after"), operation.get("patch")
+    if not (
+        _matching_schedule_row_at(
+            original,
+            after,
+            operation["profile_username"],
+            operation["to_scheduled_date"],
+        )
+        and operation.get("after_revision") == _document_revision(after)
+        and _remote_schedule_content_identity(before)
+        == _remote_schedule_content_identity(after)
+        and _has_exact_keys(
+            patch, {"outcome", "attempted_at", "http_status", "response"}
+        )
+        and patch.get("outcome") in {"response", "reconciled_after_uncertain"}
+        and isinstance(patch.get("attempted_at"), str)
+    ):
+        return None
+    if patch["outcome"] == "response":
+        try:
+            response_valid = bool(
+                patch.get("http_status") == 200
+                and isinstance(patch.get("response"), dict)
+                and patch["response"].get("success") is True
+                and patch["response"].get("job_id") == operation["job_id"]
+                and isinstance(patch["response"].get("scheduled_date"), str)
+                and _instant(
+                    _parse_remote_schedule_time(patch["response"]["scheduled_date"])
+                )
+                == _instant(target)
+            )
+        except (TypeError, ValueError):
+            response_valid = False
+        if not response_valid:
+            return None
+    elif patch.get("http_status") is not None or patch.get("response") is not None:
+        return None
+    return operation
+
+
+def effective_scheduled_date(receipt: dict) -> str | None:
+    """Resolve the current scheduled date without mutating submission proof."""
+    if "schedule_reschedule" not in receipt and "pre_reschedule_receipt" not in receipt:
+        value = receipt.get("scheduled_date")
+        return value if isinstance(value, str) and value else None
+    operation = validated_schedule_reschedule(receipt)
+    if operation is None:
+        raise ValueError("Schedule reschedule history cannot be verified")
+    if operation["state"] != "complete":
+        raise ValueError("Schedule reschedule outcome must be reconciled")
+    return operation["to_scheduled_date"]
+
+
+def start_schedule_reschedule(
+    receipt: dict,
+    remote: dict,
+    *,
+    profile_username: str,
+    to_scheduled_date: str,
+    timezone_name: str,
+    operation_id: str,
+    actor: str,
+    reason: str,
+    started_at: str,
+) -> dict:
+    """Wrap an exact receipt with a durable intent before provider PATCH."""
+    if (
+        validated_schedule_reschedule(receipt) is not None
+        and receipt.get("schedule_reschedule", {}).get("state") != "complete"
+    ):
+        raise ValueError("A schedule reschedule outcome is already unresolved")
+    if "schedule_cancellation" in receipt or "pre_cancellation_receipt" in receipt:
+        raise ValueError("A cancellation receipt cannot be rescheduled")
+    source = effective_scheduled_date(receipt)
+    if not source or not _matching_schedule_row_at(
+        receipt, remote, profile_username, source
+    ):
+        raise ValueError("The provider calendar row does not match the receipt")
+    actor, reason = actor.strip(), reason.strip()
+    if not actor or len(reason) < 3:
+        raise ValueError("Actor and reason are required")
+    try:
+        zone = ZoneInfo(timezone_name)
+        target = _parse_time(to_scheduled_date)
+        started = _parse_time(started_at)
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError("Schedule reschedule dates cannot be verified") from error
+    if (
+        target.utcoffset() != target.astimezone(zone).utcoffset()
+        or _instant(target) <= _instant(started)
+        or _instant(target) == _instant(_parse_time(source))
+    ):
+        raise ValueError("The target must be a different future instant")
+    request = {
+        "scheduled_date": target.astimezone(zone).replace(tzinfo=None).isoformat(),
+        "timezone": timezone_name,
+    }
+    original = copy.deepcopy(receipt)
+    operation = {
+        "schema": SCHEDULE_RESCHEDULE_SCHEMA,
+        "operation_id": operation_id,
+        "state": "intent_recorded",
+        "job_id": receipt["job_id"],
+        "external_id": receipt["external_id"],
+        "clip_id": receipt["clip_id"],
+        "actor": actor,
+        "reason": reason,
+        "profile_username": profile_username,
+        "from_scheduled_date": source,
+        "to_scheduled_date": to_scheduled_date,
+        "timezone": timezone_name,
+        "original_receipt_revision": _document_revision(original),
+        "before": remote,
+        "before_revision": _document_revision(remote),
+        "content_revision": _document_revision(
+            _remote_schedule_content_identity(remote)
+        ),
+        "request": request,
+        "started_at": started_at,
+    }
+    operation["revision"] = _document_revision(operation)
+    wrapped = {
+        **original,
+        "pre_reschedule_receipt": original,
+        "schedule_reschedule": operation,
+    }
+    if validated_schedule_reschedule(wrapped) is None:
+        raise ValueError("Schedule reschedule intent is invalid")
+    return wrapped
+
+
+def complete_schedule_reschedule(
+    receipt: dict,
+    remote: dict,
+    *,
+    patch: dict,
+    completed_at: str,
+) -> dict:
+    """Seal a durable intent after exact provider reconciliation."""
+    operation = validated_schedule_reschedule(receipt)
+    if operation is None or operation.get("state") != "intent_recorded":
+        raise ValueError("No exact schedule reschedule intent is pending")
+    original = receipt["pre_reschedule_receipt"]
+    if not (
+        _matching_schedule_row_at(
+            original,
+            remote,
+            operation["profile_username"],
+            operation["to_scheduled_date"],
+        )
+        and _remote_schedule_content_identity(remote)
+        == _remote_schedule_content_identity(operation["before"])
+    ):
+        raise ValueError("The provider target row does not match the intent")
+    sealed = {
+        **operation,
+        "state": "complete",
+        "patch": patch,
+        "after": remote,
+        "after_revision": _document_revision(remote),
+        "completed_at": completed_at,
+    }
+    sealed["revision"] = _document_revision(
+        {key: value for key, value in sealed.items() if key != "revision"}
+    )
+    result = {**receipt, "schedule_reschedule": sealed}
+    if validated_schedule_reschedule(result) is None:
+        raise ValueError("Completed schedule reschedule evidence is invalid")
+    return result
+
+
 def cancellable_scheduled_receipt(
     publish: dict,
     clip_id: str,
@@ -1751,7 +2100,7 @@ def cancellable_scheduled_receipt(
     ):
         raise ValueError("The scheduled receipt identity cannot be verified")
     try:
-        scheduled_at = _parse_time(receipt["scheduled_date"])
+        scheduled_at = _parse_time(effective_scheduled_date(receipt))
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise ValueError("The scheduled receipt date cannot be verified") from exc
     reference = now or datetime.now(timezone.utc)
@@ -1986,7 +2335,7 @@ def schedule_cancellation_provider_safe(
             else (False, "Provider did not confirm queued work for this job")
         )
     try:
-        scheduled = _instant(_parse_time(receipt["scheduled_date"]))
+        scheduled = _instant(_parse_time(effective_scheduled_date(receipt)))
         dates = [
             _instant(_parse_remote_schedule_time(item["run_date"]))
             for item in matched_active
@@ -2412,7 +2761,7 @@ class PublishAgent(BaseAgent):
                     )
                 if not overlap and item.get("external_id"):
                     prior_time = (
-                        _parse_time(item["scheduled_date"])
+                        _parse_time(effective_scheduled_date(item))
                         if item.get("scheduled") is not False
                         else None
                     )
@@ -3495,7 +3844,7 @@ class PublishAgent(BaseAgent):
                 ):
                     continue
                 try:
-                    scheduled_at = _parse_time(item["scheduled_date"])
+                    scheduled_at = _parse_time(effective_scheduled_date(item))
                 except (AttributeError, KeyError, TypeError, ValueError) as error:
                     raise RuntimeError(
                         f"Cannot inspect local publish receipt {path}; "
