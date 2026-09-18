@@ -869,6 +869,8 @@ def short_version_catalog(
         selection_error = str(exc).strip("'")
     if variant_ids is None:
         variant_ids = (selected_variant_id,) if selected_variant_id else ()
+    elif selected_variant_id and selected_variant_id not in variant_ids:
+        variant_ids = (*variant_ids, selected_variant_id)
     base_revision = clip_review_revision(clip, base_record, metadata_entry)
     clip_status = clip.get("status")
     current = bool(
@@ -1593,6 +1595,7 @@ def quality_snapshot(
     include_findings: bool = True,
     config: dict | None = None,
     environment: Mapping[str, str] | None = None,
+    variant_state=None,
 ) -> dict:
     """Return the single machine-readable quality and release decision."""
     episode_dir = Path(episode_dir)
@@ -1600,6 +1603,8 @@ def quality_snapshot(
         from agents.pipeline import load_config
 
         config = load_config()
+    if variant_state is None:
+        variant_state = background_variant_state
     episode = _load_json(episode_dir / "episode.json")
     clips_data = _load_json(episode_dir / "clips.json", {"clips": []})
     clips = clips_data.get("clips", []) if isinstance(clips_data, dict) else clips_data
@@ -1761,6 +1766,7 @@ def quality_snapshot(
             clip,
             current_shorts.get(str(clip["id"])),
             approval_metadata_by_id.get(clip["id"]),
+            variant_state=variant_state,
         )
         for clip in clips
         if isinstance(clip, dict) and clip.get("id")

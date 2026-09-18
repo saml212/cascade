@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from datetime import datetime
 
 import pytest
@@ -45,7 +46,7 @@ def _review(*, approved=True, distribution=None):
     if distribution is not None:
         state["clips"][0]["review"]["distribution"] = distribution
 
-    async def load(_episode_id):
+    def load(*_args, **_kwargs):
         return state
 
     return load
@@ -83,7 +84,7 @@ def test_calendar_ignores_legacy_files_and_boolean_approval(tmp_path, monkeypatc
         json.dumps([{"clip_id": "one", "approved": True}])
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review(approved=False))
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review(approved=False))
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -95,7 +96,7 @@ def test_calendar_ignores_legacy_files_and_boolean_approval(tmp_path, monkeypatc
 def test_calendar_proposes_only_current_revision_bound_approvals(tmp_path, monkeypatch):
     _episode(tmp_path, title="A current episode")
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review())
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -115,7 +116,7 @@ def test_calendar_proposal_exposes_selected_variant_identity(tmp_path, monkeypat
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
     monkeypatch.setattr(
         schedule,
-        "review_state",
+        "_schedule_review_state",
         _review(
             distribution={
                 "version": "background_motion_v1",
@@ -160,7 +161,7 @@ def test_prepared_rerelease_is_suggested_despite_historical_receipt(
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
     monkeypatch.setattr(
         schedule,
-        "review_state",
+        "_schedule_review_state",
         _review(
             distribution={
                 "version": "background_motion_v1",
@@ -200,7 +201,7 @@ def test_calendar_surfaces_rss_without_claiming_youtube_publication(
         )
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review(approved=False))
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review(approved=False))
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -230,7 +231,7 @@ def test_stale_bound_youtube_url_is_not_current_publication_evidence(
         youtube_longform_url_editorial_revision="sha256:old-longform",
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review())
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -266,7 +267,7 @@ def test_recorded_submissions_block_ambiguous_duplicate_proposals(
         )
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review())
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -312,7 +313,7 @@ def test_exact_episode_schedule_replaces_generated_slot(tmp_path, monkeypatch):
         ],
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review())
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -562,7 +563,7 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
         metadata={"youtube": {"title": "Canonical clip title"}},
     )
 
-    async def paired_review(_episode_id):
+    def paired_review(*_args, **_kwargs):
         return {
             "enabled_destinations": [
                 {"key": "youtube"},
@@ -577,7 +578,7 @@ def test_same_clip_destination_receipts_keep_separate_current_rows(
         }
 
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", paired_review)
+    monkeypatch.setattr(schedule, "_schedule_review_state", paired_review)
     monkeypatch.setattr(schedule, "_load_config", dict)
     monkeypatch.setattr(
         schedule,
@@ -651,7 +652,7 @@ def test_delete_confirmed_receipt_is_pending_cancellation_not_scheduled(
         lambda receipt: receipt.get("schedule_cancellation"),
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review(approved=False))
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review(approved=False))
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -708,7 +709,7 @@ def test_receipt_date_and_state_override_plan(
         )
     )
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review(approved=False))
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review(approved=False))
     monkeypatch.setattr(schedule, "_load_config", dict)
 
     result = asyncio.run(schedule.get_schedule())
@@ -725,7 +726,7 @@ def test_receipt_date_and_state_override_plan(
 def test_qa_blocked_clip_is_held_out_of_suggestions(tmp_path, monkeypatch):
     _episode(tmp_path, youtube_longform_url="https://youtube.example/video")
     monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
-    monkeypatch.setattr(schedule, "review_state", _review())
+    monkeypatch.setattr(schedule, "_schedule_review_state", _review())
     monkeypatch.setattr(schedule, "_load_config", dict)
     monkeypatch.setattr(
         schedule,
@@ -744,3 +745,99 @@ def test_qa_blocked_clip_is_held_out_of_suggestions(tmp_path, monkeypatch):
     assert all(not day["items"] for day in result["schedule"])
     assert result["held_items"][0]["episode_id"] == "example"
     assert result["held_items"][0]["blockers"] == ["Quality review is stale."]
+
+
+def test_schedule_review_checks_only_scheduled_receipt_variants(monkeypatch, tmp_path):
+    captured = {}
+
+    def review(_ep_dir, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(schedule, "episode_review_state", review)
+    receipts = [
+        {
+            "clip_id": "clip_01",
+            "status": "submitted",
+            "scheduled": True,
+            "scheduled_date": "2099-07-05T09:00:00-07:00",
+            "variant_id": "speaker_panels_v1",
+        },
+        {
+            "clip_id": "clip_01",
+            "status": "cancelled",
+            "scheduled": False,
+            "scheduled_date": "2099-07-05T09:00:00-07:00",
+            "variant_id": "gameplay_surround_v1",
+        },
+    ]
+    variant_state = object()
+
+    schedule._schedule_review_state(tmp_path, {}, receipts, variant_state)
+
+    assert captured["variant_ids_by_clip"] == {
+        "clip_01": ("speaker_panels_v1",)
+    }
+    assert captured["variant_state"] is variant_state
+
+
+def test_request_variant_state_reuses_only_identical_inputs(monkeypatch, tmp_path):
+    calls = []
+
+    def variant_state(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"call": len(calls)}, {"current": True}
+
+    monkeypatch.setattr(schedule, "background_variant_state", variant_state)
+    current = schedule._request_variant_state()
+    inputs = {
+        "base_record": {"fingerprint": "sha256:base"},
+        "encoding": {"codec": "h264"},
+        "variant_id": "speaker_panels_v1",
+    }
+
+    first = current(tmp_path, "clip_01", **inputs)
+    second = current(tmp_path, "clip_01", **inputs)
+    inputs["base_record"]["fingerprint"] = "sha256:changed"
+    changed_base = current(tmp_path, "clip_01", **inputs)
+    changed_encoding = current(
+        tmp_path,
+        "clip_01",
+        **(inputs | {"encoding": {"codec": "hevc"}}),
+    )
+    next_request = schedule._request_variant_state()
+    uncached_next_request = next_request(tmp_path, "clip_01", **inputs)
+
+    assert first is second
+    assert changed_base is not first
+    assert changed_encoding is not changed_base
+    assert uncached_next_request is not changed_base
+    assert len(calls) == 4
+
+
+def test_schedule_build_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_build(_episodes_dir, _config):
+        started.set()
+        assert release.wait(timeout=0.5), "event loop could not release schedule build"
+        return [], [], []
+
+    monkeypatch.setattr(schedule, "get_episodes_dir", lambda: tmp_path)
+    monkeypatch.setattr(schedule, "_load_config", dict)
+    monkeypatch.setattr(schedule, "_get_approved_items", blocked_build)
+
+    async def run():
+        task = asyncio.create_task(schedule.get_schedule())
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        release.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result["total_items"] == 0

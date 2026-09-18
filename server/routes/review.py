@@ -703,7 +703,13 @@ def _boundary_evidence_with_inspection(
     return evidence
 
 
-def episode_review_state(episode_dir: Path) -> dict:
+def episode_review_state(
+    episode_dir: Path,
+    *,
+    config: dict | None = None,
+    variant_ids_by_clip: dict[str, tuple[str, ...]] | None = None,
+    variant_state=None,
+) -> dict:
     """Build the canonical current review state for routes and local agents."""
     episode_dir = Path(episode_dir)
     episode_id = episode_dir.name
@@ -711,7 +717,9 @@ def episode_review_state(episode_dir: Path) -> dict:
     clips_data = _read_json(episode_dir / "clips.json", {"clips": []})
     clips = clips_data.get("clips", []) if isinstance(clips_data, dict) else clips_data
     clips = [clip for clip in clips if isinstance(clip, dict) and clip.get("id")]
-    config = load_config()
+    config = config if config is not None else load_config()
+    if variant_state is None:
+        variant_state = background_variant_state
     destinations = _enabled_destinations(config)
     metadata = canonical_release_metadata(episode_dir, episode, clips)
     metadata_by_id = {
@@ -786,8 +794,12 @@ def episode_review_state(episode_dir: Path) -> dict:
             approval_metadata_by_id.get(clip_id),
             base_render=render,
             encoding=variant_encoding,
-            variant_ids=BACKGROUND_VARIANT_IDS,
-            variant_state=background_variant_state,
+            variant_ids=(
+                variant_ids_by_clip.get(clip_id, ())
+                if variant_ids_by_clip is not None
+                else BACKGROUND_VARIANT_IDS
+            ),
+            variant_state=variant_state,
         )
         variants = {}
         for variant_id, variant in catalog["variants"].items():

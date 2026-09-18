@@ -1535,6 +1535,16 @@ def test_selected_variant_requires_its_own_current_pixels_and_approval(
     assert selected["revision"] == revision
     assert selected["path"].endswith(f"/{BACKGROUND_VARIANT_ID}/clip_01.mp4")
 
+    bounded = short_distribution_state(
+        episode_dir,
+        {},
+        {},
+        clip,
+        base_record,
+        variant_ids=(),
+    )
+    assert bounded == selected
+
     stat = output.stat()
     output.write_bytes(b"X" * stat.st_size)
     os.utime(output, ns=(stat.st_atime_ns, stat.st_mtime_ns))

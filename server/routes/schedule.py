@@ -1,5 +1,6 @@
 """Read-only release proposals from current approvals and publication evidence."""
 
+import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,10 +12,12 @@ from fastapi import APIRouter, HTTPException
 from agents.qa import current_funnel_urls_for_episode, quality_snapshot
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
+    BACKGROUND_VARIANT_IDS,
     DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    background_variant_state,
     normalize_destination_distribution_targets,
 )
-from server.routes.review import review_state
+from server.routes.review import episode_review_state
 
 router = APIRouter(prefix="/api", tags=["schedule"])
 
@@ -310,11 +313,14 @@ def _receipt_artifact_version(
     return candidate
 
 
-def _release_gate(ep_dir: Path, config: dict) -> dict:
+def _release_gate(ep_dir: Path, config: dict, variant_state) -> dict:
     try:
-        gate = quality_snapshot(ep_dir, include_findings=False, config=config).get(
-            "release_gate", {}
-        )
+        gate = quality_snapshot(
+            ep_dir,
+            include_findings=False,
+            config=config,
+            variant_state=variant_state,
+        ).get("release_gate", {})
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         gate = {}
     if isinstance(gate, dict) and "can_approve_publish" in gate:
@@ -323,6 +329,67 @@ def _release_gate(ep_dir: Path, config: dict) -> dict:
         "can_approve_publish": False,
         "blockers": [{"message": "Current release checks are unavailable."}],
     }
+
+
+def _request_variant_state():
+    """Reuse exact variant checks only while one schedule snapshot is built."""
+    cache = {}
+
+    def current(episode_dir, clip_id, *, base_record, encoding, variant_id):
+        key = (str(Path(episode_dir).resolve()), clip_id, variant_id)
+        inputs = json.dumps(
+            [base_record, encoding], sort_keys=True, separators=(",", ":")
+        )
+        cached = cache.get(key)
+        if cached and cached[0] == inputs:
+            return cached[1]
+        state = background_variant_state(
+            episode_dir,
+            clip_id,
+            base_record=base_record,
+            encoding=encoding,
+            variant_id=variant_id,
+        )
+        cache[key] = (inputs, state)
+        return state
+
+    return current
+
+
+def _schedule_review_state(
+    ep_dir: Path,
+    config: dict,
+    receipts: list[dict],
+    variant_state,
+) -> dict:
+    receipt_variants = {}
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, dict)
+            or not receipt.get("clip_id")
+            or receipt.get("scheduled") is not True
+            or not receipt.get("scheduled_date")
+            or _receipt_state(receipt) is None
+            or receipt.get("variant_id") not in BACKGROUND_VARIANT_IDS
+        ):
+            continue
+        receipt_variants.setdefault(str(receipt["clip_id"]), set()).add(
+            receipt["variant_id"]
+        )
+    variant_ids_by_clip = {
+        clip_id: tuple(
+            variant_id
+            for variant_id in BACKGROUND_VARIANT_IDS
+            if variant_id in variant_ids
+        )
+        for clip_id, variant_ids in receipt_variants.items()
+    }
+    return episode_review_state(
+        ep_dir,
+        config=config,
+        variant_ids_by_clip=variant_ids_by_clip,
+        variant_state=variant_state,
+    )
 
 
 def _short_item(
@@ -354,7 +421,7 @@ def _short_item(
     }
 
 
-async def _get_approved_items(
+def _get_approved_items(
     episodes_dir: Path, config: dict
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Collect exact plans, receipts, suggestions, and QA-held items."""
@@ -372,13 +439,14 @@ async def _get_approved_items(
         name = episode.get("name") or episode.get("guest_name") or episode_id
         evidence = _publication_evidence(ep_dir, episode, config)
         publication_evidence.extend(evidence)
-        gate = _release_gate(ep_dir, config)
+        variant_state = _request_variant_state()
+        gate = _release_gate(ep_dir, config, variant_state)
         publish = _read_json(ep_dir / "publish.json", {})
         publish = publish if isinstance(publish, dict) else {}
         receipts = publish.get("shorts", [])
         receipts = receipts if isinstance(receipts, list) else []
         try:
-            review = await review_state(episode_id)
+            review = _schedule_review_state(ep_dir, config, receipts, variant_state)
         except (HTTPException, OSError, TypeError, ValueError):
             review = {}
 
@@ -552,8 +620,8 @@ async def get_schedule():
     tz_name = sched_cfg.get("timezone", "America/Los_Angeles")
 
     zone = ZoneInfo(tz_name)
-    items, publication_evidence, held_items = await _get_approved_items(
-        get_episodes_dir(), config
+    items, publication_evidence, held_items = await asyncio.to_thread(
+        _get_approved_items, get_episodes_dir(), config
     )
     exact = []
     for item in items:
