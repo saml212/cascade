@@ -15,7 +15,7 @@
  */
 
 import { h, mount } from '../lib/dom';
-import { effect, signal, type Signal } from '../lib/signals';
+import { effect, onCleanup, signal, type Signal } from '../lib/signals';
 import {
   api,
   type AmbientTrackConfig,
@@ -64,10 +64,6 @@ interface CropState {
   saving: boolean;
   scrubMode: 'frame' | 'video';
   videoElement: HTMLVideoElement | null;
-  videoTime: number;
-  videoDuration: number;
-  videoPlaying: boolean;
-  videoLoading: boolean;
 }
 
 const SPEAKER_CSS_VARS = [
@@ -128,11 +124,36 @@ export function CropSetup(target: HTMLElement, episodeId: string): void {
     saving: false,
     scrubMode: 'frame',
     videoElement: null,
-    videoTime: 0,
-    videoDuration: 0,
-    videoPlaying: false,
-    videoLoading: false,
   });
+
+  let active = true;
+  onCleanup(() => {
+    active = false;
+  });
+  const refreshVideo = (): void => {
+    if (active) state.set((prev) => ({ ...prev }));
+  };
+  const video = h('video', {
+    preload: 'metadata',
+    playsinline: true,
+    crossorigin: 'anonymous',
+    onloadedmetadata: refreshVideo,
+    onplay: refreshVideo,
+    onpause: refreshVideo,
+    onseeked: refreshVideo,
+    onerror: () => {
+      if (!active) return;
+      state.set((prev) => ({
+        ...prev,
+        scrubMode: 'frame',
+        loadError:
+          'Couldn’t load the source video for scrubbing. Falling back to the crop frame.',
+      }));
+    },
+  });
+  video.muted = false;
+  video.volume = 0.6;
+  state.set((prev) => ({ ...prev, videoElement: video }));
 
   let initialised = false;
 
@@ -609,9 +630,9 @@ function renderEditor(
 
   effect(() => {
     const s = state();
-    placementBar.replaceChildren(renderPlacementBar(state, s));
+    placementBar.replaceChildren(renderPlacementBar(state, s, episodeId));
     speakerPickerBar.replaceChildren(renderSpeakerPicker(state, s));
-    scrubBar.replaceChildren(renderScrubBar(state, s, episodeId));
+    scrubBar.replaceChildren(renderScrubBar(s));
     hint.replaceChildren(renderHint(s));
   });
 
@@ -801,7 +822,8 @@ function clamp(v: number, min: number, max: number): number {
 
 function renderPlacementBar(
   state: Signal<CropState>,
-  s: CropState
+  s: CropState,
+  episodeId: string
 ): HTMLElement {
   const modeBtn = (
     mode: 'shorts' | 'longform',
@@ -828,7 +850,7 @@ function renderPlacementBar(
   const scrubToggle = h(
     'button',
     {
-      onclick: () => toggleScrubMode(state),
+      onclick: () => toggleScrubMode(state, episodeId),
       class: [
         'h-9 px-3.5 rounded-md border text-body-sm font-medium transition-colors duration-[120ms] flex items-center gap-2',
         scrubToggleActive
@@ -862,72 +884,21 @@ function renderPlacementBar(
   );
 }
 
-function toggleScrubMode(state: Signal<CropState>): void {
+function toggleScrubMode(state: Signal<CropState>, episodeId: string): void {
   const prev = state.peek();
   if (prev.scrubMode === 'video') {
-    // Turning off — pause and drop back to frame
-    if (prev.videoElement) {
-      prev.videoElement.pause();
-    }
-    state.set({ ...prev, scrubMode: 'frame', videoPlaying: false });
-    return;
-  }
-  // Turning on — lazy-create the video element if we haven't yet
-  if (!prev.videoElement) {
-    const v = document.createElement('video');
-    v.preload = 'metadata';
-    v.playsInline = true;
-    v.crossOrigin = 'anonymous';
-    // Camera audio plays during scrub so Sam can identify who's speaking
-    // while he's placing crops. For H6E episodes the SyncVerifier panel
-    // below handles the "is H6E in sync" check — those are two distinct
-    // needs and both should be audible independently.
-    v.muted = false;
-    v.volume = 0.6;
-    v.addEventListener('loadedmetadata', () => {
-      state.set({
-        ...state.peek(),
-        videoDuration: v.duration,
-        videoLoading: false,
-      });
-    });
-    v.addEventListener('play', () => {
-      state.set({ ...state.peek(), videoPlaying: true });
-    });
-    v.addEventListener('pause', () => {
-      state.set({ ...state.peek(), videoPlaying: false });
-    });
-    v.addEventListener('seeked', () => {
-      state.set({ ...state.peek(), videoTime: v.currentTime });
-    });
-    v.addEventListener('error', () => {
-      state.set({
-        ...state.peek(),
-        videoLoading: false,
-        scrubMode: 'frame',
-        loadError:
-          'Couldn’t load the source video for scrubbing. Falling back to the crop frame.',
-      });
-    });
-    state.set({
-      ...prev,
-      scrubMode: 'video',
-      videoElement: v,
-      videoLoading: true,
-    });
-    // Kick off load after state is set so readers see loading state
-    // Source URL uses the episode_id from closure; we stash it in the
-    // element's dataset so the renderScrubBar can pick it up.
+    prev.videoElement?.pause();
+    state.set({ ...prev, scrubMode: 'frame' });
     return;
   }
   state.set({ ...prev, scrubMode: 'video' });
+  if (prev.videoElement && !prev.videoElement.src) {
+    // Camera audio identifies speakers; the mixer below auditions recorder tracks.
+    prev.videoElement.src = `/api/episodes/${episodeId}/video-preview`;
+  }
 }
 
-function renderScrubBar(
-  state: Signal<CropState>,
-  s: CropState,
-  episodeId: string
-): HTMLElement {
+function renderScrubBar(s: CropState): HTMLElement {
   if (s.scrubMode !== 'video') {
     return h(
       'div',
@@ -937,12 +908,8 @@ function renderScrubBar(
     );
   }
 
-  // Attach the source if not yet set
-  if (s.videoElement && !s.videoElement.src) {
-    s.videoElement.src = `/api/episodes/${episodeId}/video-preview`;
-  }
-
-  if (s.videoLoading || (s.videoElement && s.videoElement.readyState < 1)) {
+  const video = s.videoElement;
+  if (!video || video.readyState < 1) {
     return h(
       'div',
       { class: 'flex items-center gap-3 text-body-sm text-ink-tertiary' },
@@ -955,32 +922,28 @@ function renderScrubBar(
     'button',
     {
       onclick: () => {
-        const v = state.peek().videoElement;
-        if (!v) return;
-        if (v.paused) v.play().catch(() => {});
-        else v.pause();
+        if (video.paused) video.play().catch(() => {});
+        else video.pause();
       },
       class:
         'h-9 px-3 rounded-md border border-border bg-surface-2 text-ink-primary flex items-center justify-center gap-2 hover:bg-surface-3',
-      'aria-label': s.videoPlaying ? 'Pause source video' : 'Play source video',
+      'aria-label': video.paused ? 'Play source video' : 'Pause source video',
     },
-    s.videoPlaying ? Icon.pause({ size: 16 }) : Icon.play({ size: 16 }),
-    s.videoPlaying ? 'Pause source' : 'Play source'
+    video.paused ? Icon.play({ size: 16 }) : Icon.pause({ size: 16 }),
+    video.paused ? 'Play source' : 'Pause source'
   );
 
   const seek = h('input', {
     type: 'range',
     id: 'scrub-seek',
     min: '0',
-    max: String(s.videoDuration || 0),
+    max: String(video.duration || 0),
     step: '0.05',
-    value: String(s.videoTime || 0),
+    value: String(video.currentTime || 0),
     class: 'cascade-slider flex-1',
     oninput: (e: Event) => {
-      const v = state.peek().videoElement;
-      if (!v) return;
       const t = Number((e.target as HTMLInputElement).value);
-      v.currentTime = t;
+      video.currentTime = t;
     },
   });
 
@@ -997,13 +960,13 @@ function renderScrubBar(
           id: 'scrub-time-label',
           class: 'text-code text-ink-secondary font-mono tabular',
         },
-        formatTimecode(s.videoTime)
+        formatTimecode(video.currentTime)
       ),
       seek,
       h(
         'span',
         { class: 'text-code text-ink-tertiary font-mono tabular' },
-        formatTimecode(s.videoDuration)
+        formatTimecode(video.duration)
       )
     ),
     // Unambiguous caption so Sam knows what's actually audible here.
