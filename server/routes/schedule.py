@@ -13,7 +13,7 @@ from agents.qa import current_funnel_urls_for_episode, quality_snapshot
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
     BACKGROUND_VARIANT_IDS,
-    DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    DESTINATION_DISTRIBUTION_RELEASE_SCHEMAS,
     background_variant_state,
     normalize_destination_distribution_targets,
 )
@@ -238,7 +238,7 @@ def _receipt_artifact_current(receipt: dict, version: object) -> bool | None:
 
 def _release_request_targets_artifact(request: dict, version: dict) -> bool:
     """Return whether one release request binds this exact variant render."""
-    if request.get("schema") == DESTINATION_DISTRIBUTION_RELEASE_SCHEMA:
+    if request.get("schema") in DESTINATION_DISTRIBUTION_RELEASE_SCHEMAS:
         targets = normalize_destination_distribution_targets(request.get("targets"))
         target = next(
             (

@@ -19,7 +19,7 @@ patched in every test. We never make a real network call.
 
 import json
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -2853,6 +2853,241 @@ class TestShortDestinationRequests:
         assert {
             receipt["rerelease_authorization_revision"] for receipt in receipts
         } == {authorization["revision"]}
+
+    def test_scheduled_release_waves_bind_dates_copy_and_idempotency(
+        self, env, episode_dir, monkeypatch
+    ):
+        from agents.publish import (
+            short_receipt_history_revision,
+            valid_rerelease_authorization,
+        )
+        from lib.short_variants import destination_distribution_release_revision
+
+        config = _destination_config()
+        config["platforms"]["facebook"] = {
+            "enabled": True,
+            "account_username": "facebook-account-id",
+            "page_id": "facebook-page-id",
+        }
+        self._seed(
+            episode_dir,
+            config,
+            extra_metadata={
+                "facebook": {
+                    "title": "A reviewed Reel title",
+                    "description": "A reviewed Reel description",
+                }
+            },
+        )
+        agent = _make_agent(episode_dir, config)
+        monkeypatch.setattr(agent, "_verify_destination_bindings", lambda *_args: None)
+        monkeypatch.setattr(agent, "_occupied_schedule", lambda *_args: [])
+        monkeypatch.setattr(
+            "agents.publish.validate_destination_media", lambda *_args: []
+        )
+        data = agent._inputs()
+        platforms = ["facebook", "instagram", "tiktok", "youtube"]
+        legacy = {
+            "clip_id": "clip_0",
+            "status": "published",
+            "request_id": "legacy-request",
+            "platforms": platforms,
+            "response": {
+                "status": "completed",
+                "request_id": "legacy-request",
+                "results": [
+                    {
+                        "platform": platform,
+                        "success": True,
+                        "post_url": f"https://example.com/{platform}/old",
+                        "request_id": "legacy-request",
+                        "profile_username": "test_user",
+                    }
+                    for platform in platforms
+                ],
+            },
+        }
+        gameplay = {
+            **data["short_versions"]["clip_0"],
+            "version": "gameplay_surround_v1",
+            "variant_id": "gameplay_surround_v1",
+            "revision": "sha256:" + "1" * 64,
+            "render_fingerprint": "sha256:" + "2" * 64,
+        }
+        clean = {
+            **data["short_versions"]["clip_0"],
+            "version": "speaker_panels_v1",
+            "variant_id": "speaker_panels_v1",
+            "revision": "sha256:" + "3" * 64,
+            "render_fingerprint": "sha256:" + "4" * 64,
+        }
+        minecraft = {
+            **data["short_versions"]["clip_0"],
+            "version": "minecraft_surround_v1",
+            "variant_id": "minecraft_surround_v1",
+            "revision": "sha256:" + "5" * 64,
+            "render_fingerprint": "sha256:" + "6" * 64,
+        }
+        first_date = (
+            datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=14)
+        ).replace(hour=9, minute=30, second=0, microsecond=0)
+        second_date = first_date + timedelta(days=7)
+        third_date = second_date + timedelta(days=7)
+        targets = [
+            {
+                "variant_id": gameplay["variant_id"],
+                "target_revision": gameplay["revision"],
+                "render_fingerprint": gameplay["render_fingerprint"],
+                "destinations": platforms,
+                "scheduled_date": first_date.isoformat(),
+            },
+            {
+                "variant_id": minecraft["variant_id"],
+                "target_revision": minecraft["revision"],
+                "render_fingerprint": minecraft["render_fingerprint"],
+                "destinations": platforms,
+                "scheduled_date": second_date.isoformat(),
+            },
+            {
+                "variant_id": clean["variant_id"],
+                "target_revision": clean["revision"],
+                "render_fingerprint": clean["render_fingerprint"],
+                "destinations": platforms,
+                "scheduled_date": third_date.isoformat(),
+            },
+        ]
+        history_revision = short_receipt_history_revision(
+            {"shorts": [legacy]}, "clip_0"
+        )
+        authorization = {
+            "schema": "cascade.destination-release/v2",
+            "request_id": "cbca9d92-d3fd-4e23-8742-4f190494e195",
+            "actor": "release-operator",
+            "reason": "Release exact scheduled layout waves",
+            "targets": targets,
+            "receipt_history_revision": history_revision,
+            "created_at": "2026-09-17T05:00:00+00:00",
+        }
+        authorization["revision"] = destination_distribution_release_revision(
+            request_id=authorization["request_id"],
+            actor=authorization["actor"],
+            reason=authorization["reason"],
+            targets=targets,
+            receipt_history_revision=history_revision,
+        )
+        clip = data["approved"][0]
+        clip["distribution_variant_id"] = "gameplay_surround_v1"
+        clip["distribution_release"] = authorization
+        data["previous_shorts"] = [legacy]
+
+        def versions(_data, overrides):
+            variant_id = overrides.get("clip_0", gameplay["variant_id"])
+            return {
+                "clip_0": {
+                    gameplay["variant_id"]: gameplay,
+                    minecraft["variant_id"]: minecraft,
+                    clean["variant_id"]: clean,
+                }[variant_id]
+            }
+
+        monkeypatch.setattr(agent, "_destination_versions", versions)
+        gameplay_request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_A,
+            destinations=platforms,
+            clip_ids=["clip_0"],
+        )
+        gameplay_request["schedule_overrides"] = {"clip_0": first_date.isoformat()}
+        gameplay_plan = agent._destination_plan(data, gameplay_request)
+        gameplay_intent = gameplay_plan["targets"][0]
+        assert gameplay_intent["scheduled_date"] == first_date.isoformat()
+        assert gameplay_plan["schedule_overrides"] == {"clip_0": first_date.isoformat()}
+
+        data["previous_shorts"] = [legacy, gameplay_intent]
+        minecraft_request = _destination_request(
+            episode_dir,
+            config,
+            request_id=self.REQUEST_B,
+            destinations=platforms,
+            clip_ids=["clip_0"],
+        )
+        minecraft_request["variant_overrides"] = {"clip_0": "minecraft_surround_v1"}
+        minecraft_request["schedule_overrides"] = {"clip_0": second_date.isoformat()}
+        minecraft_plan = agent._destination_plan(data, minecraft_request)
+        minecraft_intent = minecraft_plan["targets"][0]
+        assert minecraft_intent["scheduled_date"] == second_date.isoformat()
+        assert minecraft_intent["copy_revision"] == gameplay_intent["copy_revision"]
+
+        data["previous_shorts"] = [legacy, gameplay_intent, minecraft_intent]
+        clean_request = _destination_request(
+            episode_dir,
+            config,
+            request_id="3389774a-7ca5-40ae-b474-2af92b63735f",
+            destinations=platforms,
+            clip_ids=["clip_0"],
+        )
+        clean_request["variant_overrides"] = {"clip_0": "speaker_panels_v1"}
+        clean_request["schedule_overrides"] = {"clip_0": third_date.isoformat()}
+        clean_plan = agent._destination_plan(data, clean_request)
+        clean_intent = clean_plan["targets"][0]
+        assert clean_intent["scheduled_date"] == third_date.isoformat()
+        assert clean_intent["copy_revision"] == gameplay_intent["copy_revision"]
+        assert valid_rerelease_authorization(
+            {"shorts": [legacy, gameplay_intent, minecraft_intent]},
+            clip,
+            clean,
+            destinations=platforms,
+            scheduled_date=third_date.isoformat(),
+        )
+
+        wrong_date = {
+            **clean_request,
+            "schedule_overrides": {
+                "clip_0": (third_date + timedelta(days=1)).isoformat()
+            },
+        }
+        with pytest.raises(RuntimeError, match="scheduled re-release authorization"):
+            agent._destination_plan(data, wrong_date)
+
+        same_instant_wrong_offset = {
+            **gameplay_request,
+            "schedule_overrides": {
+                "clip_0": first_date.astimezone(timezone.utc).isoformat()
+            },
+        }
+        with pytest.raises(ValueError, match="offset does not match timezone"):
+            agent._destination_plan(data, same_instant_wrong_offset)
+
+        unauthorized_data = json.loads(json.dumps(data))
+        unauthorized_data["approved"][0].pop("distribution_release")
+        with pytest.raises(
+            RuntimeError,
+            match="schedule_overrides require a scheduled re-release authorization",
+        ):
+            agent._destination_plan(unauthorized_data, gameplay_request)
+
+        changed_copy = json.loads(json.dumps(gameplay_intent["destination_copy"]))
+        changed_copy["youtube"]["title"] += " changed"
+        with pytest.raises(RuntimeError, match="must use canonical copy"):
+            agent._destination_plan(
+                data,
+                {
+                    **clean_request,
+                    "copy_overrides": {"clip_0": changed_copy},
+                },
+            )
+
+        repeated = agent._destination_plan(data, gameplay_request)
+        assert repeated["targets"][0]["external_id"] == gameplay_intent["external_id"]
+        with pytest.raises(RuntimeError, match="already has a destination request"):
+            agent._destination_plan(
+                data,
+                {
+                    **gameplay_request,
+                    "request_id": "e2a512cf-60c5-4229-987f-9aa88b301bfd",
+                },
+            )
 
     @pytest.mark.parametrize("destinations", (["x"], ["youtube", "x"]))
     def test_wrong_required_variant_is_rejected_before_destination_preflight(

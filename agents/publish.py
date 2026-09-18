@@ -54,9 +54,11 @@ from lib.short_variants import (
     DISTRIBUTION_VARIANT_FIELD,
     MINECRAFT_SURROUND_DESTINATIONS,
     MINECRAFT_SURROUND_VARIANT_ID,
+    SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
     RetiredShortVariantError,
     background_variant_output,
     destination_distribution_release_revision,
+    destination_distribution_release_schema,
     distribution_release_revision,
     normalize_destination_distribution_targets,
     require_active_background_variant,
@@ -1405,7 +1407,10 @@ def short_rerelease_state(
 
 
 def _destination_release_target(
-    authorization: dict, version: dict, destinations: object
+    authorization: dict,
+    version: dict,
+    destinations: object,
+    scheduled_date: str | None,
 ) -> list[dict] | None:
     expected_fields = {
         "schema",
@@ -1423,6 +1428,8 @@ def _destination_release_target(
     if (
         set(authorization) != expected_fields
         or targets is None
+        or authorization.get("schema")
+        != destination_distribution_release_schema(targets)
         or not isinstance(destinations, list)
         or not destinations
         or destinations != sorted(set(destinations))
@@ -1442,6 +1449,8 @@ def _destination_release_target(
         version.get("render_fingerprint"),
     ):
         return None
+    if "scheduled_date" in target and target["scheduled_date"] != scheduled_date:
+        return None
     return targets
 
 
@@ -1453,6 +1462,7 @@ def _destination_release_receipts_valid(
     acknowledgement: object,
 ) -> bool:
     seen_targets = set()
+    scheduled_copies = set()
     for receipt in validated_short_receipts(publish):
         if (
             receipt["clip_id"] != clip_id
@@ -1492,8 +1502,17 @@ def _destination_release_receipts_valid(
             )
         ):
             return False
+        if (
+            "scheduled_date" in target
+            and receipt.get("scheduled_date") != target["scheduled_date"]
+        ):
+            return False
+        if authorization.get("schema") == (
+            SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
+        ):
+            scheduled_copies.add(receipt.get("copy_revision"))
         seen_targets.add(target["variant_id"])
-    return True
+    return None not in scheduled_copies and len(scheduled_copies) <= 1
 
 
 def valid_rerelease_authorization(
@@ -1502,6 +1521,7 @@ def valid_rerelease_authorization(
     version: dict,
     *,
     destinations: list[str] | None = None,
+    scheduled_date: str | None = None,
 ) -> bool:
     authorization = clip.get(DISTRIBUTION_RELEASE_FIELD)
     required = (
@@ -1517,12 +1537,15 @@ def valid_rerelease_authorization(
         for field in required
     ):
         return False
-    destination_release = authorization.get("schema") == (
-        DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
-    )
+    destination_release = authorization.get("schema") in {
+        DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+        SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    }
     targets = None
     if destination_release:
-        targets = _destination_release_target(authorization, version, destinations)
+        targets = _destination_release_target(
+            authorization, version, destinations, scheduled_date
+        )
         if targets is None:
             return False
     else:
@@ -1600,10 +1623,18 @@ def valid_rerelease_authorization(
 
 
 def _authorized_rerelease_version(
-    publish: dict, clip: dict, version: dict, destinations: list[str]
+    publish: dict,
+    clip: dict,
+    version: dict,
+    destinations: list[str],
+    scheduled_date: str | None,
 ) -> tuple[dict, bool]:
     authorized = valid_rerelease_authorization(
-        publish, clip, version, destinations=destinations
+        publish,
+        clip,
+        version,
+        destinations=destinations,
+        scheduled_date=scheduled_date,
     )
     if not authorized:
         return version, False
@@ -2201,6 +2232,7 @@ class PublishAgent(BaseAgent):
         destinations = sorted(value["destinations"])
         overrides = self._validated_variant_overrides(data, value)
         copy_overrides = value.get("copy_overrides", {})
+        schedule_overrides = value.get("schedule_overrides", {})
         publish_now = value.get("publish_now", False)
         if actor != actor.strip() or reason != reason.strip():
             raise RuntimeError("Short destination actor and reason must be trimmed")
@@ -2218,7 +2250,7 @@ class PublishAgent(BaseAgent):
             raise RuntimeError("Destination preview does not match the current release")
         destination_schema = (
             ARTIFACT_SHORT_DESTINATION_SCHEMA
-            if overrides or copy_overrides or publish_now
+            if overrides or copy_overrides or schedule_overrides or publish_now
             else EXPANDED_SHORT_DESTINATION_SCHEMA
             if set(destinations) & EXPANSION_DESTINATIONS
             else SHORT_DESTINATION_SCHEMA
@@ -2240,6 +2272,12 @@ class PublishAgent(BaseAgent):
             raise RuntimeError("variant_overrides must name selected clips")
         if not set(copy_overrides) <= set(selected_ids):
             raise RuntimeError("copy_overrides must name selected clips")
+        if schedule_overrides and set(schedule_overrides) != set(selected_ids):
+            raise RuntimeError(
+                "schedule_overrides must name every selected clip exactly"
+            )
+        if schedule_overrides and publish_now:
+            raise RuntimeError("schedule_overrides cannot be combined with publish_now")
         effective_versions = self._destination_versions(data, overrides)
         self._enforce_variant_destinations(
             selected_ids, effective_versions, destinations
@@ -2262,15 +2300,21 @@ class PublishAgent(BaseAgent):
             )
 
         selected_id_set = set(selected_ids)
-        schedule_by_clip = {}
-        schedule = data["metadata"].get("schedule", [])
-        for entry in schedule if isinstance(schedule, list) else []:
-            clip_id = str(entry.get("clip_id", "")) if isinstance(entry, dict) else ""
-            if clip_id not in selected_id_set:
-                continue
-            if clip_id in schedule_by_clip:
-                raise RuntimeError(f"Schedule has duplicate entries for {clip_id}")
-            schedule_by_clip[clip_id] = entry
+        schedule_by_clip = {
+            clip_id: {"clip_id": clip_id, "scheduled_date": scheduled_date}
+            for clip_id, scheduled_date in schedule_overrides.items()
+        }
+        if not schedule_overrides:
+            schedule = data["metadata"].get("schedule", [])
+            for entry in schedule if isinstance(schedule, list) else []:
+                clip_id = (
+                    str(entry.get("clip_id", "")) if isinstance(entry, dict) else ""
+                )
+                if clip_id not in selected_id_set:
+                    continue
+                if clip_id in schedule_by_clip:
+                    raise RuntimeError(f"Schedule has duplicate entries for {clip_id}")
+                schedule_by_clip[clip_id] = entry
         missing = [
             item
             for item in selected_ids
@@ -2291,26 +2335,11 @@ class PublishAgent(BaseAgent):
         co_schedule_ids = set()
         for clip_id in selected_ids:
             clip, version = by_id[clip_id], effective_versions[clip_id]
-            version, release_authorized = _authorized_rerelease_version(
-                {"shorts": prior},
-                clip,
-                version,
-                destinations,
-            )
-            if version.get("active_for_new_writes") is not True:
-                raise RuntimeError(
-                    f"The selected short variant for {clip_id} is retired; "
-                    "nothing was submitted"
-                )
-            target = ShortDeliverySpec.target_fields(clip_id, version)
-            target_revision = _document_revision(target)
-            identity = _destination_external_id(
-                self.episode_dir.name,
-                request_id,
-                destinations,
-                target_revision,
-                clip_id,
-                destination_schema,
+            release_request = clip.get(DISTRIBUTION_RELEASE_FIELD)
+            scheduled_release = bool(
+                isinstance(release_request, dict)
+                and release_request.get("schema")
+                == SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
             )
             scheduled_at = (
                 None
@@ -2327,6 +2356,40 @@ class PublishAgent(BaseAgent):
                 raise RuntimeError(
                     f"Schedule for {clip_id} is not safely in the future"
                 )
+            scheduled_date = (
+                scheduled_at.isoformat() if scheduled_at is not None else None
+            )
+            if schedule_overrides and not scheduled_release:
+                raise RuntimeError(
+                    f"{clip_id} schedule_overrides require a scheduled "
+                    "re-release authorization"
+                )
+            version, release_authorized = _authorized_rerelease_version(
+                {"shorts": prior},
+                clip,
+                version,
+                destinations,
+                scheduled_date,
+            )
+            if scheduled_release and not release_authorized:
+                raise RuntimeError(
+                    f"{clip_id} does not match its scheduled re-release authorization"
+                )
+            if version.get("active_for_new_writes") is not True:
+                raise RuntimeError(
+                    f"The selected short variant for {clip_id} is retired; "
+                    "nothing was submitted"
+                )
+            target = ShortDeliverySpec.target_fields(clip_id, version)
+            target_revision = _document_revision(target)
+            identity = _destination_external_id(
+                self.episode_dir.name,
+                request_id,
+                destinations,
+                target_revision,
+                clip_id,
+                destination_schema,
+            )
             recorded = [item for item in prior if item["clip_id"] == clip_id]
             current_waves = [
                 item
@@ -2390,6 +2453,10 @@ class PublishAgent(BaseAgent):
                     f"A historical publication receipt exists for {clip_id}; "
                     "prepare an explicit re-release identity"
                 )
+            if scheduled_release and clip_id in copy_overrides:
+                raise RuntimeError(
+                    f"{clip_id} scheduled re-release waves must use canonical copy"
+                )
             copy = copy_overrides.get(clip_id)
             if copy is None:
                 copy = short_destination_copy(
@@ -2416,6 +2483,19 @@ class PublishAgent(BaseAgent):
                 raise RuntimeError(
                     f"{clip_id} destination copy is invalid: " + "; ".join(copy_issues)
                 )
+            if scheduled_release:
+                prior_wave_copies = {
+                    item.get("copy_revision")
+                    for item in recorded
+                    if item.get("rerelease_request_id")
+                    == release_request.get("request_id")
+                }
+                if prior_wave_copies and prior_wave_copies != {
+                    _document_revision(copy)
+                }:
+                    raise RuntimeError(
+                        f"{clip_id} scheduled re-release waves must use identical copy"
+                    )
             media_issues = validate_destination_media(
                 self.episode_dir / version["path"], destinations
             )
@@ -2522,6 +2602,7 @@ class PublishAgent(BaseAgent):
             "reason": reason,
             "variant_overrides": overrides,
             "copy_overrides": copy_overrides,
+            "schedule_overrides": schedule_overrides,
             "publish_now": publish_now,
             "approved_destinations": approved_destinations,
             "requested_destinations": destinations,
@@ -2574,6 +2655,7 @@ class PublishAgent(BaseAgent):
                 "expected_release_revision": public_plan["release_revision"],
                 "variant_overrides": public_plan["variant_overrides"],
                 "copy_overrides": public_plan["copy_overrides"],
+                "schedule_overrides": public_plan["schedule_overrides"],
                 "publish_now": public_plan["publish_now"],
                 "preview_revision": public_plan["preview_revision"],
             },

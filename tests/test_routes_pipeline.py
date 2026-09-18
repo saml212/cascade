@@ -80,6 +80,7 @@ class TestShortDestinationPreview:
                     "tiktok": {"text": "Approved copy"},
                 }
             },
+            "schedule_overrides": {"clip_01": "2026-09-20T09:30:00-07:00"},
         }
         with patch(
             "agents.publish.PublishAgent.preview_short_destinations",
@@ -92,6 +93,10 @@ class TestShortDestinationPreview:
         assert response.json() == {"preview_revision": "sha256:preview"}
         assert preview.call_args.args[0]["request_id"] == request["request_id"]
         assert preview.call_args.args[0]["copy_overrides"] == request["copy_overrides"]
+        assert (
+            preview.call_args.args[0]["schedule_overrides"]
+            == request["schedule_overrides"]
+        )
 
         response = client.post(
             "/api/episodes/ep_001/publish-shorts/preview",
@@ -137,6 +142,7 @@ class TestShortDestinationPreview:
             ("publish_now", 1),
             ("variant_overrides", {"clip_01": 7}),
             ("copy_overrides", {"clip_01": {"youtube": {"title": 7}}}),
+            ("schedule_overrides", {"clip_01": 7}),
         ],
     )
     def test_rejects_coerced_wire_types(self, test_client, field, value):

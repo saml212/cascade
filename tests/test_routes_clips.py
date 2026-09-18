@@ -6,6 +6,8 @@ import asyncio
 import json
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import HTTPException
@@ -558,6 +560,7 @@ class TestDistributionSelection:
         identities = {
             "gameplay_surround_v1": ("1", "2"),
             "speaker_panels_v1": ("3", "4"),
+            "minecraft_surround_v1": ("5", "6"),
         }
         revision, fingerprint = identities[variant_id]
         return {
@@ -1240,6 +1243,169 @@ class TestDistributionSelection:
         assert acknowledgement["receipt_history_revision"] == history_revision
         assert len(acknowledgement["obligations"]) == 1
         assert acknowledgement["obligations"][0]["artifact_identity"] == "unknown"
+
+    def test_prepares_scheduled_variant_waves_without_rewriting_history(
+        self, test_client, monkeypatch
+    ):
+        client, episodes_dir = test_client
+        episode_dir = _create_episode(episodes_dir, "ep_001")
+        _add_clips(
+            episodes_dir,
+            "ep_001",
+            [
+                dict(
+                    SAMPLE_CLIPS[0],
+                    status="approved",
+                    distribution_variant_id="gameplay_surround_v1",
+                )
+            ],
+        )
+        platforms = ["facebook", "instagram", "tiktok", "youtube"]
+        receipt = {
+            "clip_id": "clip_01",
+            "status": "published",
+            "request_id": "old-request",
+            "platforms": platforms,
+            "response": {
+                "status": "completed",
+                "request_id": "old-request",
+                "results": [
+                    {
+                        "platform": platform,
+                        "success": True,
+                        "post_url": f"https://example.com/{platform}/old",
+                        "request_id": "old-request",
+                        "profile_username": "up",
+                    }
+                    for platform in platforms
+                ],
+            },
+        }
+        publish_path = episode_dir / "publish.json"
+        publish_path.write_text(
+            json.dumps({"profile_username": "up", "shorts": [receipt]})
+        )
+        publish_before = publish_path.read_bytes()
+
+        from agents.publish import valid_rerelease_authorization
+        from server.routes import clips as clips_mod
+
+        monkeypatch.setattr(
+            clips_mod,
+            "_distribution_state",
+            lambda _episode_dir, candidate: self._destination_state(candidate),
+        )
+        now = datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0)
+        scheduled_dates = [
+            (now + timedelta(days=30 + 7 * index)).isoformat() for index in range(3)
+        ]
+        body = {
+            "request_id": "c3f97654-9762-4d3b-a7db-f80a55b51247",
+            "actor": "release-operator",
+            "reason": "Release exact scheduled layout waves",
+            "targets": [
+                {
+                    "variant_id": "gameplay_surround_v1",
+                    "expected_revision": "sha256:" + "1" * 64,
+                    "destinations": platforms,
+                    "scheduled_date": scheduled_dates[0],
+                },
+                {
+                    "variant_id": "minecraft_surround_v1",
+                    "expected_revision": "sha256:" + "5" * 64,
+                    "destinations": platforms,
+                    "scheduled_date": scheduled_dates[1],
+                },
+                {
+                    "variant_id": "speaker_panels_v1",
+                    "expected_revision": "sha256:" + "3" * 64,
+                    "destinations": platforms,
+                    "scheduled_date": scheduled_dates[2],
+                },
+            ],
+        }
+
+        clips_before = (episode_dir / "clips.json").read_bytes()
+        for request_id, unusable_dates in (
+            (
+                "f48b6c24-494b-4c83-bc8b-e10720b71611",
+                [
+                    (now - timedelta(days=30 + 7 * index)).isoformat()
+                    for index in range(3)
+                ],
+            ),
+            (
+                "c31139df-a5ae-454c-957a-ca536d11a2d2",
+                [
+                    (now + timedelta(days=400 + 7 * index)).isoformat()
+                    for index in range(3)
+                ],
+            ),
+        ):
+            unusable = json.loads(json.dumps(body))
+            unusable["request_id"] = request_id
+            for target, date in zip(
+                unusable["targets"],
+                unusable_dates,
+                strict=True,
+            ):
+                target["scheduled_date"] = date
+            rejected_date = client.post(
+                "/api/episodes/ep_001/clips/clip_01/re-release-targets",
+                json=unusable,
+            )
+            assert rejected_date.status_code == 422
+            assert (episode_dir / "clips.json").read_bytes() == clips_before
+
+        prepared = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets", json=body
+        )
+        repeated = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets", json=body
+        )
+        mixed_dates = json.loads(json.dumps(body))
+        mixed_dates["targets"][1].pop("scheduled_date")
+        rejected = client.post(
+            "/api/episodes/ep_001/clips/clip_01/re-release-targets",
+            json={**mixed_dates, "request_id": "5d96eb92-9104-4546-bbcf-d85efeb95263"},
+        )
+
+        assert prepared.status_code == 200
+        assert prepared.json()["status"] == "prepared"
+        assert repeated.status_code == 200
+        assert repeated.json()["status"] == "already_prepared"
+        assert rejected.status_code == 422
+        assert publish_path.read_bytes() == publish_before
+
+        stored_clip = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+        authorization = stored_clip["distribution_release"]
+        assert authorization["schema"] == "cascade.destination-release/v2"
+        assert [
+            target["scheduled_date"] for target in authorization["targets"]
+        ] == scheduled_dates
+        assert stored_clip["distribution_variant_id"] == "gameplay_surround_v1"
+        clean = {
+            "variant_id": "speaker_panels_v1",
+            "revision": "sha256:" + "3" * 64,
+            "render_fingerprint": "sha256:" + "4" * 64,
+        }
+        publish = json.loads(publish_before)
+        assert valid_rerelease_authorization(
+            publish,
+            stored_clip,
+            clean,
+            destinations=platforms,
+            scheduled_date=scheduled_dates[2],
+        )
+        assert not valid_rerelease_authorization(
+            publish,
+            stored_clip,
+            clean,
+            destinations=platforms,
+            scheduled_date=(
+                datetime.fromisoformat(scheduled_dates[2]) + timedelta(days=7)
+            ).isoformat(),
+        )
 
     @pytest.mark.parametrize("variant_id", ACTIVE_VARIANT_IDS)
     def test_acknowledges_exact_legacy_history_for_variant_rerelease(

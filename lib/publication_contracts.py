@@ -34,6 +34,7 @@ class ShortDestinationRequest(BaseModel):
     expected_release_revision: str = Field(min_length=1)
     variant_overrides: dict[str, str] = Field(default_factory=dict)
     copy_overrides: dict[str, dict[str, dict[str, str]]] = Field(default_factory=dict)
+    schedule_overrides: dict[str, str] = Field(default_factory=dict)
     publish_now: bool = False
 
 

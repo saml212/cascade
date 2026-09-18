@@ -8,10 +8,11 @@ import math
 import os
 import subprocess
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Self
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -40,7 +41,7 @@ from lib.ffprobe import get_duration
 from lib.paths import get_episodes_dir
 from lib.short_variants import (
     BACKGROUND_VARIANT_IDS,
-    DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    DESTINATION_DISTRIBUTION_RELEASE_SCHEMAS,
     DESTINATION_DISTRIBUTION_TARGETS,
     DISTRIBUTION_RELEASE_FIELD,
     DISTRIBUTION_VARIANT_FIELD,
@@ -51,6 +52,7 @@ from lib.short_variants import (
     background_variant_state,
     default_background_asset_id,
     destination_distribution_release_revision,
+    destination_distribution_release_schema,
     distribution_release_revision,
     normalize_destination_distribution_targets,
     require_active_background_variant,
@@ -242,6 +244,7 @@ class DestinationReReleaseTargetRequest(BaseModel):
     variant_id: str
     expected_revision: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     destinations: list[str] = Field(min_length=1)
+    scheduled_date: str | None = None
 
 
 class DestinationReReleaseRequest(BaseModel):
@@ -250,7 +253,7 @@ class DestinationReReleaseRequest(BaseModel):
     request_id: UUID
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=3, max_length=500)
-    targets: list[DestinationReReleaseTargetRequest] = Field(min_length=2, max_length=2)
+    targets: list[DestinationReReleaseTargetRequest] = Field(min_length=1, max_length=3)
     acknowledge_unresolved_history_revision: str | None = Field(
         default=None, pattern=r"^sha256:[0-9a-f]{64}$"
     )
@@ -558,8 +561,9 @@ _RELEASE_REQUEST_STRING_FIELDS = (
 
 
 def _valid_release_request(value: object) -> bool:
-    if isinstance(value, dict) and value.get("schema") == (
-        DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
+    if (
+        isinstance(value, dict)
+        and value.get("schema") in DESTINATION_DISTRIBUTION_RELEASE_SCHEMAS
     ):
         expected_fields = {
             "schema",
@@ -582,6 +586,8 @@ def _valid_release_request(value: object) -> bool:
             )
             and normalize_destination_distribution_targets(value.get("targets"))
             is not None
+            and value.get("schema")
+            == destination_distribution_release_schema(value.get("targets"))
         ):
             return False
         acknowledgement = value.get("unresolved_history_acknowledgement")
@@ -1152,11 +1158,14 @@ def _rerelease_target_fields(
 ) -> tuple[dict, dict, dict, bool]:
     if isinstance(req, DestinationReReleaseRequest):
         candidate, state, targets = _destination_rerelease_targets(ep_dir, clip, req)
+        schema = destination_distribution_release_schema(targets)
+        if schema is None:
+            raise HTTPException(status_code=422, detail="Invalid release targets.")
         return (
             candidate,
             state,
             {
-                "schema": DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+                "schema": schema,
                 "targets": targets,
             },
             True,
@@ -1407,29 +1416,69 @@ async def prepare_clip_rerelease(
 def _destination_rerelease_targets(
     ep_dir: Path, clip: dict, req: DestinationReReleaseRequest
 ) -> tuple[dict, dict, list[dict]]:
-    supplied = {
-        target.variant_id: target
-        for target in req.targets
-        if target.variant_id in DESTINATION_DISTRIBUTION_TARGETS
-    }
-    if len(supplied) != len(req.targets) or set(supplied) != set(
-        DESTINATION_DISTRIBUTION_TARGETS
-    ):
+    supplied = {target.variant_id: target for target in req.targets}
+    if len(supplied) != len(req.targets):
+        raise HTTPException(
+            status_code=422,
+            detail="Re-release targets must use unique variants.",
+        )
+    scheduled = [target.scheduled_date is not None for target in req.targets]
+    if any(scheduled) and not all(scheduled):
+        raise HTTPException(
+            status_code=422,
+            detail="Scheduled re-release targets must all bind exact dates.",
+        )
+    scheduled_release = all(scheduled)
+    if not scheduled_release and set(supplied) != set(DESTINATION_DISTRIBUTION_TARGETS):
         raise HTTPException(
             status_code=422,
             detail=(
                 "Targets must be the exact gameplay/non-X and clean/X variant pair."
             ),
         )
+    if scheduled_release:
+        from agents.pipeline import load_config
+        from agents.publish import PublishAgent
+
+        tz_name = str(
+            load_config().get("schedule", {}).get("timezone", "America/Los_Angeles")
+        )
+        reference = datetime.now(ZoneInfo(tz_name))
+        try:
+            scheduled_dates = [
+                PublishAgent._schedule_to_datetime(
+                    {"scheduled_date": target.scheduled_date},
+                    tz_name,
+                    reference=reference,
+                )
+                for target in req.targets
+            ]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        reference_instant = reference.astimezone(timezone.utc)
+        horizon = (reference + timedelta(days=365)).astimezone(timezone.utc)
+        if any(
+            not reference_instant < value.astimezone(timezone.utc) <= horizon
+            for value in scheduled_dates
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Scheduled re-release dates must be safely in the future.",
+            )
     states = {}
     candidates = {}
     targets = []
-    for variant_id, destinations in DESTINATION_DISTRIBUTION_TARGETS.items():
-        requested = supplied[variant_id]
-        if requested.destinations != list(destinations):
+    for variant_id, requested in supplied.items():
+        _require_active_variant(variant_id)
+        if not scheduled_release and requested.destinations != list(
+            DESTINATION_DISTRIBUTION_TARGETS[variant_id]
+        ):
             raise HTTPException(
                 status_code=422,
-                detail=f"{variant_id} must bind destinations: {', '.join(destinations)}",
+                detail=(
+                    f"{variant_id} must bind destinations: "
+                    + ", ".join(DESTINATION_DISTRIBUTION_TARGETS[variant_id])
+                ),
             )
         candidate, state = _rerelease_target(
             ep_dir,
@@ -1446,14 +1495,37 @@ def _destination_rerelease_targets(
                 "variant_id": variant_id,
                 "target_revision": state["revision"],
                 "render_fingerprint": state["render_fingerprint"],
-                "destinations": list(destinations),
+                "destinations": requested.destinations,
+                **(
+                    {"scheduled_date": requested.scheduled_date}
+                    if scheduled_release
+                    else {}
+                ),
             }
         )
-    targets.sort(key=lambda target: target["variant_id"])
+    if scheduled_release:
+        targets.sort(
+            key=lambda target: (target["scheduled_date"], target["variant_id"])
+        )
+    else:
+        targets.sort(key=lambda target: target["variant_id"])
+    normalized = normalize_destination_distribution_targets(targets)
+    if normalized is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Re-release targets do not form one exact supported wave set.",
+        )
+    preferred_variant = (
+        GAMEPLAY_SURROUND_VARIANT_ID
+        if not scheduled_release
+        else selected_short_variant_id(clip)
+    )
+    if preferred_variant not in candidates:
+        preferred_variant = normalized[0]["variant_id"]
     return (
-        candidates[GAMEPLAY_SURROUND_VARIANT_ID],
-        states[GAMEPLAY_SURROUND_VARIANT_ID],
-        targets,
+        candidates[preferred_variant],
+        states[preferred_variant],
+        normalized,
     )
 
 
@@ -1461,7 +1533,7 @@ def _destination_rerelease_targets(
 async def prepare_clip_destination_rerelease(
     episode_id: str, clip_id: str, req: DestinationReReleaseRequest
 ) -> dict:
-    """Bind the exact gameplay/non-X and clean/X release pair."""
+    """Bind exact destination variants, artifacts, and optional future dates."""
     return await asyncio.to_thread(
         _prepare_clip_rerelease_locked, episode_id, clip_id, req
     )

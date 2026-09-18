@@ -35,6 +35,7 @@ from lib.gameplay_playback import (
     require_resolved_gameplay_playback,
     resolve_gameplay_asset_playback,
 )
+from lib.short_distribution import SHORT_DESTINATIONS
 from lib.timeline import Timeline, rebase_diarized
 
 BACKGROUND_VARIANT_ID = "background_motion_v1"
@@ -125,6 +126,13 @@ BASE_SHORT_VERSION = "base"
 DISTRIBUTION_VARIANT_FIELD = "distribution_variant_id"
 DISTRIBUTION_RELEASE_FIELD = "distribution_release"
 DESTINATION_DISTRIBUTION_RELEASE_SCHEMA = "cascade.destination-release/v1"
+SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA = "cascade.destination-release/v2"
+DESTINATION_DISTRIBUTION_RELEASE_SCHEMAS = frozenset(
+    {
+        DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+        SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+    }
+)
 
 _VARIANT_LABELS = {
     BACKGROUND_VARIANT_ID: "Motion background",
@@ -293,28 +301,77 @@ def distribution_release_revision(
     return _json_revision(inputs)
 
 
-def normalize_destination_distribution_targets(value: object) -> list[dict] | None:
-    """Validate the exact gameplay/non-X and clean/X re-release pair."""
-    if not isinstance(value, list) or len(value) != len(
-        DESTINATION_DISTRIBUTION_TARGETS
-    ):
+def _scheduled_destination_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.isoformat() == value
+
+
+def destination_distribution_release_schema(targets: object) -> str | None:
+    normalized = normalize_destination_distribution_targets(targets)
+    if normalized is None:
         return None
-    normalized = []
-    for target in value:
-        if not isinstance(target, dict) or set(target) != {
+    return (
+        SCHEDULED_DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
+        if "scheduled_date" in normalized[0]
+        else DESTINATION_DISTRIBUTION_RELEASE_SCHEMA
+    )
+
+
+def normalize_destination_distribution_targets(value: object) -> list[dict] | None:
+    """Validate either the legacy destination split or scheduled variant waves."""
+    if not isinstance(value, list):
+        return None
+    scheduled = bool(value) and all(
+        isinstance(target, dict) and "scheduled_date" in target for target in value
+    )
+    if scheduled:
+        if not 1 <= len(value) <= 3:
+            return None
+        expected_fields = {
             "variant_id",
             "target_revision",
             "render_fingerprint",
             "destinations",
-        }:
+            "scheduled_date",
+        }
+    else:
+        if len(value) != len(DESTINATION_DISTRIBUTION_TARGETS):
+            return None
+        expected_fields = {
+            "variant_id",
+            "target_revision",
+            "render_fingerprint",
+            "destinations",
+        }
+    normalized = []
+    for target in value:
+        if not isinstance(target, dict) or set(target) != expected_fields:
             return None
         variant_id = target.get("variant_id")
         if not isinstance(variant_id, str):
             return None
-        expected_destinations = DESTINATION_DISTRIBUTION_TARGETS.get(variant_id)
+        destinations = target.get("destinations")
         if (
-            expected_destinations is None
-            or target.get("destinations") != list(expected_destinations)
+            variant_id not in BACKGROUND_VARIANT_IDS
+            or (scheduled and variant_id not in ACTIVE_BACKGROUND_VARIANT_IDS)
+            or not isinstance(destinations, list)
+            or not destinations
+            or any(
+                not isinstance(destination, str) or not destination
+                for destination in destinations
+            )
+            or destinations != sorted(set(destinations))
+            or not set(destinations) <= set(SHORT_DESTINATIONS)
+            or (
+                scheduled
+                and variant_id == MINECRAFT_SURROUND_VARIANT_ID
+                and not set(destinations) <= set(MINECRAFT_SURROUND_DESTINATIONS)
+            )
             or not isinstance(target.get("target_revision"), str)
             or _SHA256.fullmatch(target["target_revision"]) is None
             or not isinstance(target.get("render_fingerprint"), str)
@@ -322,11 +379,40 @@ def normalize_destination_distribution_targets(value: object) -> list[dict] | No
         ):
             return None
         normalized.append(target)
-    if {target["variant_id"] for target in normalized} != set(
-        DESTINATION_DISTRIBUTION_TARGETS
-    ):
-        return None
-    normalized.sort(key=lambda target: target["variant_id"])
+    if scheduled:
+        variant_ids = {target["variant_id"] for target in normalized}
+        exact_pilot = len(normalized) == 3 and variant_ids == SPEAKER_PANEL_VARIANT_IDS
+        exact_carryover = len(normalized) == 1 and variant_ids == {
+            GAMEPLAY_SURROUND_VARIANT_ID
+        }
+        if (
+            not (exact_pilot or exact_carryover)
+            or any(
+                target["destinations"] != list(MINECRAFT_SURROUND_DESTINATIONS)
+                for target in normalized
+            )
+            or len({tuple(target["destinations"]) for target in normalized}) != 1
+            or any(
+                not _scheduled_destination_date(target["scheduled_date"])
+                for target in normalized
+            )
+            or len({target["scheduled_date"] for target in normalized})
+            != len(normalized)
+        ):
+            return None
+        normalized.sort(
+            key=lambda target: (target["scheduled_date"], target["variant_id"])
+        )
+    else:
+        if any(
+            target["destinations"]
+            != list(DESTINATION_DISTRIBUTION_TARGETS.get(target["variant_id"], ()))
+            for target in normalized
+        ) or {target["variant_id"] for target in normalized} != set(
+            DESTINATION_DISTRIBUTION_TARGETS
+        ):
+            return None
+        normalized.sort(key=lambda target: target["variant_id"])
     return normalized if value == normalized else None
 
 
@@ -342,8 +428,10 @@ def destination_distribution_release_revision(
     normalized = normalize_destination_distribution_targets(targets)
     if normalized is None:
         raise ValueError("invalid destination release targets")
+    schema = destination_distribution_release_schema(normalized)
+    assert schema is not None
     inputs = {
-        "schema": DESTINATION_DISTRIBUTION_RELEASE_SCHEMA,
+        "schema": schema,
         "request_id": request_id,
         "actor": actor,
         "reason": reason,

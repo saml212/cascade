@@ -1,6 +1,8 @@
 """Receipt-bound Upload-Post schedule cancellation tests."""
 
 import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -17,6 +19,8 @@ ACTIVE_VARIANT_IDS = (
 )
 ACTIVE_VARIANT_ID = "speaker_panels_v1"
 RETIRED_VARIANT_ID = "background_motion_v1"
+TARGET_REVISION = "sha256:" + "a" * 64
+TARGET_RENDER_FINGERPRINT = "sha256:" + "b" * 64
 
 
 def _receipt():
@@ -253,8 +257,8 @@ def _state(candidate):
         "active_for_new_writes": (
             variant_id is None or variant_id in ACTIVE_VARIANT_IDS
         ),
-        "revision": "sha256:selected-target",
-        "render_fingerprint": "sha256:selected-render",
+        "revision": TARGET_REVISION,
+        "render_fingerprint": TARGET_RENDER_FINGERPRINT,
     }
 
 
@@ -309,7 +313,7 @@ def _setup(test_client, monkeypatch):
     monkeypatch.setattr(clips, "_delete_upload_post_schedule", delete)
     request = {
         "variant_id": ACTIVE_VARIANT_ID,
-        "expected_revision": "sha256:selected-target",
+        "expected_revision": TARGET_REVISION,
         "request_id": REQUEST_ID,
         "actor": "release-operator",
         "reason": "Replace the approved Base schedule with clean speaker panels",
@@ -436,6 +440,93 @@ def test_exact_preview_cancel_and_idempotent_rerelease(test_client, monkeypatch)
         ]
         is None
     )
+
+
+@pytest.mark.parametrize("pilot_source", [False, True])
+def test_cancelled_schedule_can_bind_exact_scheduled_wave_set(
+    test_client, monkeypatch, pilot_source
+):
+    client, episode_dir, _original, _deleted, request = _setup(test_client, monkeypatch)
+    cancellation_request = {
+        "expected_external_id": "cascade-short-old",
+        "request_id": request["request_id"],
+        "actor": request["actor"],
+        "reason": request["reason"],
+    }
+    preview = client.post(
+        "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/job-old/cancellation/preview",
+        json=cancellation_request,
+    ).json()
+    cancelled = client.post(
+        "/api/episodes/ep_001/clips/clip_01/scheduled-jobs/job-old/cancellation",
+        json=preview["execute"],
+    )
+    assert cancelled.status_code == 200
+
+    first_date = (
+        datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=14)
+    ).replace(hour=9, minute=0, second=0, microsecond=0)
+    targets = [
+        {
+            "variant_id": "gameplay_surround_v1",
+            "expected_revision": TARGET_REVISION,
+            "destinations": ["facebook", "instagram", "tiktok", "youtube"],
+            "scheduled_date": first_date.isoformat(),
+        }
+    ]
+    if pilot_source:
+        targets.extend(
+            [
+                {
+                    "variant_id": "minecraft_surround_v1",
+                    "expected_revision": TARGET_REVISION,
+                    "destinations": [
+                        "facebook",
+                        "instagram",
+                        "tiktok",
+                        "youtube",
+                    ],
+                    "scheduled_date": (first_date + timedelta(days=7)).isoformat(),
+                },
+                {
+                    "variant_id": "speaker_panels_v1",
+                    "expected_revision": TARGET_REVISION,
+                    "destinations": [
+                        "facebook",
+                        "instagram",
+                        "tiktok",
+                        "youtube",
+                    ],
+                    "scheduled_date": (first_date + timedelta(days=14)).isoformat(),
+                },
+            ]
+        )
+    body = {
+        "request_id": request["request_id"],
+        "actor": request["actor"],
+        "reason": request["reason"],
+        "targets": targets,
+    }
+    prepared = client.post(
+        "/api/episodes/ep_001/clips/clip_01/re-release-targets", json=body
+    )
+
+    assert prepared.status_code == 200, prepared.json()
+    assert prepared.json()["status"] == "prepared"
+    stored = json.loads((episode_dir / "clips.json").read_text())["clips"][0]
+    assert stored["distribution_release"]["schema"] == (
+        "cascade.destination-release/v2"
+    )
+    assert stored["distribution_release"]["targets"] == [
+        {
+            "variant_id": target["variant_id"],
+            "target_revision": target["expected_revision"],
+            "render_fingerprint": TARGET_RENDER_FINGERPRINT,
+            "destinations": target["destinations"],
+            "scheduled_date": target["scheduled_date"],
+        }
+        for target in targets
+    ]
 
 
 def test_retired_historical_target_can_be_cancelled_without_rerelease_next(

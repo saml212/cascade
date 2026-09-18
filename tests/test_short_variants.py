@@ -52,6 +52,7 @@ from lib.short_variants import (
     background_variant_output,
     background_variant_state,
     default_background_asset_id,
+    destination_distribution_release_schema,
     file_content_identity,
     gameplay_caption_width_policy,
     load_background_asset,
@@ -113,6 +114,112 @@ def test_destination_release_targets_require_exact_unique_variant_pair():
     for unhashable in ([], {}):
         malformed = {**clean, "variant_id": unhashable}
         assert normalize_destination_distribution_targets([gameplay, malformed]) is None
+
+
+def test_scheduled_destination_release_targets_bind_unique_variants_and_dates():
+    destinations = ["facebook", "instagram", "tiktok", "youtube"]
+    gameplay = {
+        "variant_id": GAMEPLAY_SURROUND_VARIANT_ID,
+        "target_revision": "sha256:" + "1" * 64,
+        "render_fingerprint": "sha256:" + "2" * 64,
+        "destinations": destinations,
+        "scheduled_date": "2026-09-20T09:30:00-07:00",
+    }
+    clean = {
+        "variant_id": SPEAKER_PANELS_VARIANT_ID,
+        "target_revision": "sha256:" + "3" * 64,
+        "render_fingerprint": "sha256:" + "4" * 64,
+        "destinations": destinations,
+        "scheduled_date": "2026-10-04T09:30:00-07:00",
+    }
+    minecraft = {
+        "variant_id": MINECRAFT_SURROUND_VARIANT_ID,
+        "target_revision": "sha256:" + "5" * 64,
+        "render_fingerprint": "sha256:" + "6" * 64,
+        "destinations": destinations,
+        "scheduled_date": "2026-09-27T09:30:00-07:00",
+    }
+
+    targets = [gameplay, minecraft, clean]
+    assert normalize_destination_distribution_targets([gameplay]) == [gameplay]
+    assert destination_distribution_release_schema([gameplay]) == (
+        "cascade.destination-release/v2"
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [{**gameplay, "variant_id": BACKGROUND_VARIANT_ID}]
+        )
+        is None
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [
+                {
+                    **gameplay,
+                    "variant_id": MINECRAFT_SURROUND_VARIANT_ID,
+                    "destinations": [*destinations, "x"],
+                }
+            ]
+        )
+        is None
+    )
+    assert normalize_destination_distribution_targets(targets) == targets
+    assert destination_distribution_release_schema(targets) == (
+        "cascade.destination-release/v2"
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [
+                gameplay,
+                {**minecraft, "scheduled_date": gameplay["scheduled_date"]},
+                clean,
+            ]
+        )
+        is None
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [gameplay, minecraft, {**clean, "destinations": ["instagram", "youtube"]}]
+        )
+        is None
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [gameplay, minecraft, {**clean, "destinations": ["youtube", []]}]
+        )
+        is None
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [gameplay, minecraft, {**clean, "scheduled_date": "2026-10-04T09:30:00"}]
+        )
+        is None
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [gameplay, minecraft, {**clean, "scheduled_date": []}]
+        )
+        is None
+    )
+    assert normalize_destination_distribution_targets([clean]) is None
+    assert normalize_destination_distribution_targets([minecraft]) is None
+    assert normalize_destination_distribution_targets([gameplay, clean]) is None
+    assert (
+        normalize_destination_distribution_targets(
+            [{**gameplay, "destinations": ["youtube"]}]
+        )
+        is None
+    )
+    assert (
+        normalize_destination_distribution_targets(
+            [
+                gameplay,
+                minecraft,
+                {**clean, "destinations": [*destinations, "x"]},
+            ]
+        )
+        is None
+    )
 
 
 def _asset(tmp_path, monkeypatch):
