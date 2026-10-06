@@ -72,7 +72,7 @@ else
     echo "WARNING: no .env file found; API-backed features may be unavailable."
 fi
 
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] || echo "ANTHROPIC_API_KEY is not set; optional API-based clip generation is unavailable. Local release preparation still works."
+echo "Automatic clip mining uses [generation] in config/config.toml: OpenAI API or an authenticated Claude CLI. See README.md."
 [[ -n "${DEEPGRAM_API_KEY:-}" ]] || echo "WARNING: DEEPGRAM_API_KEY is not set; transcription will be unavailable."
 
 mkdir -p config output work

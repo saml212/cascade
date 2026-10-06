@@ -1,195 +1,152 @@
 # Cascade
 
-Podcast automation pipeline that turns raw recordings into publish-ready shorts, longform video, and an Apple video podcast RSS feed. Supports single-camera or multi-camera setups with external multi-track audio (Zoom H6E or similar).
+Turn podcast recordings into reviewed longform video, captioned shorts, thumbnails, and publish-ready files. Cascade supports single- and multi-camera recordings, separate microphones, speaker framing, audio repair, and optional publishing and scheduling.
 
-## What It Does
+**Use [OpenAI Codex](https://developers.openai.com/codex/quickstart) as your production agent.** Open this repository in Codex, give it your recordings, and let it operate Cascade's local API while you review the media in the browser. Codex is the recommended starting point; Claude Code remains compatible with the shared producer instructions.
 
-Cascade runs a dependency-aware agent pipeline:
+## Get started with Codex
 
-1. **Ingest** — Copy media from SD card(s) to SSD, validate with ffprobe, sync external audio
-2. **Stitch** — Concatenate clips via ffmpeg stream-copy
-3. **Audio Analysis** — Detect true stereo vs identical/mono channels
-4. **Speaker Cut** — Segment speakers via per-channel RMS energy (supports N-speaker multi-track)
-5. **Transcribe** — Deepgram Nova-3 with diarization + SRT generation
-6. **Clip Miner** — Claude identifies top 10 short-form candidates
-7. **Longform Render** — 16:9 speaker-cropped video with hardware encoding
-8. **Shorts Render** — 9:16 shorts with burned-in subtitles
-9. **Thumbnail Gen** — AI-generated caricature artwork via OpenAI
-10. **QA** — Validate all outputs (durations, file sizes, formats, and reviewed release copy)
-11. **Video Feed** — Publish approved full-episode video to the Apple video podcast RSS feed in Cloudflare R2
-12. **Publish** — Distribute to YouTube, TikTok, Instagram, and more
-13. **Backup** — rsync episode to external HDD
-
-Agents run in parallel where possible (transcribe runs alongside audio analysis + speaker cut).
-
-## Quick Start
-
-### Prerequisites
-
-- **Python 3.11+** (`start.sh` creates a Python 3.12 environment)
-- **ffmpeg** with the `ass` subtitle filter. On Homebrew, use `brew install ffmpeg-full` and ensure that build is first on `PATH`.
-- **uv** (required by `start.sh`) — `brew install uv`
-- **Node.js + npm** — used to compile the TypeScript frontend
-
-### Setup
+Clone this repository, then open the `cascade` folder in the Codex desktop app. For the terminal version, follow the [official Codex CLI setup](https://developers.openai.com/codex/cli):
 
 ```bash
-git clone https://github.com/saml212/cascade.git && cd cascade
-cp config/config.example.toml config/config.toml  # Edit paths & podcast info
-cp .env.example .env                               # Fill in your API keys (see below)
-./start.sh                                         # Repairs setup, builds UI, opens loopback server
+git clone https://github.com/saml212/cascade.git
+cd cascade
+npm install -g @openai/codex
+codex
 ```
 
-Or manually:
+Sign in when prompted. Give Codex this first task, replacing the media path:
+
+> Read AGENTS.md and README.md, then help me install and start Cascade on this computer. Read the producer workflow before operating an episode. Set up my own podcast name and storage paths. My recordings are in /absolute/path/to/recordings. Check which services are configured before starting paid work. Prepare a short local sample for me to review before rendering the whole episode. Preserve my source recordings. Do not publish or schedule anything yet.
+
+Codex operates the software through its API and local tools. Its login is separate from service credentials used by Cascade. In particular, the optional built-in automatic clip miner currently supports **OpenAI's Responses API or Claude CLI**, not a `codex_cli` provider. You can use Codex for production without installing Claude Code; configure the OpenAI generation option below if you want the built-in clip miner too.
+
+## Install and launch
+
+macOS is the primary development environment. You need Git, Node.js/npm, `uv`, and FFmpeg with the `ass` subtitle filter. The launcher creates a Python 3.12 environment (Python 3.11+ is supported).
+
+With [Homebrew](https://brew.sh/) installed:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cd frontend && npm ci && npm run build && cd ..
-cp config/config.example.toml config/config.toml   # Edit paths & podcast info
-cp .env.example .env                               # Fill in API keys
+brew install git node uv ffmpeg-full
+# If you have not cloned the repository yet:
+git clone https://github.com/saml212/cascade.git
+cd cascade
+cp config/config.example.toml config/config.toml
+cp .env.example .env
 ```
 
-### API Keys
+Before the first episode:
 
-| Key | Required | Purpose |
-|-----|----------|---------|
-| `ANTHROPIC_API_KEY` | For API generation | Clip mining |
-| `DEEPGRAM_API_KEY` | For transcription | Nova-3 transcription + speaker diarization |
-| `OPENAI_API_KEY` | No | Thumbnail generation (caricature artwork) |
-| `YOUTUBE_CLIENT_ID` | No | YouTube publishing |
-| `YOUTUBE_CLIENT_SECRET` | No | YouTube publishing |
-| `TIKTOK_CLIENT_KEY` | No | TikTok publishing |
-| `TIKTOK_CLIENT_SECRET` | No | TikTok publishing |
-| `INSTAGRAM_ACCESS_TOKEN` | No | Instagram publishing |
-| `FACEBOOK_PAGE_ID` | No | Instagram publishing |
-| `CLOUDFLARE_ACCOUNT_ID` | No | Apple video podcast RSS feed (R2 storage) |
-| `CLOUDFLARE_API_TOKEN` | No | Apple video podcast RSS feed (R2 storage) |
-| `UPLOAD_POST_API_KEY` | No | Upload-Post publishing |
-| `UPLOAD_POST_USER` | No | Upload-Post publishing |
+1. Edit `config/config.toml`: set your podcast title/author and storage paths. Use absolute paths to existing storage locations. Allow space for source copies, render intermediates, and final videos.
+2. Add only the credentials you need to `.env`, using the table below. Neither this file nor your local config is committed to Git.
+3. Start the app:
 
-Local import, framing, manual metadata, audio mastering, and upload-video
-preparation do not require either key. The full automated pipeline needs
-`ANTHROPIC_API_KEY` and `DEEPGRAM_API_KEY` for its generation and transcription
-stages. Publishing and RSS keys are only needed for those specific agents.
+```bash
+./start.sh
+```
 
-The default audio mastering path uses ffmpeg and the lean dependencies in
-`requirements.txt`. DeepFilterNet restoration is optional because its PyTorch
-runtime is large. Install it only when the configured denoise model needs it:
+The launcher installs Python dependencies, builds the frontend, and starts [Cascade at http://127.0.0.1:8420](http://127.0.0.1:8420). Keep that terminal open; Ctrl+C stops the server. The local UI can launch without service credentials.
+
+### Credentials and generation
+
+| Feature | Setup |
+| --- | --- |
+| Local import, framing, manual editing, rendering and export | No service key required; transcription and automatic clip mining are separate stages |
+| Transcription | `DEEPGRAM_API_KEY` in `.env` |
+| Automatic clip mining with OpenAI | `OPENAI_API_KEY` in `.env`, plus the generation settings below |
+| Automatic clip mining with Claude | An installed, authenticated `claude` CLI; `[generation] provider = "claude_cli"` is the existing example default |
+| Social publishing/scheduling | `UPLOAD_POST_API_KEY`, `UPLOAD_POST_USER`, connected destination accounts, and reviewed platform configuration |
+| Video podcast RSS and hosted media | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, and your own `[podcast.r2]`/feed settings |
+
+To use OpenAI for the built-in clip miner, **replace the existing `[generation]` section** in `config/config.toml` with:
+
+```toml
+[generation]
+provider = "openai"
+openai_model = "YOUR_MODEL_ID"
+reasoning_effort = "medium"
+timeout_seconds = 180
+```
+
+Replace `YOUR_MODEL_ID` with a model available to your API project that supports structured output and the configured reasoning effort. This API usage is billed separately from a Codex subscription. An Anthropic API key is not required by the current Claude CLI generation path. Service pricing and account limits vary; check them before processing a long recording.
+
+### First episode
+
+Start with a small copy of representative footage and matching recorder tracks. Ask Codex to follow [AGENTS.md](AGENTS.md) and the [producer workflow](.claude/skills/produce/SKILL.md), or import the source directory in the browser.
+
+Review microphone mapping, synchronization, speaker names, crops, and a short rendered sample before running a full export. The release workflow is: confirm picture and sound, edit episode details, then prepare and download the local upload files. Publishing is a separate explicit action with revision-bound approval and QA checks.
+
+The API contract is available at [http://127.0.0.1:8420/docs](http://127.0.0.1:8420/docs). For recovery and detailed production steps, see [docs/recovery-workflow.md](docs/recovery-workflow.md).
+
+## What Cascade supports
+
+- Media ingest, validation, stitching, and external audio synchronization.
+- Per-microphone analysis, speaker segmentation, framing, and longform rendering.
+- Transcription, captioned vertical shorts, and optional automatic clip selection.
+- Clean shorts, one-gameplay and multi-gameplay compositions using your supplied media.
+- Audio mastering and evidence-based repair with reviewable replacement files.
+- Thumbnails from actual episode footage, metadata, QA, and local export.
+- Optional Upload-Post publishing/scheduling and Cloudflare R2 video podcast RSS.
+- Optional backups to your configured storage.
+
+The dependency-aware pipeline runs independent stages in parallel. It does not install recurring social-growth jobs as part of app startup. Publishing still requires your own accounts and approvals; this repository does not include the maintainer's recordings or account credentials.
+
+## Troubleshooting
+
+| Problem | Next step |
+| --- | --- |
+| FFmpeg has no `ass` filter | Install `ffmpeg-full`. The launcher prefers its Homebrew binary over the minimal build. |
+| Missing `uv`, `node`, or `npm` | Install the prerequisites above and reopen your terminal. |
+| Transcription cannot start | Set `DEEPGRAM_API_KEY` and restart the server. |
+| Clip mining asks for `claude`, or generation fails | Choose and configure one of the generation options above; Codex sign-in alone does not configure this stage. |
+| Browser does not open | Visit `http://127.0.0.1:8420` directly and inspect the launch terminal for errors. |
+| Port 8420 is already in use | Check whether Cascade is already running before starting another server. |
+| Storage resolves somewhere unexpected | Verify absolute paths and mounted volumes; inspect the episode location returned by the API. |
+
+The launcher opens the browser using macOS `open`. On another system, install the equivalent prerequisites and use the manual launch below; cross-platform production is less exercised than macOS.
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
+.venv/bin/uvicorn server.app:app --host 127.0.0.1 --port 8420
+```
+
+Create and edit the config and `.env` files first, as above. Keep the server on loopback; it is a local production tool, not a hosted multi-user service.
+
+Optional DeepFilterNet restoration has a large PyTorch dependency. Install it only if you select that restoration path:
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements-restoration.txt
 ```
 
-### Run the Pipeline
+## Configuration and development
+
+See [configuration](docs/configuration.md), [architecture](docs/architecture.md), and [recovery workflow](docs/recovery-workflow.md). Core directories:
+
+| Directory | Purpose |
+| --- | --- |
+| `agents/` | Pipeline stages and dependency orchestration |
+| `lib/` | Media, generation, storage, and approval helpers |
+| `server/` | FastAPI application and production API |
+| `frontend/` | TypeScript/Vite browser UI |
+| `config/` | Example configuration; your `config.toml` stays local |
+| `tests/`, `frontend/test/` | Python and frontend tests |
+
+To update an existing installation, preserve your local config/media, stop active work, then run `git pull --ff-only` and `./start.sh`. If you have local code changes, review them before pulling.
 
 ```bash
-# Full pipeline from SD card
-python -m agents --source-path "/path/to/media/"
-
-# Specific agents only
-python -m agents --source-path "/path/to/media/" --agents ingest stitch audio_analysis
-
-# With a custom episode ID
-python -m agents --source-path "/path/to/media/" --episode-id ep_2026-02-19_120000
+uv pip install --python .venv/bin/python -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
-### Run the Web UI
+Storage can live on local or external disks. `CASCADE_OUTPUT_DIR`, `CASCADE_WORK_DIR`, and `CASCADE_BACKUP_DIR` override configured paths. Use absolute paths; missing external volumes can cause a local fallback, so verify the resolved location before ingesting large recordings.
 
-```bash
-./start.sh
-# Opens http://localhost:8420 automatically
-```
-
-The web UI uses a three-step release workflow: confirm picture and sound, edit
-episode details, then prepare and download verified local upload files. Publishing
-is a separate explicit action. FastAPI serves the canonical TypeScript/Vite app
-from `frontend/dist`; `./start.sh` rebuilds it before every launch.
-
-## Architecture
-
-See [the system architecture](docs/architecture.md) and the
-[recovery and production workflow](docs/recovery-workflow.md) for the API and
-artifact contracts used by both the UI and autonomous agents.
-
-```
-cascade/
-├── agents/          # Pipeline agents (DAG-parallel execution)
-│   ├── base.py      # BaseAgent ABC (timing, logging, JSON I/O, config helpers)
-│   ├── pipeline.py  # DAG orchestrator with dependency-aware parallelism
-│   ├── ingest.py → stitch.py → audio_analysis.py → speaker_cut.py
-│   ├── transcribe.py (runs parallel to audio_analysis + speaker_cut)
-│   ├── clip_miner.py → shorts_render.py
-│   ├── longform_render.py (starts when speaker_cut + transcribe finish)
-│   ├── thumbnail_gen.py → qa.py; video_feed.py + publish.py; backup.py
-│   └── ...
-├── lib/             # Shared utilities
-│   ├── encoding.py  # VideoToolbox / libx264 encoder selection + LUT support
-│   ├── ffprobe.py   # ffprobe wrapper
-│   ├── audio_mix.py # Multi-track audio mixing with per-track volume control
-│   ├── paths.py     # Path resolution (external drive fallback)
-│   ├── clips.py     # Clip normalization
-│   └── srt.py       # SRT generation, parsing, and ffmpeg escaping
-├── server/          # FastAPI app (port 8420)
-│   ├── app.py       # Entry point + static files
-│   └── routes/      # API endpoints (episodes, clips, pipeline, trim, etc.)
-├── frontend/        # TypeScript + Vite SPA; FastAPI serves frontend/dist
-├── config/          # config.toml — all settings
-├── tests/           # Python pytest suite
-├── frontend/tests/  # TypeScript helper/state tests run with Node
-└── start.sh         # One-command setup + launch
-```
-
-## Storage
-
-By default, Cascade stores everything locally in `./episodes/` and `./work/`. This works out of the box with no external drives.
-
-For large episodes (multi-GB source files), you can point to an external SSD by editing `config/config.toml`:
-
-```toml
-[paths]
-output_dir = "~/cascade/episodes"
-work_dir = "~/cascade/work"
-backup_dir = "~/cascade/backup"
-```
-
-If an external drive path is configured but the volume isn't mounted, Cascade automatically falls back to local storage.
-
-## Configuration
-
-All settings live in `config/config.toml`. Key sections:
-
-- **`[paths]`** — Output directory, work directory, backup drive (local fallback if drive missing)
-- **`[processing]`** — CRF, resolution, clip duration limits, hardware acceleration
-- **`[transcription]`** — Deepgram model, language, diarization settings
-- **`[clip_mining]`** — LLM model, temperature, clip count
-- **`[schedule]`** — Shorts posting cadence, peak days, timezone
-- **`[platforms.*]`** — Per-platform publishing settings
-- **`[podcast]`** — Show and Apple video podcast RSS metadata (title, author, artwork)
-- **`[podcast.links]`** — Link-in-bio page URLs (see below)
-
-## Episode Hub (Link-in-Bio)
-
-The canonical public episode hub is maintained in the separate
-`thelocalpod.link` GitHub Pages repository. Configure its exact episode URL under
-`podcast.links.episode_url_template`; Cascade uses that URL in reviewed publication
-copy and the read-only watch-link API. Cloudflare R2 continues to serve media, RSS,
-artwork, and historical watch pages, but Cascade no longer creates or replaces R2
-HTML pages.
-
-`GET /api/episodes/{episode_id}/watch-links` exposes current revision-bound
-YouTube and Spotify destinations plus the exact-ID Apple catalog match when one is
-available. `GET /api/episodes/{episode_id}/watch-page` renders the same document as
-an escaped local HTML preview. `landing_page.path` is the canonical origin-relative
-path, query, and fragment, so fragment-routed episode identities remain distinct.
-Neither endpoint writes episode or remote state.
-
-## API Costs per Episode
-
-| Service | Cost |
-|---------|------|
-| Deepgram transcription | ~$0.50 |
-| Claude clip mining | ~$0.10-0.30 |
+For a public episode hub, configure your own `podcast.links.episode_url_template` as an HTTPS URL containing one `{episode_id}` placeholder. The maintainer's separate show website is not required to run Cascade. See the configuration guide for destination-specific link handling.
 
 ## License
 

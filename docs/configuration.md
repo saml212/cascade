@@ -1,8 +1,8 @@
 # Configuration
 
 - **`config/config.toml`** — all paths, thresholds, API settings. Copy from `config.example.toml`. Gitignored.
-- **`.env`** — API keys: `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`. Copy from `.env.example`. Gitignored.
-- **`requirements.txt`** — installed via `uv pip install`. Includes `ruff` for dev tooling.
+- **`.env`** — service credentials such as `DEEPGRAM_API_KEY` and optional `OPENAI_API_KEY`. Copy from `.env.example`. Gitignored.
+- **`requirements.txt`** — core runtime dependencies installed via `uv pip install`. Development tooling, including `ruff`, lives in `requirements-dev.txt`.
 - **`tomllib`** (stdlib, Python 3.11+) is used for TOML parsing. `tomli` has been removed.
 
 Short-form destinations are enabled independently under `platforms`. Facebook,
@@ -68,6 +68,12 @@ copy with the bare show URL plus an explicit guest or episode cue, such as `Full
 episode at thelocalpod.link — choose Arnold Gray.` Facebook and YouTube can
 retain the episode fragment.
 
-## API Costs per Episode (current)
-- Deepgram transcription: ~$0.50 (stays on API — best-in-class STT).
-- Claude clip mining: ~$0.10-0.30 (pending migration to `claude` CLI / Max subscription).
+## Generation and costs
+
+Use Codex as the production agent as described in [the README](../README.md).
+The app's automatic clip miner has its own transport: the example defaults to an
+authenticated Claude CLI (`generation.provider = "claude_cli"`), or you can select
+`"openai"` with `OPENAI_API_KEY` and an explicit `generation.openai_model`.
+Codex login does not configure the app's generation transport. Transcription uses
+Deepgram separately. Check current provider pricing and account limits before
+processing; costs depend on recording length and the chosen model.
